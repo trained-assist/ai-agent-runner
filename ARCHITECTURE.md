@@ -187,3 +187,9 @@ Serialisation учитывает conversation/session writer keys, а не об�
 - [ ] Граница между этим Runner и существующими serverless wrappers.
 
 Каждый epic должен ссылаться на конкретный контракт/требование и указывать: что меняется, как проверяется, какие пробелы остаются. Draft улучшаем по фактам реализации и проверок.
+
+## Уточнение implementation order — 30.09.2026
+
+Первое исполнение — OpenCode на существующей sandbox VM с reproducible setup/fault fixtures и обязательными scoped logs. Следующий этап — **external Serverless Agent API даже на одной VM**, затем manifest/direct artifact transfer; внутренний multi-worker API — отдельная более поздняя граница. API admission/result adapter может быть package этого repo, без mandatory GTD/frontend dependencies. Free-only default требует лимитов и controlled failures, не unlimited live runs.
+
+[Serverless API](https://github.com/trained-assist/trained-agent-architecture/blob/main/SERVERLESS-AGENT-API.md), [Sandbox Driven Development](https://github.com/trained-assist/trained-agent-architecture/blob/main/ENGINEERING-APPROACH.md), [Observability](https://github.com/trained-assist/trained-agent-architecture/blob/main/OBSERVABILITY-AND-ERROR-CONTRACT.md). Изменяемые implementation statuses ведутся в GitHub Projects.
