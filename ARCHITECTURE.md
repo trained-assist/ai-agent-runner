@@ -92,7 +92,7 @@ Result manifest содержит outcome, exit reason/code, output refs, session
 
 ## 6. Изоляция: что есть и чего ещё нет
 
-Основа аудита — core [trained-assist](https://github.com/trained-assist/trained-assist) на revision **c83e6931d61ddb205779ee670e4c4c59b26580eb**. Пути ниже относятся к изученному core; развёрнутые настройки VM отдельно не проверены.
+Основа аудита — core [trained-assist](https://github.com/trained-assist/trained-assist-agent) на revision **c83e6931d61ddb205779ee670e4c4c59b26580eb**. Пути ниже относятся к изученному core; развёрнутые настройки VM отдельно не проверены.
 
 | Механизм в текущем core | Ограничение |
 |---|---|
