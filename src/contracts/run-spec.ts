@@ -1,0 +1,398 @@
+import {
+  ErrorCollector,
+  checkArray,
+  checkKeys,
+  checkObject,
+  checkPositiveInt,
+  checkSafeId,
+  checkString,
+  isEnvName,
+  isRecord,
+  isUtcTimestamp,
+  type ValidationResult,
+} from './validate.js';
+
+export const RUN_SPEC_CONTRACT_VERSION = 1 as const;
+
+export interface EngineModelSettings {
+  model?: string;
+  temperature?: number;
+}
+
+export interface EngineSpec {
+  name: string;
+  adapterVersion: string;
+  modelSettings?: EngineModelSettings;
+}
+
+export interface InputRef {
+  ref: string;
+  version?: string;
+}
+
+export interface InputSpec {
+  refs?: InputRef[];
+  inlinePrompt?: string;
+}
+
+export interface CredentialBinding {
+  ref: string;
+  scope: string;
+  expiresAt?: string;
+  status?: 'active' | 'missing' | 'expired';
+}
+
+export interface BudgetSpec {
+  correlationRef: string;
+  approved: boolean;
+  reason?: string;
+}
+
+export interface RegionConstraints {
+  allowedRegions?: string[];
+}
+
+export interface RunLimits {
+  timeoutMs: number;
+  maxOutputBytes?: number;
+  maxLogBytes?: number;
+}
+
+export interface ResultPolicy {
+  destinationRef?: string;
+  retentionPolicy?: string;
+}
+
+export interface RunSpec {
+  contractVersion: typeof RUN_SPEC_CONTRACT_VERSION;
+  jobId: string;
+  runId: string;
+  operationId: string;
+  userTaskId: string;
+  profileId: string;
+  conversationId: string;
+  ownerGeneration: number;
+  engine: EngineSpec;
+  cwd: string;
+  envAllowlist: string[];
+  limits: RunLimits;
+  deadline?: string;
+  input?: InputSpec;
+  isolation?: { mode: string };
+  regionConstraints?: RegionConstraints;
+  credentialBindings?: CredentialBinding[];
+  budget?: BudgetSpec;
+  result?: ResultPolicy;
+  traceId?: string;
+}
+
+const TOP_LEVEL_KEYS = [
+  'contractVersion',
+  'jobId',
+  'runId',
+  'operationId',
+  'userTaskId',
+  'profileId',
+  'conversationId',
+  'ownerGeneration',
+  'engine',
+  'cwd',
+  'envAllowlist',
+  'limits',
+  'deadline',
+  'input',
+  'isolation',
+  'regionConstraints',
+  'credentialBindings',
+  'budget',
+  'result',
+  'traceId',
+] as const;
+
+const TOP_LEVEL_REQUIRED = [
+  'contractVersion',
+  'jobId',
+  'runId',
+  'operationId',
+  'userTaskId',
+  'profileId',
+  'conversationId',
+  'ownerGeneration',
+  'engine',
+  'cwd',
+  'envAllowlist',
+  'limits',
+] as const;
+
+function validateEngine(value: unknown, path: string, collector: ErrorCollector): EngineSpec | undefined {
+  if (!checkObject(value, path, collector)) return undefined;
+  checkKeys(value, ['name', 'adapterVersion', 'modelSettings'], ['name', 'adapterVersion'], path, collector);
+  const engine: EngineSpec = { name: '', adapterVersion: '' };
+  checkString(value['name'], `${path}.name`, collector, 100);
+  if (typeof value['name'] === 'string') engine.name = value['name'];
+  checkString(value['adapterVersion'], `${path}.adapterVersion`, collector, 100);
+  if (typeof value['adapterVersion'] === 'string') engine.adapterVersion = value['adapterVersion'];
+  if (value['modelSettings'] !== undefined) {
+    const ms = value['modelSettings'];
+    if (!checkObject(ms, `${path}.modelSettings`, collector)) return engine;
+    checkKeys(ms, ['model', 'temperature'], [], `${path}.modelSettings`, collector);
+    const modelSettings: EngineModelSettings = {};
+    if (ms['model'] !== undefined) {
+      checkString(ms['model'], `${path}.modelSettings.model`, collector, 200);
+      if (typeof ms['model'] === 'string') modelSettings.model = ms['model'];
+    }
+    if (ms['temperature'] !== undefined) {
+      const t = ms['temperature'];
+      if (typeof t !== 'number' || Number.isNaN(t) || t < 0 || t > 2) {
+        collector.push(`${path}.modelSettings.temperature: expected number in [0, 2]`);
+      } else {
+        modelSettings.temperature = t;
+      }
+    }
+    engine.modelSettings = modelSettings;
+  }
+  return engine;
+}
+
+function validateLimits(value: unknown, path: string, collector: ErrorCollector): RunLimits | undefined {
+  if (!checkObject(value, path, collector)) return undefined;
+  checkKeys(value, ['timeoutMs', 'maxOutputBytes', 'maxLogBytes'], ['timeoutMs'], path, collector);
+  const limits: RunLimits = { timeoutMs: 0 };
+  checkPositiveInt(value['timeoutMs'], `${path}.timeoutMs`, collector);
+  if (typeof value['timeoutMs'] === 'number') limits.timeoutMs = value['timeoutMs'];
+  for (const key of ['maxOutputBytes', 'maxLogBytes'] as const) {
+    const v = value[key];
+    if (v === undefined) continue;
+    if (typeof v !== 'number' || !Number.isInteger(v) || v <= 0) {
+      collector.push(`${path}.${key}: expected positive integer`);
+    } else {
+      limits[key] = v;
+    }
+  }
+  return limits;
+}
+
+function validateEnvAllowlist(value: unknown, path: string, collector: ErrorCollector): string[] {
+  if (!checkArray(value, path, collector)) return [];
+  if (value.length > 200) collector.push(`${path}: too many entries`);
+  const names: string[] = [];
+  value.forEach((entry, i) => {
+    if (!isEnvName(entry)) {
+      collector.push(`${path}[${i}]: expected environment variable NAME (no values, no "NAME=value")`);
+      return;
+    }
+    names.push(entry);
+  });
+  return names;
+}
+
+function validateInput(value: unknown, path: string, collector: ErrorCollector): InputSpec | undefined {
+  if (!checkObject(value, path, collector)) return undefined;
+  checkKeys(value, ['refs', 'inlinePrompt'], [], path, collector);
+  const input: InputSpec = {};
+  if (value['refs'] !== undefined) {
+    const refs = value['refs'];
+    if (checkArray(refs, `${path}.refs`, collector)) {
+      input.refs = refs.map((entry, i) => {
+        const refPath = `${path}.refs[${i}]`;
+        if (!checkObject(entry, refPath, collector)) return { ref: '' };
+        checkKeys(entry, ['ref', 'version'], ['ref'], refPath, collector);
+        const ref: InputRef = { ref: '' };
+        checkString(entry['ref'], `${refPath}.ref`, collector, 500);
+        if (typeof entry['ref'] === 'string') ref.ref = entry['ref'];
+        if (entry['version'] !== undefined) {
+          checkString(entry['version'], `${refPath}.version`, collector, 200);
+          if (typeof entry['version'] === 'string') ref.version = entry['version'];
+        }
+        return ref;
+      });
+    }
+  }
+  if (value['inlinePrompt'] !== undefined) {
+    checkString(value['inlinePrompt'], `${path}.inlinePrompt`, collector, 100_000);
+    if (typeof value['inlinePrompt'] === 'string') input.inlinePrompt = value['inlinePrompt'];
+  }
+  return input;
+}
+
+function validateCredentialBindings(value: unknown, path: string, collector: ErrorCollector): CredentialBinding[] | undefined {
+  if (!checkArray(value, path, collector)) return undefined;
+  return value.map((entry, i) => {
+    const entryPath = `${path}[${i}]`;
+    const binding: CredentialBinding = { ref: '', scope: '' };
+    if (!checkObject(entry, entryPath, collector)) return binding;
+    checkKeys(entry, ['ref', 'scope', 'expiresAt', 'status'], ['ref', 'scope'], entryPath, collector);
+    checkString(entry['ref'], `${entryPath}.ref`, collector, 300);
+    if (typeof entry['ref'] === 'string') binding.ref = entry['ref'];
+    checkString(entry['scope'], `${entryPath}.scope`, collector, 300);
+    if (typeof entry['scope'] === 'string') binding.scope = entry['scope'];
+    if (entry['expiresAt'] !== undefined) {
+      if (!isUtcTimestamp(entry['expiresAt'])) collector.push(`${entryPath}.expiresAt: expected UTC ISO timestamp`);
+      else binding.expiresAt = entry['expiresAt'];
+    }
+    if (entry['status'] !== undefined) {
+      if (entry['status'] !== 'active' && entry['status'] !== 'missing' && entry['status'] !== 'expired') {
+        collector.push(`${entryPath}.status: expected active | missing | expired`);
+      } else {
+        binding.status = entry['status'];
+      }
+    }
+    return binding;
+  });
+}
+
+function validateBudget(value: unknown, path: string, collector: ErrorCollector): BudgetSpec | undefined {
+  if (!checkObject(value, path, collector)) return undefined;
+  checkKeys(value, ['correlationRef', 'approved', 'reason'], ['correlationRef', 'approved'], path, collector);
+  const budget: BudgetSpec = { correlationRef: '', approved: false };
+  checkString(value['correlationRef'], `${path}.correlationRef`, collector, 300);
+  if (typeof value['correlationRef'] === 'string') budget.correlationRef = value['correlationRef'];
+  if (typeof value['approved'] !== 'boolean') collector.push(`${path}.approved: expected boolean`);
+  else budget.approved = value['approved'];
+  if (value['reason'] !== undefined) {
+    checkString(value['reason'], `${path}.reason`, collector, 300);
+    if (typeof value['reason'] === 'string') budget.reason = value['reason'];
+  }
+  return budget;
+}
+
+export function validateRunSpec(input: unknown): ValidationResult<RunSpec> {
+  const collector = new ErrorCollector();
+  if (!checkObject(input, 'spec', collector)) return collector.finish(undefined as never);
+  checkKeys(input, TOP_LEVEL_KEYS, TOP_LEVEL_REQUIRED, 'spec', collector);
+
+  if (input['contractVersion'] !== RUN_SPEC_CONTRACT_VERSION) {
+    collector.push(`spec.contractVersion: expected ${RUN_SPEC_CONTRACT_VERSION}`);
+  }
+
+  for (const key of ['jobId', 'runId', 'operationId'] as const) {
+    if (key in input) checkSafeId(input[key], `spec.${key}`, collector);
+  }
+  for (const key of ['userTaskId', 'profileId', 'conversationId'] as const) {
+    if (key in input) checkString(input[key], `spec.${key}`, collector, 200);
+  }
+
+  if ('ownerGeneration' in input) {
+    const gen = input['ownerGeneration'];
+    if (typeof gen !== 'number' || !Number.isInteger(gen) || gen < 0) {
+      collector.push('spec.ownerGeneration: expected non-negative integer');
+    }
+  }
+
+  const engine = 'engine' in input ? validateEngine(input['engine'], 'spec.engine', collector) : undefined;
+
+  if ('cwd' in input) {
+    const cwd = input['cwd'];
+    if (typeof cwd !== 'string' || cwd.length === 0) {
+      collector.push('spec.cwd: expected non-empty string');
+    } else if (!(cwd.startsWith('/') || /^[A-Za-z]:[\\/]/.test(cwd))) {
+      collector.push('spec.cwd: expected absolute path');
+    }
+  }
+
+  const envAllowlist = 'envAllowlist' in input ? validateEnvAllowlist(input['envAllowlist'], 'spec.envAllowlist', collector) : [];
+  const limits = 'limits' in input ? validateLimits(input['limits'], 'spec.limits', collector) : undefined;
+
+  if ('deadline' in input && input['deadline'] !== undefined && !isUtcTimestamp(input['deadline'])) {
+    collector.push('spec.deadline: expected UTC ISO timestamp');
+  }
+  if ('traceId' in input && input['traceId'] !== undefined) {
+    checkString(input['traceId'], 'spec.traceId', collector, 200);
+  }
+
+  let inputSpec: InputSpec | undefined;
+  if ('input' in input && input['input'] !== undefined) inputSpec = validateInput(input['input'], 'spec.input', collector);
+
+  let isolation: { mode: string } | undefined;
+  if ('isolation' in input && input['isolation'] !== undefined) {
+    const iso = input['isolation'];
+    if (checkObject(iso, 'spec.isolation', collector)) {
+      checkKeys(iso, ['mode'], ['mode'], 'spec.isolation', collector);
+      checkString(iso['mode'], 'spec.isolation.mode', collector, 100);
+      if (typeof iso['mode'] === 'string') isolation = { mode: iso['mode'] };
+    }
+  }
+
+  let regionConstraints: RegionConstraints | undefined;
+  if ('regionConstraints' in input && input['regionConstraints'] !== undefined) {
+    const rc = input['regionConstraints'];
+    if (checkObject(rc, 'spec.regionConstraints', collector)) {
+      checkKeys(rc, ['allowedRegions'], [], 'spec.regionConstraints', collector);
+      if (rc['allowedRegions'] !== undefined) {
+        const list = rc['allowedRegions'];
+        if (checkArray(list, 'spec.regionConstraints.allowedRegions', collector)) {
+          const allowed: string[] = [];
+          list.forEach((entry, i) => {
+            checkString(entry, `spec.regionConstraints.allowedRegions[${i}]`, collector, 50);
+            if (typeof entry === 'string') allowed.push(entry);
+          });
+          regionConstraints = { allowedRegions: allowed };
+        }
+      }
+    }
+  }
+
+  const credentialBindings =
+    'credentialBindings' in input && input['credentialBindings'] !== undefined
+      ? validateCredentialBindings(input['credentialBindings'], 'spec.credentialBindings', collector)
+      : undefined;
+
+  const budget = 'budget' in input && input['budget'] !== undefined ? validateBudget(input['budget'], 'spec.budget', collector) : undefined;
+
+  let result: ResultPolicy | undefined;
+  if ('result' in input && input['result'] !== undefined) {
+    const res = input['result'];
+    if (checkObject(res, 'spec.result', collector)) {
+      checkKeys(res, ['destinationRef', 'retentionPolicy'], [], 'spec.result', collector);
+      const policy: ResultPolicy = {};
+      if (res['destinationRef'] !== undefined) {
+        checkString(res['destinationRef'], 'spec.result.destinationRef', collector, 300);
+        if (typeof res['destinationRef'] === 'string') policy.destinationRef = res['destinationRef'];
+      }
+      if (res['retentionPolicy'] !== undefined) {
+        checkString(res['retentionPolicy'], 'spec.result.retentionPolicy', collector, 100);
+        if (typeof res['retentionPolicy'] === 'string') policy.retentionPolicy = res['retentionPolicy'];
+      }
+      result = policy;
+    }
+  }
+
+  if (!collector.ok) return collector.finish(undefined as never);
+
+  const spec: RunSpec = {
+    contractVersion: RUN_SPEC_CONTRACT_VERSION,
+    jobId: input['jobId'] as string,
+    runId: input['runId'] as string,
+    operationId: input['operationId'] as string,
+    userTaskId: input['userTaskId'] as string,
+    profileId: input['profileId'] as string,
+    conversationId: input['conversationId'] as string,
+    ownerGeneration: input['ownerGeneration'] as number,
+    engine: engine as EngineSpec,
+    cwd: input['cwd'] as string,
+    envAllowlist,
+    limits: limits as RunLimits,
+  };
+  if (input['deadline'] !== undefined) spec.deadline = input['deadline'] as string;
+  if (inputSpec !== undefined) spec.input = inputSpec;
+  if (isolation !== undefined) spec.isolation = isolation;
+  if (regionConstraints !== undefined) spec.regionConstraints = regionConstraints;
+  if (credentialBindings !== undefined) spec.credentialBindings = credentialBindings;
+  if (budget !== undefined) spec.budget = budget;
+  if (result !== undefined) spec.result = result;
+  if (input['traceId'] !== undefined) spec.traceId = input['traceId'] as string;
+
+  return collector.finish(spec);
+}
+
+export function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null';
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  const record = value as Record<string, unknown>;
+  const keys = Object.keys(record).sort();
+  return `{${keys.map((k) => `${JSON.stringify(k)}:${canonicalJson(record[k])}`).join(',')}}`;
+}
+
+export function isRecordValue(value: unknown): value is Record<string, unknown> {
+  return isRecord(value);
+}
