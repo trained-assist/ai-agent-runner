@@ -407,21 +407,26 @@ export class Runner {
             this.markOrphaned(run, report);
             break;
           }
-          st.workerCrashed = true;
           if (!st.exit) {
+            st.workerCrashed = true;
             st.exit = { code: null, signal: null, observed: false, at: this.nowIso() };
             this.store.saveState(st);
             this.emit(st, 'exit', { code: null, signal: null });
+          } else if (!st.exit.observed) {
+            st.workerCrashed = true;
+            this.store.saveState(st);
           }
+          const reason = st.workerCrashed ? 'worker_crash' : 'engine_exit';
           if (this.transition(st, 'finalizing')) {
-            this.emit(st, 'finalizing', { reason: 'worker_crash' });
+            this.emit(st, 'finalizing', { reason });
             try {
               await this.finalize(st.runId);
             } catch {
               // stays resumable
             }
           }
-          report.lost += 1;
+          if (st.workerCrashed) report.lost += 1;
+          else report.finalizingResumed += 1;
           break;
         }
         case 'finalizing':
@@ -521,6 +526,7 @@ export class Runner {
     let phase: 'preflight' | 'spawn' = 'preflight';
     try {
       await this.fireFault('preflight', runId);
+      if (this.disposed) return;
       this.preflight(st);
       if (this.disposed) return;
       if (st.cancelRequested) {

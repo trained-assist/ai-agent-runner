@@ -91,7 +91,8 @@ const OUTCOME_EXIT_REASONS: Record<RunOutcome, readonly ExitReason[]> = {
 export function validateRunResult(input: unknown): ValidationResult<RunResult> {
   const collector = new ErrorCollector();
   if (!checkObject(input, 'result', collector)) return collector.finish(undefined as never);
-  checkKeys(input, RESULT_KEYS, RESULT_KEYS, 'result', collector);
+  const required = RESULT_KEYS.filter((key) => key !== 'failure');
+  checkKeys(input, RESULT_KEYS, required, 'result', collector);
 
   if (input['schemaVersion'] !== RUN_RESULT_SCHEMA_VERSION) collector.push('result.schemaVersion: expected 1');
   if (!isSafeId(input['runId'])) collector.push('result.runId: expected id');
