@@ -70,6 +70,7 @@ export interface RunSnapshot {
   connectionLost: boolean;
   orphanedPid: number | null;
   pid: number | null;
+  pgid: number | null;
   exit: PersistedRunState['exit'];
   finalized: boolean;
   result: RunResult | null;
@@ -157,6 +158,7 @@ export class Runner {
       connectionLost: st.connectionLost,
       orphanedPid: st.orphanedPid,
       pid: st.pid,
+      pgid: st.pgid,
       exit: st.exit ? { ...st.exit } : null,
       finalized: st.finalized,
       result: st.result ? { ...st.result } : null,
@@ -328,7 +330,7 @@ export class Runner {
     if (isTerminalState(st.state)) return { accepted: false, reason: 'already_terminal' };
     const candidate = {
       schemaVersion: 1,
-      eventId: `${st.runId}#${st.sequence + 1}`,
+      eventId: `${st.runId}:${st.sequence + 1}`,
       runId: st.runId,
       jobId: st.jobId,
       userTaskId: st.userTaskId,
@@ -403,6 +405,7 @@ export class Runner {
           }
           break;
         case 'running': {
+          if (run.handle) break;
           if (st.pid && isProcessAlive(st.pid)) {
             this.markOrphaned(run, report);
             break;
@@ -482,7 +485,7 @@ export class Runner {
   private emit(st: PersistedRunState, type: RunnerEventType, payload: unknown): RunnerEvent {
     const candidate = {
       schemaVersion: 1,
-      eventId: `${st.runId}#${st.sequence + 1}`,
+      eventId: `${st.runId}:${st.sequence + 1}`,
       runId: st.runId,
       jobId: st.jobId,
       userTaskId: st.userTaskId,
