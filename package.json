@@ -10,6 +10,8 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node dist/api/main.js",
     "test": "vitest run",
     "test:watch": "vitest"
   },
