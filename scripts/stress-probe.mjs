@@ -151,13 +151,31 @@ async function phaseTimeline() {
   marks.submitAccepted = Date.now();
   const runId = submit.json.runId;
 
-  const running = await waitForStatus(base, server.key, runId, (s) => s.state === 'running', 15000, 'running');
-  marks.running = Date.now();
-  void running;
-
-  const terminal = await waitTerminal(base, server.key, runId, 30000);
+  // стрим-шкала: ловим КАЖДОЕ событие в момент первого появления (клиентская метка)
+  const seen = new Map();
+  const pollDeadline = Date.now() + 30000;
+  let snapState = null;
+  while (Date.now() < pollDeadline) {
+    const r = await getEvents(base, server.key, runId, 0, 500);
+    if (r.status === 200) {
+      for (const e of r.json?.events ?? []) {
+        if (!seen.has(e.sequence)) {
+          seen.set(e.sequence, {
+            type: e.type,
+            seq: e.sequence,
+            recvOffMs: Date.now() - marks.submitAccepted,
+            ...(e.at ? { at: e.at } : {}),
+          });
+        }
+      }
+      snapState = r.json?.snapshot?.state ?? snapState;
+      if (['succeeded', 'failed', 'cancelled'].includes(snapState)) break;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  marks.running = marks.submitAccepted + ([...seen.values()].find((e) => e.type === 'started')?.recvOffMs ?? 0);
   marks.terminal = Date.now();
-  void terminal;
+  if (!['succeeded', 'failed', 'cancelled'].includes(snapState)) throw new Error(`run не стал терминальным за 30s (state=${snapState})`);
 
   const resultAt0 = Date.now();
   const result = await getResult(base, server.key, runId);
@@ -193,12 +211,7 @@ async function phaseTimeline() {
     ...(firstClaimed ? { firstEvent: { type: firstClaimed.type, sequence: firstClaimed.sequence } } : {}),
     ...(firstStarted ? { startedEvent: { type: firstStarted.type, sequence: firstStarted.sequence } } : {}),
     // общая шкала сравнения машин: события стрима с таймкодом относительно submit
-    eventTimeline: list.map((e) => ({
-      type: e.type,
-      seq: e.sequence,
-      at: e.at ?? null,
-      offSubmitMs: e.at ? Date.parse(e.at) - marks.submitAccepted : null,
-    })),
+    eventTimeline: [...seen.values()].sort((a, b) => a.seq - b.seq),
   };
   report.notes.push(`result готов через ${marks.resultReady - marks.terminal} мс после терминала; upload-artifact в workflow идёт отдельным шагом после job`);
   return resultAt0;
