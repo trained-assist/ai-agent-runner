@@ -45,6 +45,9 @@ jobs:
       - name: "Stress: timeline + memory→OOM + CPU burn"
         run: node scripts/stress-probe.mjs --json stress-report.json
 
+      - name: Install opencode (глобально)
+        run: npm install -g opencode-ai >/dev/null 2>&1 && opencode --version
+
       - name: "Opencode free-ladder: 4 параллельных + 1 длинный"
         env:
           LLM_LADDER_TOKEN: ${{ secrets.LLM_LADDER_TOKEN }}
@@ -92,6 +95,7 @@ jobs:
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: "Сигнатура таймаута: шаг с timeout-minutes=1 (спим 5 минут)"
+        if: always()
         id: tsig
         timeout-minutes: 1
         continue-on-error: true
