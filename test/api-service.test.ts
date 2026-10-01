@@ -1,5 +1,5 @@
 import { describe, expect, it, onTestFinished } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { FakeEngine, type FakeScenario } from '../src/adapters/engine/fake-engine.js';
@@ -8,7 +8,7 @@ import { ApiError } from '../src/api/errors.js';
 import { AgentApi } from '../src/api/service.js';
 import { FaultRegistry } from '../src/faults/registry.js';
 import { isTerminalState } from '../src/runner/state-machine.js';
-import { waitFor } from './helpers.js';
+import { removeDirWithRetry, waitFor } from './helpers.js';
 
 const alpha: Principal = { principalId: 'p-alpha', profileId: 'profile-a', scopes: ['runs:read', 'runs:write'], engines: ['fake'] };
 const beta: Principal = { principalId: 'p-beta', profileId: 'profile-b', scopes: ['runs:read', 'runs:write'] };
@@ -46,7 +46,7 @@ function createApi(scenario: FakeScenario = 'success', opts: { heartbeatInterval
       }
     }
     api.dispose();
-    rmSync(rootDir, { recursive: true, force: true });
+    await removeDirWithRetry(rootDir);
   });
   return { api, fake, faults, logs };
 }

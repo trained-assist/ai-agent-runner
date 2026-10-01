@@ -140,6 +140,42 @@ describe('validateRunSpec', () => {
     const result = validateRunSpec(validSpec({ limits: { timeoutMs: 0 } }));
     expect(result.ok).toBe(false);
   });
+
+  it('accepts a repository group with owner/name and optional token', () => {
+    const result = validateRunSpec(validSpec({ repository: { fullName: 'owner/name', token: 'ghs_abcdef0123456789' } }));
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.value.repository).toEqual({ fullName: 'owner/name', token: 'ghs_abcdef0123456789' });
+  });
+
+  it('treats an empty repository group as the default-repository mode', () => {
+    const result = validateRunSpec(validSpec({ repository: {} }));
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.value.repository).toBeUndefined();
+  });
+
+  it('rejects malformed repository fullName', () => {
+    for (const fullName of ['owner', 'a/b/c', 'no-slash', '../evil', 'owner/', '/name', 'a/../b']) {
+      const result = validateRunSpec(validSpec({ repository: { fullName } }));
+      expect(result.ok, `fullName "${fullName}" must be rejected`).toBe(false);
+      if (!result.ok) expect(result.errors.join(' ')).toContain('spec.repository.fullName');
+    }
+  });
+
+  it('rejects an empty or oversized repository token', () => {
+    const empty = validateRunSpec(validSpec({ repository: { fullName: 'owner/name', token: '' } }));
+    expect(empty.ok).toBe(false);
+    if (!empty.ok) expect(empty.errors.join(' ')).toContain('spec.repository.token');
+
+    const oversized = validateRunSpec(validSpec({ repository: { fullName: 'owner/name', token: 'x'.repeat(501) } }));
+    expect(oversized.ok).toBe(false);
+    if (!oversized.ok) expect(oversized.errors.join(' ')).toContain('spec.repository.token');
+  });
+
+  it('rejects unknown fields inside the repository group', () => {
+    const result = validateRunSpec(validSpec({ repository: { fullName: 'owner/name', passphrase: 'x' } }));
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.errors.join(' ')).toContain('unknown field "passphrase"');
+  });
 });
 
 describe('validateRunnerEvent', () => {

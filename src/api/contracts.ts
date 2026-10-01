@@ -3,12 +3,14 @@ import type { RunnerEvent } from '../contracts/events.js';
 import type { RunResult } from '../contracts/result.js';
 import {
   canonicalJson,
+  redactRepositoryToken,
   validateRunSpec,
   type BudgetSpec,
   type CredentialBinding,
   type EngineSpec,
   type InputSpec,
   type RegionConstraints,
+  type RepositorySpec,
   type ResultPolicy,
   type RunLimits,
   type RunSpec,
@@ -33,6 +35,7 @@ export interface SubmitRequest {
   result?: ResultPolicy;
   traceId?: string;
   instructions?: string;
+  repository?: RepositorySpec;
 }
 
 export interface Receipt {
@@ -90,6 +93,7 @@ const SUBMIT_KEYS = [
   'result',
   'traceId',
   'instructions',
+  'repository',
 ] as const;
 
 const SUBMIT_REQUIRED = ['engine', 'limits'] as const;
@@ -101,7 +105,8 @@ export function newApiId(prefix: string): string {
 }
 
 export function submitPayloadHash(request: SubmitRequest): string {
-  return createHash('sha256').update(canonicalJson(request)).digest('hex');
+  // hash считается без repository.token: идентичность payload не зависит от токена
+  return createHash('sha256').update(canonicalJson(redactRepositoryToken(request))).digest('hex');
 }
 
 export function validateSubmitRequest(input: unknown): ValidationResult<SubmitRequest> {
@@ -127,7 +132,7 @@ export function validateSubmitRequest(input: unknown): ValidationResult<SubmitRe
     envAllowlist: input['envAllowlist'] ?? [],
     limits: input['limits'],
   };
-  for (const key of ['input', 'deadline', 'regionConstraints', 'credentialBindings', 'budget', 'result', 'traceId'] as const) {
+  for (const key of ['input', 'deadline', 'regionConstraints', 'credentialBindings', 'budget', 'result', 'traceId', 'repository'] as const) {
     if (input[key] !== undefined) specLike[key] = input[key];
   }
 
@@ -150,6 +155,7 @@ export function validateSubmitRequest(input: unknown): ValidationResult<SubmitRe
   if (spec.budget !== undefined) request.budget = spec.budget;
   if (spec.result !== undefined) request.result = spec.result;
   if (spec.traceId !== undefined) request.traceId = spec.traceId;
+  if (spec.repository !== undefined) request.repository = spec.repository;
   if (typeof input['userTaskId'] === 'string') request.userTaskId = input['userTaskId'];
   if (typeof input['conversationId'] === 'string') request.conversationId = input['conversationId'];
   if (typeof input['instructions'] === 'string') request.instructions = input['instructions'];

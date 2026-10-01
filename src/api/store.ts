@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { RunSpec } from '../contracts/run-spec.js';
+import { redactRepositoryToken } from '../contracts/run-spec.js';
 import { writeFileAtomic } from '../runner/util.js';
 
 export const API_STORE_SCHEMA_VERSION = 1 as const;
@@ -91,9 +92,10 @@ export class ApiStore {
   }
 
   private persist(): void {
+    // repository.token не пишется на диск ни при каком порядке put/serialize
     const file: StoreFile = {
       schemaVersion: API_STORE_SCHEMA_VERSION,
-      admissions: [...this.byIdempotency.values()],
+      admissions: [...this.byIdempotency.values()].map((record) => ({ ...record, spec: redactRepositoryToken(record.spec) })),
     };
     writeFileAtomic(this.admissionsPath, `${JSON.stringify(file, null, 2)}\n`);
   }

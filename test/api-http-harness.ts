@@ -1,5 +1,5 @@
 import { onTestFinished } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync } from 'node:fs';
 import type { Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -12,6 +12,7 @@ import { createAgentApiServer } from '../src/api/server.js';
 import { AgentApi, type AgentApiOptions, type ServiceRecoveryReport } from '../src/api/service.js';
 import { FaultRegistry } from '../src/faults/registry.js';
 import { isTerminalState } from '../src/runner/state-machine.js';
+import { removeDirWithRetry } from './helpers.js';
 
 export const alphaKey = generateApiKey();
 export const betaKey = generateApiKey();
@@ -130,7 +131,7 @@ export async function startHttpHarness(options: HttpHarnessOptions = {}): Promis
     async close() {
       await shutdown(server);
       service.dispose({ killProcesses: true });
-      rmSync(rootDir, { recursive: true, force: true });
+      await removeDirWithRetry(rootDir);
     },
   };
 

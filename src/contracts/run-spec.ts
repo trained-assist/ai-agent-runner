@@ -52,6 +52,19 @@ export interface RegionConstraints {
   allowedRegions?: string[];
 }
 
+export interface RepositorySpec {
+  fullName: string;
+  token?: string;
+}
+
+export const REPOSITORY_TOKEN_MAX_LENGTH = 500;
+
+const REPOSITORY_FULL_NAME = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,98}[A-Za-z0-9])?\/[A-Za-z0-9](?:[A-Za-z0-9._-]{0,98}[A-Za-z0-9])?$/;
+
+export function isFullRepositoryName(value: unknown): value is string {
+  return typeof value === 'string' && value.length <= 200 && REPOSITORY_FULL_NAME.test(value);
+}
+
 export interface RunLimits {
   timeoutMs: number;
   maxOutputBytes?: number;
@@ -84,6 +97,7 @@ export interface RunSpec {
   budget?: BudgetSpec;
   result?: ResultPolicy;
   traceId?: string;
+  repository?: RepositorySpec;
 }
 
 const TOP_LEVEL_KEYS = [
@@ -107,6 +121,7 @@ const TOP_LEVEL_KEYS = [
   'budget',
   'result',
   'traceId',
+  'repository',
 ] as const;
 
 const TOP_LEVEL_REQUIRED = [
@@ -213,6 +228,24 @@ function validateInput(value: unknown, path: string, collector: ErrorCollector):
     if (typeof value['inlinePrompt'] === 'string') input.inlinePrompt = value['inlinePrompt'];
   }
   return input;
+}
+
+function validateRepository(value: unknown, path: string, collector: ErrorCollector): RepositorySpec | undefined {
+  if (!checkObject(value, path, collector)) return undefined;
+  checkKeys(value, ['fullName', 'token'], ['fullName'], path, collector);
+  const repository: RepositorySpec = { fullName: '' };
+  checkString(value['fullName'], `${path}.fullName`, collector, 200);
+  if (typeof value['fullName'] === 'string' && !isFullRepositoryName(value['fullName'])) {
+    collector.push(`${path}.fullName: expected "owner/name" (letters, digits, ".", "_", "-")`);
+  }
+  if (typeof value['fullName'] === 'string') repository.fullName = value['fullName'];
+  if (value['token'] !== undefined) {
+    checkString(value['token'], `${path}.token`, collector, REPOSITORY_TOKEN_MAX_LENGTH);
+    if (typeof value['token'] === 'string' && value['token'].length > 0 && value['token'].length <= REPOSITORY_TOKEN_MAX_LENGTH) {
+      repository.token = value['token'];
+    }
+  }
+  return repository;
 }
 
 function validateCredentialBindings(value: unknown, path: string, collector: ErrorCollector): CredentialBinding[] | undefined {
@@ -357,6 +390,15 @@ export function validateRunSpec(input: unknown): ValidationResult<RunSpec> {
     }
   }
 
+  let repository: RepositorySpec | undefined;
+  if ('repository' in input && input['repository'] !== undefined && input['repository'] !== null) {
+    const repo = input['repository'];
+    // пустая группа ({} или null) = дефолтная репозиторий-контекст (см. runner/repository)
+    if (!(isRecord(repo) && Object.keys(repo).length === 0)) {
+      repository = validateRepository(repo, 'spec.repository', collector);
+    }
+  }
+
   if (!collector.ok) return collector.finish(undefined as never);
 
   const spec: RunSpec = {
@@ -381,8 +423,33 @@ export function validateRunSpec(input: unknown): ValidationResult<RunSpec> {
   if (budget !== undefined) spec.budget = budget;
   if (result !== undefined) spec.result = result;
   if (input['traceId'] !== undefined) spec.traceId = input['traceId'] as string;
+  if (repository !== undefined) spec.repository = repository;
 
   return collector.finish(spec);
+}
+
+/**
+ * Возвращает копию value без repository.token: токен не должен попадать в хэши
+ * (specHash/payloadHash), state-файлы и admissions store — «на диске секретов нет».
+ */
+export function redactRepositoryToken<T>(value: T): T {
+  if (value === null || typeof value !== 'object') return value;
+  const record = value as Record<string, unknown>;
+  const repository = record['repository'];
+  if (repository === null || typeof repository !== 'object' || Array.isArray(repository)) return value;
+  if (!('token' in repository)) return value;
+  const cleanedRepository = { ...(repository as Record<string, unknown>) };
+  delete cleanedRepository['token'];
+  return { ...record, repository: cleanedRepository } as T;
+}
+
+/**
+ * Вычищает repository.token из живой структуры после попытки clone
+ * (и из admission-записи после передачи токена в runner).
+ */
+export function stripRepositoryToken(spec: { repository?: RepositorySpec }): void {
+  const repository = spec.repository;
+  if (repository && 'token' in repository) delete repository.token;
 }
 
 export function canonicalJson(value: unknown): string {
