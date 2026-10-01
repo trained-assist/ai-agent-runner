@@ -5,12 +5,13 @@ import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { FakeEngine, type FakeScenario } from '../src/adapters/engine/fake-engine.js';
-import { sleep } from '../src/adapters/engine/process-tree.js';
+import { sleep, waitForProcessDeath } from '../src/adapters/engine/process-tree.js';
 import { OpenCodeAdapter } from '../src/adapters/engine/opencode-adapter.js';
 import { generateApiKey, KeyRegistry, keyRecordFor, type Principal } from '../src/api/auth.js';
 import { createAgentApiServer } from '../src/api/server.js';
 import { AgentApi, type AgentApiOptions, type ServiceRecoveryReport } from '../src/api/service.js';
 import { FaultRegistry } from '../src/faults/registry.js';
+import { isTerminalState } from '../src/runner/state-machine.js';
 
 export const alphaKey = generateApiKey();
 export const betaKey = generateApiKey();
@@ -109,9 +110,17 @@ export async function startHttpHarness(options: HttpHarnessOptions = {}): Promis
       return `http://127.0.0.1:${port}`;
     },
     async restart(restartOptions = {}) {
+      const killProcesses = restartOptions.killProcesses ?? true;
+      const victims = killProcesses
+        ? service.runner
+            .listRunIds()
+            .map((runId) => service.runner.getRun(runId))
+            .filter((snapshot) => snapshot !== null && !isTerminalState(snapshot.state) && snapshot.pid !== null)
+            .map((snapshot) => ({ pgid: snapshot!.pgid, pid: snapshot!.pid }))
+        : [];
       await shutdown(server);
-      service.dispose({ killProcesses: restartOptions.killProcesses ?? true });
-      if ((restartOptions.killProcesses ?? true) === true) await sleep(50);
+      service.dispose({ killProcesses });
+      for (const victim of victims) await waitForProcessDeath(victim.pgid, victim.pid, 3000);
       service = new AgentApi(serviceOptions);
       const report = await service.recover();
       server = createAgentApiServer(service, { keys, logger, streamPollMs, keepaliveMs, maxBodyBytes });
