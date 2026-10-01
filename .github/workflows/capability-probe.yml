@@ -77,7 +77,9 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: E2E acceptance loop (fake engines, без reboot)
-        run: ./scripts/e2e-loop.sh
+        # passwordless sudo на GitHub-hosted раннере — штатное свойство хоста,
+        # поэтому sudo-проба в CI в режиме report (см. --sudo-policy в доках цикла)
+        run: ./scripts/e2e-loop.sh --sudo-policy report
 
       - name: Reboot-шаг — невозможен (документируем)
         run: |
