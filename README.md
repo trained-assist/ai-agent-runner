@@ -1,6 +1,6 @@
 # AI Agent Runner
 
-Статус: **slice 1 + Serverless Agent API (P04–P06) реализованы** · 01.10.2026. Код жизненного цикла Run и внешний admission/result adapter для одной VM есть в этом репозитории; storage/materialize, artifact transfer и межмашинные leases ещё не вынесены (см. roadmap).
+Статус: **slice 1 + Serverless Agent API (P04–P06) + slice D1 (storage/артефакты) реализованы** · 01.10.2026. Код жизненного цикла Run, внешний admission/result adapter для одной VM и storage-контракт с менеджментом артефактов есть в этом репозитории; materialize/sweep, artifact transfer и межмашинные leases ещё не вынесены (см. roadmap).
 
 **Agent Runner** управляет запуском **ai-agent-job** на выбранной виртуальной машине: готовит **Agent clean room**, запускает агентский движок с разрешёнными правами, наблюдает выполнение, сохраняет результат и освобождает ресурсы.
 
@@ -75,6 +75,68 @@
 - [x] `connection_lost` ≠ failed; cancel requested ≠ stopped — `test/api-service.test.ts`, `test/api-http.test.ts`
 - [x] Два principals изолированы (read/cancel чужого run → 404) — `test/api-service.test.ts`
 
+## Slice D1 — Storage и менеджмент артефактов
+
+Соответствует [ARCHITECTURE §5](ARCHITECTURE.md) (контракт C05), §7 «Рабочие данные и финализация» (export commit) и §10 «Открытые решения» (snapshot/commit semantics, result retention — остаются открытыми), [SERVERLESS-AGENT-API § direct artifact transfer](https://github.com/trained-assist/trained-agent-architecture/blob/main/SERVERLESS-AGENT-API.md) и [PR #13 в arch-репо](https://github.com/trained-assist/trained-agent-architecture/pull/13) (один контракт — три бэкенда; **никаких presigned URL в записях данных**).
+
+| Область | Файл | Что делает |
+|---|---|---|
+| Контракт | `src/storage/blob-store.ts` | `BlobStore {put, get, head, delete?}`: `put → {sha256, size, generation}`, sha256 **сохранённых** байтов (C05) подтверждается бэкендом (local-fs — read-back хэша, GCS — crc32c объекта), каждый вызов ограничен дедлайном (`BLOB_TIMEOUT`), опциональный `shareUrl` для presigned-выдачи; ошибки `BLOB_*`/`ARTIFACT_*` проходят redaction |
+| Ключи | `src/storage/keys.ts` | Один строитель ключей: `runs/<runId>/artifacts/<artifactId>` и `profiles/<profileId>/...`; запрет `..`, абсолютных путей, NUL и пустых сегментов (`BLOB_UNSAFE_KEY`), `slugKeySegment` для потенциально «грязных» id |
+| local-fs | `src/storage/local-fs.ts` | Один VM + тесты: atomic write, **read-back sha256** после записи, `generation` = mtime; io асинхронный (`fs/promises`), поэтому дедлайну есть где сработать; инжектируемый `io` — в тестах нет живого диска (синхронный инжектируемый io блокирует loop и дедлайн не сработает — caveat) |
+| GCS | `src/storage/gcs.ts` | `@google-cloud/storage`, **ADC через metadata-сервер, ключей на диске нет**; после записи сверяется `crc32c` объекта (иначе `BLOB_UPLOAD_UNVERIFIED`), клиент создаётся лениво при первом обращении, bucket инжектируется в тестах (никакого ADC/сети в тестах) |
+| R2/S3 | `src/storage/r2.ts` | Заготовка: `BLOB_BACKEND_UNSUPPORTED` с явным gap — S3-клиент, presigned upload/download session, multipart/resume + abort-expiry, CORS браузера |
+| Выбор по env | `src/storage/create-blob-store.ts` | `STORAGE_BACKEND=local-fs\|gcs\|r2` (default `local-fs`), `STORAGE_LOCAL_ROOT`, `GCS_BUCKET`, `STORAGE_DEADLINE_MS`; неизвестный бэкенд → `BLOB_BACKEND_MISCONFIGURED` |
+| Manifest | `src/storage/manifest.ts` | Ровно `{artifactId, runId, userTaskId, profileId, name, mime, size, sha256, storageKey, createdAt}`; **неизвестные поля запрещены** — URL/токен в запись данных не попасть может |
+| Менеджмент | `src/storage/artifact-store.ts` | Один json на артефакт рядом с run: `runs/<runId>/artifacts/<artifactId>.json` (atomic, рядом с `state.json/result.json`); `put` (идемпотентный по sha, дубль `artifactId` в другом run → `ARTIFACT_CONFLICT`, конфликт байтов → `ARTIFACT_CONFLICT`), `read` (сверка байтов с digest'ом), `commit` (глубокая сверка без перезаписи), `export` (чек `present/verified/missing/size_mismatch/corrupt`); неоднозначный id (файл появился вне store) → `find` отдаёт `null` → 404 (fail closed) |
+| Share-by-link | `src/storage/share.ts` | `ShareTokenIssuer` — короткоживущий HMAC-токен, привязанный к `artifactId` + срок (секрет: аргумент или `ARTIFACT_SHARE_SECRET`); `createShareLink` → для local-fs токен-URL через API (`baseUrl` или `ARTIFACT_BASE_URL`), для GCS presigned/generation URL. **Ссылка нигде не хранится**: в manifest поля нет, в логи попадает путь без query-string |
+| API-точка входа | `src/api/artifact-route.ts` | **Новый файл-роут**, существующие файлы `src/api/**` не менялись: `GET /v1/artifacts/:id[?t=…]`, алиас `GET /artifact/:id`, `…/meta` → manifest; auth = share-токен **или** Bearer + `runs:read` + сверка `profileId` (чужой профиль → 404) |
+
+### Как шарить артефакт ссылкой
+
+```ts
+import { createLocalFsBlobStore, ArtifactStore, ShareTokenIssuer, createShareLink, createArtifactServer } from 'ai-agent-runner';
+
+const blob = createLocalFsBlobStore({ rootDir: './data/blobs' });   // или createBlobStore() по env
+const artifacts = new ArtifactStore({ rootDir: './data', blob });
+const tokens = new ShareTokenIssuer({ secret: process.env.ARTIFACT_SHARE_SECRET, ttlSeconds: 600 });
+
+const manifest = await artifacts.put({ runId, userTaskId, profileId, name: 'report.csv', mime: 'text/csv', bytes });
+const link = await createShareLink({ blob, tokens, baseUrl: 'http://vm:8080' }, manifest);
+// link.url → http://vm:8080/v1/artifacts/art-…?t=…   (не записывать в manifest/журналы)
+createArtifactServer({ artifacts, keys, tokens, logger }).listen(8080);
+```
+
+`handleArtifactRequest(req, res, deps)` возвращает `null` для чужих путей — одна строка монтирования в существующий `createAgentApiServer`, если понадобится общий listener (в этом slice роут работает как отдельный сервер; **правки в существующие файлы `src/api/**` не вносились**, потому что их ведёт параллельная сессия).
+
+Переменные окружения storage:
+
+```bash
+STORAGE_BACKEND=local-fs|gcs|r2   # выбор бэкенда, default local-fs
+STORAGE_LOCAL_ROOT=data/blobs     # корень local-fs (относительно cwd)
+GCS_BUCKET=<bucket>               # обязателен для gcs: ADC через metadata-сервер, ключи на диске не используются
+STORAGE_DEADLINE_MS=60000         # дедлайн каждого вызова storage → BLOB_TIMEOUT
+ARTIFACT_SHARE_SECRET=<random>    # HMAC-секрет share-токенов; без него — случайный секрет процесса (ссылки живут до рестарта)
+```
+
+### Что покрыто тестами
+
+- [x] sha256 сохранённых байтов: read-back в local-fs, crc32c-сверка объекта в GCS — `test/storage-backends.test.ts`, `test/storage-manifest.test.ts`
+- [x] Дедлайн каждого вызова (`BLOB_TIMEOUT`) — `test/storage-blob-store.test.ts`, `test/storage-backends.test.ts`
+- [x] Мок-бэкенд: инжектируемые `io`/bucket, ни одного живого хранилища и ни одного обращения к ADC в тестах — `test/storage-backends.test.ts`
+- [x] Manifest round-trip через переоткрытый store + запрет неизвестных полей — `test/storage-manifest.test.ts`
+- [x] Дубль `artifactId` между runs: `ARTIFACT_CONFLICT` на put и fail-closed `find` — `test/storage-manifest.test.ts`
+- [x] Ссылка/токен не утекает в manifest и в логи (путь без query, включая error-ответы) — `test/storage-share.test.ts`, `test/storage-api-route.test.ts`
+- [x] Выбор бэкенда по env, включая отказ до ADC — `test/storage-backends.test.ts`
+- [x] Share-ссылка: выдача, tamper, истечение, чужой артефакт, изоляция профилей — `test/storage-api-route.test.ts`
+
+### Готово / не готово
+
+- **Готово:** контракт C05 + local-fs + GCS + manifest/commit/export + share-by-link + точка входа в API.
+- **Gap R2/S3:** заготовка без клиентской части (см. `src/storage/r2.ts`) — до неё presigned upload/download-сессии и multipart/resume не работают.
+- **Gap GCS presigned:** v4-подпись под ADC требует `roles/iam.serviceAccountTokenCreator` у сервис-аккаунта (локального приватного ключа нет и не будет); без права `getSignedUrl` → `BLOB_BACKEND_UNSUPPORTED`, рабочая альтернатива — share-токен через API (local-fs путь) либо R2/S3. Smoke на живом бакете — отдельной задачей, в тестах только инжектируемый bucket.
+- **Вне этого slice (roadmap):** интеграция с GitHub — текстовой образ профиля → приватные репозитории `profiles-artifacts` ([trained-assist-agent#1921](https://github.com/trained-assist/trained-assist-agent/issues/1921)); materialize при старте и sweep в finalizing (D2); открытые вопросы ARCH §10 — snapshot/commit semantics и retention/export-гарантии.
+
 ## Разработка
 
 ```bash
@@ -85,7 +147,7 @@ npm test            # vitest run
 
 Требования: Node 20+, npm. CI (`.github/workflows/ci.yml`) гоняет `npm ci` + typecheck + test на каждый push/PR.
 
-Библиотека + внешний network-API: локальный adapter на VM (ARCHITECTURE §3) и Serverless Agent API выше — оба в этом репозитории; следующий этап — storage/materialize и artifacts.
+Библиотека + внешний network-API: локальный adapter на VM (ARCHITECTURE §3) и Serverless Agent API выше — оба в этом репозитории; storage/артефакты есть (Slice D1), следующий этап — materialize/sweep и artifact transfer.
 
 Минимальный запуск API (ключи — sha256-hashes в файле реестра, сам plaintext-ключ вне репозитория и логов):
 
@@ -112,10 +174,11 @@ curl -X POST localhost:8080/v1/runs \
 
 1. **Slice 1 (сделано)** — контракты RunSpec/события/результат, fake adapter, lifecycle state machine, scoped logs, fault injection, CI.
 2. **Serverless Agent API P04–P06 (сделано)** — admission/result adapter на node:http: auth/keys, idempotent receipt, status/cancel/result/events + SSE replay, durable store и recovery API-сессии на одной VM.
-3. **Slice 3 — storage/materialize** (детализация D1–D6 в [issue #17](https://github.com/trained-assist/trained-agent-architecture/issues/17)): BlobStore-контракт, materialize при старте, sweep в finalizing, маркер индекса, lease+generation на профиль.
+3. **Storage/materialize** (детализация D1–D6 в [issue #17](https://github.com/trained-assist/trained-agent-architecture/issues/17)): **D1 сделан** — BlobStore-контракт, бэкенды local-fs/GCS/R2-заготовка, manifest+commit/export, share-by-link (см. «Slice D1»); остаётся materialize при старте, sweep в finalizing, маркер индекса, lease+generation на профиль.
 4. **Live OpenCode на sandbox VM** — reproducible setup (P01/P02), free-only профиль, два synthetic principals, sanitized transcript приёмки.
-5. **Artifact transfer P07–P09** — manifest/export, direct signed upload/download (I02B).
+5. **Artifact transfer P07–P09** — manifest/export и выдача ссылок есть (D1); остаётся direct signed upload/download-сессии, multipart/resume и реализация R2/S3-бэкенда (I02B).
 6. **Worker API и межмашинные leases/fencing** — при переходе к нескольким workers (ARCHITECTURE §9, пп. 5–6).
+7. **Интеграция с GitHub** — текстовой образ профиля выгружается в приватные репозитории `profiles-artifacts` ([trained-assist-agent#1921](https://github.com/trained-assist/trained-assist-agent/issues/1921)); **не в этом slice**, только roadmap-строка — решение за владельцем (PR #13 arch-репо, открытый вопрос §8.3).
 
 Отложено из P04–P06 (вне этого этапа): callback delivery, квоты/конкурентность по principals (caps), `awaiting_user` durable prompt+response, multi-VM admission — контракты местами зарезервированы, реализация следует за control plane.
 
