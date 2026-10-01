@@ -1,0 +1,83 @@
+name: capability-probe
+
+# Замер ограничений GitHub-hosted runner для задач проекта:
+# что можно гонять в CI (tests, Playwright, opencode headless, e2e-цикл),
+# что нельзя (reboot, входящие порты). Владелец: направление «API + артефакты».
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: System facts
+        run: |
+          {
+            echo "### Runner facts"
+            echo '```'
+            echo "cpus: $(nproc)  load: $(cut -d' ' -f1-3 /proc/loadavg)"
+            free -h | head -2
+            df -h / /mnt 2>/dev/null | sed -n '1,4p'
+            echo "sudo: $(sudo -n true 2>/dev/null && echo passwordless || echo NO)"
+            echo "docker: $(docker --version 2>/dev/null || echo none)"
+            echo "kvm: $([ -w /dev/kvm ] && echo usable || echo no) $(ls -la /dev/kvm 2>/dev/null || true)"
+            echo "systemd: $(systemctl --version 2>/dev/null | head -1 || echo none)"
+            echo "os: $(. /etc/os-release && echo $PRETTY_NAME)"
+            echo "disk-inode:"; df -ih / | tail -1
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: npm ci + typecheck + unit
+        run: |
+          npm ci --no-audit --no-fund
+          npm run typecheck
+          npm test
+
+      - name: Playwright (chromium) — установка и живой прогон
+        run: |
+          npx playwright install --with-deps chromium
+          node -e "
+            const { chromium } = require('playwright');
+            (async () => {
+              const b = await chromium.launch();
+              const p = await b.newPage();
+              await p.setContent('<button id=b>ok</button><script>b.onclick=()=>document.title=\"clicked\"</script>');
+              await p.click('#b');
+              const t = await p.title();
+              console.log('playwright click title =', t);
+              if (t !== 'clicked') process.exit(1);
+              await b.close();
+            })().catch(e => { console.error(e); process.exit(1); });
+          "
+          echo "playwright: OK" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: opencode headless — установка и поведение без конфига
+        run: |
+          npm install -g opencode-ai >/dev/null 2>&1
+          opencode --version
+          set +e
+          OUT=$(timeout 60 opencode run "reply with exactly: pong" 2>&1)
+          CODE=$?
+          set -e
+          echo "opencode run exit=$CODE"
+          echo "$OUT" | tail -5
+          {
+            echo "### opencode в CI"
+            echo "- \`opencode --version\`: \`$(opencode --version)\`"
+            echo "- без провайдера/токена: exit=$CODE (ожидаем отказ авторизации — рабочая схема pr-autofix: свой \`opencode.json\` → llm-ladder + \`LLM_LADDER_TOKEN\`, флаг \`-m ladder/<model>\`)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: E2E acceptance loop (fake engines, без reboot)
+        run: ./scripts/e2e-loop.sh
+
+      - name: Reboot-шаг — невозможен (документируем)
+        run: |
+          echo "step-4b (systemctl reboot) в GitHub Actions НЕ запускается: reboot убивает раннер вместе с job. Валидация reboot-пути — только на песочной VM (см. runner#6)." >> "$GITHUB_STEP_SUMMARY"
