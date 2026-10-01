@@ -152,12 +152,30 @@ ARTIFACT_SHARE_SECRET=<random>    # HMAC-секрет share-токенов; бе
 - **Gap GCS presigned:** v4-подпись под ADC требует `roles/iam.serviceAccountTokenCreator` у сервис-аккаунта (локального приватного ключа нет и не будет); без права `getSignedUrl` → `BLOB_BACKEND_UNSUPPORTED`, рабочая альтернатива — share-токен через API (local-fs путь) либо R2/S3. Smoke на живом бакете — отдельной задачей, в тестах только инжектируемый bucket.
 - **Вне этого slice (roadmap):** интеграция с GitHub — текстовой образ профиля → приватные репозитории `profiles-artifacts` ([trained-assist-agent#1921](https://github.com/trained-assist/trained-assist-agent/issues/1921)); materialize при старте и sweep в finalizing (D2); открытые вопросы ARCH §10 — snapshot/commit semantics и retention/export-гарантии.
 
+## Деплой на песочную VM + runner-cli (dogfooding, runner#7)
+
+Сервисный запуск того же API на одной VM: `infra/agent-runner-api.service` (systemd, `User=sandbox`, `Restart=always`, durable store `/var/lib/agent-runner` `0700`) + `scripts/deploy-api-service.sh` (build → dirs → генерация API-ключа `0600` → юнит → enable+start → `GET /healthz` → проверка auth → **ufw открывает порт только после успешной auth-пробы**). Порт **8787**, health — `GET /healthz` (единственный маршрут без ключа).
+
+Ключ генерируется при деплое, живёт только в `/etc/agent-runner/api-key` (`0600`) и один раз печатается в лог первого деплоя — в репо/доки/коммит не попадает; в key registry хранится только sha256.
+
+Транспорт для runner#7 — `scripts/runner-cli.mjs`: `submit/status/events/follow/result/cancel` против `RUNNER_API_URL` + `RUNNER_API_KEY` (или `RUNNER_API_KEY_FILE`/флаги `--url/--key/--key-file`).
+
+```bash
+bash scripts/deploy-api-service.sh                 # на VM, от root
+export RUNNER_API_URL=http://127.0.0.1:8787 RUNNER_API_KEY_FILE=/etc/agent-runner/api-key
+node scripts/runner-cli.mjs submit --prompt "hi" --engine fake
+node scripts/runner-cli.mjs follow <runId>         # SSE до терминального состояния
+```
+
+Факты прогона на живой VM (юнит, порт, health, auth-пробы, смоук рана и артефакта, restart-персистентность): **[docs/API-SERVICE.md](docs/API-SERVICE.md)**.
+
 ## Разработка
 
 ```bash
 npm ci
 npm run typecheck   # tsc --noEmit
 npm test            # vitest run
+npm run build       # tsc -p tsconfig.build.json → dist/   (запуск сервиса: npm start)
 ```
 
 Требования: Node 20+, npm. CI (`.github/workflows/ci.yml`) гоняет `npm ci` + typecheck + test на каждый push/PR.

@@ -1,0 +1,27 @@
+[Unit]
+Description=Agent Runner Serverless Agent API (single VM)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sandbox
+Group=sandbox
+WorkingDirectory=/opt/sb/ai-agent-runner
+EnvironmentFile=/etc/agent-runner/agent-runner-api.env
+ExecStart=@NODE@ /opt/sb/ai-agent-runner/dist/api/main.js
+Restart=always
+RestartSec=2
+TimeoutStopSec=20
+KillSignal=SIGTERM
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/var/lib/agent-runner
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=agent-runner-api
+
+[Install]
+WantedBy=multi-user.target
