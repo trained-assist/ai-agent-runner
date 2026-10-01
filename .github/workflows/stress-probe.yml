@@ -45,6 +45,9 @@ jobs:
       - name: "Stress: timeline (запуск → result)"
         run: node scripts/stress-probe.mjs --phase timeline --merge --json stress-report.json
 
+      - name: "Stress: recovery — смерть сервера → данные читаются"
+        run: node scripts/stress-probe.mjs --phase recovery --merge --json stress-report.json
+
       - name: "Stress: CPU burn"
         run: node scripts/stress-probe.mjs --phase cpu --merge --json stress-report.json
 
