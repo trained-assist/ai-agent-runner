@@ -39,6 +39,7 @@ const EXPECTED_STEPS = [
   'step-1-submit-idempotency',
   'step-2-events-stream-replay',
   'step-3-fault-injection',
+  'step-4-recovery-restart',
 ];
 
 const tempDirs: string[] = [];

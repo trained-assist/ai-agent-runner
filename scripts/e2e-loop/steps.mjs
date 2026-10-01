@@ -280,3 +280,76 @@ export async function stepFaultInjection(ctx, step) {
     step.check('реестр faults исчерпан: обычный run succeeded', status.state === 'succeeded', `state=${status.state}`);
   }
 }
+
+// ---------------------------------------------------------------- step 4
+
+export async function stepRecoveryRestart(ctx, step) {
+  const body = engineBody('fake-timeout', {
+    timeoutMs: 120000,
+    input: { inlinePrompt: 'e2e step 4: hang across a hard restart' },
+  });
+  const submit = await submitRun(ctx.base, ctx.key, 'e2e-step-4', body);
+  step.check('submit принят: HTTP 202', submit.status === 202, `HTTP ${submit.status} ${submit.text.slice(0, 160)}`);
+  if (submit.status !== 202) return;
+  const runId = submit.json.runId;
+
+  const running = await waitForStatus(ctx.base, ctx.key, runId, (status) => status.state === 'running', 10000, 'run to start');
+  step.check('run перешёл в running до kill -9', running.state === 'running', `state=${running.state}`);
+  const mid = await ctx.control.health();
+
+  const exitInfo = await ctx.killServer('SIGKILL');
+  step.check('процесс runner убит SIGKILL', exitInfo.killed, exitInfo.detail ?? '');
+
+  await ctx.startServer();
+  step.check('процесс runner перезапущен', true, 'server restarted');
+
+  const statusResponse = await getStatus(ctx.base, ctx.key, runId);
+  step.check('status читается после рестарта', statusResponse.status === 200, `HTTP ${statusResponse.status}`);
+  const status = statusResponse.json ?? {};
+  step.check('потеря связи ≠ failed: state остался running', status.state === 'running', `state=${status.state}`);
+  step.check('connectionLost зафиксирован в status', status.connectionLost === true, `connectionLost=${String(status.connectionLost)}`);
+
+  const stateFile = join(ctx.rootDir, 'runs', runId, 'state.json');
+  const eventsFile = join(ctx.rootDir, 'runs', runId, 'events.jsonl');
+  step.check('durable store: state.json пережил kill -9', existsSync(stateFile), stateFile);
+  step.check('durable store: events.jsonl пережил kill -9', existsSync(eventsFile), eventsFile);
+  if (existsSync(stateFile)) {
+    try {
+      const persisted = JSON.parse(readFileSync(stateFile, 'utf8'));
+      step.check('state.json содержит тот же runId и состояние running', persisted.runId === runId && persisted.state === 'running', `runId=${persisted.runId} state=${persisted.state}`);
+    } catch (err) {
+      step.fail('state.json читается как JSON', String(err));
+    }
+  }
+
+  const replay = await collectAllEvents(ctx.base, ctx.key, runId, { from: 0 });
+  const chain = validateEventChain(replay, { requireTerminal: false });
+  step.check('events replay после рестарта полный и упорядочен', chain.ok, chain.problems.join('; '));
+  step.check('replay начинается с claimed (события читаются с диска)', replay[0]?.type === 'claimed', `first=${replay[0]?.type}`);
+  step.check('replay содержит connection_lost', replay.some((event) => event.type === 'connection_lost'));
+
+  const duplicate = await submitRun(ctx.base, ctx.key, 'e2e-step-4', body);
+  step.check('повторный submit после рестарта: HTTP 200', duplicate.status === 200, `HTTP ${duplicate.status}`);
+  step.check('повторный submit вернул тот же runId', duplicate.json?.runId === runId, `${duplicate.json?.runId} vs ${runId}`);
+  step.check('повторный submit помечен deduplicated', duplicate.json?.deduplicated === true, `got ${String(duplicate.json?.deduplicated)}`);
+
+  const after = await ctx.control.health();
+  step.check('admissions не выросли от повторного submit', after.admissions === mid.admissions, `${mid.admissions}→${after.admissions}`);
+  const postRestartStarts = after.startsByEngine['fake-timeout'] ?? 0;
+  step.check(
+    'engine не стартовал заново после рестарта (нет второго run)',
+    postRestartStarts === 0,
+    `starts after restart=${postRestartStarts}`,
+  );
+
+  const cancel = await postCancel(ctx.base, ctx.key, runId, {});
+  step.check('cancel осиротевшего run принят', cancel.status === 200 || cancel.status === 202, `HTTP ${cancel.status} ${cancel.text.slice(0, 160)}`);
+  const terminal = await waitTerminal(ctx.base, ctx.key, runId, 15000);
+  step.check('run финализирован после cancel', isTerminalState(terminal.state), `state=${terminal.state}`);
+
+  const finalEvents = await collectAllEvents(ctx.base, ctx.key, runId, { from: 0 });
+  const finalChain = validateEventChain(finalEvents, { requireTerminal: true });
+  step.check('финальная цепочка терминальна и полна', finalChain.ok, finalChain.problems.join('; '));
+  const finalHealth = await ctx.control.health();
+  step.check('движок остановлен после шага', finalHealth.activeRuns === 0, `activeRuns=${finalHealth.activeRuns}`);
+}
