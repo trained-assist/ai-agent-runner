@@ -208,7 +208,7 @@ function phaseMemory() {
       for (let i = 0; i < 400; i++) {
         const buf = Buffer.alloc(CHUNK); buf.fill(1); held.push(buf);
         total += CHUNK;
-        if (i % 8 === 0) { console.log('alloc_mb=' + (total / 1048576)); }
+        if (i % 4 === 0) { console.log('alloc_mb=' + (total / 1048576)); }
       }
       console.log('SURVIVED_total_mb=' + (total / 1048576));
       process.exit(0);
