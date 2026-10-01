@@ -2,7 +2,7 @@ import { join } from 'node:path';
 import type { EngineAdapter } from '../adapters/engine/engine-adapter.js';
 import { killProcessTree } from '../adapters/engine/process-tree.js';
 import type { RunResult } from '../contracts/result.js';
-import { validateRunSpec, type InputSpec, type RunSpec } from '../contracts/run-spec.js';
+import { stripRepositoryToken, validateRunSpec, type InputSpec, type RunSpec } from '../contracts/run-spec.js';
 import type { FaultRegistry } from '../faults/registry.js';
 import { Runner, type CancelReceipt, type RecoveryReport, type RunnerHostInfo, type RunSnapshot } from '../runner/runner.js';
 import type { LogSink } from '../runner/scoped-log.js';
@@ -99,6 +99,10 @@ export class AgentApi {
 
     const bodyResult = validateSubmitRequest(rawBody);
     if (!bodyResult.ok) {
+      const repositoryErrors = bodyResult.errors.filter((entry) => entry.startsWith('request.repository.'));
+      if (repositoryErrors.length > 0) {
+        throw new ApiError('INVALID_REPOSITORY', `invalid repository: ${repositoryErrors.join('; ')}`, { errors: bodyResult.errors });
+      }
       throw new ApiError('INVALID_REQUEST', `invalid submit body: ${bodyResult.errors.join('; ')}`, { errors: bodyResult.errors });
     }
     const request = bodyResult.value;
@@ -341,6 +345,7 @@ export class AgentApi {
     if (request.budget !== undefined) spec.budget = request.budget;
     if (request.result !== undefined) spec.result = request.result;
     if (request.traceId !== undefined) spec.traceId = request.traceId;
+    if (request.repository !== undefined) spec.repository = request.repository;
 
     const validated = validateRunSpec(spec);
     if (!validated.ok) {
@@ -375,6 +380,9 @@ export class AgentApi {
         message: err instanceof Error ? err.message : String(err),
       });
       return false;
+    } finally {
+      // токен передан в runner (там живёт только до clone) — в admission-записи он не остаётся
+      stripRepositoryToken(record.spec);
     }
   }
 
