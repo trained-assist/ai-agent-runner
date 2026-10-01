@@ -504,3 +504,118 @@ export async function stepArtifactDownload(ctx, step) {
   const noAuth = await fetch(`${ctx.base}/v1/runs/${encodeURIComponent(runId)}/download?ref=${ref}`);
   step.check('download без ключа → 401', noAuth.status === 401, `HTTP ${noAuth.status}`);
 }
+
+// ---------------------------------------------------------------- step 7
+
+export async function stepCredentialScopes(ctx, step) {
+  const readCred = ctx.creds.find((entry) => entry.scope === 'read');
+  const writeCred = ctx.creds.find((entry) => entry.scope === 'write');
+  if (!readCred || !writeCred) {
+    step.fail('синтетические креды подготовлены', 'creds fixture is incomplete');
+    return;
+  }
+  const transcript = [];
+
+  const readBody = engineBody('cred', {
+    timeoutMs: 20000,
+    envAllowlist: ['E2E_CRED_READ', 'E2E_GATEWAY_URL'],
+    credentialBindings: [{ ref: `env:${readCred.env}`, scope: 'read', status: 'active' }],
+    input: { inlinePrompt: 'e2e step 7: read-scope credential' },
+  });
+  const readSubmit = await submitRun(ctx.base, ctx.key, 'e2e-step-7-read', readBody);
+  transcript.push(readSubmit.text);
+  step.check('run со scope=read принят', readSubmit.status === 202, `HTTP ${readSubmit.status}`);
+
+  const writeBody = engineBody('cred', {
+    timeoutMs: 20000,
+    envAllowlist: ['E2E_CRED_WRITE', 'E2E_GATEWAY_URL'],
+    credentialBindings: [{ ref: `env:${writeCred.env}`, scope: 'write', status: 'active' }],
+    input: { inlinePrompt: 'e2e step 7: write-scope credential' },
+  });
+  const writeSubmit = await submitRun(ctx.base, ctx.key, 'e2e-step-7-write', writeBody);
+  transcript.push(writeSubmit.text);
+  step.check('run со scope=write принят', writeSubmit.status === 202, `HTTP ${writeSubmit.status}`);
+  if (readSubmit.status !== 202 || writeSubmit.status !== 202) return;
+
+  const readRunId = readSubmit.json.runId;
+  const writeRunId = writeSubmit.json.runId;
+  const readStatus = await waitTerminal(ctx.base, ctx.key, readRunId, 20000);
+  const writeStatus = await waitTerminal(ctx.base, ctx.key, writeRunId, 20000);
+  step.check('run со scope=read succeeded (gateway-отказ не валит ран)', readStatus.state === 'succeeded', `state=${readStatus.state}`);
+  step.check('run со scope=write succeeded', writeStatus.state === 'succeeded', `state=${writeStatus.state}`);
+
+  const readEvents = await collectAllEvents(ctx.base, ctx.key, readRunId, { from: 0 });
+  const writeEvents = await collectAllEvents(ctx.base, ctx.key, writeRunId, { from: 0 });
+  transcript.push(JSON.stringify(readEvents), JSON.stringify(writeEvents));
+
+  const readCredLine = findLog(readEvents, /E2E_CRED /).map((event) => event.payload.message)[0] ?? '';
+  const writeCredLine = findLog(writeEvents, /E2E_CRED /).map((event) => event.payload.message)[0] ?? '';
+  step.check('scope=read: чтение через gateway разрешено (read=200)', /\bread=200\b/.test(readCredLine), readCredLine);
+  step.check('scope=read: запись через gateway запрещена (write=403)', /\bwrite=403\b/.test(readCredLine), readCredLine);
+  step.check('scope=write: запись через gateway разрешена (write=200)', /\bwrite=200\b/.test(writeCredLine), writeCredLine);
+  step.check('scope=write: чтение разрешено (read=200)', /\bread=200\b/.test(writeCredLine), writeCredLine);
+
+  const readKeys = runtimeEnvKeys(envKeysFromLogs(readEvents)).sort();
+  const expectedReadKeys = ['E2E_CRED_READ', 'E2E_GATEWAY_URL'];
+  step.check(
+    'в ран только allowlist-переменные (нет креда другого скоупа)',
+    JSON.stringify(readKeys) === JSON.stringify(expectedReadKeys),
+    `keys=${JSON.stringify(readKeys)}`,
+  );
+
+  const attempts = await ctx.control.credAttempts();
+  const list = attempts.attempts ?? [];
+  step.check(
+    'gateway зафиксировал отказ записи для read-скопа',
+    list.some((attempt) => attempt.env === readCred.env && attempt.action === 'write' && attempt.outcome === 'denied'),
+    JSON.stringify(list),
+  );
+  step.check(
+    'gateway зафиксировал успешную запись для write-скопа',
+    list.some((attempt) => attempt.env === writeCred.env && attempt.action === 'write' && attempt.outcome === 'allowed'),
+    JSON.stringify(list),
+  );
+  step.check(
+    'gateway зафиксировал чтение read-скопа',
+    list.some((attempt) => attempt.env === readCred.env && attempt.action === 'read' && attempt.outcome === 'allowed'),
+    JSON.stringify(list),
+  );
+
+  const resultRead = await getResult(ctx.base, ctx.key, readRunId);
+  const resultWrite = await getResult(ctx.base, ctx.key, writeRunId);
+  transcript.push(resultRead.text, resultWrite.text);
+  const statusRead = await getStatus(ctx.base, ctx.key, readRunId);
+  const statusWrite = await getStatus(ctx.base, ctx.key, writeRunId);
+  transcript.push(statusRead.text, statusWrite.text);
+  const serverLog = ctx.getServerLog();
+  transcript.push(serverLog);
+
+  const secrets = [readCred.value, writeCred.value];
+  for (const [name, text] of [
+    ['client-visible ответы (receipt/status/result/events)', transcript.filter((entry) => entry !== serverLog).join('\n')],
+    ['server log (stdout/stderr)', serverLog],
+  ]) {
+    const hits = findSecretsInText(text, secrets);
+    step.check(`креды отсутствуют в ${name}`, hits.length === 0, `hits at indexes ${hits.map((hit) => hit.secretIndex).join(',')}`);
+  }
+
+  for (const [name, file] of [
+    ['admissions store', join(ctx.rootDir, 'api', 'admissions.json')],
+    ['operations index', join(ctx.rootDir, 'operations.json')],
+  ]) {
+    const content = existsSync(file) ? readFileSync(file, 'utf8') : '';
+    const hits = findSecretsInText(content, secrets);
+    step.check(`креды отсутствуют в ${name}`, hits.length === 0, `hits at indexes ${hits.map((hit) => hit.secretIndex).join(',')}`);
+  }
+
+  for (const [name, runId] of [['scope=read', readRunId], ['scope=write', writeRunId]]) {
+    const runFiles = [join(ctx.rootDir, 'runs', runId, 'state.json'), join(ctx.rootDir, 'runs', runId, 'events.jsonl'), join(ctx.rootDir, 'runs', runId, 'result.json')];
+    for (const file of runFiles) {
+      const content = existsSync(file) ? readFileSync(file, 'utf8') : '';
+      const hits = findSecretsInText(content, secrets);
+      step.check(`креды отсутствуют в ${name}: ${file.split('/').slice(-2).join('/')}`, hits.length === 0, `hits at indexes ${hits.map((hit) => hit.secretIndex).join(',')}`);
+    }
+    const workspaceHits = findSecretsInTree(join(ctx.rootDir, 'workspaces', runId), secrets);
+    step.check(`креды не остались в workspace после run (${name})`, workspaceHits.length === 0, workspaceHits.map((hit) => hit.file).join(','));
+  }
+}

@@ -42,6 +42,7 @@ const EXPECTED_STEPS = [
   'step-4-recovery-restart',
   'step-5-security-probes',
   'step-6-artifact',
+  'step-7-credential-scopes',
 ];
 
 const tempDirs: string[] = [];
@@ -62,11 +63,11 @@ interface DriverRun {
   stderr: string;
 }
 
-function runDriver(args: string[]): Promise<DriverRun> {
+function runCommand(command: string, args: string[]): Promise<DriverRun> {
   return new Promise((resolveRun) => {
     // NODE_ENV=development: тестовое окружение может иметь NODE_ENV=production,
     // из-за которого npm ci не ставит devDependencies (vitest/tsc).
-    const child = spawn(process.execPath, [driverPath, ...args], {
+    const child = spawn(command, args, {
       cwd: repoRoot,
       env: { ...process.env, NODE_ENV: 'development' },
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -85,6 +86,10 @@ function runDriver(args: string[]): Promise<DriverRun> {
       resolveRun({ code: code ?? (signal ? -1 : 0), stdout, stderr });
     });
   });
+}
+
+function runDriver(args: string[]): Promise<DriverRun> {
+  return runCommand(process.execPath, [driverPath, ...args]);
 }
 
 function loadReport(path: string): DriverReport {
@@ -182,4 +187,14 @@ describe('e2e acceptance loop driver (issue #2)', () => {
     expect(run.code).toBe(2);
     expect(run.stderr).toContain('--with-reboot');
   }, 30000);
+
+  it('scripts/e2e-loop.sh запускает драйвер (обёртка из README)', async () => {
+    const dir = tempDir();
+    const reportPath = join(dir, 'report.json');
+    const run = await runCommand('sh', [join(repoRoot, 'scripts', 'e2e-loop.sh'), '--only', 'step-1', '--report', reportPath]);
+    expect(run.stderr, `stderr: ${run.stderr.slice(0, 1000)}`).toBe('');
+    expect(run.code, `stdout: ${run.stdout.slice(0, 2000)}`).toBe(0);
+    expect(run.stdout).toContain('E2E LOOP RESULT: PASS 1/1');
+    expect(loadReport(reportPath).steps.map((step) => step.id)).toEqual(['step-1-submit-idempotency']);
+  }, 120000);
 });

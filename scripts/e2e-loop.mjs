@@ -8,6 +8,7 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   renameSync,
   rmSync,
   statSync,
@@ -19,12 +20,13 @@ import { fileURLToPath } from 'node:url';
 import { Step, buildIssueDraft, redact, sleep, summarize, validateEventChain } from './e2e-loop/checks.mjs';
 import { ControlClient, request, submitRun, waitForStatus } from './e2e-loop/client.mjs';
 import {
-  stepSubmitIdempotency,
+  stepArtifactDownload,
+  stepCredentialScopes,
   stepEventsStreamReplay,
   stepFaultInjection,
   stepRecoveryRestart,
   stepSecurityProbes,
-  stepArtifactDownload,
+  stepSubmitIdempotency,
 } from './e2e-loop/steps.mjs';
 
 const SCRIPT_PATH = fileURLToPath(import.meta.url);
@@ -490,6 +492,7 @@ async function main() {
     { id: 'step-4-recovery-restart', title: 'Recovery после kill -9 процесса runner: durable store, без rerun', run: stepRecoveryRestart },
     { id: 'step-5-security-probes', title: 'Security-пробы изнутри рана: чужой профиль/sudo/metadata/secrets.env → deny', run: stepSecurityProbes },
     { id: 'step-6-artifact', title: 'Артефакт: агент создаёт файл, клиент забирает через API и сверяет sha256', run: stepArtifactDownload },
+    { id: 'step-7-credential-scopes', title: 'Креды со скоупами: scope read не пишет, креды не в events/log/receipt/workspace', run: stepCredentialScopes },
   ];
   if (opts.withReboot) {
     definitions.push({ id: 'step-4b-reboot', title: 'Полный systemctl reboot VM (только root): durable recovery, rerun отсутствует', run: stepRebootPre });
@@ -766,8 +769,18 @@ async function waitListened(handle, timeoutMs = 30000) {
   return handle.port;
 }
 
-const isDirectRun = process.argv[1] && resolve(process.argv[1]) === resolve(SCRIPT_PATH);
-if (isDirectRun) {
+function isDirectRun() {
+  if (!process.argv[1]) return false;
+  // Сравниваем через realpath: на macOS /var — симmlink на /private/var,
+  // argv[1] (обёртка передаёт абсолютный путь) и import.meta.url могут различаться.
+  try {
+    return realpathSync(process.argv[1]) === realpathSync(SCRIPT_PATH);
+  } catch {
+    return resolve(process.argv[1]) === resolve(SCRIPT_PATH);
+  }
+}
+
+if (isDirectRun()) {
   const flushAndExit = (code) => {
     process.stdout.write('', () => {
       process.stderr.write('', () => process.exit(code));
