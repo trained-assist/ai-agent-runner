@@ -41,6 +41,7 @@ const EXPECTED_STEPS = [
   'step-3-fault-injection',
   'step-4-recovery-restart',
   'step-5-security-probes',
+  'step-6-artifact',
 ];
 
 const tempDirs: string[] = [];

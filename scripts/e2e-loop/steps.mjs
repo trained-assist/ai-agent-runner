@@ -454,3 +454,53 @@ export async function stepSecurityProbes(ctx, step) {
     }
   }
 }
+
+// ---------------------------------------------------------------- step 6
+
+export async function stepArtifactDownload(ctx, step) {
+  const ref = 'report.txt';
+  const lines = ['# e2e acceptance artifact', 'created by the engine inside the run', 'byte-for-byte check'];
+  const body = engineBody('artifact', {
+    timeoutMs: 20000,
+    input: { inlinePrompt: JSON.stringify({ ref, lines }) },
+  });
+  const submit = await submitRun(ctx.base, ctx.key, 'e2e-step-6', body);
+  step.check('submit принят: HTTP 202', submit.status === 202, `HTTP ${submit.status}`);
+  if (submit.status !== 202) return;
+  const runId = submit.json.runId;
+
+  const status = await waitTerminal(ctx.base, ctx.key, runId, 20000);
+  step.check('run succeeded', status.state === 'succeeded', `state=${status.state}`);
+  const result = await getResult(ctx.base, ctx.key, runId);
+  step.check('result доступен через API', result.status === 200, `HTTP ${result.status}`);
+
+  const events = await collectAllEvents(ctx.base, ctx.key, runId, { from: 0 });
+  const artifactLine = findLog(events, /E2E_ARTIFACT /).map((event) => event.payload.message)[0] ?? '';
+  const match = /E2E_ARTIFACT ref=(\S+) sha256=([0-9a-f]+) bytes=(\d+) mode=(\d+)/.exec(artifactLine);
+  step.check('движок сообщил артефакт (ref/sha256/bytes) в scoped events', Boolean(match), `line="${artifactLine}"`);
+  if (!match) return;
+  const declaredSha = match[2];
+  const declaredBytes = Number(match[3]);
+
+  const download = await downloadArtifact(ctx.base, ctx.key, runId, ref);
+  step.check('клиент получил артефакт через API download: HTTP 200', download.status === 200, `HTTP ${download.status} ${download.errorBody ?? ''}`);
+  if (download.status !== 200) return;
+  const actualSha = sha256Hex(download.buffer);
+  step.check('sha256 байтов совпадает с объявленным', actualSha === declaredSha, `actual=${actualSha} declared=${declaredSha}`);
+  step.check('download header sha256 совпадает', download.sha256 === actualSha, `header=${download.sha256}`);
+  step.check('размер байт-в-байт совпадает', download.buffer.length === declaredBytes, `${download.buffer.length} vs ${declaredBytes}`);
+  step.check('body совпадает с содержимым файла на диске', sha256Hex(readFileSync(join(ctx.rootDir, 'workspaces', runId, ref))) === actualSha);
+
+  const artifactMode = describePathMode(join(ctx.rootDir, 'workspaces', runId, ref));
+  step.check('артефакт не доступен миру (mode 600)', artifactMode.exists && ((artifactMode.mode ?? 0o777) & 0o077) === 0, `mode=${artifactMode.modeText ?? artifactMode.error}`);
+  const workspaceMode = describePathMode(join(ctx.rootDir, 'workspaces', runId));
+  step.check('workspace не доступен миру (mode 700)', workspaceMode.exists && ((workspaceMode.mode ?? 0o777) & 0o077) === 0, `mode=${workspaceMode.modeText ?? workspaceMode.error}`);
+  step.check('download отдаёт тот же mode, что на диске', download.fileMode === artifactMode.modeText, `header=${download.fileMode} disk=${artifactMode.modeText}`);
+
+  const traversal = await downloadArtifact(ctx.base, ctx.key, runId, '../api/admissions.json');
+  step.check('path traversal через ref отклонён (400)', traversal.status === 400, `HTTP ${traversal.status}`);
+  const missing = await downloadArtifact(ctx.base, ctx.key, runId, 'missing.txt');
+  step.check('отсутствующий артефакт → 404', missing.status === 404, `HTTP ${missing.status}`);
+  const noAuth = await fetch(`${ctx.base}/v1/runs/${encodeURIComponent(runId)}/download?ref=${ref}`);
+  step.check('download без ключа → 401', noAuth.status === 401, `HTTP ${noAuth.status}`);
+}
