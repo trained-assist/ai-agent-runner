@@ -40,6 +40,7 @@ const EXPECTED_STEPS = [
   'step-2-events-stream-replay',
   'step-3-fault-injection',
   'step-4-recovery-restart',
+  'step-5-security-probes',
 ];
 
 const tempDirs: string[] = [];
@@ -134,6 +135,45 @@ describe('e2e acceptance loop driver (issue #2)', () => {
     expect(run.stdout).toContain(`E2E LOOP RESULT: PASS ${EXPECTED_STEPS.length}/${EXPECTED_STEPS.length}`);
   }, 240000);
 
+  // [[ e2e-failure-detection ]]
+  it('провал шага = FAIL + reproduction + черновик issue, exit code 1', async () => {
+    const dir = tempDir();
+    const reportPath = join(dir, 'report.json');
+    const readableTarget = join(dir, 'foreign-profile.db');
+    writeFileSync(readableTarget, 'E2E-CANARY-LEAKED-CONTENT\n');
+    // Читаемая цель для пробы "чужой профиль" должна дать LEAKED и уронить шаг.
+    const run = await runDriver([
+      '--root',
+      join(dir, 'data'),
+      '--report',
+      reportPath,
+      '--only',
+      'step-5',
+      '--foreign-profile',
+      readableTarget,
+      '--sudo-policy',
+      'report',
+    ]);
+    expect(run.code).toBe(1);
+    expect(run.stdout).toContain('FAIL step-5-security-probes');
+
+    const report = loadReport(reportPath);
+    expect(report.steps).toHaveLength(1);
+    const step = report.steps[0]!;
+    expect(step.id).toBe('step-5-security-probes');
+    expect(step.status).toBe('FAIL');
+    const names = failedChecks(step).map((check) => check.name).join(' | ');
+    expect(names).toContain('LEAKED');
+    expect(step.reproduction).toContain('--only step-5');
+    expect(step.reproduction).toContain('--root');
+    expect(step.issueDraft?.title).toContain('step-5-security-probes');
+    expect(step.issueDraft?.body).toContain('Reproduction');
+    expect(report.summary.ok).toBe(false);
+    expect(report.summary.finalized).toBe(true);
+    // Данные прогона сохранены для reproduction.
+    expect(existsSync(join(dir, 'data', 'fixtures', 'secrets.env'))).toBe(true);
+  }, 120000);
+  // [[/e2e-failure-detection ]]
 
   it('--with-reboot отклоняется без root до старта прогона (exit 2)', async () => {
     if (typeof process.getuid === 'function' && process.getuid() === 0) return;

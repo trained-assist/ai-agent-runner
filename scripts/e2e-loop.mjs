@@ -23,6 +23,7 @@ import {
   stepEventsStreamReplay,
   stepFaultInjection,
   stepRecoveryRestart,
+  stepSecurityProbes,
 } from './e2e-loop/steps.mjs';
 
 const SCRIPT_PATH = fileURLToPath(import.meta.url);
@@ -486,6 +487,7 @@ async function main() {
     { id: 'step-2-events-stream-replay', title: 'Events stream/replay по cursor: полнота порядка, reconnect без rerun', run: stepEventsStreamReplay },
     { id: 'step-3-fault-injection', title: 'Fault injection: nonzero/startup/timeout/crash → структурированный outcome', run: stepFaultInjection },
     { id: 'step-4-recovery-restart', title: 'Recovery после kill -9 процесса runner: durable store, без rerun', run: stepRecoveryRestart },
+    { id: 'step-5-security-probes', title: 'Security-пробы изнутри рана: чужой профиль/sudo/metadata/secrets.env → deny', run: stepSecurityProbes },
   ];
   if (opts.withReboot) {
     definitions.push({ id: 'step-4b-reboot', title: 'Полный systemctl reboot VM (только root): durable recovery, rerun отсутствует', run: stepRebootPre });

@@ -353,3 +353,104 @@ export async function stepRecoveryRestart(ctx, step) {
   const finalHealth = await ctx.control.health();
   step.check('движок остановлен после шага', finalHealth.activeRuns === 0, `activeRuns=${finalHealth.activeRuns}`);
 }
+
+// ---------------------------------------------------------------- step 5
+
+export async function stepSecurityProbes(ctx, step) {
+  const targets = {
+    foreignProfile: ctx.fixtures.foreignProfile,
+    secretsEnv: ctx.fixtures.secretsEnv,
+    metadataUrl: ctx.fixtures.metadataUrl,
+  };
+  const body = engineBody('probe', {
+    timeoutMs: 30000,
+    envAllowlist: [],
+    input: { inlinePrompt: JSON.stringify(targets) },
+  });
+  const submit = await submitRun(ctx.base, ctx.key, 'e2e-step-5', body);
+  step.check('submit принят: HTTP 202', submit.status === 202, `HTTP ${submit.status} ${submit.text.slice(0, 160)}`);
+  if (submit.status !== 202) return;
+  const runId = submit.json.runId;
+
+  const status = await waitTerminal(ctx.base, ctx.key, runId, 30000);
+  step.check('пробы выполнились (run succeeded)', status.state === 'succeeded', `state=${status.state}`);
+
+  const events = await collectAllEvents(ctx.base, ctx.key, runId, { from: 0 });
+  const probeLines = findLog(events, /E2E_PROBE /).map((event) => event.payload.message);
+  const probes = probeLines.map(parseProbeLine).filter(Boolean);
+  const byName = new Map(probes.map((probe) => [probe.name, probe]));
+
+  for (const name of ['foreign_profile', 'sudo', 'metadata', 'secrets_env']) {
+    const present = byName.has(name);
+    step.check(`проба "${name}" зафиксирована в scoped events`, present, `missing; got [${[...byName.keys()].join(',')}]`);
+  }
+
+  const foreignExists = ctx.fixtures.foreignProfileExists;
+  const foreign = byName.get('foreign_profile');
+  if (foreign) {
+    if (foreign.verdict === 'LEAKED') {
+      step.fail('чужой профиль не читается из рана', `verdict=LEAKED detail=${foreign.detail}`);
+    } else if (foreignExists) {
+      step.check('чужой профиль: отказ доступа (DENIED)', foreign.verdict === 'DENIED', `verdict=${foreign.verdict} detail=${foreign.detail}`);
+    } else {
+      step.check('чужой профиль: DENIED или ABSENT (нет данных)', foreign.verdict === 'DENIED' || foreign.verdict === 'ABSENT', `verdict=${foreign.verdict}`);
+    }
+  }
+
+  const sudo = byName.get('sudo');
+  const sudoPolicy = ctx.opts.sudoPolicy ?? 'deny';
+  if (sudo) {
+    if (sudo.verdict === 'DENIED') {
+      step.check('sudo: отказ (нет привилегирования)', true, `detail=${sudo.detail}`);
+    } else if (sudoPolicy === 'report') {
+      step.check(
+        'sudo: passwordless sudo окружения зафиксирован, policy=report не валит шаг',
+        true,
+        `verdict=${sudo.verdict} detail=${sudo.detail}`,
+      );
+    } else {
+      step.check('sudo: отказ (нет привилегирования)', false, `verdict=${sudo.verdict} detail=${sudo.detail}`);
+    }
+  }
+
+  const metadata = byName.get('metadata');
+  if (metadata) step.check('metadata endpoint 169.254.169.254: отказ', metadata.verdict === 'DENIED', `verdict=${metadata.verdict} detail=${metadata.detail}`);
+
+  const secrets = byName.get('secrets_env');
+  if (secrets) step.check('secrets.env: отказ доступа (DENIED)', secrets.verdict === 'DENIED', `verdict=${secrets.verdict} detail=${secrets.detail}`);
+
+  const violations = probes.filter(
+    (probe) => probe.verdict === 'LEAKED' && !(probe.name === 'sudo' && sudoPolicy === 'report'),
+  );
+  step.check('ни одна проба не показала LEAKED', violations.length === 0, violations.map((probe) => probe.name).join(','));
+
+  const rawKeys = envKeysFromLogs(events);
+  const envKeys = runtimeEnvKeys(rawKeys);
+  step.check(
+    'engine env пуст: host-секреты не переданы в ран',
+    rawKeys !== null && envKeys.length === 0,
+    `line=${rawKeys === null ? 'missing' : 'present'} keys=${JSON.stringify(envKeys)}`,
+  );
+
+  const diskLog = existsSync(join(ctx.rootDir, 'runs', runId, 'events.jsonl'))
+    ? readFileSync(join(ctx.rootDir, 'runs', runId, 'events.jsonl'), 'utf8')
+    : '';
+  step.check('попытки видны в scoped log на диске', (diskLog.match(/E2E_PROBE /g) ?? []).length >= 4, `found ${(diskLog.match(/E2E_PROBE /g) ?? []).length}`);
+
+  if (ctx.opts.withOpencode) {
+    const prompt = `Run this exact shell command with the bash tool and print its full output: ${process.execPath} ${PROBE_SCRIPT} ${JSON.stringify(JSON.stringify(targets))}`;
+    const opencodeBody = engineBody('opencode', { timeoutMs: 180000, envAllowlist: [], input: { inlinePrompt: prompt } });
+    const opencodeSubmit = await submitRun(ctx.base, ctx.key, 'e2e-step-5-opencode', opencodeBody);
+    step.check('opencode: submit принят', opencodeSubmit.status === 202, `HTTP ${opencodeSubmit.status}`);
+    if (opencodeSubmit.status === 202) {
+      const opencodeRunId = opencodeSubmit.json.runId;
+      const opencodeStatus = await waitTerminal(ctx.base, ctx.key, opencodeRunId, 180000);
+      step.check('opencode: run дошёл до терминального состояния', isTerminalState(opencodeStatus.state), `state=${opencodeStatus.state}`);
+      const opencodeEvents = await collectAllEvents(ctx.base, ctx.key, opencodeRunId, { from: 0 });
+      const blob = logMessages(opencodeEvents).join('\n');
+      step.check('opencode: канарейки чужого профиля/secrets не утекли в логи', findSecretsInText(blob, ctx.secrets).length === 0);
+      step.check('opencode: нет verdict=LEAKED', !blob.includes('verdict=LEAKED'));
+      step.check('opencode: пробы действительно выполнялись', blob.includes('E2E_PROBE '), 'нет строк E2E_PROBE в выводе opencode');
+    }
+  }
+}
