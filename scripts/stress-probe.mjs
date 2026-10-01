@@ -11,7 +11,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { getEvents, getResult, getStatus, submitRun, waitForStatus, waitTerminal } from './e2e-loop/client.mjs';
+import { getEvents, getResult, getStatus, postCancel, submitRun, waitForStatus, waitTerminal } from './e2e-loop/client.mjs';
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(SCRIPT_DIR, '..');
@@ -197,6 +197,82 @@ async function phaseTimeline() {
   return resultAt0;
 }
 
+// ---------------------------------------------------------------- B2: recovery после смерти процесса
+// Ключевая метрика владельца: сколько проходит от СМЕРТИ сервера до того, как
+// данные (status/events/result) снова читаются с durable store.
+async function phaseRecovery() {
+  const rootDir = mkdtempSync(join(tmpdir(), 'stress-recovery-'));
+  const dist = buildDist();
+  let server = await startServer(dist, rootDir);
+  const base = () => `http://127.0.0.1:${server.port}`;
+
+  const body = {
+    engine: { name: 'fake-timeout', adapterVersion: '1' },
+    limits: { timeoutMs: 180000 },
+    envAllowlist: [],
+    input: { inlinePrompt: 'stress-recovery: in-flight run across server death' },
+  };
+  const submit = await submitRun(base(), server.key, `stress-rec-${Date.now()}`, body);
+  if (submit.status !== 202) throw new Error(`submit HTTP ${submit.status}: ${submit.text.slice(0, 160)}`);
+  const runId = submit.json.runId;
+  await waitForStatus(base(), server.key, runId, (s) => s.state === 'running', 15000, 'running before kill');
+
+  // смерть процесса
+  const tKill = Date.now();
+  server.child.kill('SIGKILL');
+  await new Promise((resolve) => server.child.on('exit', resolve));
+  const tKilled = Date.now();
+
+  // рестарт того же rootDir → durable store
+  server = await startServer(dist, rootDir);
+  const tUp = Date.now();
+
+  let tStatus = null;
+  let status = null;
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline) {
+    const r = await getStatus(base(), server.key, runId);
+    if (r.status === 200) { status = r.json; tStatus = Date.now(); break; }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  if (tStatus === null) throw new Error('status не читается за 5s после рестарта');
+
+  let tEvents = null;
+  let eventsCount = 0;
+  const deadline2 = Date.now() + 5000;
+  while (Date.now() < deadline2) {
+    const r = await getEvents(base(), server.key, runId, 0, 500);
+    if (r.status === 200 && (r.json?.events?.length ?? 0) > 0) {
+      eventsCount = r.json.events.length;
+      tEvents = Date.now();
+      break;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+
+  // уборка: гасим run и сервер
+  await postCancel(base(), server.key, runId, {}).catch(() => {});
+  server.child.kill('SIGTERM');
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  if (server.child.exitCode === null) server.child.kill('SIGKILL');
+  try { rmSync(rootDir, { recursive: true, force: true }); } catch { /* ok */ }
+
+  report.recovery = {
+    killToProcessDeadMs: tKilled - tKill,
+    killToServerUpMs: tUp - tKill,
+    killToStatusReadableMs: tStatus - tKill,
+    killToEventsReplayMs: tEvents ? tEvents - tKill : null,
+    statusAfterRestart: status?.state ?? null,
+    eventsReplayed: eventsCount,
+    note: 'смерть = SIGKILL процесса сервера; данные читаются из durable store того же rootDir',
+  };
+  report.notes.push(
+    `recovery: status читается через ${tStatus - tKill} мс после смерти, события реплеятся через ${tEvents ? tEvents - tKill : 'n/a'} мс, состояние=${status?.state}`,
+  );
+  save();
+  console.log('RECOVERY:', JSON.stringify(report.recovery, null, 2));
+}
+
 // ---------------------------------------------------------------- B: memory → OOM
 function phaseMemory() {
   const swapsBefore = readFileSync('/proc/swaps', 'utf8').trim();
@@ -303,6 +379,9 @@ const phase = process.argv.includes('--phase') ? process.argv[process.argv.index
       await phaseTimeline();
       save();
       console.log('TIMELINE:', JSON.stringify(report.timeline, null, 2));
+    }
+    if (phase === 'all' || phase === 'recovery') {
+      await phaseRecovery();
     }
     if (phase === 'all' || phase === 'memory') {
       await phaseMemory();
