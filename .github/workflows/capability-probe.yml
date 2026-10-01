@@ -33,7 +33,7 @@ jobs:
             echo "os: $(. /etc/os-release && echo $PRETTY_NAME)"
             echo "disk-inode:"; df -ih / | tail -1
             echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: npm ci + typecheck + unit
         run: |
@@ -74,7 +74,7 @@ jobs:
             echo "### opencode в CI"
             echo "- \`opencode --version\`: \`$(opencode --version)\`"
             echo "- без провайдера/токена: exit=$CODE (ожидаем отказ авторизации — рабочая схема pr-autofix: свой \`opencode.json\` → llm-ladder + \`LLM_LADDER_TOKEN\`, флаг \`-m ladder/<model>\`)"
-          } >> "$GITHUB_STEP_SUMMARY"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: E2E acceptance loop (fake engines, без reboot)
         # passwordless sudo на GitHub-hosted раннере — штатное свойство хоста,
@@ -83,4 +83,4 @@ jobs:
 
       - name: Reboot-шаг — невозможен (документируем)
         run: |
-          echo "step-4b (systemctl reboot) в GitHub Actions НЕ запускается: reboot убивает раннер вместе с job. Валидация reboot-пути — только на песочной VM (см. runner#6)." >> "$GITHUB_STEP_SUMMARY"
+          echo "step-4b (systemctl reboot) в GitHub Actions НЕ запускается: reboot убивает раннер вместе с job. Валидация reboot-пути — только на песочной VM (см. runner#6)." | tee -a "$GITHUB_STEP_SUMMARY"
