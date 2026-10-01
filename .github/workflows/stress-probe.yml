@@ -42,8 +42,23 @@ jobs:
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
-      - name: "Stress: timeline + memory→OOM + CPU burn"
-        run: node scripts/stress-probe.mjs --json stress-report.json
+      - name: "Stress: timeline (запуск → result)"
+        run: node scripts/stress-probe.mjs --phase timeline --merge --json stress-report.json
+
+      - name: "Stress: CPU burn"
+        run: node scripts/stress-probe.mjs --phase cpu --merge --json stress-report.json
+
+      - name: "Stress: память → OOM (изолированно, ожидаем kill)"
+        id: mem
+        continue-on-error: true
+        run: |
+          set +e
+          node scripts/stress-probe.mjs --phase memory --merge --json stress-report.json
+          EC=$?
+          echo "memory-phase exit=$EC" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "--- free после:"; free -h | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "--- dmesg OOM:"; sudo dmesg 2>/dev/null | grep -iE "oom|killed process" | tail -5 | tee -a "$GITHUB_STEP_SUMMARY" || echo "(нет OOM-строк)" | tee -a "$GITHUB_STEP_SUMMARY"
+          exit 0
 
       - name: Install opencode (глобально)
         run: npm install -g opencode-ai >/dev/null 2>&1 && opencode --version

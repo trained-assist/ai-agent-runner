@@ -19,7 +19,13 @@ const reportPath = process.argv.includes('--json')
   ? process.argv[process.argv.indexOf('--json') + 1]
   : 'stress-report.json';
 
-const report = { startedAt: new Date().toISOString(), timeline: null, memory: null, cpu: null, notes: [] };
+let report = { startedAt: new Date().toISOString(), timeline: null, memory: null, cpu: null, notes: [] };
+if (process.argv.includes('--merge') && existsSync(reportPath)) {
+  try {
+    const prev = JSON.parse(readFileSync(reportPath, 'utf8'));
+    report = { ...report, ...prev, notes: Array.isArray(prev.notes) ? prev.notes : [] };
+  } catch { /* начинаем заново */ }
+}
 const t = (label) => ({ label, at: Date.now(), iso: new Date().toISOString() });
 const jobStartMs = Number(process.env.JOB_START_MS || 0);
 const npmDoneMs = Number(process.env.NPM_DONE_MS || 0);
