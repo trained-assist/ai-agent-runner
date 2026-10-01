@@ -152,6 +152,27 @@ ARTIFACT_SHARE_SECRET=<random>    # HMAC-секрет share-токенов; бе
 - **Gap GCS presigned:** v4-подпись под ADC требует `roles/iam.serviceAccountTokenCreator` у сервис-аккаунта (локального приватного ключа нет и не будет); без права `getSignedUrl` → `BLOB_BACKEND_UNSUPPORTED`, рабочая альтернатива — share-токен через API (local-fs путь) либо R2/S3. Smoke на живом бакете — отдельной задачей, в тестах только инжектируемый bucket.
 - **Вне этого slice (roadmap):** интеграция с GitHub — текстовой образ профиля → приватные репозитории `profiles-artifacts` ([trained-assist-agent#1921](https://github.com/trained-assist/trained-assist-agent/issues/1921)); materialize при старте и sweep в finalizing (D2); открытые вопросы ARCH §10 — snapshot/commit semantics и retention/export-гарантии.
 
+## Repository context — репозиторий в контексте run (01.10.2026)
+
+RunSpec получил необязательную группу `repository`: ран клонирует репозиторий **до** спавна движка, и cwd движка = этот клон. Движок работает *в чужой репе* — это основа будущего pr-fixer.
+
+| Поле | Формат | Смысл |
+|---|---|---|
+| `repository.fullName` | `owner/name` (regex, до 200 символов) | целевая репозитория, клонируется из `<base>/<fullName>.git` |
+| `repository.token` | непустая строка до 500 символов (опционально) | токен доступа для приватной репы |
+
+- **Пустая/отсутствующая группа = дефолтный режим**: клонируется `trained-assist/ai-agent-runner` (константа `DEFAULT_REPOSITORY_FULL_NAME`, env-оверрайд `RUNNER_DEFAULT_REPO` — для тестов: `owner/name` либо готовый источник вида `/tmp/fixture.git`/`file:///…`). Задачи без явной репозитории идут в контексте этого продукта.
+- **Клон делает runner, не движок**: child-процесс `git clone --depth 1` в `src/runner/repository.ts`, таймаут 60 с (`CLONE_TIMEOUT_MS`). Движок получает только `cwd` готового клона; токен в его окружение не передаётся.
+- **Секретность токена**: токен не попадает в argv git (argv виден через `ps` всем локальным пользователям) — он уходит в окружение child'а и доходит до git через статический `GIT_ASKPASS`-помошник, файл секрета на диск не пишется и удаляется сразу после clone. `redactRepositoryToken` вычищает поле из `state.json`, `admissions.json` и из хэшей (`specHash`/`submitPayloadHash` — ротация токена не ломает идемпотентность), `stripRepositoryToken` вычищает его из живой структуры после clone; `redactSecrets` дополнительно маскирует `ghp_…`/`github_pat_…`/`x-access-token:…`. Итог: токена нет в events, status, result, receipt, логах, отчётах и на диске — проверяется поиском по строке в JSON (`test/repository-context.test.ts`).
+- **Ошибки**: любой сбой clone (404/403/нет сети/нет git/таймаут) — не crash, а структурированный отказ: `failure.code = REPOSITORY_UNAVAILABLE`, состояние `failed`, `exitReason = preflight_refused`, понятное сообщение в `safeSummary` (через redaction). API-валидация кривого `fullName` → **400 `INVALID_REPOSITORY`**.
+- **Переопределения для тестов/гетерогенных стендов**: `RUNNER_DEFAULT_REPO`, `RUNNER_REPOSITORY_BASE_URL` (базовый URL вместо `https://github.com` — локальный git-сервер в тестах, self-hosted GitHub). Тесты офлайновые: `npm test` поднимает локальный фикстурный репозиторий (`test/default-repo-fixture-setup.ts`), интеграционные пробы идут на локальном git-сервере с Basic-auth.
+
+Env/константы: `RUNNER_DEFAULT_REPO` (дефолтная репа), `RUNNER_REPOSITORY_BASE_URL` (база URL), `CLONE_TIMEOUT_MS=60000` (таймаут clone).
+
+Покрытие: `test/repository-context.test.ts` (clone с токеном против локального репо, file://-клон без токена, дефолтная репа, redaction по всем поверхностям, clone-fail → `REPOSITORY_UNAVAILABLE`, 400 `INVALID_REPOSITORY`), `test/contracts.test.ts` (валидация группы), `test/default-repo-fixture-setup.ts` (офлайн-фикстура).
+
+Оговорка: токен хранится только в памяти процесса до clone — после рестарта воркера queued-ран возобновляется уже без токена (для приватной репы это `REPOSITORY_UNAVAILABLE` до нового submit с токеном). Это осознанный обмен: секретов на диске нет.
+
 ## Разработка
 
 ```bash
