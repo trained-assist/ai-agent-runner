@@ -8,7 +8,8 @@ export type StorageErrorCode =
   | 'BLOB_UPLOAD_UNVERIFIED'
   | 'BLOB_BACKEND_UNSUPPORTED'
   | 'BLOB_BACKEND_MISCONFIGURED'
-  | 'ARTIFACT_CONFLICT';
+  | 'ARTIFACT_CONFLICT'
+  | 'ARTIFACT_MANIFEST_INVALID';
 
 const STORAGE_CODES: readonly StorageErrorCode[] = [
   'BLOB_UNSAFE_KEY',
@@ -19,6 +20,7 @@ const STORAGE_CODES: readonly StorageErrorCode[] = [
   'BLOB_BACKEND_UNSUPPORTED',
   'BLOB_BACKEND_MISCONFIGURED',
   'ARTIFACT_CONFLICT',
+  'ARTIFACT_MANIFEST_INVALID',
 ];
 
 export class StorageError extends Error {

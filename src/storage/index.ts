@@ -5,3 +5,5 @@ export * from './local-fs.js';
 export * from './gcs.js';
 export * from './r2.js';
 export * from './create-blob-store.js';
+export * from './manifest.js';
+export * from './artifact-store.js';
