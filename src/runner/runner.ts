@@ -110,6 +110,7 @@ export class Runner {
   private readonly eventLog: ScopedEventLog;
   private readonly clock: () => Date;
   private readonly runs = new Map<string, InternalRun>();
+  private readonly cloneControllers = new Map<string, AbortController>();
   private disposed = false;
 
   constructor(options: RunnerOptions) {
@@ -450,6 +451,8 @@ export class Runner {
 
   dispose(): void {
     this.disposed = true;
+    for (const controller of this.cloneControllers.values()) controller.abort();
+    this.cloneControllers.clear();
     for (const run of this.runs.values()) {
       this.clearTimers(run);
       run.handle?.dispose();
@@ -585,6 +588,8 @@ export class Runner {
         handle.killTree('SIGKILL');
         handle.dispose();
       }
+      // воркер останавливается: run остаётся в starting, recover() разберёт его
+      if (this.disposed) return;
       if (isTerminalState(st.state) || st.finalized) return;
       this.failStartPath(st, err, phase);
     }
@@ -626,8 +631,12 @@ export class Runner {
     try {
       // clone идёт в runner (child git), НЕ в движке: cwd движка = этот клон
       const source = resolveCloneSource(st.spec.repository);
-      await cloneRepository(source, st.spec.cwd);
+      const controller = new AbortController();
+      this.cloneControllers.set(st.runId, controller);
+      if (this.disposed) controller.abort();
+      await cloneRepository(source, st.spec.cwd, { signal: controller.signal });
     } finally {
+      this.cloneControllers.delete(st.runId);
       // токен живёт только до попытки clone: в движок, env и журналы он не уходит
       stripRepositoryToken(st.spec);
     }

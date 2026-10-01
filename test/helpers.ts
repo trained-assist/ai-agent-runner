@@ -118,16 +118,32 @@ export function createHarness(options: HarnessOptions = {}): Harness {
     },
   };
 
-  onTestFinished(() => {
+  onTestFinished(async () => {
     for (const runId of runner.listRunIds()) {
       const snap = runner.getRun(runId);
       if (snap && !isTerminalState(snap.state)) killProcessTree(snap.pgid, snap.pid, 'SIGKILL');
     }
     runner.dispose();
-    rmSync(rootDir, { recursive: true, force: true });
+    await removeDirWithRetry(rootDir);
   });
 
   return harness;
+}
+
+/**
+ * clone пишет .git асинхронно; dispose убивает git-процесс сигналом, но файлы могут
+ * дописываться доли секунды — один rmSync в этот момент падает ENOTEMPTY.
+ */
+export async function removeDirWithRetry(dir: string, attempts = 10): Promise<void> {
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      rmSync(dir, { recursive: true, force: true });
+      return;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOTEMPTY' || attempt === attempts - 1) throw err;
+      await sleep(50);
+    }
+  }
 }
 
 export { isProcessAlive, killProcessTree, sleep };

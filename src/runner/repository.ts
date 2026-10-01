@@ -85,7 +85,14 @@ export function planClone(source: CloneSource, targetDir: string): ClonePlan {
   return { args, env };
 }
 
-export async function cloneRepository(source: CloneSource, targetDir: string, timeoutMs: number = CLONE_TIMEOUT_MS): Promise<void> {
+export interface CloneOptions {
+  timeoutMs?: number;
+  /** Прерывает clone (dispose воркера): git-процесс убивается, записи в cwd прекращаются. */
+  signal?: AbortSignal;
+}
+
+export async function cloneRepository(source: CloneSource, targetDir: string, options: CloneOptions = {}): Promise<void> {
+  const timeoutMs = options.timeoutMs ?? CLONE_TIMEOUT_MS;
   const plan = planClone(source, targetDir);
   let askpassDir: string | null = null;
   const env: NodeJS.ProcessEnv = { ...process.env, ...plan.env };
@@ -96,15 +103,19 @@ export async function cloneRepository(source: CloneSource, targetDir: string, ti
     env['GIT_ASKPASS'] = scriptPath;
   }
   try {
-    await runGit(plan.args, env, timeoutMs, source);
+    await runGit(plan.args, env, timeoutMs, source, options.signal);
   } finally {
     if (askpassDir) rmSync(askpassDir, { recursive: true, force: true });
   }
 }
 
-function runGit(args: string[], env: NodeJS.ProcessEnv, timeoutMs: number, source: CloneSource): Promise<void> {
+function runGit(args: string[], env: NodeJS.ProcessEnv, timeoutMs: number, source: CloneSource, signal?: AbortSignal): Promise<void> {
   return new Promise<void>((resolve, reject) => {
-    const child = spawn('git', args, { env, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    if (signal?.aborted) {
+      reject(new PreflightError('REPOSITORY_UNAVAILABLE', `clone of "${source.fullName}" aborted: worker is shutting down`, { retryable: true }));
+      return;
+    }
+    const child = spawn('git', args, { env, detached: true, stdio: ['ignore', 'pipe', 'pipe'], ...(signal ? { signal } : {}) });
     let stderr = '';
     let timedOut = false;
     let settled = false;
@@ -124,10 +135,25 @@ function runGit(args: string[], env: NodeJS.ProcessEnv, timeoutMs: number, sourc
     }, timeoutMs);
     timer.unref?.();
 
+    if (signal) {
+      // abort = dispose воркера: убиваем всё процессное дерево git, чтобы в cwd
+      // не оставались дописывающиеся файлы после остановки
+      const onAbort = (): void => killProcessTree(child.pid, child.pid, 'SIGKILL');
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
+
     child.stderr?.on('data', (chunk: Buffer) => {
       if (stderr.length < 8192) stderr += chunk.toString('utf8');
     });
     child.on('error', (err: NodeJS.ErrnoException) => {
+      if (signal?.aborted || err.name === 'AbortError') {
+        settle(
+          new PreflightError('REPOSITORY_UNAVAILABLE', `clone of "${source.fullName}" aborted: worker is shutting down`, {
+            retryable: true,
+          }),
+        );
+        return;
+      }
       settle(
         err.code === 'ENOENT'
           ? new PreflightError('REPOSITORY_UNAVAILABLE', 'git is not available on this worker; cannot clone the run repository', {

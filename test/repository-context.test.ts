@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, onTestFinished } from 'vitest';
-import { existsSync, readFileSync, rmSync, mkdtempSync } from 'node:fs';
+import { existsSync, readFileSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { FakeEngine } from '../src/adapters/engine/fake-engine.js';
@@ -10,7 +10,7 @@ import { validateRunSpec, type RunSpec } from '../src/contracts/run-spec.js';
 import { isTerminalState } from '../src/runner/state-machine.js';
 import { specHash } from '../src/runner/util.js';
 import { buildRepositoryUrl, planClone, repositoryBaseUrl, resolveCloneSource } from '../src/runner/repository.js';
-import { createHarness } from './helpers.js';
+import { createHarness, removeDirWithRetry } from './helpers.js';
 import {
   cleanupTempDirs,
   createBareRepo,
@@ -237,7 +237,7 @@ function createApiLite(): ApiHarnessLite {
       }
     }
     api.dispose();
-    rmSync(rootDir, { recursive: true, force: true });
+    await removeDirWithRetry(rootDir);
   });
   return { api, rootDir, logs };
 }
