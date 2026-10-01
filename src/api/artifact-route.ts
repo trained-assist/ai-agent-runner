@@ -56,7 +56,7 @@ export async function handleArtifactRequest(
   }
 
   if (action === 'meta') {
-    sendJson(res, 200, manifest);
+    sendJson(res, 200, manifest, { 'cache-control': 'private, no-store', 'x-content-type-options': 'nosniff' });
     return 200;
   }
 
@@ -67,6 +67,7 @@ export async function handleArtifactRequest(
     etag: `"${manifest.sha256}"`,
     'x-artifact-sha256': manifest.sha256,
     'x-artifact-id': manifest.artifactId,
+    'x-content-type-options': 'nosniff',
     'content-disposition': `attachment; filename="${safeFileName(manifest.name)}"`,
     'cache-control': 'private, no-store',
   });
@@ -131,11 +132,12 @@ function safeFileName(name: string): string {
   return cleaned.length > 0 ? cleaned.slice(0, 150) : 'artifact';
 }
 
-function sendJson(res: ServerResponse, status: number, data: unknown): void {
+function sendJson(res: ServerResponse, status: number, data: unknown, extraHeaders: Record<string, string> = {}): void {
   const payload = JSON.stringify(data);
   res.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
     'content-length': Buffer.byteLength(payload),
+    ...extraHeaders,
   });
   res.end(payload);
 }

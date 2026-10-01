@@ -198,5 +198,7 @@ describe('artifact download route', () => {
     expect(tokenLog).toMatchObject({ event: 'artifact_request', status: 200, runId: 'run-2', action: 'download' });
     const keyLog = logs.find((entry) => entry['auth'] === 'key' && entry['principalId'] === 'principal-b' && entry['action'] === 'meta');
     expect(keyLog).toMatchObject({ event: 'artifact_request', status: 200, artifactId: 'art-b' });
+    expect(logs.some((entry) => entry['status'] === 401)).toBe(true);
+    expect(logs.some((entry) => entry['status'] === 404)).toBe(true);
   });
 });

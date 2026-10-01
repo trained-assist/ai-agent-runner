@@ -28,6 +28,27 @@ export interface GcsBlobStoreOptions {
 const BUCKET_NAME_RE = /^[a-z0-9][a-z0-9._-]{1,61}[a-z0-9]$/;
 const DEFAULT_SHARE_TTL_SECONDS = 600;
 
+const CRC32C_TABLE = ((): Uint32Array => {
+  const table = new Uint32Array(256);
+  for (let index = 0; index < 256; index += 1) {
+    let value = index;
+    for (let bit = 0; bit < 8; bit += 1) value = value & 1 ? 0x82f63b78 ^ (value >>> 1) : value >>> 1;
+    table[index] = value >>> 0;
+  }
+  return table;
+})();
+
+export function crc32cBase64(data: Uint8Array): string {
+  let crc = 0xffffffff;
+  for (let index = 0; index < data.length; index += 1) {
+    crc = (CRC32C_TABLE[(crc ^ data[index]!) & 0xff]! ^ (crc >>> 8)) >>> 0;
+  }
+  crc = (crc ^ 0xffffffff) >>> 0;
+  const bytes = Buffer.alloc(4);
+  bytes.writeUInt32LE(crc, 0);
+  return bytes.toString('base64');
+}
+
 function firstOf<T>(value: unknown): T {
   return (Array.isArray(value) ? value[0] : value) as T;
 }
@@ -96,6 +117,13 @@ export class GcsBlobStore implements BlobStore {
           `blob put ${key} succeeded but the object metadata could not be read: ${err instanceof Error ? err.message : String(err)}`,
         );
       }
+      const storedCrc = typeof meta['crc32c'] === 'string' ? meta['crc32c'] : null;
+      if (storedCrc === null) {
+        throw new StorageError('BLOB_UPLOAD_UNVERIFIED', `blob put ${key} returned no crc32c, so the stored bytes cannot be verified`);
+      }
+      if (storedCrc !== crc32cBase64(buf)) {
+        throw new StorageError('BLOB_SHA_MISMATCH', `stored object for ${key} does not match the uploaded bytes`);
+      }
       const generation = meta['generation'] !== undefined && meta['generation'] !== null ? String(meta['generation']) : null;
       return { sha256, size: buf.length, generation };
     });
@@ -155,8 +183,17 @@ export class GcsBlobStore implements BlobStore {
       if (typeof file.getSignedUrl !== 'function') {
         throw new StorageError('BLOB_BACKEND_UNSUPPORTED', `gcs signed urls are unavailable for ${key}`);
       }
-      const [url] = await file.getSignedUrl({ action: 'read', version: 'v4', expires: expiresAt });
-      return { url, expiresAt: expiresAt.toISOString() };
+      try {
+        const [url] = await file.getSignedUrl({ action: 'read', version: 'v4', expires: expiresAt });
+        return { url, expiresAt: expiresAt.toISOString() };
+      } catch (err) {
+        throw new StorageError(
+          'BLOB_BACKEND_UNSUPPORTED',
+          `gcs signed url for ${key} could not be created: ${err instanceof Error ? err.message : String(err)} ` +
+            '(v4 signing under ADC needs roles/iam.serviceAccountTokenCreator for the runtime service account; ' +
+            'without it use the api share token path or an R2/S3 backend with presigned urls)',
+        );
+      }
     });
   }
 }

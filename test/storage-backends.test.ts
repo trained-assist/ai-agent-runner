@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createBlobStore, matchBackend, resolveBackend, resolveDeadlineMs } from '../src/storage/create-blob-store.js';
-import type { GcsBucketLike } from '../src/storage/gcs.js';
+import { crc32cBase64, type GcsBucketLike } from '../src/storage/gcs.js';
 import { LocalFsBlobStore, type LocalFsIo } from '../src/storage/local-fs.js';
 import { sha256Hex } from '../src/storage/blob-store.js';
 
@@ -16,7 +16,7 @@ interface FakeBucket {
   bucket: GcsBucketLike;
   objects: Map<string, FakeObject>;
   calls: string[];
-  fail: { save?: boolean; getMetadata?: boolean; download?: boolean; slowDownloadMs?: number };
+  fail: { save?: boolean; getMetadata?: boolean; download?: boolean; slowDownloadMs?: number; omitCrc?: boolean; corruptSave?: boolean };
 }
 
 function notFound(): Error {
@@ -38,14 +38,16 @@ function fakeBucket(): FakeBucket {
           calls.push(`save:${key}`);
           if (fail.save) throw new Error('save failed');
           generation += 1;
-          objects.set(key, { data: Buffer.from(data), generation });
+          objects.set(key, { data: fail.corruptSave ? Buffer.from('stored instead of uploaded') : Buffer.from(data), generation });
         },
         async getMetadata() {
           calls.push(`getMetadata:${key}`);
           if (fail.getMetadata) throw new Error('metadata failed');
           const object = objects.get(key);
           if (!object) throw notFound();
-          return [{ size: String(object.data.length), generation: String(object.generation) }];
+          const metadata: Record<string, unknown> = { size: String(object.data.length), generation: String(object.generation) };
+          if (!fail.omitCrc) metadata['crc32c'] = crc32cBase64(object.data);
+          return [metadata];
         },
         async download() {
           calls.push(`download:${key}`);
@@ -248,6 +250,32 @@ describe('gcs backend with an injected client', () => {
     fake.fail.save = true;
     const store = createBlobStore({ backend: 'gcs', bucket: fake.bucket });
     await expect(store.put('runs/run-1/artifacts/art-1', 'x')).rejects.toThrow('save failed');
+  });
+
+  it('computes the published crc32c vector used for store verification', () => {
+    expect(crc32cBase64(Buffer.from('123456789'))).toBe('g5IG4w==');
+  });
+
+  it('verifies stored bytes through the crc32c gcs reports for the object', async () => {
+    const fake = fakeBucket();
+    const store = createBlobStore({ backend: 'gcs', bucket: fake.bucket });
+    const ref = await store.put('runs/run-1/artifacts/art-1', 'crc checked bytes');
+    expect(ref.sha256).toBe(sha256Hex('crc checked bytes'));
+    expect(fake.calls).toContain('getMetadata:runs/run-1/artifacts/art-1');
+  });
+
+  it('refuses the digest when the stored object differs from the uploaded bytes', async () => {
+    const fake = fakeBucket();
+    fake.fail.corruptSave = true;
+    const store = createBlobStore({ backend: 'gcs', bucket: fake.bucket });
+    await expect(store.put('runs/run-1/artifacts/art-1', 'uploaded bytes')).rejects.toMatchObject({ code: 'BLOB_SHA_MISMATCH' });
+  });
+
+  it('refuses to claim a digest when the backend reports no crc32c', async () => {
+    const fake = fakeBucket();
+    fake.fail.omitCrc = true;
+    const store = createBlobStore({ backend: 'gcs', bucket: fake.bucket });
+    await expect(store.put('runs/run-1/artifacts/art-1', 'uploaded bytes')).rejects.toMatchObject({ code: 'BLOB_UPLOAD_UNVERIFIED' });
   });
 
   it('issues a generation-bound signed url for the object', async () => {

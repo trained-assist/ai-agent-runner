@@ -24,6 +24,7 @@ export interface ShareTokenIssuerOptions {
   secret?: string;
   ttlSeconds?: number;
   now?: () => Date;
+  env?: Record<string, string | undefined>;
 }
 
 function hmac(secret: Buffer, payload: string): string {
@@ -41,7 +42,8 @@ export class ShareTokenIssuer {
       throw new StorageError('BLOB_BACKEND_MISCONFIGURED', `share ttl must be a positive number of seconds, got ${String(ttl)}`);
     }
     this.ttlSeconds = ttl;
-    this.secret = Buffer.from(options.secret ?? randomBytes(32).toString('hex'), 'utf8');
+    const env = options.env ?? process.env;
+    this.secret = Buffer.from(options.secret || env['ARTIFACT_SHARE_SECRET'] || randomBytes(32).toString('hex'), 'utf8');
     this.now = options.now ?? (() => new Date());
   }
 
@@ -81,6 +83,7 @@ export interface ShareLinkDeps {
   blob: BlobStore;
   tokens?: ShareTokenIssuer;
   baseUrl?: string;
+  env?: Record<string, string | undefined>;
 }
 
 export interface CreateShareLinkOptions {
@@ -99,7 +102,8 @@ export async function createShareLink(deps: ShareLinkDeps, manifest: ArtifactMan
 
   if (deps.tokens) {
     const issued = deps.tokens.issue(manifest.artifactId, { ttlSeconds });
-    const url = artifactSharePath(deps.baseUrl ?? '', manifest.artifactId, issued.token);
+    const env = deps.env ?? process.env;
+    const url = artifactSharePath(deps.baseUrl ?? env['ARTIFACT_BASE_URL'] ?? '', manifest.artifactId, issued.token);
     return { artifactId: manifest.artifactId, runId: manifest.runId, url, expiresAt: issued.expiresAt, backend: deps.blob.backend };
   }
 

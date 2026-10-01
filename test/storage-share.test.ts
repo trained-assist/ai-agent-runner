@@ -182,4 +182,21 @@ describe('share links', () => {
   it('rejects a non-positive ttl', () => {
     expect(() => new ShareTokenIssuer({ ttlSeconds: 0 })).toThrow(/positive number/);
   });
+
+  it('reads the share secret from the environment when none is passed', () => {
+    const first = new ShareTokenIssuer({ env: { ARTIFACT_SHARE_SECRET: 'env-secret' } });
+    const second = new ShareTokenIssuer({ env: { ARTIFACT_SHARE_SECRET: 'env-secret' } });
+    const stranger = new ShareTokenIssuer({ env: { ARTIFACT_SHARE_SECRET: 'other-secret' } });
+    const issued = first.issue('art-1');
+    expect(second.verify('art-1', issued.token)).toBe(true);
+    expect(stranger.verify('art-1', issued.token)).toBe(false);
+  });
+
+  it('falls back to ARTIFACT_BASE_URL from the environment', async () => {
+    const blob = createLocalFsBlobStore({ rootDir: root() });
+    const tokens = new ShareTokenIssuer({ secret: 'test-secret' });
+    const link = await createShareLink({ blob, tokens, env: { ARTIFACT_BASE_URL: 'http://env-base:9090' } }, manifest());
+    expect(link.url.startsWith('http://env-base:9090/v1/artifacts/art-1?t=')).toBe(true);
+    await expect(createShareLink({ blob, tokens, env: {} }, manifest())).rejects.toMatchObject({ code: 'BLOB_BACKEND_MISCONFIGURED' });
+  });
 });

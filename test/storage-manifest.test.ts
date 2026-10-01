@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { BlobHead, BlobRef, BlobStore } from '../src/storage/blob-store.js';
@@ -126,6 +126,7 @@ describe('artifact manifest schema', () => {
     expect(validateArtifactManifest({ ...base, sha256: 'nope' }).ok).toBe(false);
     expect(validateArtifactManifest({ ...base, mime: 'text' }).ok).toBe(false);
     expect(validateArtifactManifest({ ...base, name: '../report.txt' }).ok).toBe(false);
+    expect(validateArtifactManifest({ ...base, name: 'report\r\n.txt' }).ok).toBe(false);
     expect(validateArtifactManifest({ ...base, size: -1 }).ok).toBe(false);
     expect(validateArtifactManifest({ ...base, storageKey: 'runs/other/artifacts/art-1' }).ok).toBe(false);
     expect(validateArtifactManifest({ ...base, createdAt: 'yesterday' }).ok).toBe(false);
@@ -170,6 +171,39 @@ describe('artifact store', () => {
     expect(again).toEqual(first);
     await expect(store.put(putInput({ artifactId: 'art-1', bytes: 'other bytes' }))).rejects.toMatchObject({ code: 'ARTIFACT_CONFLICT' });
     clock.current = '2026-10-01T10:00:00.000Z';
+  });
+
+  it('keeps artifact ids unambiguous across runs', async () => {
+    const rootDir = root();
+    const blob = memoryBlob();
+    const store = new ArtifactStore({ rootDir, blob, now });
+    await store.put(putInput({ artifactId: 'art-1', runId: 'run-1', profileId: 'profile-a' }));
+    await expect(store.put(putInput({ artifactId: 'art-1', runId: 'run-2', profileId: 'profile-b' }))).rejects.toMatchObject({
+      code: 'ARTIFACT_CONFLICT',
+    });
+
+    const foreign = join(rootDir, 'runs', 'run-2', 'artifacts');
+    mkdirSync(foreign, { recursive: true });
+    writeFileSync(
+      join(foreign, 'art-1.json'),
+      JSON.stringify({
+        artifactId: 'art-1',
+        runId: 'run-2',
+        userTaskId: 'task-2',
+        profileId: 'profile-b',
+        name: 'foreign.txt',
+        mime: 'text/plain',
+        size: 7,
+        sha256: sha256Hex('foreign'),
+        storageKey: 'runs/run-2/artifacts/art-1',
+        createdAt: '2026-10-01T10:00:00.000Z',
+      }),
+    );
+
+    const reopened = new ArtifactStore({ rootDir, blob, now });
+    expect(reopened.find('art-1')).toBeNull();
+    expect(reopened.list('run-1')).toHaveLength(1);
+    expect(reopened.list('run-2')).toHaveLength(1);
   });
 
   it('refuses a backend that reports a digest of bytes it did not store', async () => {

@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import type { BlobCallOptions, BlobHead, BlobRef, BlobStore } from './blob-store.js';
 import { DEFAULT_DEADLINE_MS, boundCall, sha256Hex, toBuffer } from './blob-store.js';
@@ -29,27 +29,27 @@ let tmpCounter = 0;
 
 function defaultIo(): LocalFsIo {
   return {
-    write(absPath, bytes) {
-      mkdirSync(dirname(absPath), { recursive: true });
+    async write(absPath, bytes) {
+      await mkdir(dirname(absPath), { recursive: true });
       tmpCounter += 1;
       const tmp = `${absPath}.${process.pid}.${tmpCounter}.tmp`;
-      writeFileSync(tmp, bytes);
-      renameSync(tmp, absPath);
+      await writeFile(tmp, bytes);
+      await rename(tmp, absPath);
     },
-    read(absPath) {
-      return readFileSync(absPath);
+    async read(absPath) {
+      return readFile(absPath);
     },
-    stat(absPath) {
+    async stat(absPath) {
       try {
-        const info = statSync(absPath);
+        const info = await stat(absPath);
         if (!info.isFile()) return null;
         return { size: info.size, mtimeMs: info.mtimeMs };
       } catch {
         return null;
       }
     },
-    remove(absPath) {
-      rmSync(absPath, { force: true });
+    async remove(absPath) {
+      await rm(absPath, { force: true });
     },
   };
 }

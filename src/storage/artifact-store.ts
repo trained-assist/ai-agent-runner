@@ -127,6 +127,10 @@ export class ArtifactStore {
       if (existing.sha256 === sha256 && existing.size === bytes.length) return existing;
       throw new StorageError('ARTIFACT_CONFLICT', `artifact ${artifactId} of run ${runId} already exists with different bytes`);
     }
+    const elsewhere = this.find(artifactId);
+    if (elsewhere && elsewhere.runId !== runId) {
+      throw new StorageError('ARTIFACT_CONFLICT', `artifact ${artifactId} already exists in run ${elsewhere.runId} of profile ${elsewhere.manifest.profileId}`);
+    }
 
     const ref = await this.blob.put(storageKey, bytes);
     if (ref.sha256 !== sha256) {
@@ -229,6 +233,8 @@ export class ArtifactStore {
 
   private scanIndex(): void {
     this.index.clear();
+    const seen = new Set<string>();
+    const ambiguous = new Set<string>();
     if (existsSync(this.runsDir)) {
       for (const runId of readdirSync(this.runsDir).sort()) {
         if (!isSafeId(runId)) continue;
@@ -237,10 +243,14 @@ export class ArtifactStore {
         for (const entry of readdirSync(dir)) {
           if (!entry.endsWith('.json')) continue;
           const artifactId = entry.slice(0, -'.json'.length);
-          if (isSafeId(artifactId)) this.index.set(artifactId, runId);
+          if (!isSafeId(artifactId)) continue;
+          if (seen.has(artifactId)) ambiguous.add(artifactId);
+          seen.add(artifactId);
+          this.index.set(artifactId, runId);
         }
       }
     }
+    for (const artifactId of ambiguous) this.index.delete(artifactId);
     this.indexed = true;
   }
 }
