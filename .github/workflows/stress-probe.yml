@@ -1,0 +1,144 @@
+name: stress-probe
+
+# Замеры лимитах CI (инициатива владельца, 01.10.2026):
+#  1) timeline: старт job → npm ci → API → submit → running → succeeded → result;
+#  2) память до OOM-kill (сигнатура убийства + dmesg + swap);
+#  3) CPU burn (троттлинг);
+#  4) свободный opencode через llm-ladder под нагрузкой (параллельные + длинный ран);
+#  5) сигнатура таймаута — какой ошибкой джоба умирает, чтобы классификатор её знал.
+# Только workflow_dispatch (ручной прогон). Отчёты без секретов → artifact.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  limits:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Clock (t0 = старт job)
+        run: echo "JOB_START_MS=$(date +%s%3N)" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: npm ci
+        run: |
+          npm ci --no-audit --no-fund
+          echo "NPM_DONE_MS=$(date +%s%3N)" >> "$GITHUB_ENV"
+
+      - name: Facts: swap / ulimit / cgroup / memory
+        run: |
+          {
+            echo "### Лимиты хоста"
+            echo '```'
+            echo "--- /proc/swaps"; cat /proc/swaps || true
+            echo "--- free"; free -h
+            echo "--- ulimit -a (ключевые)"; ulimit -a | grep -E "virtual|max memory|open files|cpu time|processes"
+            echo "--- cgroup"; cat /sys/fs/cgroup/memory.max 2>/dev/null || echo "memory.max: n/a"; cat /sys/fs/cgroup/memory.swap.max 2>/dev/null || echo "swap.max: n/a"
+            echo "--- disk"; df -h / | tail -1
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Stress: timeline + memory→OOM + CPU burn
+        run: node scripts/stress-probe.mjs --json stress-report.json
+
+      - name: Opencode free-ladder: 4 параллельных + 1 длинный
+        env:
+          LLM_LADDER_TOKEN: ${{ secrets.LLM_LADDER_TOKEN }}
+        run: |
+          cat > opencode.json <<'JSON'
+          {
+            "$schema": "https://opencode.ai/config.json",
+            "provider": {
+              "ladder": {
+                "name": "llm-ladder",
+                "options": { "baseURL": "https://llm-ladder.trainedassist.store/v1", "apiKey": "{env:LLM_LADDER_TOKEN}" },
+                "models": { "free-ladder": { "name": "free-ladder" } }
+              }
+            }
+          }
+          JSON
+          : > oc.tsv
+          run_one() {
+            local label="$1" prompt="$2" tmo="$3"
+            local s e code out
+            s=$(date +%s%3N)
+            out=$(timeout "$tmo" opencode run --auto -m ladder/free-ladder "$prompt" 2>&1)
+            code=$?
+            e=$(date +%s%3N)
+            printf '%s\t%s\t%s\t%s\n' "$label" "$code" "$((e - s))" "$(echo "$out" | tail -1 | tr '\t' ' ' | cut -c1-140)" >> oc.tsv
+          }
+          # 4 параллельных коротких (нагрузка на free-пул → ловим rate limit/429)
+          for i in 1 2 3 4; do run_one "parallel-$i" "Reply with exactly one word: pong$i" 180 & done
+          wait
+          # 1 длинный (контекст/время — «собрать кучу инфы»)
+          run_one "long-report" "Write a detailed structured report of about 600 words about reliable distributed job queues. Plain text." 300
+          node -e '
+            const fs = require("fs");
+            const rows = fs.readFileSync("oc.tsv", "utf8").trim().split("\n").map(l => { const [label, code, ms, tail] = l.split("\t"); return { label, exit: Number(code), ms: Number(ms), tail }; });
+            const summary = { runs: rows, ok: rows.filter(r => r.exit === 0).length, failed: rows.filter(r => r.exit !== 0).length,
+              rateLikeErrors: rows.filter(r => /429|rate|limit|quota|FreeTier|unauthorized/i.test(r.tail)).map(r => r.label) };
+            fs.writeFileSync("opencode-stress.json", JSON.stringify(summary, null, 2));
+            console.log(JSON.stringify(summary, null, 2));
+          '
+          {
+            echo "### opencode free-ladder под нагрузкой"
+            echo '```'
+            column -t -s$'\t' oc.tsv | head -10
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: "Сигнатура таймаута: шаг с timeout-minutes=1 (спим 5 минут)"
+        id: tsig
+        timeout-minutes: 1
+        continue-on-error: true
+        run: sleep 300
+
+      - name: Зафиксировать исход таймаута
+        if: always()
+        run: |
+          echo "timeout-step outcome=${{ steps.tsig.outcome }} conclusion=${{ steps.tsig.conclusion }}" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "timeout-signature outcome=${{ steps.tsig.outcome }}" >> stress-timeout.txt
+
+      - name: Итоговая сводка
+        if: always()
+        run: |
+          node -e '
+            const fs = require("fs");
+            const r = fs.existsSync("stress-report.json") ? JSON.parse(fs.readFileSync("stress-report.json", "utf8")) : {};
+            const t = r.timeline || {};
+            const m = r.memory || {};
+            const lines = [
+              "### Замеры лимитов (stress-probe)",
+              "| Этап | Время |", "|---|---|",
+              `| job start → npm ci done | ${t.jobStartToNpmDone ?? "—"} мс |`,
+              `| npm ci → dist built | ${t.npmDoneToDistBuilt ?? "—"} мс |`,
+              `| dist build → API listening | ${t.distBuildToServerListening ?? "—"} мс |`,
+              `| listening → healthz | ${t.serverListeningToHealth ?? "—"} мс |`,
+              `| healthz → submit 202 | ${t.healthToSubmitAccepted ?? "—"} мс |`,
+              `| submit → running (начало рана) | ${t.submitToRunning ?? "—"} мс |`,
+              `| submit → succeeded | ${t.submitToTerminal ?? "—"} мс |`,
+              `| succeeded → result готов | ${t.terminalToResultReady ?? "—"} мс |`,
+              `| **job start → result готов** | ${t.jobStartToResultReady ?? "—"} мс |`,
+              "",
+              `**Память:** до OOM ≈ ${m.allocatedBeforeDeathMb} МБ, exit=${m.exitCode}, signal=${m.signal}, dmesg OOM=${m.oomKillerInDmesg}, swap=${JSON.stringify(m.swapAfter)}`,
+              "",
+              `**Таймаут:** outcome=${process.env.TSIG_OUTCOME ?? "см. шаг выше"}`,
+            ].join("\n");
+            fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, lines + "\n");
+          '
+
+      - name: Отчёты как artifact (без секретов)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stress-probe-reports
+          path: |
+            stress-report.json
+            opencode-stress.json
+            stress-timeout.txt
+          retention-days: 30
+          if-no-files-found: ignore
