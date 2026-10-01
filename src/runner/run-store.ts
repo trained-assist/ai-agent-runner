@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { validateRunnerEvent, type RunnerEvent } from '../contracts/events.js';
 import type { RunResult } from '../contracts/result.js';
-import type { RunSpec } from '../contracts/run-spec.js';
+import { redactRepositoryToken, type RunSpec } from '../contracts/run-spec.js';
 import { isSafeId } from '../contracts/validate.js';
 import { writeFileAtomic } from './util.js';
 import type { RunState } from './state-machine.js';
@@ -94,7 +94,9 @@ export class RunStore {
   }
 
   saveState(state: PersistedRunState): void {
-    writeFileAtomic(this.statePath(state.runId), `${JSON.stringify(state, null, 2)}\n`);
+    // repository.token никогда не пишется на диск: секрет живёт только в памяти процесса до clone
+    const persisted = { ...state, spec: redactRepositoryToken(state.spec) };
+    writeFileAtomic(this.statePath(state.runId), `${JSON.stringify(persisted, null, 2)}\n`);
   }
 
   loadState(runId: string): PersistedRunState | null {

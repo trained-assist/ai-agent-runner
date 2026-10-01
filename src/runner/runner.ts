@@ -10,10 +10,11 @@ import {
 } from '../contracts/events.js';
 import type { RunResult } from '../contracts/result.js';
 import type { RunSpec } from '../contracts/run-spec.js';
-import { validateRunSpec } from '../contracts/run-spec.js';
+import { stripRepositoryToken, validateRunSpec } from '../contracts/run-spec.js';
 import { ConflictError, PreflightError, SpecValidationError } from '../contracts/validate.js';
 import { FaultInjectedError, FaultRegistry, type FaultPoint } from '../faults/registry.js';
 import { RunStore, type PersistedRunState } from './run-store.js';
+import { cloneRepository, resolveCloneSource } from './repository.js';
 import { ScopedEventLog, type LogSink } from './scoped-log.js';
 import { canTransition, isTerminalState, type RunState } from './state-machine.js';
 import { redactSecrets, specHash, truncateLine } from './util.js';
@@ -538,7 +539,7 @@ export class Runner {
         this.completeWithoutEngine(st, 'cancelled', 'cancelled');
         return;
       }
-      this.materialize(st);
+      await this.materialize(st);
       if (this.disposed) return;
       if (st.cancelRequested) {
         this.completeWithoutEngine(st, 'cancelled', 'cancelled');
@@ -614,13 +615,21 @@ export class Runner {
     }
   }
 
-  private materialize(st: PersistedRunState): void {
+  private async materialize(st: PersistedRunState): Promise<void> {
     try {
       mkdirSync(st.spec.cwd, { recursive: true });
     } catch (err) {
       throw new PreflightError('WORKSPACE_UNAVAILABLE', `cannot prepare workspace "${st.spec.cwd}": ${String((err as Error).message)}`, {
         retryable: true,
       });
+    }
+    try {
+      // clone идёт в runner (child git), НЕ в движке: cwd движка = этот клон
+      const source = resolveCloneSource(st.spec.repository);
+      await cloneRepository(source, st.spec.cwd);
+    } finally {
+      // токен живёт только до попытки clone: в движок, env и журналы он не уходит
+      stripRepositoryToken(st.spec);
     }
     this.emit(st, 'materialized', { inputs: st.spec.input?.refs?.length ?? 0 });
   }
@@ -766,6 +775,7 @@ export class Runner {
       logPath: this.store.relLogPath(st.runId),
     };
     if (failure) result.failure = failure;
+    stripRepositoryToken(st.spec);
     this.persistResult(st, result);
   }
 
