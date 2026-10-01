@@ -192,6 +192,13 @@ async function phaseTimeline() {
     eventTypes: [...new Set(list.map((e) => e.type))],
     ...(firstClaimed ? { firstEvent: { type: firstClaimed.type, sequence: firstClaimed.sequence } } : {}),
     ...(firstStarted ? { startedEvent: { type: firstStarted.type, sequence: firstStarted.sequence } } : {}),
+    // общая шкала сравнения машин: события стрима с таймкодом относительно submit
+    eventTimeline: list.map((e) => ({
+      type: e.type,
+      seq: e.sequence,
+      at: e.at ?? null,
+      offSubmitMs: e.at ? Date.parse(e.at) - marks.submitAccepted : null,
+    })),
   };
   report.notes.push(`result готов через ${marks.resultReady - marks.terminal} мс после терминала; upload-artifact в workflow идёт отдельным шагом после job`);
   return resultAt0;
