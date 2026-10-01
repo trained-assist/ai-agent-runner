@@ -1,6 +1,6 @@
 # AI Agent Runner
 
-Статус: **slice 1 + Serverless Agent API (P04–P06) + slice D1 (storage/артефакты) реализованы** · 01.10.2026. Код жизненного цикла Run, внешний admission/result adapter для одной VM и storage-контракт с менеджментом артефактов есть в этом репозитории; materialize/sweep, artifact transfer и межмашинные leases ещё не вынесены (см. roadmap).
+Статус: **slice 1 + Serverless Agent API (P04–P06) + slice D1 (storage/артефакты) + E2E acceptance loop (issue #2) реализованы** · 01.10.2026. Код жизненного цикла Run, внешний admission/result adapter, storage-контракт с менеджментом артефактов и цикл приёмки владельца есть в этом репозитории; materialize/sweep и межмашинные leases ещё не вынесены (см. roadmap).
 
 **Agent Runner** управляет запуском **ai-agent-job** на выбранной виртуальной машине: готовит **Agent clean room**, запускает агентский движок с разрешёнными правами, наблюдает выполнение, сохраняет результат и освобождает ресурсы.
 
@@ -75,6 +75,21 @@
 - [x] `connection_lost` ≠ failed; cancel requested ≠ stopped — `test/api-service.test.ts`, `test/api-http.test.ts`
 - [x] Два principals изолированы (read/cancel чужого run → 404) — `test/api-service.test.ts`
 
+## E2E acceptance loop (issue #2)
+
+Замкнутый цикл приёмки: submit/идемпотентность → events stream/replay → fault injection → recovery после kill -9 (+ reboot по флагу) → security-пробы → артефакт через API → креды со скоупами. Каждый шаг — PASS/FAIL с reproduction, результат — JSON-отчёт, провал — готовый черновик issue.
+
+```bash
+npm ci                 # devDependencies (typescript/vitest)
+./scripts/e2e-loop.sh  # либо node scripts/e2e-loop.mjs --help
+# → ./e2e-loop-report.json, exit 0 = все шаги зелёные
+```
+
+Драйвер сам компилирует `src/` в `.e2e-dist/` (package.json/lock не меняются), поднимает дочерний API-сервер и работает только через его HTTP-контракт. Дефолтный прогон — детерминированный и free-only (fake-движки); `--with-reboot` (только root) и `--with-opencode` включаются явно. Провал шага: `node scripts/e2e-loop.mjs --root <data> --only <step-id>`.
+
+Подробности, границы harness (download/gateway — e2e-стенд-ины под P07/#30) и ожидания на песочной VM — [docs/E2E-acceptance-loop.md](docs/E2E-acceptance-loop.md).
+
+Из «Проверок до первого production rollout» ([ARCHITECTURE §9](ARCHITECTURE.md)) цикл закрывает: duplicate start = один запуск (шаги 1 и 4), worker restart восстанавливает запись либо фиксирует потерю без скрытого rerun (шаг 4), сбои дают структурированные outcomes (шаг 3), filesystem/tool/credential probes блокируются (шаг 5; оговорка про UID — в docs), engine logs и события доступны после restart (шаг 4).
 ## Slice D1 — Storage и менеджмент артефактов
 
 Соответствует [ARCHITECTURE §5](ARCHITECTURE.md) (контракт C05), §7 «Рабочие данные и финализация» (export commit) и §10 «Открытые решения» (snapshot/commit semantics, result retention — остаются открытыми), [SERVERLESS-AGENT-API § direct artifact transfer](https://github.com/trained-assist/trained-agent-architecture/blob/main/SERVERLESS-AGENT-API.md) и [PR #13 в arch-репо](https://github.com/trained-assist/trained-agent-architecture/pull/13) (один контракт — три бэкенда; **никаких presigned URL в записях данных**).

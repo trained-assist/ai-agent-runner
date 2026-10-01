@@ -6,4 +6,7 @@ coverage/
 .env.*
 .DS_Store
 tmp/
+.e2e-dist/
+.e2e-dist.lock
+e2e-loop-report*.json
 data/
