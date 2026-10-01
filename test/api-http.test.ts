@@ -213,6 +213,11 @@ describe('http sse replay', () => {
     const submit = await postSubmit(h.base, alphaKey, 'idem-sse', submitBody());
     const receipt = (await submit.json()) as { runId: string };
 
+    await waitFor(async () => {
+      const response = await getStatus(h.base, alphaKey, receipt.runId);
+      return ((await response.json()) as { state: string }).state === 'running';
+    }, 8000, 'run to be running before the first stream');
+
     const controller = new AbortController();
     const firstResponse = await fetch(`${h.base}/v1/runs/${receipt.runId}/events`, {
       headers: { ...authHeader(alphaKey), accept: 'text/event-stream' },
