@@ -68,6 +68,7 @@ export interface RunSnapshot {
   ownerGeneration: number;
   sequence: number;
   connectionLost: boolean;
+  cancelRequested: 'cancel' | 'timeout' | null;
   orphanedPid: number | null;
   pid: number | null;
   pgid: number | null;
@@ -156,6 +157,7 @@ export class Runner {
       ownerGeneration: st.ownerGeneration,
       sequence: st.sequence,
       connectionLost: st.connectionLost,
+      cancelRequested: st.cancelRequested,
       orphanedPid: st.orphanedPid,
       pid: st.pid,
       pgid: st.pgid,
