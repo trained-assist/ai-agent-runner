@@ -5,6 +5,7 @@ import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { FakeEngine, type FakeScenario } from '../src/adapters/engine/fake-engine.js';
+import { sleep } from '../src/adapters/engine/process-tree.js';
 import { OpenCodeAdapter } from '../src/adapters/engine/opencode-adapter.js';
 import { generateApiKey, KeyRegistry, keyRecordFor, type Principal } from '../src/api/auth.js';
 import { createAgentApiServer } from '../src/api/server.js';
@@ -29,6 +30,15 @@ export function testKeyRegistry(): KeyRegistry {
 
 export function authHeader(key: string): Record<string, string> {
   return { authorization: `Bearer ${key}` };
+}
+
+export async function waitForAsync(condition: () => boolean | Promise<boolean>, timeoutMs = 8000, label = 'condition'): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await condition()) return;
+    await sleep(25);
+  }
+  throw new Error(`timeout waiting for ${label}`);
 }
 
 export interface HttpHarnessOptions {
@@ -101,6 +111,7 @@ export async function startHttpHarness(options: HttpHarnessOptions = {}): Promis
     async restart(restartOptions = {}) {
       await shutdown(server);
       service.dispose({ killProcesses: restartOptions.killProcesses ?? true });
+      if ((restartOptions.killProcesses ?? true) === true) await sleep(50);
       service = new AgentApi(serviceOptions);
       const report = await service.recover();
       server = createAgentApiServer(service, { keys, logger, streamPollMs, keepaliveMs, maxBodyBytes });
