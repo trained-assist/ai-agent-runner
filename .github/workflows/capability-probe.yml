@@ -76,6 +76,26 @@ jobs:
             echo "- без провайдера/токена: exit=$CODE (ожидаем отказ авторизации — рабочая схема pr-autofix: свой \`opencode.json\` → llm-ladder + \`LLM_LADDER_TOKEN\`, флаг \`-m ladder/<model>\`)"
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
+      - name: opencode через llm-ladder (схема pr-autofix: свой конфиг, free-ladder)
+        env:
+          LLM_LADDER_TOKEN: ${{ secrets.LLM_LADDER_TOKEN }}
+        run: |
+          cat > opencode.json <<'JSON'
+          {
+            "$schema": "https://opencode.ai/config.json",
+            "provider": {
+              "ladder": {
+                "name": "llm-ladder",
+                "options": { "baseURL": "https://llm-ladder.trainedassist.store/v1", "apiKey": "{env:LLM_LADDER_TOKEN}" },
+                "models": { "free-ladder": { "name": "free-ladder" } }
+              }
+            }
+          }
+          JSON
+          OUT=$(timeout 180 opencode run --auto -m ladder/free-ladder "Reply with exactly one word: pong" 2>&1) || { echo "$OUT" | tail -15; exit 1; }
+          echo "$OUT" | tail -3
+          echo "$OUT" | grep -qi "pong" && echo "opencode через ladder: OK (pong)" | tee -a "$GITHUB_STEP_SUMMARY"
+
       - name: E2E acceptance loop (fake engines, без reboot)
         # passwordless sudo на GitHub-hosted раннере — штатное свойство хоста,
         # поэтому sudo-проба в CI в режиме report (см. --sudo-policy в доках цикла)
