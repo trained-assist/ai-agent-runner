@@ -29,7 +29,7 @@ jobs:
           npm ci --no-audit --no-fund
           echo "NPM_DONE_MS=$(date +%s%3N)" >> "$GITHUB_ENV"
 
-      - name: Facts: swap / ulimit / cgroup / memory
+      - name: "Facts: swap / ulimit / cgroup / memory"
         run: |
           {
             echo "### Лимиты хоста"
@@ -42,10 +42,10 @@ jobs:
             echo '```'
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
-      - name: Stress: timeline + memory→OOM + CPU burn
+      - name: "Stress: timeline + memory→OOM + CPU burn"
         run: node scripts/stress-probe.mjs --json stress-report.json
 
-      - name: Opencode free-ladder: 4 параллельных + 1 длинный
+      - name: "Opencode free-ladder: 4 параллельных + 1 длинный"
         env:
           LLM_LADDER_TOKEN: ${{ secrets.LLM_LADDER_TOKEN }}
         run: |
