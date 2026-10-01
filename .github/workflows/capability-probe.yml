@@ -76,7 +76,7 @@ jobs:
             echo "- без провайдера/токена: exit=$CODE (ожидаем отказ авторизации — рабочая схема pr-autofix: свой \`opencode.json\` → llm-ladder + \`LLM_LADDER_TOKEN\`, флаг \`-m ladder/<model>\`)"
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
-      - name: opencode через llm-ladder (схема pr-autofix: свой конфиг, free-ladder)
+      - name: "opencode через llm-ladder (схема pr-autofix: свой конфиг, free-ladder)"
         env:
           LLM_LADDER_TOKEN: ${{ secrets.LLM_LADDER_TOKEN }}
         run: |
