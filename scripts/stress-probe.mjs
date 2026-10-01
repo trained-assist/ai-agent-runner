@@ -218,6 +218,7 @@ function phaseMemory() {
     }
   `;
   const child = spawn(process.execPath, ['-e', childScript], { stdio: ['ignore', 'pipe', 'pipe'] });
+  child.stdout.pipe(process.stdout); // прогресс alloc_mb должен дойти до лога ДО смерти джобы
   let lastMb = 0;
   let stderr = '';
   child.stdout.on('data', (chunk) => {
