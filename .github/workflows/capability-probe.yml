@@ -43,6 +43,7 @@ jobs:
 
       - name: Playwright (chromium) — установка и живой прогон
         run: |
+          npm install --no-save playwright
           npx playwright install --with-deps chromium
           node -e "
             const { chromium } = require('playwright');
