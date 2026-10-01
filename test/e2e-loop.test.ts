@@ -38,6 +38,7 @@ const driverPath = join(repoRoot, 'scripts', 'e2e-loop.mjs');
 const EXPECTED_STEPS = [
   'step-1-submit-idempotency',
   'step-2-events-stream-replay',
+  'step-3-fault-injection',
 ];
 
 const tempDirs: string[] = [];

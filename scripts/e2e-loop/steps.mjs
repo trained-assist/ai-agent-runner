@@ -186,3 +186,97 @@ export async function stepEventsStreamReplay(ctx, step) {
   step.check('engine fake-slow стартовал 1 раз (reconnect ≠ rerun)', (after.startsByEngine['fake-slow'] ?? 0) - (before.startsByEngine['fake-slow'] ?? 0) === 1);
   step.check('admissions выросли ровно на 1', after.admissions - before.admissions === 1, `${before.admissions}→${after.admissions}`);
 }
+
+// ---------------------------------------------------------------- step 3
+
+const FAULT_CASES = [
+  {
+    name: 'nonzero-exit',
+    engine: 'fake-nonzero',
+    expect: { outcome: 'failed', exitReason: 'nonzero_exit', code: 'ENGINE_NONZERO_EXIT' },
+  },
+  {
+    name: 'startup-failure',
+    engine: 'fake-startup',
+    expect: { outcome: 'failed', exitReason: 'startup_failure', code: 'ENGINE_STARTUP_FAILED' },
+  },
+  {
+    name: 'timeout',
+    engine: 'fake-timeout',
+    timeoutMs: 400,
+    expect: { outcome: 'failed', exitReason: 'timeout', code: 'TIMEOUT' },
+  },
+  {
+    name: 'crash',
+    engine: 'fake-crash',
+    expect: { outcome: 'failed', exitReason: 'crash', code: 'ENGINE_CRASH' },
+  },
+  {
+    name: 'fault-spawn',
+    engine: 'fake',
+    fault: 'spawn',
+    expect: { outcome: 'failed', exitReason: 'startup_failure', code: 'ENGINE_STARTUP_FAILED' },
+  },
+  {
+    name: 'fault-preflight',
+    engine: 'fake',
+    fault: 'preflight',
+    expect: { outcome: 'failed', exitReason: 'preflight_refused', code: 'PREFLIGHT_FAILED' },
+  },
+];
+
+export async function stepFaultInjection(ctx, step) {
+  for (const testCase of FAULT_CASES) {
+    if (testCase.fault) await ctx.control.injectFault(testCase.fault, { kind: 'throw', once: true });
+    const body = engineBody(testCase.engine, {
+      timeoutMs: testCase.timeoutMs ?? 15000,
+      input: { inlinePrompt: `e2e step 3: ${testCase.name}` },
+    });
+    const submit = await submitRun(ctx.base, ctx.key, `e2e-step-3-${testCase.name}`, body);
+    step.check(`${testCase.name}: submit принят`, submit.status === 202, `HTTP ${submit.status} ${submit.text.slice(0, 160)}`);
+    if (submit.status !== 202) continue;
+    const runId = submit.json.runId;
+
+    const status = await waitTerminal(ctx.base, ctx.key, runId, 20000);
+    step.check(`${testCase.name}: состояние failed`, status.state === 'failed', `state=${status.state}`);
+
+    const result = await getResult(ctx.base, ctx.key, runId);
+    const runResult = result.json ?? {};
+    step.check(`${testCase.name}: result.outcome=failed`, result.status === 200 && runResult.outcome === 'failed', `HTTP ${result.status} outcome=${runResult.outcome}`);
+    step.check(
+      `${testCase.name}: структурированный exitReason`,
+      runResult.exitReason === testCase.expect.exitReason,
+      `expected ${testCase.expect.exitReason}, got ${runResult.exitReason}`,
+    );
+    step.check(
+      `${testCase.name}: failure.code=${testCase.expect.code}`,
+      runResult.failure?.code === testCase.expect.code,
+      `got ${runResult.failure?.code}`,
+    );
+    step.check(
+      `${testCase.name}: failureClass/retryable заполнены`,
+      typeof runResult.failure?.failureClass === 'string' && typeof runResult.failure?.retryable === 'boolean',
+      JSON.stringify(runResult.failure ?? null),
+    );
+    step.check(`${testCase.name}: logPath указывает на scoped log`, typeof runResult.logPath === 'string' && runResult.logPath.includes(runId), String(runResult.logPath));
+
+    const events = await collectAllEvents(ctx.base, ctx.key, runId, { from: 0 });
+    const chain = validateEventChain(events, { requireTerminal: true });
+    step.check(`${testCase.name}: цепочка событий полная`, chain.ok, chain.problems.join('; '));
+    const terminal = events[events.length - 1];
+    step.check(
+      `${testCase.name}: терминальное событие failed видно клиенту в events`,
+      terminal?.type === 'failed' && terminal.payload.code === testCase.expect.code,
+      `last=${terminal?.type} code=${terminal?.payload?.code}`,
+    );
+  }
+
+  await ctx.control.clearFaults();
+  const recoveryBody = engineBody('fake', { input: { inlinePrompt: 'e2e step 3: registry drained' } });
+  const recovery = await submitRun(ctx.base, ctx.key, 'e2e-step-3-recovery', recoveryBody);
+  step.check('после очистки реестра обычный run снова принимается', recovery.status === 202, `HTTP ${recovery.status}`);
+  if (recovery.status === 202) {
+    const status = await waitTerminal(ctx.base, ctx.key, recovery.json.runId, 20000);
+    step.check('реестр faults исчерпан: обычный run succeeded', status.state === 'succeeded', `state=${status.state}`);
+  }
+}

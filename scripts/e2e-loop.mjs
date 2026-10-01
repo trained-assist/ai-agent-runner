@@ -21,6 +21,7 @@ import { ControlClient, request, submitRun, waitForStatus } from './e2e-loop/cli
 import {
   stepSubmitIdempotency,
   stepEventsStreamReplay,
+  stepFaultInjection,
 } from './e2e-loop/steps.mjs';
 
 const SCRIPT_PATH = fileURLToPath(import.meta.url);
@@ -482,6 +483,7 @@ async function main() {
   const definitions = [
     { id: 'step-1-submit-idempotency', title: 'Submit → receipt: идемпотентный дубль = тот же run', run: stepSubmitIdempotency },
     { id: 'step-2-events-stream-replay', title: 'Events stream/replay по cursor: полнота порядка, reconnect без rerun', run: stepEventsStreamReplay },
+    { id: 'step-3-fault-injection', title: 'Fault injection: nonzero/startup/timeout/crash → структурированный outcome', run: stepFaultInjection },
   ];
 
   let selected = definitions;
