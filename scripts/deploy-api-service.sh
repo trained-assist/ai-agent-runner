@@ -34,6 +34,7 @@ Options:
 
 Environment overrides: REPO_DIR, SERVICE_USER, AGENT_API_PORT, AGENT_API_DATA_DIR,
 CONF_DIR, ARTIFACT_SHARE_SECRET, ARTIFACT_BASE_URL.
+Extra KEY=value lines already present in the service env file are kept as they are.
 USAGE
 }
 
@@ -121,7 +122,14 @@ if [[ -z "$BASE_URL" ]]; then
   SRC_IP="$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -n1)"
   BASE_URL="http://${SRC_IP:-127.0.0.1}:$PORT"
 fi
-cat > "$CONF_DIR/.env.tmp" <<ENV
+EXTRA_ENV=""
+if [[ -f "$ENV_FILE" ]]; then
+  EXTRA_ENV="$(grep -E '^[A-Za-z_][A-Za-z0-9_]*=' "$ENV_FILE" \
+    | grep -vE '^(AGENT_API_HOST|AGENT_API_PORT|AGENT_API_DATA_DIR|AGENT_API_KEY_REGISTRY|AGENT_API_REGION|AGENT_API_ENVIRONMENT|ARTIFACT_SHARE_SECRET|ARTIFACT_BASE_URL)=' \
+    || true)"
+fi
+{
+  cat <<ENV
 AGENT_API_HOST=0.0.0.0
 AGENT_API_PORT=$PORT
 AGENT_API_DATA_DIR=$DATA_DIR
@@ -131,6 +139,8 @@ AGENT_API_ENVIRONMENT=sandbox
 ARTIFACT_SHARE_SECRET=$SHARE_SECRET
 ARTIFACT_BASE_URL=$BASE_URL
 ENV
+  if [[ -n "$EXTRA_ENV" ]]; then printf '%s\n' "$EXTRA_ENV"; fi
+} > "$CONF_DIR/.env.tmp"
 chown "$SERVICE_USER:$SERVICE_GROUP" "$CONF_DIR/.env.tmp"
 chmod 0600 "$CONF_DIR/.env.tmp"
 mv "$CONF_DIR/.env.tmp" "$ENV_FILE"
