@@ -3,14 +3,14 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Agent Runner — lifecycle of ai-agent-job runs (RunSpec, engine adapters, scoped events, fault injection) plus external Serverless Agent API (admission/result, idempotent receipts, replayable events) for a single VM",
+  "description": "Agent Runner \u2014 lifecycle of ai-agent-job runs (RunSpec, engine adapters, scoped events, fault injection) plus external Serverless Agent API (admission/result, idempotent receipts, replayable events) for a single VM",
   "license": "UNLICENSED",
   "engines": {
     "node": ">=20"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "build": "tsc -p tsconfig.build.json",
+    "build": "tsc -p tsconfig.build.json && node scripts/copy-mcp-fixtures.mjs",
     "start": "node dist/api/main.js",
     "test": "vitest run",
     "test:watch": "vitest"

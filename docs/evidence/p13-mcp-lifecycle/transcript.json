@@ -1,0 +1,471 @@
+{
+  "schemaVersion": 1,
+  "probe": "P13 MCP lifecycle и scoped bindings (карточка #52, этап I04)",
+  "generatedAt": "2026-10-02T23:20:37.812Z",
+  "topology": "engine → per-run broker (stdio) → unix-socket мост → хост → per-run stdio MCP-сервер → мост → CapabilityRegistry → fake remote domain service",
+  "isolation": "per-run MCP-процессы стартуют под тем же service UID, что и runner: OS-изоляция НЕ доказана и не заявлена",
+  "bindings": {
+    "cred:demo-domain-write": "scope demo:write",
+    "cred:demo-domain-read": "scope demo:read",
+    "cred:demo-domain-readonly": "scope demo:read (write-capability объявлен намеренно — отказ по scope)"
+  },
+  "steps": [
+    {
+      "at": "2026-10-02T23:20:29.624Z",
+      "step": "probe_started",
+      "outDir": "/Users/vova/Code/m1-e5-p13/docs/evidence/p13-mcp-lifecycle",
+      "workDir": "/var/folders/1m/v4ljzvzx5x566w1r067w5vmw0000gn/T/mcp-p13-probe-7xHbY2",
+      "remote": "http://127.0.0.1:52869",
+      "tokenConfigured": true
+    },
+    {
+      "at": "2026-10-02T23:20:31.303Z",
+      "step": "run_happy",
+      "runId": "run-happy",
+      "outcome": "succeeded",
+      "exitCode": 0,
+      "failureCode": null
+    },
+    {
+      "at": "2026-10-02T23:20:32.256Z",
+      "step": "run_startup-fail",
+      "runId": "run-startup-fail",
+      "outcome": "failed",
+      "exitReason": "startup_failure",
+      "failureCode": "MCP_STARTUP_FAILED",
+      "detail": "процесс сервера ушёл до handshake"
+    },
+    {
+      "at": "2026-10-02T23:20:33.904Z",
+      "step": "run_handshake-hang",
+      "runId": "run-handshake-hang",
+      "outcome": "failed",
+      "exitReason": "startup_failure",
+      "failureCode": "MCP_STARTUP_FAILED",
+      "detail": "initialize не отвечает — readiness timeout"
+    },
+    {
+      "at": "2026-10-02T23:20:35.660Z",
+      "step": "run_tool-hang",
+      "runId": "run-tool-hang",
+      "outcome": "failed",
+      "exitReason": "nonzero_exit",
+      "failureCode": "ENGINE_NONZERO_EXIT",
+      "detail": "инструмент завис — tool timeout и гашение сервера"
+    },
+    {
+      "at": "2026-10-02T23:20:36.701Z",
+      "step": "run_cancel",
+      "runId": "run-cancel",
+      "cancelStatus": "stopped",
+      "outcome": "cancelled",
+      "mcpPid": 91652
+    },
+    {
+      "at": "2026-10-02T23:20:37.790Z",
+      "step": "run_orphan_restart",
+      "runId": "run-orphan",
+      "orphanedMcp": 1,
+      "mcpPid": 91669
+    }
+  ],
+  "checks": [
+    {
+      "name": "сценарий 1: ран завершён успешно",
+      "ok": true,
+      "detail": "outcome=succeeded"
+    },
+    {
+      "name": "сценарий 1: инструмент вызван по-настоящему (не только перечислен)",
+      "ok": true,
+      "detail": "tool_call steps=2"
+    },
+    {
+      "name": "сценарий 1: у вызовов есть квитанции эффекта",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "сценарий 1: внешний сервис выдал ровно две квитанции",
+      "ok": true,
+      "detail": "receipts=2"
+    },
+    {
+      "name": "сценарий 1: write выполнен под своим binding-ом",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "сценарий 1: инструмент вне scoped bindings отказан",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "сценарий 1: capability вне scope binding-а отказан",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "сценарий 1: наружу не ушло ни одной операции admin_purge",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "сценарий 1: handshake и readiness в логе рана",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "сценарий 1: отказы в логе рана с причиной",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "сценарий 1: квитанция эффекта в логе рана",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "сценарий 1: cleanup серверов в логе рана",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "сценарий 1: после рана не осталось живых MCP-процессов",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "сценарий 2 (startup-fail): сбой отражён в логах и в результате",
+      "ok": true,
+      "detail": "outcome=failed code=MCP_STARTUP_FAILED"
+    },
+    {
+      "name": "сценарий 2 (startup-fail): движок не запускался",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "сценарий 2 (handshake-hang): сбой отражён в логах и в результате",
+      "ok": true,
+      "detail": "outcome=failed code=MCP_STARTUP_FAILED"
+    },
+    {
+      "name": "сценарий 2 (handshake-hang): движок не запускался",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "сценарий 2 (tool-hang): сбой отражён в логах и в результате",
+      "ok": true,
+      "detail": "outcome=failed code=ENGINE_NONZERO_EXIT"
+    },
+    {
+      "name": "сценарий 2 (tool-hang): движок не запускался",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "сценарий 3: отмена остановила ран",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "сценарий 3: MCP-процессы погашены при отмене",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "сценарий 3: причина cleanup в логе — отмена",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "сценарий 4: рестарт воркера дочистил осиротевший MCP-процесс",
+      "ok": true,
+      "detail": "orphanedMcp=1 alive=false"
+    },
+    {
+      "name": "сценарий 4: дочистка отражена в логе",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "сценарий 5: значение binding-а не попало ни в одну поверхность",
+      "ok": true,
+      "detail": ""
+    }
+  ],
+  "runLogs": {
+    "happy": [
+      "mcp.bridge_ready runId=run-happy serverCount=3 scopedTools=3",
+      "mcp.server_starting serverId=demo-domain-write transport=stdio commandRef=cmd-c2c4b2fc declaredTools=1 bindingRef=cred:demo-domain-write",
+      "mcp.server_spawned serverId=demo-domain-write commandRef=cmd-c2c4b2fc pid=91579",
+      "mcp.server_stderr serverId=demo-domain-write line={\"ts\":\"2026-10-02T23:20:31.127Z\",\"level\":\"info\",\"event\":\"bridge_connected\",\"serverId\":\"demo-domain-write\",\"mode\":\"ok\"}",
+      "mcp.server_stderr serverId=demo-domain-write line={\"ts\":\"2026-10-02T23:20:31.127Z\",\"level\":\"info\",\"event\":\"fixture_initialize\",\"serverId\":\"demo-domain-write\",\"mode\":\"ok\",\"clientProtocolVersion\":\"2025-06-18\"}",
+      "mcp.server_ready serverId=demo-domain-write protocolVersion=2025-06-18 protocolVersionSupported=true serverName=sandbox-domain-mcp serverVersion=1.0.0 offeredTools=4 scopedTools=1 tools=demo.record_note bindingRef=cred:demo-domain-write bindingScope=demo:write commandRef=cmd-c2c4b2fc pid=91579 isolation=same_service_uid_not_os_isolated",
+      "mcp.server_starting serverId=demo-domain-read transport=stdio commandRef=cmd-c2c4b2fc declaredTools=1 bindingRef=cred:demo-domain-read",
+      "mcp.server_spawned serverId=demo-domain-read commandRef=cmd-c2c4b2fc pid=91580",
+      "mcp.server_stderr serverId=demo-domain-read line={\"ts\":\"2026-10-02T23:20:31.150Z\",\"level\":\"info\",\"event\":\"bridge_connected\",\"serverId\":\"demo-domain-read\",\"mode\":\"ok\"}",
+      "mcp.server_stderr serverId=demo-domain-read line={\"ts\":\"2026-10-02T23:20:31.150Z\",\"level\":\"info\",\"event\":\"fixture_initialize\",\"serverId\":\"demo-domain-read\",\"mode\":\"ok\",\"clientProtocolVersion\":\"2025-06-18\"}",
+      "mcp.server_ready serverId=demo-domain-read protocolVersion=2025-06-18 protocolVersionSupported=true serverName=sandbox-domain-mcp serverVersion=1.0.0 offeredTools=4 scopedTools=1 tools=demo.search_status bindingRef=cred:demo-domain-read bindingScope=demo:read commandRef=cmd-c2c4b2fc pid=91580 isolation=same_service_uid_not_os_isolated",
+      "mcp.server_starting serverId=demo-domain-readonly transport=stdio commandRef=cmd-c2c4b2fc declaredTools=1 bindingRef=cred:demo-domain-readonly",
+      "mcp.server_spawned serverId=demo-domain-readonly commandRef=cmd-c2c4b2fc pid=91581",
+      "mcp.server_stderr serverId=demo-domain-readonly line={\"ts\":\"2026-10-02T23:20:31.170Z\",\"level\":\"info\",\"event\":\"bridge_connected\",\"serverId\":\"demo-domain-readonly\",\"mode\":\"ok\"}",
+      "mcp.server_stderr serverId=demo-domain-readonly line={\"ts\":\"2026-10-02T23:20:31.171Z\",\"level\":\"info\",\"event\":\"fixture_initialize\",\"serverId\":\"demo-domain-readonly\",\"mode\":\"ok\",\"clientProtocolVersion\":\"2025-06-18\"}",
+      "mcp.server_ready serverId=demo-domain-readonly protocolVersion=2025-06-18 protocolVersionSupported=true serverName=sandbox-domain-mcp serverVersion=1.0.0 offeredTools=4 scopedTools=1 tools=demo.admin_purge bindingRef=cred:demo-domain-readonly bindingScope=demo:read commandRef=cmd-c2c4b2fc pid=91581 isolation=same_service_uid_not_os_isolated",
+      "mcp.session_ready runId=run-happy servers=3 scopedTools=3 bindings=3 elapsedMs=69",
+      "mcp.engine_config configPath=/var/folders/1m/v4ljzvzx5x566w1r067w5vmw0000gn/T/mcp-p13-probe-7xHbY2/ws/run-happy/.runner/mcp.json servers=3 bindingValues=false isolation=bridge_token_visible_to_engine_not_os_isolation",
+      "mcp.tool_invoked serverId=demo-domain-write tool=demo.record_note bindingRef=cred:demo-domain-write bindingScope=demo:write userTaskId=task-1a744a38",
+      "mcp.capability_invoked serverId=demo-domain-write capabilityId=demo.record_note bindingRef=cred:demo-domain-write bindingScope=demo:write runId=run-happy",
+      "mcp.tool_result serverId=demo-domain-write tool=demo.record_note outcome=completed effectReceiptId=rcpt-195a899c-e52d-4d5a-90ec-b87f6e4cb314 bindingRef=cred:demo-domain-write",
+      "mcp.tool_invoked serverId=demo-domain-read tool=demo.search_status bindingRef=cred:demo-domain-read bindingScope=demo:read userTaskId=task-1a744a38",
+      "mcp.capability_invoked serverId=demo-domain-read capabilityId=demo.search_status bindingRef=cred:demo-domain-read bindingScope=demo:read runId=run-happy",
+      "mcp.tool_result serverId=demo-domain-read tool=demo.search_status outcome=completed effectReceiptId=rcpt-d87728d9-8af5-4e2c-8e22-c6f034aa6492 bindingRef=cred:demo-domain-read",
+      "mcp.tool_denied serverId= tool=demo.internal_debug reason=tool_not_in_scope via=bridge",
+      "mcp.tool_invoked serverId=demo-domain-readonly tool=demo.admin_purge bindingRef=cred:demo-domain-readonly bindingScope=demo:read userTaskId=task-1a744a38",
+      "mcp.capability_invoked serverId=demo-domain-readonly capabilityId=demo.admin_purge bindingRef=cred:demo-domain-readonly bindingScope=demo:read runId=run-happy",
+      "mcp.capability_denied serverId=demo-domain-readonly capabilityId=demo.admin_purge code=BINDING_SCOPE_MISSING bindingRef=cred:demo-domain-readonly bindingScope=demo:read",
+      "mcp.tool_failed serverId=demo-domain-readonly tool=demo.admin_purge reason=rpc_error detail=BINDING_SCOPE_MISSING: credential binding \"cred:demo-domain-readonly\" has scope \"demo:read\", capability \"demo.admin_purge\" requires demo:admin",
+      "mcp.bridge_disconnected runId=run-happy",
+      "mcp.bridge_disconnected runId=run-happy",
+      "mcp.server_cleanup serverId=demo-domain-write reason=engine_exit signal=SIGTERM outcome=exited alive=false elapsedMs=21 pid=91579",
+      "mcp.bridge_disconnected runId=run-happy",
+      "mcp.server_cleanup serverId=demo-domain-read reason=engine_exit signal=SIGTERM outcome=exited alive=false elapsedMs=21 pid=91580",
+      "mcp.bridge_disconnected runId=run-happy",
+      "mcp.server_cleanup serverId=demo-domain-readonly reason=engine_exit signal=SIGTERM outcome=exited alive=false elapsedMs=22 pid=91581",
+      "mcp.session_cleanup runId=run-happy reason=engine_exit servers=3"
+    ],
+    "cancel": [
+      "mcp.bridge_ready runId=run-cancel serverCount=1 scopedTools=1",
+      "mcp.server_starting serverId=demo-domain-write transport=stdio commandRef=cmd-c2c4b2fc declaredTools=1 bindingRef=cred:demo-domain-write",
+      "mcp.server_spawned serverId=demo-domain-write commandRef=cmd-c2c4b2fc pid=91652",
+      "mcp.server_stderr serverId=demo-domain-write line={\"ts\":\"2026-10-02T23:20:36.651Z\",\"level\":\"info\",\"event\":\"bridge_connected\",\"serverId\":\"demo-domain-write\",\"mode\":\"ok\"}",
+      "mcp.server_stderr serverId=demo-domain-write line={\"ts\":\"2026-10-02T23:20:36.652Z\",\"level\":\"info\",\"event\":\"fixture_initialize\",\"serverId\":\"demo-domain-write\",\"mode\":\"ok\",\"clientProtocolVersion\":\"2025-06-18\"}",
+      "mcp.server_ready serverId=demo-domain-write protocolVersion=2025-06-18 protocolVersionSupported=true serverName=sandbox-domain-mcp serverVersion=1.0.0 offeredTools=4 scopedTools=1 tools=demo.record_note bindingRef=cred:demo-domain-write bindingScope=demo:write commandRef=cmd-c2c4b2fc pid=91652 isolation=same_service_uid_not_os_isolated",
+      "mcp.session_ready runId=run-cancel servers=1 scopedTools=1 bindings=1 elapsedMs=26",
+      "mcp.engine_config configPath=/var/folders/1m/v4ljzvzx5x566w1r067w5vmw0000gn/T/mcp-p13-probe-7xHbY2/ws/run-cancel/.runner/mcp.json servers=1 bindingValues=false isolation=bridge_token_visible_to_engine_not_os_isolation",
+      "mcp.bridge_disconnected runId=run-cancel",
+      "mcp.server_cleanup serverId=demo-domain-write reason=cancel signal=SIGTERM outcome=exited alive=false elapsedMs=20 pid=91652",
+      "mcp.session_cleanup runId=run-cancel reason=cancel servers=1"
+    ],
+    "orphan": [
+      "mcp.bridge_ready runId=run-orphan serverCount=1 scopedTools=1",
+      "mcp.server_starting serverId=demo-domain-write transport=stdio commandRef=cmd-c2c4b2fc declaredTools=1 bindingRef=cred:demo-domain-write",
+      "mcp.server_spawned serverId=demo-domain-write commandRef=cmd-c2c4b2fc pid=91669",
+      "mcp.server_stderr serverId=demo-domain-write line={\"ts\":\"2026-10-02T23:20:37.758Z\",\"level\":\"info\",\"event\":\"bridge_connected\",\"serverId\":\"demo-domain-write\",\"mode\":\"ok\"}",
+      "mcp.server_stderr serverId=demo-domain-write line={\"ts\":\"2026-10-02T23:20:37.759Z\",\"level\":\"info\",\"event\":\"fixture_initialize\",\"serverId\":\"demo-domain-write\",\"mode\":\"ok\",\"clientProtocolVersion\":\"2025-06-18\"}",
+      "mcp.server_ready serverId=demo-domain-write protocolVersion=2025-06-18 protocolVersionSupported=true serverName=sandbox-domain-mcp serverVersion=1.0.0 offeredTools=4 scopedTools=1 tools=demo.record_note bindingRef=cred:demo-domain-write bindingScope=demo:write commandRef=cmd-c2c4b2fc pid=91669 isolation=same_service_uid_not_os_isolated",
+      "mcp.session_ready runId=run-orphan servers=1 scopedTools=1 bindings=1 elapsedMs=26",
+      "mcp.engine_config configPath=/var/folders/1m/v4ljzvzx5x566w1r067w5vmw0000gn/T/mcp-p13-probe-7xHbY2/ws/run-orphan/.runner/mcp.json servers=1 bindingValues=false isolation=bridge_token_visible_to_engine_not_os_isolation",
+      "mcp.bridge_disconnected runId=run-orphan",
+      "mcp.orphan_reaped servers=1 reaped=1 reason=worker_restart"
+    ]
+  },
+  "engineEvidence": [
+    {
+      "at": "2026-10-02T23:20:31.193Z",
+      "elapsedMs": 2,
+      "step": "broker_spawned",
+      "runId": "run-happy",
+      "serverIds": [
+        "demo-domain-write",
+        "demo-domain-read",
+        "demo-domain-readonly"
+      ],
+      "pid": 91583
+    },
+    {
+      "at": "2026-10-02T23:20:31.211Z",
+      "elapsedMs": 20,
+      "step": "broker_stderr",
+      "line": "{\"ts\":\"2026-10-02T23:20:31.210Z\",\"level\":\"info\",\"event\":\"broker_bridge_connected\",\"runId\":\"run-happy\",\"component\":\"mcp-broker\"}"
+    },
+    {
+      "at": "2026-10-02T23:20:31.211Z",
+      "elapsedMs": 20,
+      "step": "broker_stderr",
+      "line": "{\"ts\":\"2026-10-02T23:20:31.210Z\",\"level\":\"info\",\"event\":\"broker_ready\",\"runId\":\"run-happy\",\"component\":\"mcp-broker\",\"pid\":91583}"
+    },
+    {
+      "at": "2026-10-02T23:20:31.211Z",
+      "elapsedMs": 20,
+      "step": "initialize",
+      "protocolVersion": "2025-06-18",
+      "serverName": "ai-agent-runner-mcp-broker"
+    },
+    {
+      "at": "2026-10-02T23:20:31.212Z",
+      "elapsedMs": 21,
+      "step": "tools_list",
+      "count": 3,
+      "tools": [
+        {
+          "name": "demo.record_note",
+          "serverId": "demo-domain-write",
+          "bindingRef": "cred:demo-domain-write",
+          "bindingScope": "demo:write",
+          "effect": "write"
+        },
+        {
+          "name": "demo.search_status",
+          "serverId": "demo-domain-read",
+          "bindingRef": "cred:demo-domain-read",
+          "bindingScope": "demo:read",
+          "effect": "read"
+        },
+        {
+          "name": "demo.admin_purge",
+          "serverId": "demo-domain-readonly",
+          "bindingRef": "cred:demo-domain-readonly",
+          "bindingScope": "demo:read",
+          "effect": "write"
+        }
+      ]
+    },
+    {
+      "at": "2026-10-02T23:20:31.229Z",
+      "elapsedMs": 38,
+      "step": "tool_call",
+      "tool": "demo.record_note",
+      "expect": "completed",
+      "ok": true,
+      "error": null,
+      "outcomeKind": "completed",
+      "effectReceiptId": "rcpt-195a899c-e52d-4d5a-90ec-b87f6e4cb314",
+      "bindingRef": "cred:demo-domain-write",
+      "result": {
+        "noteId": "note-1",
+        "stored": true,
+        "text": "P13 acceptance: реальный вызов инструмента",
+        "remoteReceiptId": "rcpt-195a899c-e52d-4d5a-90ec-b87f6e4cb314"
+      }
+    },
+    {
+      "at": "2026-10-02T23:20:31.232Z",
+      "elapsedMs": 41,
+      "step": "tool_call",
+      "tool": "demo.search_status",
+      "expect": "completed",
+      "ok": true,
+      "error": null,
+      "outcomeKind": "completed",
+      "effectReceiptId": "rcpt-d87728d9-8af5-4e2c-8e22-c6f034aa6492",
+      "bindingRef": "cred:demo-domain-read",
+      "result": {
+        "searchId": "search-p13",
+        "state": "in_progress",
+        "candidates": 3,
+        "updatedAt": "2026-10-02T23:20:31.231Z",
+        "remoteReceiptId": "rcpt-d87728d9-8af5-4e2c-8e22-c6f034aa6492"
+      }
+    },
+    {
+      "at": "2026-10-02T23:20:31.233Z",
+      "elapsedMs": 42,
+      "step": "tool_call_denied_probe",
+      "tool": "demo.internal_debug",
+      "expect": "refused",
+      "ok": true,
+      "error": {
+        "code": -32001,
+        "message": "tool \"demo.internal_debug\" is not in the scoped bindings of this run",
+        "data": {
+          "reason": "tool_not_in_scope",
+          "tool": "demo.internal_debug",
+          "serverId": null,
+          "detail": null
+        }
+      },
+      "isError": false,
+      "text": null
+    },
+    {
+      "at": "2026-10-02T23:20:31.234Z",
+      "elapsedMs": 43,
+      "step": "tool_call_denied_probe",
+      "tool": "demo.admin_purge",
+      "expect": "refused",
+      "ok": true,
+      "error": {
+        "code": -32001,
+        "message": "tool \"demo.admin_purge\" was refused (rpc_error): BINDING_SCOPE_MISSING: credential binding \"cred:demo-domain-readonly\" has scope \"demo:read\", capability \"demo.admin_purge\" requires demo:admin",
+        "data": {
+          "reason": "rpc_error",
+          "tool": "demo.admin_purge",
+          "serverId": "demo-domain-readonly",
+          "detail": "BINDING_SCOPE_MISSING: credential binding \"cred:demo-domain-readonly\" has scope \"demo:read\", capability \"demo.admin_purge\" requires demo:admin"
+        }
+      },
+      "isError": false,
+      "text": null
+    },
+    {
+      "at": "2026-10-02T23:20:31.234Z",
+      "elapsedMs": 43,
+      "step": "finished",
+      "failures": 0,
+      "ok": true
+    }
+  ],
+  "remoteServiceLog": [
+    {
+      "at": "2026-10-02T23:20:31.224Z",
+      "method": "POST",
+      "path": "/v1/domain",
+      "capabilityId": "demo.record_note",
+      "bindingRef": "cred:demo-domain-write",
+      "bindingScopes": [
+        "demo:write"
+      ],
+      "profileId": "profile-sandbox",
+      "outcome": "completed",
+      "receiptId": "rcpt-195a899c-e52d-4d5a-90ec-b87f6e4cb314",
+      "externalRef": "note-1"
+    },
+    {
+      "at": "2026-10-02T23:20:31.231Z",
+      "method": "POST",
+      "path": "/v1/domain",
+      "capabilityId": "demo.search_status",
+      "bindingRef": "cred:demo-domain-read",
+      "bindingScopes": [
+        "demo:read"
+      ],
+      "profileId": "profile-sandbox",
+      "outcome": "completed",
+      "receiptId": "rcpt-d87728d9-8af5-4e2c-8e22-c6f034aa6492",
+      "externalRef": null
+    }
+  ],
+  "remoteReceipts": [
+    {
+      "at": "2026-10-02T23:20:31.224Z",
+      "method": "POST",
+      "path": "/v1/domain",
+      "capabilityId": "demo.record_note",
+      "bindingRef": "cred:demo-domain-write",
+      "bindingScopes": [
+        "demo:write"
+      ],
+      "profileId": "profile-sandbox",
+      "outcome": "completed",
+      "receiptId": "rcpt-195a899c-e52d-4d5a-90ec-b87f6e4cb314",
+      "externalRef": "note-1"
+    },
+    {
+      "at": "2026-10-02T23:20:31.231Z",
+      "method": "POST",
+      "path": "/v1/domain",
+      "capabilityId": "demo.search_status",
+      "bindingRef": "cred:demo-domain-read",
+      "bindingScopes": [
+        "demo:read"
+      ],
+      "profileId": "profile-sandbox",
+      "outcome": "completed",
+      "receiptId": "rcpt-d87728d9-8af5-4e2c-8e22-c6f034aa6492",
+      "externalRef": null
+    }
+  ]
+}
