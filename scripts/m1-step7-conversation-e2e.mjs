@@ -356,6 +356,14 @@ const CONVERSATION_TURNS = [
   { turn: 5, taskId: 'step7-task-delivery', prompt: 'подтверди готовность сводки и назови файл-артефакт' },
 ];
 
+// Ключи идемпотентности уникальны на прогон: один и тот же ключ с другим payload —
+// честный 409 IDEMPOTENCY_CONFLICT, поэтому перезапуск сценария на той же VM должен
+// получать свои ключи (иначе прогон невоспроизводим).
+function makeKeyFactory(conversationId) {
+  const tag = String(conversationId).replace(/[^A-Za-z0-9._:-]/g, '-').slice(0, 40);
+  return (name) => `step7-${tag}-${name}`;
+}
+
 function contextLines(savedContext) {
   // inlinePrompt запрещает control characters (контракт RunSpec) → контекст вкладываем строками
   const lines = [];
@@ -430,6 +438,7 @@ async function main() {
   const reportPath = resolve(opts.report ?? join(process.cwd(), 'm1-step7-report.json'));
   journalPath = resolve(opts.journal ?? `${reportPath}.journal.jsonl`);
   const conversationId = opts.conversation ?? `conv-step7-${randomBytes(4).toString('hex')}`;
+  const idem = makeKeyFactory(conversationId);
   const report = {
     schemaVersion: 1,
     tool: 'scripts/m1-step7-conversation-e2e.mjs',
@@ -460,7 +469,7 @@ async function main() {
     const first = await submitAttempt(conn, {
       taskId: turn.taskId,
       conversationId,
-      key: `step7-t${turn.turn}-a1`,
+      key: idem(`t${turn.turn}-a1`),
       prompt: turn.prompt,
       engine: opts.engine,
       timeoutMs: opts.timeoutMs,
@@ -473,7 +482,7 @@ async function main() {
       turn: turn.turn,
       userTaskId: turn.taskId,
       conversationId,
-      idempotencyKey: `step7-t${turn.turn}-a1`,
+      idempotencyKey: idem(`t${turn.turn}-a1`),
       runId: first.receipt.runId,
       requestId: first.receipt.requestId,
       ownerGeneration: terminal.ownerGeneration,
@@ -502,7 +511,7 @@ async function main() {
     const dedup1 = await submitAttempt(conn, {
       taskId: CONVERSATION_TURNS[0].taskId,
       conversationId,
-      key: `step7-t1-a1`,
+      key: idem('t1-a1'),
       prompt: CONVERSATION_TURNS[0].prompt,
       engine: opts.engine,
       timeoutMs: opts.timeoutMs,
@@ -559,7 +568,7 @@ async function main() {
     attemptB1 = await submitAttempt(conn, {
       taskId: turn3.taskId,
       conversationId,
-      key: 'step7-t3-a1',
+      key: idem('t3-a1'),
       prompt: `${turn3.prompt}; ответ на вопрос: за вчера; контекст предыдущих попыток: ${contextLines(savedContext)}`,
       engine: 'fake',
       timeoutMs: opts.timeoutMs,
@@ -567,7 +576,7 @@ async function main() {
     report.turns.push({
       turn: 3,
       userTaskId: turn3.taskId,
-      idempotencyKey: 'step7-t3-a1',
+      idempotencyKey: idem('t3-a1'),
       runId: attemptB1.receipt.runId,
       requestId: attemptB1.receipt.requestId,
       ownerGeneration: undefined,
@@ -629,7 +638,7 @@ async function main() {
     const dedupAfter = await submitAttempt(conn, {
       taskId: report.turns[report.turns.length - 1].userTaskId,
       conversationId,
-      key: 'step7-t3-a1',
+      key: idem('t3-a1'),
       prompt: 'повтор после восстановления',
       engine: 'fake',
       timeoutMs: opts.timeoutMs,
@@ -662,7 +671,7 @@ async function main() {
   const continuation = await submitAttempt(conn, {
     taskId: turn3.taskId,
     conversationId,
-    key: 'step7-t3-a2',
+    key: idem('t3-a2'),
     prompt: `${turn3.prompt}; продолжение после восстановления; сохранённые данные: ${contextLines(savedContext)}`,
     engine: 'fake',
     timeoutMs: opts.timeoutMs,
@@ -674,7 +683,7 @@ async function main() {
     previousRunId: previousRun.runId,
     runId: continuation.receipt.runId,
     requestId: continuation.receipt.requestId,
-    idempotencyKey: 'step7-t3-a2',
+    idempotencyKey: idem('t3-a2'),
     newRunId: continuation.receipt.runId !== previousRun.runId,
     state: continuationTerminal.state,
     ownerGeneration: continuationTerminal.ownerGeneration,
