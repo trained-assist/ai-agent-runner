@@ -12,3 +12,4 @@ export * from './export.js';
 export * from './artifact-store.js';
 export * from './share.js';
 export * from './upload-session.js';
+export * from './workspace-snapshot.js';

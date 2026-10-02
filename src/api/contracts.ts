@@ -134,6 +134,13 @@ export interface ApiCapabilities {
       maxTotalBytes: number;
       ttlSeconds: number;
     };
+    snapshot: {
+      enabled: boolean;
+      versioning: true;
+      conflictDetection: true;
+      conflictPolicies: readonly ('reject' | 'overwrite' | 'merge')[];
+      cleanRoomOnNewAttempt: true;
+    };
   };
   cancel: { requestedReceipt: true; terminalConfirmation: true };
   engines: string[];

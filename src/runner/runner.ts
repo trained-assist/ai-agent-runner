@@ -21,6 +21,7 @@ import { canTransition, isTerminalState, type RunState } from './state-machine.j
 import type { BlobStore } from '../storage/blob-store.js';
 import { RunExportStore, type PlannedOutput } from '../storage/export.js';
 import type { UploadSessionStore } from '../storage/upload-session.js';
+import type { WorkspaceSnapshotStore } from '../storage/workspace-snapshot.js';
 import { artifactNameFor, mimeForName } from '../storage/export-manifest.js';
 import type { RunExportManifest } from '../storage/export-manifest.js';
 import { isRegularFile, resolveExistingInsideRoot } from '../storage/local-paths.js';
@@ -65,6 +66,12 @@ export interface RunnerOptions {
    * и короткоживущие signed URLs.
    */
   uploads?: UploadSessionStore;
+  /**
+   * Снимки workspace (P09). Позволяют версионировать файлы воркспейса,
+   * обнаруживать конфликты при параллельных записьх и создавать clean room
+   * для следующей попытки.
+   */
+  snapshots?: WorkspaceSnapshotStore;
 }
 
 export interface StartReceipt {

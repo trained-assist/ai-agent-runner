@@ -5,10 +5,12 @@ import type { ArtifactStore } from '../storage/artifact-store.js';
 import type { RunExportStore } from '../storage/export.js';
 import type { ShareTokenIssuer } from '../storage/share.js';
 import type { UploadSessionStore } from '../storage/upload-session.js';
+import type { WorkspaceSnapshotStore } from '../storage/workspace-snapshot.js';
 import type { KeyRegistry, Principal, Scope } from './auth.js';
 import { ApiError } from './errors.js';
 import { handleExportAction, type ExportRouteDeps } from './export-route.js';
 import { handleUploadAction, handleUploadSessionAction, type UploadRouteDeps } from './upload-route.js';
+import { handleSnapshotAction, handleSnapshotFileAction, type SnapshotRouteDeps } from './snapshot-route.js';
 import type { AgentApi, ApiLogger } from './service.js';
 
 export interface AgentApiServerOptions {
@@ -26,6 +28,8 @@ export interface AgentApiServerOptions {
   baseUrl?: string;
   /** Сессии прямой загрузки артефактов для `POST|GET /v1/runs/{id}/artifacts/upload` (P08). */
   uploads?: UploadSessionStore;
+  /** Снимки workspace для P09 — версионирование файлов и обнаружение конфликтов. */
+  snapshots?: WorkspaceSnapshotStore;
 }
 
 interface RequestContext {
@@ -180,6 +184,51 @@ export function createAgentApiServer(service: AgentApi, options: AgentApiServerO
         runId,
         sessionId,
         userTaskId: sessionId,
+        profileId: principal.profileId,
+      });
+      sendJson(res, status, view);
+      return status;
+    }
+
+    if (action === 'snapshot') {
+      const store = options.snapshots;
+      if (!store) throw new ApiError('ROUTE_NOT_FOUND', 'workspace snapshots are not enabled in this deployment');
+      if (req.method !== 'GET' && req.method !== 'POST') {
+        throw new ApiError('METHOD_NOT_ALLOWED', 'snapshot actions support GET and POST only');
+      }
+      requireScope(principal, 'runs:write');
+      const deps: SnapshotRouteDeps = { service, snapshots: store, artifacts: options.artifacts!, keys: options.keys };
+      const body = req.method === 'POST' ? await readJsonBody(req, maxBodyBytes) : {};
+      const { status, view } = await handleSnapshotAction(deps, principal, runId, req.method, body);
+      logger({
+        event: 'snapshot_action',
+        method: req.method,
+        runId,
+        userTaskId: principal.profileId,
+        profileId: principal.profileId,
+      });
+      sendJson(res, status, view);
+      return status;
+    }
+
+    if (action === 'snapshot-file') {
+      const store = options.snapshots;
+      if (!store) throw new ApiError('ROUTE_NOT_FOUND', 'workspace snapshots are not enabled in this deployment');
+      if (req.method !== 'POST') {
+        throw new ApiError('METHOD_NOT_ALLOWED', 'snapshot file actions support POST only');
+      }
+      requireScope(principal, 'runs:write');
+      const snapshotId = segments[4];
+      if (!snapshotId) throw new ApiError('ROUTE_NOT_FOUND', `no route for ${path}`);
+      const deps: SnapshotRouteDeps = { service, snapshots: store, artifacts: options.artifacts!, keys: options.keys };
+      const body = await readJsonBody(req, maxBodyBytes);
+      const { status, view } = await handleSnapshotFileAction(deps, principal, runId, snapshotId, req.method, body);
+      logger({
+        event: 'snapshot_file_action',
+        method: req.method,
+        runId,
+        snapshotId,
+        userTaskId: principal.profileId,
         profileId: principal.profileId,
       });
       sendJson(res, status, view);
