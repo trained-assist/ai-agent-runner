@@ -43,6 +43,33 @@ export interface CredentialBinding {
   status?: 'active' | 'missing' | 'expired';
 }
 
+/**
+ * Agent-local MCP: локальный stdio process/proxy, который runner поднимает на ран
+ * (TASK-ROUTER-AND-MCP §5). `allowedTools` — приёмка хоста: инструмент вне списка
+ * отказывается до похода в сервер, даже если дочерний процесс его запросит.
+ * `bindingRef` обязан быть объявлен в `credentialBindings` рана; значение binding'а
+ * остаётся в процессе хоста и в дочерний процесс не передаётся.
+ */
+export interface McpServerSpec {
+  serverId: string;
+  transport: 'stdio';
+  command: string;
+  args?: string[];
+  envAllowlist?: string[];
+  bindingRef?: string;
+  allowedTools: string[];
+  readinessTimeoutMs?: number;
+  toolTimeoutMs?: number;
+}
+
+export interface McpSpec {
+  servers: McpServerSpec[];
+}
+
+export const MCP_MAX_SERVERS = 8;
+export const MCP_TIMEOUT_MAX_MS = 120_000;
+export const MCP_TOOL_NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
+
 export interface BudgetSpec {
   correlationRef: string;
   approved: boolean;
@@ -106,6 +133,7 @@ export interface RunSpec {
   isolation?: { mode: string };
   regionConstraints?: RegionConstraints;
   credentialBindings?: CredentialBinding[];
+  mcp?: McpSpec;
   budget?: BudgetSpec;
   result?: ResultPolicy;
   outputs?: OutputSpec[];
@@ -131,6 +159,7 @@ const TOP_LEVEL_KEYS = [
   'isolation',
   'regionConstraints',
   'credentialBindings',
+  'mcp',
   'budget',
   'result',
   'outputs',
@@ -323,6 +352,130 @@ function validateCredentialBindings(value: unknown, path: string, collector: Err
   });
 }
 
+function validateMcpTimeout(value: unknown, path: string, collector: ErrorCollector): number | undefined {
+  if (typeof value !== 'number' || !Number.isInteger(value) || value <= 0 || value > MCP_TIMEOUT_MAX_MS) {
+    collector.push(`${path}: expected an integer in [1, ${MCP_TIMEOUT_MAX_MS}]`);
+    return undefined;
+  }
+  return value;
+}
+
+function validateMcpServer(value: unknown, path: string, collector: ErrorCollector): McpServerSpec | undefined {
+  if (!checkObject(value, path, collector)) return undefined;
+  checkKeys(
+    value,
+    ['serverId', 'transport', 'command', 'args', 'envAllowlist', 'bindingRef', 'allowedTools', 'readinessTimeoutMs', 'toolTimeoutMs'],
+    ['serverId', 'transport', 'command', 'allowedTools'],
+    path,
+    collector,
+  );
+  const server: McpServerSpec = { serverId: '', transport: 'stdio', command: '', allowedTools: [] };
+
+  checkSafeId(value['serverId'], `${path}.serverId`, collector);
+  if (typeof value['serverId'] === 'string') server.serverId = value['serverId'];
+
+  if (value['transport'] !== 'stdio') {
+    collector.push(`${path}.transport: expected "stdio" (remote domain services are shared services, not per-run processes)`);
+  }
+
+  checkString(value['command'], `${path}.command`, collector, 512);
+  if (typeof value['command'] === 'string') server.command = value['command'];
+
+  if (value['args'] !== undefined) {
+    const args = value['args'];
+    if (checkArray(args, `${path}.args`, collector)) {
+      if (args.length > 32) collector.push(`${path}.args: too many entries`);
+      const parsed: string[] = [];
+      args.forEach((entry, i) => {
+        checkString(entry, `${path}.args[${i}]`, collector, 512);
+        if (typeof entry === 'string') parsed.push(entry);
+      });
+      server.args = parsed;
+    }
+  }
+
+  if (value['envAllowlist'] !== undefined) {
+    const names = value['envAllowlist'];
+    if (checkArray(names, `${path}.envAllowlist`, collector)) {
+      if (names.length > 50) collector.push(`${path}.envAllowlist: too many entries`);
+      const parsed: string[] = [];
+      names.forEach((entry, i) => {
+        if (!isEnvName(entry)) {
+          collector.push(`${path}.envAllowlist[${i}]: expected environment variable NAME (no values)`);
+          return;
+        }
+        parsed.push(entry);
+      });
+      server.envAllowlist = parsed;
+    }
+  }
+
+  if (value['bindingRef'] !== undefined) {
+    checkString(value['bindingRef'], `${path}.bindingRef`, collector, 300);
+    if (typeof value['bindingRef'] === 'string') server.bindingRef = value['bindingRef'];
+  }
+
+  const allowedTools = value['allowedTools'];
+  if (checkArray(allowedTools, `${path}.allowedTools`, collector)) {
+    if (allowedTools.length === 0) collector.push(`${path}.allowedTools: at least one tool is required (a server without tools would be spawned for nothing)`);
+    if (allowedTools.length > 50) collector.push(`${path}.allowedTools: too many entries`);
+    const seen = new Set<string>();
+    const parsed: string[] = [];
+    allowedTools.forEach((entry, i) => {
+      if (typeof entry !== 'string' || entry.length === 0 || entry.length > 200 || !MCP_TOOL_NAME.test(entry)) {
+        collector.push(`${path}.allowedTools[${i}]: expected a tool name (letters, digits, "_", "-", ".")`);
+        return;
+      }
+      if (seen.has(entry)) collector.push(`${path}.allowedTools[${i}]: duplicate tool "${entry}"`);
+      seen.add(entry);
+      parsed.push(entry);
+    });
+    server.allowedTools = parsed;
+  }
+
+  for (const key of ['readinessTimeoutMs', 'toolTimeoutMs'] as const) {
+    if (value[key] === undefined) continue;
+    const timeout = validateMcpTimeout(value[key], `${path}.${key}`, collector);
+    if (timeout !== undefined) server[key] = timeout;
+  }
+
+  return server;
+}
+
+function validateMcp(value: unknown, path: string, collector: ErrorCollector): McpSpec | undefined {
+  if (!checkObject(value, path, collector)) return undefined;
+  checkKeys(value, ['servers'], ['servers'], path, collector);
+  const servers = value['servers'];
+  if (!checkArray(servers, `${path}.servers`, collector)) return undefined;
+  if (servers.length === 0) {
+    collector.push(`${path}.servers: expected at least one server`);
+    return undefined;
+  }
+  if (servers.length > MCP_MAX_SERVERS) collector.push(`${path}.servers: at most ${MCP_MAX_SERVERS} servers per run`);
+  const parsed: McpServerSpec[] = [];
+  const seen = new Set<string>();
+  const toolOwner = new Map<string, string>();
+  servers.forEach((entry, i) => {
+    const server = validateMcpServer(entry, `${path}.servers[${i}]`, collector);
+    if (!server) return;
+    if (server.serverId === '') return;
+    if (seen.has(server.serverId)) collector.push(`${path}.servers: duplicate serverId "${server.serverId}"`);
+    seen.add(server.serverId);
+    // Имена MCP-инструментов образуют одно плоское пространство имён у клиента рана:
+    // один инструмент = один server, иначе вызов неоднозначен.
+    for (const tool of server.allowedTools) {
+      const owner = toolOwner.get(tool);
+      if (owner !== undefined) {
+        collector.push(`${path}.servers[${i}].allowedTools: tool "${tool}" is already declared by server "${owner}"`);
+      } else {
+        toolOwner.set(tool, server.serverId);
+      }
+    }
+    parsed.push(server);
+  });
+  return { servers: parsed };
+}
+
 function validateBudget(value: unknown, path: string, collector: ErrorCollector): BudgetSpec | undefined {
   if (!checkObject(value, path, collector)) return undefined;
   checkKeys(value, ['correlationRef', 'approved', 'reason'], ['correlationRef', 'approved'], path, collector);
@@ -419,6 +572,22 @@ export function validateRunSpec(input: unknown): ValidationResult<RunSpec> {
       ? validateCredentialBindings(input['credentialBindings'], 'spec.credentialBindings', collector)
       : undefined;
 
+  let mcp: McpSpec | undefined;
+  if ('mcp' in input && input['mcp'] !== undefined) {
+    mcp = validateMcp(input['mcp'], 'spec.mcp', collector);
+    // Статическая половина scoped bindings: MCP-сервер ранa не может ссылаться на binding,
+    // который ран не объявил. Вторую половину (scope/права) проверяет McpRunScope в рантайме.
+    if (mcp && credentialBindings) {
+      const declared = new Set(credentialBindings.filter((binding) => binding.ref !== '').map((binding) => binding.ref));
+      mcp.servers.forEach((server, i) => {
+        if (!server.bindingRef) return;
+        if (!declared.has(server.bindingRef)) {
+          collector.push(`spec.mcp.servers[${i}].bindingRef: "${server.bindingRef}" is not declared in spec.credentialBindings`);
+        }
+      });
+    }
+  }
+
   const budget = 'budget' in input && input['budget'] !== undefined ? validateBudget(input['budget'], 'spec.budget', collector) : undefined;
 
   let result: ResultPolicy | undefined;
@@ -474,6 +643,7 @@ export function validateRunSpec(input: unknown): ValidationResult<RunSpec> {
   if (isolation !== undefined) spec.isolation = isolation;
   if (regionConstraints !== undefined) spec.regionConstraints = regionConstraints;
   if (credentialBindings !== undefined) spec.credentialBindings = credentialBindings;
+  if (mcp !== undefined) spec.mcp = mcp;
   if (budget !== undefined) spec.budget = budget;
   if (result !== undefined) spec.result = result;
   if (outputs !== undefined) spec.outputs = outputs;

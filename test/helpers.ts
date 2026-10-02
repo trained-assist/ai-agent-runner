@@ -15,6 +15,8 @@ import type { BlobStore } from '../src/storage/blob-store.js';
 import { createBlobStore } from '../src/storage/create-blob-store.js';
 import { ArtifactStore } from '../src/storage/artifact-store.js';
 import { RunExportStore } from '../src/storage/export.js';
+import type { CapabilityRegistry } from '../src/mcp/capabilities.js';
+import type { BindingValueResolver } from '../src/mcp/scope.js';
 
 let counter = 0;
 
@@ -68,6 +70,10 @@ export interface HarnessOptions {
   artifactExport?: boolean;
   /** Отключить удаление локальных копий после подтверждённого сохранения. */
   pruneLocalCopies?: boolean;
+  /** Реестр capability handler'ов (P13): общий для MCP-вызовов рана и API. */
+  capabilities?: CapabilityRegistry;
+  /** Резолвер значений credential binding'ов (P13). */
+  bindingResolver?: BindingValueResolver;
 }
 
 export interface Harness {
@@ -79,6 +85,8 @@ export interface Harness {
   makeSpec: (over?: Partial<RunSpec>) => RunSpec;
   start: (over?: Partial<RunSpec>) => { receipt: StartReceipt; spec: RunSpec };
   reopen: () => Runner;
+  /** Рестарт воркера БЕЗ dispose предыдущего процесса — эмуляция падения воркера. */
+  reopenWithoutDispose: () => Runner;
 }
 
 export function createHarness(options: HarnessOptions = {}): Harness {
@@ -97,6 +105,8 @@ export function createHarness(options: HarnessOptions = {}): Harness {
   if (options.heartbeatIntervalMs !== undefined) base.heartbeatIntervalMs = options.heartbeatIntervalMs;
   if (options.blob) base.blob = options.blob;
   if (options.profileTrace !== undefined) base.profileTrace = options.profileTrace;
+  if (options.capabilities) base.capabilities = options.capabilities;
+  if (options.bindingResolver) base.bindingResolver = options.bindingResolver;
   let exports: RunExportStore | null = null;
   if (options.artifactExport) {
     const blob = options.blob ?? createBlobStore({ backend: 'local-fs', localRoot: join(rootDir, 'blobs') });
@@ -138,6 +148,11 @@ export function createHarness(options: HarnessOptions = {}): Harness {
     },
     reopen() {
       runner.dispose();
+      runner = new Runner(base);
+      return runner;
+    },
+    /** Рестарт воркера БЕЗ dispose предыдущего процесса — эмуляция падения воркера. */
+    reopenWithoutDispose() {
       runner = new Runner(base);
       return runner;
     },

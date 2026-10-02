@@ -1,5 +1,6 @@
-import { mkdirSync } from 'node:fs';
+import { chmodSync, mkdirSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import type { EngineAdapter, EngineHandle } from '../adapters/engine/engine-adapter.js';
 import { isProcessAlive, isProcessGroupAlive, killProcessGroup, killProcessTree, sleep, waitForProcessDeath } from '../adapters/engine/process-tree.js';
 import {
@@ -26,7 +27,12 @@ import { artifactNameFor, mimeForName } from '../storage/export-manifest.js';
 import type { RunExportManifest } from '../storage/export-manifest.js';
 import { isRegularFile, resolveExistingInsideRoot } from '../storage/local-paths.js';
 import { profileKey } from '../storage/keys.js';
-import { redactSecrets, specHash, truncateLine } from './util.js';
+import { redactSecrets, specHash, truncateLine, writeFileAtomic } from './util.js';
+import type { CapabilityRegistry } from '../mcp/capabilities.js';
+import { newBridgeToken } from '../mcp/bridge.js';
+import { McpRunSession, McpStartupError, type EngineMcpConfig, type McpLogFields, type McpLogLevel } from '../mcp/session.js';
+import { McpRunScope, McpScopeError, type BindingValueResolver } from '../mcp/scope.js';
+
 
 export interface RunnerHostInfo {
   region?: string;
@@ -72,6 +78,18 @@ export interface RunnerOptions {
    * для следующей попытки.
    */
   snapshots?: WorkspaceSnapshotStore;
+  /**
+   * Реестр capability handler'ов хоста (P13). Один и тот же реестр обслуживает вызовы MCP
+   * ран'а и внутренний API control plane — бизнес-логика домена не дублируется в транспортах.
+   */
+  capabilities?: CapabilityRegistry;
+  /**
+   * Резолвер значений credential binding'ов (P13). В песочнице — фикстура, в бою —
+   * Credential Broker / Secret Manager. Значение binding'а не попадает в spec/state/events.
+   */
+  bindingResolver?: BindingValueResolver;
+  /** Команда broker'а MCP для движка; по умолчанию — per-run прокси из репозитория. */
+  mcpBrokerCommand?: { command: string; args: string[] };
 }
 
 export interface StartReceipt {
@@ -116,6 +134,8 @@ export interface RunSnapshot {
   /** Снимок манифеста экспорта на момент последнего чтения (null — экспорт не открывался). */
   export: RunExportSnapshot | null;
   fencing: { rejected: number };
+  /** Живые per-run MCP-процессы (P13): null, если сессия MCP не поднималась или погашена. */
+  mcp: { serverPids: Array<{ serverId: string; pid: number }> } | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -140,6 +160,8 @@ export interface RecoveryReport {
   finalizingResumed: number;
   terminal: number;
   exportRetried: number;
+  /** Per-run MCP-процессы, погашенные после рестарта воркера (P13). */
+  orphanedMcp: number;
 }
 
 interface InternalRun {
@@ -150,10 +172,25 @@ interface InternalRun {
   timers: NodeJS.Timeout[];
   exitReceived: boolean;
   finalizePromise: Promise<RunResult> | null;
+  /** Per-run сессия MCP (P13): bridge + stdio-серверы; гасится вместе с раном. */
+  mcp: McpRunSession | null;
+  mcpCleanup: Promise<void> | null;
+  /** Путь к per-run конфигу MCP для движка (секретов не содержит). */
+  mcpConfigPath: string | null;
 }
 
 const DEFAULT_CANCEL_GRACE_MS = 1000;
 const DEFAULT_MAX_LOG_LINE = 4096;
+/** Каталог и переменная окружения per-run конфигу MCP (P13). */
+const MCP_CONFIG_DIR = '.runner';
+const MCP_CONFIG_ENV = 'RUNNER_MCP_CONFIG';
+
+/** Плоские поля MCP-события в текст лога рана: `mcp.<event> key=value ...`. */
+function formatMcpFields(fields: McpLogFields): string {
+  return Object.entries(fields)
+    .map(([key, value]) => `${key}=${value === null ? '-' : String(value)}`)
+    .join(' ');
+}
 
 export class Runner {
   private readonly opts: RunnerOptions;
@@ -185,6 +222,9 @@ export class Runner {
         timers: [],
         exitReceived: Boolean(state.exit?.observed),
         finalizePromise: null,
+        mcp: null,
+        mcpCleanup: null,
+        mcpConfigPath: null,
       });
     }
   }
@@ -222,6 +262,10 @@ export class Runner {
       result: st.result ? { ...st.result } : null,
       export: this.exportSnapshot(runId),
       fencing: { rejected: st.fencing.rejected },
+      mcp:
+        st.mcp && st.mcp.serverPids.length > 0
+          ? { serverPids: st.mcp.serverPids.map((entry) => ({ serverId: entry.serverId, pid: entry.pid })) }
+          : null,
       createdAt: st.createdAt,
       updatedAt: st.updatedAt,
     };
@@ -315,6 +359,7 @@ export class Runner {
       finalized: false,
       result: null,
       fencing: { rejected: 0 },
+      mcp: null,
       createdAt: now,
       updatedAt: now,
     };
@@ -328,6 +373,9 @@ export class Runner {
       timers: [],
       exitReceived: false,
       finalizePromise: null,
+      mcp: null,
+      mcpCleanup: null,
+      mcpConfigPath: null,
     });
     this.emit(state, 'claimed', { operationId });
     void this.execute(spec.runId).catch(() => undefined);
@@ -370,6 +418,7 @@ export class Runner {
       const dead = await waitForProcessDeath(st.pgid, st.pid, grace);
       if (!dead) killProcessTree(st.pgid, st.pid, 'SIGKILL');
     }
+    await this.stopMcpSession(run, 'cancel');
 
     const stopped = await this.awaitStop(run);
     if (!stopped && !isTerminalState(st.state) && !run.exitReceived) {
@@ -449,7 +498,7 @@ export class Runner {
   }
 
   async recover(): Promise<RecoveryReport> {
-    const report: RecoveryReport = { scanned: 0, resumedQueued: 0, orphaned: 0, lost: 0, finalizingResumed: 0, terminal: 0, exportRetried: 0 };
+    const report: RecoveryReport = { scanned: 0, resumedQueued: 0, orphaned: 0, lost: 0, finalizingResumed: 0, terminal: 0, exportRetried: 0, orphanedMcp: 0 };
     await this.fireFault('recovery');
     for (const run of [...this.runs.values()]) {
       if (this.disposed) break;
@@ -465,6 +514,7 @@ export class Runner {
           void this.execute(st.runId).catch(() => undefined);
           break;
         case 'starting':
+          report.orphanedMcp += await this.reapOrphanedMcp(run);
           if (st.pid && isProcessAlive(st.pid)) {
             this.markOrphaned(run, report);
           } else {
@@ -480,6 +530,7 @@ export class Runner {
           }
           break;
         case 'running': {
+          report.orphanedMcp += await this.reapOrphanedMcp(run);
           if (run.handle) break;
           if (st.pid && isProcessAlive(st.pid)) {
             this.markOrphaned(run, report);
@@ -534,11 +585,44 @@ export class Runner {
       run.handle?.dispose();
       run.handle = null;
       run.finalizePromise = null;
+      // dispose() синхронный: MCP-процессы рана гасим без ожидания, финализация их не требует
+      void run.mcp?.dispose('runner_dispose');
+      run.mcp = null;
+      run.mcpConfigPath = null;
     }
   }
 
   private nowIso(): string {
     return this.clock().toISOString();
+  }
+
+  /**
+   * Рестарт воркера не гасит per-run процессы MCP сам (они в собственной группе), поэтому
+   * recover() дочищает их по pid из state.json. Молча оставлять их работать нельзя: они
+   * держат локальный сокет моста и учётные данные в окружении.
+   */
+  private async reapOrphanedMcp(run: InternalRun): Promise<number> {
+    const st = run.state;
+    const pids = st.mcp?.serverPids ?? [];
+    if (pids.length === 0) return 0;
+    let reaped = 0;
+    for (const entry of pids) {
+      if (!isProcessAlive(entry.pid)) continue;
+      killProcessTree(entry.pid, entry.pid, 'SIGTERM');
+      const dead = await waitForProcessDeath(entry.pid, entry.pid, 300);
+      if (!dead) killProcessTree(entry.pid, entry.pid, 'SIGKILL');
+      reaped += 1;
+    }
+    st.mcp = null;
+    this.store.saveState(st);
+    if (!isTerminalState(st.state)) {
+      this.emit(st, 'log', {
+        stream: 'runner',
+        level: 'warn',
+        message: `mcp.orphan_reaped servers=${pids.length} reaped=${reaped} reason=worker_restart`,
+      });
+    }
+    return reaped;
   }
 
   private markOrphaned(run: InternalRun, report: RecoveryReport): void {
@@ -608,7 +692,7 @@ export class Runner {
     if (isTerminalState(st.state) || !this.transition(st, 'starting')) return;
 
     let handle: EngineHandle | null = null;
-    let phase: 'preflight' | 'spawn' = 'preflight';
+    let phase: 'preflight' | 'mcp' | 'spawn' = 'preflight';
     try {
       await this.fireFault('preflight', runId);
       if (this.disposed) return;
@@ -626,6 +710,23 @@ export class Runner {
       }
       const adapter = this.opts.adapters[st.spec.engine.name];
       if (!adapter) throw new PreflightError('ENGINE_UNSUPPORTED', `engine "${st.spec.engine.name}" is not registered on this worker`);
+      // P13: MCP-серверы рана поднимаются ДО движка — к моменту старта engine client
+      // должен иметь готовый локальный proxy. Отказ здесь валит старт, а не «тихий» ран.
+      if ((st.spec.mcp?.servers.length ?? 0) > 0) {
+        phase = 'mcp';
+        await this.fireFault('mcp', runId);
+        if (this.disposed) return;
+        await this.startMcpSession(run, st);
+        if (this.disposed) {
+          await this.stopMcpSession(run, 'worker_disposed');
+          return;
+        }
+        if (st.cancelRequested) {
+          await this.stopMcpSession(run, 'cancelled');
+          this.completeWithoutEngine(st, 'cancelled', 'cancelled');
+          return;
+        }
+      }
       phase = 'spawn';
       await this.fireFault('spawn', runId);
       if (this.disposed) return;
@@ -636,7 +737,7 @@ export class Runner {
       handle = await adapter.start({
         spec: st.spec,
         cwd: st.spec.cwd,
-        env: this.buildEnv(st.spec),
+        env: this.buildEngineEnv(run, st.spec),
         onLog: (stream, line) => this.onEngineLog(runId, stream, line),
         onExit: (code, signal) => {
           void this.onEngineExit(runId, code, signal);
@@ -728,6 +829,128 @@ export class Runner {
     return env;
   }
 
+  /**
+   * Окружение движка: allowlist рана + путь к per-run конфигу MCP (P13). Значений credential
+   * binding'ов в конфиге нет; run token локального моста там есть — это координата
+   * per-run процесса, а не изоляционная граница (см. docs/MCP-LIFECYCLE.md).
+   */
+  private buildEngineEnv(run: InternalRun, spec: RunSpec): Record<string, string> {
+    const env = this.buildEnv(spec);
+    const config = run.mcpConfigPath;
+    if (config) env[MCP_CONFIG_ENV] = config;
+    return env;
+  }
+
+  private mcpLog(runId: string): (level: McpLogLevel, event: string, fields: McpLogFields) => void {
+    return (level, event, fields) => {
+      const run = this.runs.get(runId);
+      if (!run || this.disposed) return;
+      const st = run.state;
+      if (isTerminalState(st.state)) return;
+      const message = redactSecrets(`${event} ${formatMcpFields(fields)}`.trim());
+      this.emit(st, 'log', { stream: 'runner', level, message: truncateLine(message, 2000) });
+    };
+  }
+
+  /**
+   * Старт MCP-сессии рана. Fail-closed: неизвестный binding, недоступное значение или
+   * отказ сервера (spawn/handshake/readiness) валят старт рана, причина — в логе рана.
+   */
+  private async startMcpSession(run: InternalRun, st: PersistedRunState): Promise<void> {
+    const log = this.mcpLog(st.runId);
+    let scope: McpRunScope;
+    try {
+      scope = McpRunScope.fromSpec(st.spec, this.opts.bindingResolver);
+    } catch (err) {
+      if (err instanceof McpScopeError) {
+        log('error', 'mcp.binding_denied', {
+          serverId: err.serverId,
+          bindingRef: err.bindingRef,
+          reason: err.code,
+          detail: err.message,
+        });
+      }
+      throw err;
+    }
+
+    for (const scoped of scope.servers) {
+      if (!scoped.binding) continue;
+      // Значение binding'а проверяется до спавна: сервер, которому хост не может выдать
+      // учётные данные, не поднимается вовсе.
+      try {
+        await scope.bindingValue(scoped);
+      } catch (err) {
+        const code = err instanceof McpScopeError ? err.code : 'MCP_BINDING_VALUE_UNAVAILABLE';
+        log('error', 'mcp.binding_unavailable', {
+          serverId: scoped.serverId,
+          bindingRef: scoped.binding.ref,
+          bindingScope: scoped.binding.scope,
+          reason: code,
+          detail: err instanceof Error ? err.message : String(err),
+        });
+        throw new McpStartupError(scoped.serverId, 'binding_unavailable', err instanceof Error ? err.message : String(err));
+      }
+    }
+
+    const session = await McpRunSession.start({
+      spec: st.spec,
+      scope,
+      log,
+      ...(this.opts.capabilities ? { registry: this.opts.capabilities } : {}),
+      bridgeToken: newBridgeToken(),
+      bridgeDir: join(this.opts.rootDir, 'mcp'),
+      ...(this.opts.mcpBrokerCommand ? { brokerCommand: this.opts.mcpBrokerCommand } : {}),
+    });
+    run.mcp = session;
+    st.mcp = { serverPids: session.servers.map((server) => ({ serverId: server.serverId, pid: server.pid ?? -1 })).filter((entry) => entry.pid > 0) };
+    this.store.saveState(st);
+    run.mcpConfigPath = this.writeMcpConfig(st.spec.cwd, session.engineConfig(), log);
+  }
+
+  /** Конфиг для движка пишется в workspace рана с правами 0600 и без значений binding'ов. */
+  private writeMcpConfig(cwd: string, config: EngineMcpConfig, log: (level: McpLogLevel, event: string, fields: McpLogFields) => void): string {
+    const path = join(cwd, MCP_CONFIG_DIR, 'mcp.json');
+    mkdirSync(join(cwd, MCP_CONFIG_DIR), { recursive: true, mode: 0o700 });
+    writeFileAtomic(path, `${JSON.stringify(config, null, 2)}\n`);
+    try {
+      chmodSync(path, 0o600);
+    } catch {
+      // право 0600 усиливаем chmod'ом ниже; ошибка не должна валить старт рана
+    }
+    log('info', 'mcp.engine_config', {
+      configPath: path,
+      servers: config.serverIds.length,
+      bindingValues: false,
+      isolation: 'bridge_token_visible_to_engine_not_os_isolation',
+    });
+    return path;
+  }
+
+  /**
+   * Гашение MCP-процессов рана. Идемпотентно и безопасно для повторного вызова: один и тот
+   * же прогон cleanup (engine exit, cancel, timeout, dispose, recover) гасит сессию один раз.
+   */
+  private async stopMcpSession(run: InternalRun, reason: string): Promise<void> {
+    const session = run.mcp;
+    if (!session) return;
+    run.mcp = null;
+    run.mcpConfigPath = null;
+    const st = run.state;
+    if (st.mcp) {
+      st.mcp = null;
+      this.store.saveState(st);
+    }
+    if (run.mcpCleanup) {
+      await run.mcpCleanup;
+      return;
+    }
+    const cleanup = session.dispose(reason).finally(() => {
+      run.mcpCleanup = null;
+    });
+    run.mcpCleanup = cleanup;
+    await cleanup;
+  }
+
   private armTimers(runId: string, st: PersistedRunState): void {
     const run = this.runs.get(runId);
     if (!run) return;
@@ -765,6 +988,7 @@ export class Runner {
         if (!dead) killProcessTree(st.pgid, st.pid, 'SIGKILL');
       });
     }
+    void this.stopMcpSession(run, 'timeout');
   }
 
   private onHeartbeat(runId: string): void {
@@ -806,6 +1030,9 @@ export class Runner {
     if (isTerminalState(st.state)) return;
     run.exitReceived = true;
     this.clearTimers(run);
+    // P13: MCP-процессы рана живут дольше движка только до его выхода; дальше — cleanup.
+    // Причина берётся из состояния рана: отмена/таймаут двигателя гасят MCP с той же причиной.
+    await this.stopMcpSession(run, st.cancelRequested ?? 'engine_exit');
     st.exit = { code, signal, observed: true, at: this.nowIso() };
     this.store.saveState(st);
     this.emit(st, 'exit', { code, signal });
@@ -864,16 +1091,23 @@ export class Runner {
     this.persistResult(st, result);
   }
 
-  private failStartPath(st: PersistedRunState, err: unknown, phase: 'preflight' | 'spawn'): void {
+  private failStartPath(st: PersistedRunState, err: unknown, phase: 'preflight' | 'mcp' | 'spawn'): void {
     const message = err instanceof Error ? err.message : String(err);
     const safeSummary = truncateLine(redactSecrets(message), 500);
     const failure: RunResult['failure'] =
-      phase === 'spawn'
-        ? { code: 'ENGINE_STARTUP_FAILED', failureClass: 'engine', safeSummary, retryable: true }
-        : err instanceof PreflightError
-          ? { code: err.code, failureClass: err.failureClass, safeSummary, retryable: err.retryable }
-          : { code: 'PREFLIGHT_FAILED', failureClass: 'preflight', safeSummary, retryable: true };
-    const exitReason = phase === 'spawn' ? 'startup_failure' : 'preflight_refused';
+      phase === 'mcp'
+        ? {
+            code: err instanceof McpStartupError ? err.code : err instanceof McpScopeError ? err.code : 'MCP_STARTUP_FAILED',
+            failureClass: 'runtime',
+            safeSummary,
+            retryable: true,
+          }
+        : phase === 'spawn'
+          ? { code: 'ENGINE_STARTUP_FAILED', failureClass: 'engine', safeSummary, retryable: true }
+          : err instanceof PreflightError
+            ? { code: err.code, failureClass: err.failureClass, safeSummary, retryable: err.retryable }
+            : { code: 'PREFLIGHT_FAILED', failureClass: 'preflight', safeSummary, retryable: true };
+    const exitReason = phase === 'spawn' || phase === 'mcp' ? 'startup_failure' : 'preflight_refused';
     this.completeWithoutEngine(st, 'failed', exitReason, failure);
   }
 

@@ -1,5 +1,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { TERMINAL_EVENT_TYPES } from '../contracts/events.js';
+import { CapabilityError, type CapabilityRegistry } from '../mcp/capabilities.js';
+import type { BindingValueResolver } from '../mcp/scope.js';
 import type { CancelReceipt } from '../runner/runner.js';
 import type { ArtifactStore } from '../storage/artifact-store.js';
 import type { RunExportStore } from '../storage/export.js';
@@ -8,6 +10,7 @@ import type { UploadSessionStore } from '../storage/upload-session.js';
 import type { WorkspaceSnapshotStore } from '../storage/workspace-snapshot.js';
 import type { KeyRegistry, Principal, Scope } from './auth.js';
 import { ApiError } from './errors.js';
+import { newApiId } from './contracts.js';
 import { handleExportAction, type ExportRouteDeps } from './export-route.js';
 import { handleUploadAction, handleUploadSessionAction, type UploadRouteDeps } from './upload-route.js';
 import { handleSnapshotAction, handleSnapshotFileAction, type SnapshotRouteDeps } from './snapshot-route.js';
@@ -30,6 +33,13 @@ export interface AgentApiServerOptions {
   uploads?: UploadSessionStore;
   /** Снимки workspace для P09 — версионирование файлов и обнаружение конфликтов. */
   snapshots?: WorkspaceSnapshotStore;
+  /**
+   * Реестр capability handler'ов (P13). Тот же реестр обслуживает вызовы MCP ран'а:
+   * `POST /v1/capabilities/invoke` — второй транспортный фасад над тем же handler'ом.
+   */
+  capabilities?: CapabilityRegistry;
+  /** Резолвер значений credential binding'ов для capability-вызовов control plane. */
+  bindingResolver?: BindingValueResolver;
 }
 
 interface RequestContext {
@@ -91,6 +101,29 @@ export function createAgentApiServer(service: AgentApi, options: AgentApiServerO
       if (req.method !== 'GET') throw new ApiError('METHOD_NOT_ALLOWED', 'capabilities supports GET only');
       sendJson(res, 200, service.capabilities());
       return 200;
+    }
+
+    // Второй транспортный фасад над теми же capability handler'ами, что и MCP-вызовы рана (P13):
+    // «Один domain handler имеет contract и разные transport facades».
+    if (segments[0] === 'v1' && segments[1] === 'capabilities' && segments[2] === 'invoke' && segments.length === 3) {
+      if (req.method !== 'POST') throw new ApiError('METHOD_NOT_ALLOWED', 'capability invoke supports POST only');
+      const registry = options.capabilities;
+      if (!registry) throw new ApiError('ROUTE_NOT_FOUND', 'capability handlers are not enabled in this deployment');
+      requireScope(principal, 'runs:write');
+      const body = await readJsonBody(req, maxBodyBytes);
+      const outcome = await invokeCapabilityOverApi(registry, principal, body, options.bindingResolver);
+      logger({
+        event: 'capability_invoked',
+        principalId: principal.principalId,
+        profileId: principal.profileId,
+        userTaskId: outcome.userTaskId,
+        capabilityId: outcome.capabilityId,
+        kind: outcome.kind,
+        effectReceiptId: outcome.effectReceiptId,
+        bindingRef: outcome.bindingRef,
+      });
+      sendJson(res, outcome.status, outcome.body);
+      return outcome.status;
     }
 
     if (segments[0] !== 'v1' || segments[1] !== 'runs') {
@@ -463,6 +496,130 @@ function sendJson(res: ServerResponse, status: number, data: unknown): void {
     'content-length': Buffer.byteLength(payload),
   });
   res.end(payload);
+}
+
+interface CapabilityInvokeView {
+  status: number;
+  body: Record<string, unknown>;
+  kind: string;
+  capabilityId: string;
+  userTaskId: string;
+  effectReceiptId: string | null;
+  bindingRef: string | null;
+}
+
+/**
+ * Вызов capability через API control plane. Проверки хоста те же, что и на MCP-пути
+ * (TASK-ROUTER-AND-MCP §11.2 шаг 4): capability существует, аргументы на месте, binding
+ * объявлен и его scope покрывает requiredScopes handler'а. Значение binding'а приходит
+ * от host-owned резолвера и наружу (в ответ/логи) не выходит.
+ */
+async function invokeCapabilityOverApi(
+  registry: CapabilityRegistry,
+  principal: Principal,
+  body: unknown,
+  bindingResolver?: BindingValueResolver,
+): Promise<CapabilityInvokeView> {
+  const record = typeof body === 'object' && body !== null && !Array.isArray(body) ? (body as Record<string, unknown>) : {};
+  const capabilityId = typeof record['capabilityId'] === 'string' ? record['capabilityId'] : '';
+  const capabilityVersion = typeof record['capabilityVersion'] === 'number' ? record['capabilityVersion'] : undefined;
+  const args = typeof record['arguments'] === 'object' && record['arguments'] !== null && !Array.isArray(record['arguments'])
+    ? (record['arguments'] as Record<string, unknown>)
+    : {};
+  const bindingRef = typeof record['bindingRef'] === 'string' ? record['bindingRef'] : '';
+  const userTaskId = typeof record['userTaskId'] === 'string' ? record['userTaskId'] : `capability-${newApiId('task').slice(5)}`;
+  const operationId = typeof record['operationId'] === 'string' ? record['operationId'] : newApiId('op');
+
+  if (capabilityId.length === 0) {
+    throw new ApiError('INVALID_REQUEST', 'capabilityId is required');
+  }
+
+  let handler;
+  try {
+    handler = registry.get(capabilityId, capabilityVersion);
+  } catch (err) {
+    if (err instanceof CapabilityError) {
+      const code = err.code === 'CAPABILITY_NOT_FOUND' ? 'CAPABILITY_NOT_FOUND' : 'INVALID_REQUEST';
+      throw new ApiError(code, err.message, err.details);
+    }
+    throw err;
+  }
+
+  const view = (kind: string, status: number, payload: Record<string, unknown>, receiptId: string | null): CapabilityInvokeView => ({
+    status,
+    kind,
+    capabilityId,
+    userTaskId,
+    effectReceiptId: receiptId,
+    bindingRef: bindingRef || null,
+    body: payload,
+  });
+
+  const bindingScope = typeof record['bindingScope'] === 'string' ? record['bindingScope'] : '';
+  if (handler.requiredScopes.length > 0 && bindingScope.length === 0) {
+    throw new ApiError('CAPABILITY_BLOCKED', `capability "${capabilityId}" requires a credential binding with scope ${handler.requiredScopes.join('|')}`, {
+      capabilityId,
+      requiredScopes: [...handler.requiredScopes],
+    });
+  }
+
+  const bindingValue = bindingRef.length > 0 && bindingResolver ? ((await bindingResolver(bindingRef)) ?? undefined) : undefined;
+  if (bindingRef.length > 0 && handler.requiredScopes.length > 0 && !bindingValue) {
+    throw new ApiError('CAPABILITY_BLOCKED', `credential binding "${bindingRef}" has no value on this host`, { bindingRef });
+  }
+
+  let outcome;
+  try {
+    outcome = await registry.invoke(
+      {
+        capabilityId,
+        arguments: args,
+        caller: {
+          principalId: principal.principalId,
+          profileId: principal.profileId,
+          userTaskId,
+          runId: null,
+          operationId,
+        },
+        ...(bindingRef.length > 0 ? { binding: { ref: bindingRef, scope: bindingScope } } : {}),
+      },
+      bindingValue,
+    );
+  } catch (err) {
+    // Отказ хоста на MCP-пути и на этом пути должен читаться одинаково.
+    if (err instanceof CapabilityError) {
+      if (err.code === 'BINDING_SCOPE_MISSING') throw new ApiError('SCOPE_DENIED', err.message, err.details);
+      if (err.code === 'BINDING_REQUIRED') throw new ApiError('CAPABILITY_BLOCKED', err.message, err.details);
+      throw new ApiError('CAPABILITY_NOT_FOUND', err.message, err.details);
+    }
+    throw err;
+  }
+
+  switch (outcome.kind) {
+    case 'completed':
+      return view(
+        'completed',
+        200,
+        {
+          capabilityId,
+          capabilityVersion: handler.capabilityVersion,
+          userTaskId,
+          outcome: outcome.kind,
+          result: outcome.result,
+          ...(outcome.effectReceipt ? { effectReceipt: outcome.effectReceipt } : {}),
+        },
+        outcome.effectReceipt?.receiptId ?? null,
+      );
+    case 'missing_input':
+      return view('missing_input', 400, { capabilityId, userTaskId, outcome: outcome.kind, fields: outcome.fields }, null);
+    case 'blocked':
+      return view('blocked', 403, { capabilityId, userTaskId, outcome: outcome.kind, reason: outcome.reason }, null);
+    case 'needs_agent':
+      return view('needs_agent', 409, { capabilityId, userTaskId, outcome: outcome.kind, reason: outcome.reason }, null);
+    case 'technical_error':
+    default:
+      return view('technical_error', 502, { capabilityId, userTaskId, outcome: 'technical_error', code: outcome.code }, null);
+  }
 }
 
 function safePath(url: string | undefined): string {

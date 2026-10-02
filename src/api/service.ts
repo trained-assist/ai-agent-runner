@@ -8,6 +8,8 @@ import type { WorkspaceSnapshotStore } from '../storage/workspace-snapshot.js';
 import type { RunResult } from '../contracts/result.js';
 import { stripRepositoryToken, validateRunSpec, type InputSpec, type RunSpec } from '../contracts/run-spec.js';
 import type { FaultRegistry } from '../faults/registry.js';
+import type { CapabilityRegistry } from '../mcp/capabilities.js';
+import type { BindingValueResolver } from '../mcp/scope.js';
 import { Runner, type CancelReceipt, type RecoveryReport, type RunnerHostInfo, type RunSnapshot } from '../runner/runner.js';
 import type { LogSink } from '../runner/scoped-log.js';
 import { isTerminalState } from '../runner/state-machine.js';
@@ -50,6 +52,10 @@ export interface AgentApiOptions {
   uploads?: UploadSessionStore;
   /** Снимки workspace — см. RunnerOptions.snapshots (P09). */
   snapshots?: WorkspaceSnapshotStore;
+  /** Реестр capability handler'ов (P13) — общий для MCP-вызовов рана и этого API. */
+  capabilities?: CapabilityRegistry;
+  /** Резолвер значений credential binding'ов (P13). */
+  bindingResolver?: BindingValueResolver;
 }
 
 export interface ServiceRecoveryReport extends RecoveryReport {
@@ -87,6 +93,8 @@ export class AgentApi {
     if (options.logSink) runnerOptions.logSink = options.logSink;
     if (options.heartbeatIntervalMs !== undefined) runnerOptions.heartbeatIntervalMs = options.heartbeatIntervalMs;
     if (options.cancelGraceMs !== undefined) runnerOptions.cancelGraceMs = options.cancelGraceMs;
+    if (options.capabilities) runnerOptions.capabilities = options.capabilities;
+    if (options.bindingResolver) runnerOptions.bindingResolver = options.bindingResolver;
     this.runner = new Runner(runnerOptions);
   }
 
@@ -315,6 +323,16 @@ export class AgentApi {
           conflictPolicies: ['reject', 'overwrite', 'merge'] as const,
           cleanRoomOnNewAttempt: true,
         },
+      },
+      mcp: {
+        perRunStdioProxy: this.opts.capabilities !== undefined,
+        scopedBindings: true,
+        capabilityHandlersSharedWithMcp: this.opts.capabilities !== undefined,
+        capabilityInvokeEndpoint: this.opts.capabilities !== undefined,
+        remoteTransport: 'absent',
+        osIsolation: 'not_proven_service_uid_only',
+        osIsolationNote:
+          'per-run MCP processes are spawned by this worker under the same service UID; a service UID is not a proven OS isolation boundary (ARCHITECTURE §9, карточка P13)',
       },
       cancel: { requestedReceipt: true, terminalConfirmation: true },
       engines: Object.keys(this.opts.adapters).sort(),

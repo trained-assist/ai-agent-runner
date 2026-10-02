@@ -143,6 +143,19 @@ export interface ApiCapabilities {
     };
   };
   cancel: { requestedReceipt: true; terminalConfirmation: true };
+  /**
+   * MCP (P13). Значения объявлены честно: per-run stdio proxy — да, remote transport у
+   * раннего агента — нет, а «UID сервиса» НЕ является доказанной OS-изоляцией.
+   */
+  mcp: {
+    perRunStdioProxy: boolean;
+    scopedBindings: boolean;
+    capabilityHandlersSharedWithMcp: boolean;
+    capabilityInvokeEndpoint: boolean;
+    remoteTransport: 'absent';
+    osIsolation: 'not_proven_service_uid_only';
+    osIsolationNote: string;
+  };
   engines: string[];
 }
 
