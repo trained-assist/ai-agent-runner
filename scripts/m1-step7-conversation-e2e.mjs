@@ -504,7 +504,13 @@ async function main() {
   // ---------------------------------------------------------------- ходы 1–2: обычный диалог + открытие ожидания
   if (!opts.resume) {
     await waitForApi(conn, 30_000, 'старт');
-    if (opts.restartMode !== 'none') setFakeScenario(opts, 'success');
+    if (opts.restartMode !== 'none') {
+      // env-файл читается сервисом на старте: без рестарта смена сценария не действует,
+      // и ходы 1–2 уехали бы на сценарии, оставшемся от прошлого прогона (failed/timeout)
+      setFakeScenario(opts, 'success');
+      restartService(opts);
+      await waitForApi(conn, 60_000, 'рестарт сервиса на штатном сценарии');
+    }
 
     const turn1 = await runTurn(CONVERSATION_TURNS[0]);
     check('ход 1: принят и терминален (succeeded)', turn1.state === 'succeeded', turn1.state);
@@ -550,6 +556,7 @@ async function main() {
   // ---------------------------------------------------------------- ход 3: ответ + управляемый сбой посреди попытки
   const turn3 = CONVERSATION_TURNS[2];
   let attemptB1 = null;
+  let attemptB1Payload = null;
   if (!opts.resume && opts.restartMode === 'none') {
     // без управляемого сбоя ход 3 — обычная попытка; явное продолжение (новая попытка) всё равно проверяем ниже
     const turn3plain = await runTurn(turn3);
@@ -565,11 +572,14 @@ async function main() {
       awaitingInputId: report.awaitingInput.awaitingInputId,
       note: 'сохранённый контекст = result+events предыдущих попыток (capabilities.savedDataRefs)',
     };
+    // payload попытки запоминаем: проба «потерянный ответ» обязана повторить его ДОСЛОВНО
+    // (тот же Idempotency-Key с другим payload — это 409 IDEMPOTENCY_CONFLICT, а не дедуп)
+    attemptB1Payload = `${turn3.prompt}; ответ на вопрос: за вчера; контекст предыдущих попыток: ${contextLines(savedContext)}`;
     attemptB1 = await submitAttempt(conn, {
       taskId: turn3.taskId,
       conversationId,
       key: idem('t3-a1'),
-      prompt: `${turn3.prompt}; ответ на вопрос: за вчера; контекст предыдущих попыток: ${contextLines(savedContext)}`,
+      prompt: attemptB1Payload,
       engine: 'fake',
       timeoutMs: opts.timeoutMs,
     });
@@ -639,7 +649,7 @@ async function main() {
       taskId: report.turns[report.turns.length - 1].userTaskId,
       conversationId,
       key: idem('t3-a1'),
-      prompt: 'повтор после восстановления',
+      prompt: attemptB1Payload ?? `${turn3.prompt}; ответ на вопрос: за вчера`,
       engine: 'fake',
       timeoutMs: opts.timeoutMs,
     });
