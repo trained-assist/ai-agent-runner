@@ -465,6 +465,9 @@ async function main() {
   check('capabilities: continuation policy = new_run_same_user_task', caps.interaction?.continuation?.policy === 'new_run_same_user_task');
 
   const profileId = 'profile-sandbox';
+  // объявляются до любых веток: ими пользуются и путь обычного прогона, и --resume
+  let attemptB1 = null;
+  let attemptB1Payload = null;
   const runTurn = async (turn) => {
     const first = await submitAttempt(conn, {
       taskId: turn.taskId,
@@ -549,14 +552,13 @@ async function main() {
       if (entry.event === 'turn') report.turns.push(entry.record);
       if (entry.event === 'awaiting_input') report.awaitingInput = entry.awaitingInput;
       if (entry.event === 'controlled_failure') report.controlledFailure = entry.controlledFailure;
+      if (entry.event === 'turn' && entry.record?.replayPrompt) attemptB1Payload = entry.record.replayPrompt;
     }
     check('resume: журнал прогресса прочитан', report.turns.length > 0, `ходов в журнале: ${report.turns.length}`);
   }
 
   // ---------------------------------------------------------------- ход 3: ответ + управляемый сбой посреди попытки
   const turn3 = CONVERSATION_TURNS[2];
-  let attemptB1 = null;
-  let attemptB1Payload = null;
   if (!opts.resume && opts.restartMode === 'none') {
     // без управляемого сбоя ход 3 — обычная попытка; явное продолжение (новая попытка) всё равно проверяем ниже
     const turn3plain = await runTurn(turn3);
@@ -592,6 +594,8 @@ async function main() {
       ownerGeneration: undefined,
       state: 'running',
       savedContext,
+      // payload для пробы «потерянный ответ» после resume: тот же ключ требует тот же payload
+      replayPrompt: attemptB1Payload,
       transitions: [],
     });
     journalWrite({ event: 'turn', record: report.turns[report.turns.length - 1] });
