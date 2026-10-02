@@ -6,7 +6,10 @@ import { FakeEngine, fakeScenarioResult, type FakeScenario } from '../adapters/e
 import { OpenCodeAdapter } from '../adapters/engine/opencode-adapter.js';
 import { ArtifactStore } from '../storage/artifact-store.js';
 import { createBlobStore } from '../storage/create-blob-store.js';
+import { RunExportStore } from '../storage/export.js';
 import { ShareTokenIssuer } from '../storage/share.js';
+import { UploadSessionStore } from '../storage/upload-session.js';
+import { WorkspaceSnapshotStore } from '../storage/workspace-snapshot.js';
 import { KeyRegistry } from './auth.js';
 import { handleArtifactRequest, type ArtifactRouteDeps } from './artifact-route.js';
 import { ApiError } from './errors.js';
@@ -129,7 +132,11 @@ async function main(): Promise<void> {
 
   const blob = createBlobStore({ env: process.env, localRoot: join(config.dataDir, 'blobs') });
   const artifacts = new ArtifactStore({ rootDir: config.dataDir, blob });
+  const exports = new RunExportStore({ rootDir: config.dataDir, artifacts });
+  const uploads = new UploadSessionStore({ rootDir: config.dataDir });
+  const snapshots = new WorkspaceSnapshotStore({ rootDir: config.dataDir });
   const tokens = new ShareTokenIssuer(shareSecret !== undefined ? { secret: shareSecret } : {});
+  const baseUrl = process.env['ARTIFACT_BASE_URL']?.trim();
 
   const service = new AgentApi({
     rootDir: config.dataDir,
@@ -137,11 +144,16 @@ async function main(): Promise<void> {
     host: { region: config.region, environment: config.environment },
     logger: log,
     blob,
+    exports,
+    uploads,
+    snapshots,
   });
   const recovery = await service.recover();
 
   const artifactDeps: ArtifactRouteDeps = { artifacts, keys, tokens, logger: log };
-  const apiServer = createAgentApiServer(service, { keys, logger: log, artifacts });
+  const apiServerOptions: Parameters<typeof createAgentApiServer>[1] = { keys, logger: log, artifacts, exports, tokens, uploads, snapshots };
+  if (baseUrl) apiServerOptions.baseUrl = baseUrl;
+  const apiServer = createAgentApiServer(service, apiServerOptions);
 
   const server: Server = createServer((req, res) => {
     handleArtifactRequest(req, res, artifactDeps)
@@ -214,6 +226,7 @@ async function main(): Promise<void> {
         terminal: recovery.terminal,
         healed: recovery.healed,
       },
+      artifactExport: { enabled: true, versions: 'runs/<runId>/export/v<N>.json' },
       startedAt: new Date().toISOString(),
     });
   });

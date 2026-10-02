@@ -11,6 +11,7 @@ import {
   isUtcTimestamp,
   type ValidationResult,
 } from './validate.js';
+import { isSafeRelativePath } from '../storage/local-paths.js';
 
 export const RUN_SPEC_CONTRACT_VERSION = 1 as const;
 
@@ -76,6 +77,17 @@ export interface ResultPolicy {
   retentionPolicy?: string;
 }
 
+/**
+ * Объявленные выходы рана: относительные пути внутри `cwd`, которые после завершения
+ * исполнения уезжают в object storage и попадают в закоммиченный манифест экспорта.
+ * Путь проверяется на выход из workspace при экспорте, а не при приёме запроса.
+ */
+export interface OutputSpec {
+  path: string;
+  name?: string;
+  mime?: string;
+}
+
 export interface RunSpec {
   contractVersion: typeof RUN_SPEC_CONTRACT_VERSION;
   jobId: string;
@@ -96,6 +108,7 @@ export interface RunSpec {
   credentialBindings?: CredentialBinding[];
   budget?: BudgetSpec;
   result?: ResultPolicy;
+  outputs?: OutputSpec[];
   traceId?: string;
   repository?: RepositorySpec;
 }
@@ -120,6 +133,7 @@ const TOP_LEVEL_KEYS = [
   'credentialBindings',
   'budget',
   'result',
+  'outputs',
   'traceId',
   'repository',
 ] as const;
@@ -228,6 +242,41 @@ function validateInput(value: unknown, path: string, collector: ErrorCollector):
     if (typeof value['inlinePrompt'] === 'string') input.inlinePrompt = value['inlinePrompt'];
   }
   return input;
+}
+
+function validateOutputs(value: unknown, path: string, collector: ErrorCollector): OutputSpec[] | undefined {
+  if (!checkArray(value, path, collector)) return undefined;
+  if (value.length > 100) {
+    collector.push(`${path}: too many entries`);
+    return undefined;
+  }
+  const seen = new Set<string>();
+  return value.map((entry, i) => {
+    const entryPath = `${path}[${i}]`;
+    const output: OutputSpec = { path: '' };
+    if (!checkObject(entry, entryPath, collector)) return output;
+    checkKeys(entry, ['path', 'name', 'mime'], ['path'], entryPath, collector);
+    if (typeof entry['path'] === 'string') output.path = entry['path'];
+    if (output.path.length > 0 && !isSafeRelativePath(output.path)) {
+      collector.push(`${entryPath}.path: expected a relative path inside the run workspace without "..", "." or a leading "/"`);
+    }
+    if (seen.has(output.path)) collector.push(`${entryPath}.path: duplicate output path "${output.path}"`);
+    seen.add(output.path);
+    if (entry['name'] !== undefined) {
+      checkString(entry['name'], `${entryPath}.name`, collector, 200);
+      if (typeof entry['name'] === 'string') {
+        if (entry['name'].includes('/') || entry['name'].includes('\\')) {
+          collector.push(`${entryPath}.name: a file name must not contain path separators`);
+        }
+        output.name = entry['name'];
+      }
+    }
+    if (entry['mime'] !== undefined) {
+      checkString(entry['mime'], `${entryPath}.mime`, collector, 100);
+      if (typeof entry['mime'] === 'string') output.mime = entry['mime'];
+    }
+    return output;
+  });
 }
 
 function validateRepository(value: unknown, path: string, collector: ErrorCollector): RepositorySpec | undefined {
@@ -390,6 +439,11 @@ export function validateRunSpec(input: unknown): ValidationResult<RunSpec> {
     }
   }
 
+  let outputs: OutputSpec[] | undefined;
+  if ('outputs' in input && input['outputs'] !== undefined) {
+    outputs = validateOutputs(input['outputs'], 'spec.outputs', collector);
+  }
+
   let repository: RepositorySpec | undefined;
   if ('repository' in input && input['repository'] !== undefined && input['repository'] !== null) {
     const repo = input['repository'];
@@ -422,6 +476,7 @@ export function validateRunSpec(input: unknown): ValidationResult<RunSpec> {
   if (credentialBindings !== undefined) spec.credentialBindings = credentialBindings;
   if (budget !== undefined) spec.budget = budget;
   if (result !== undefined) spec.result = result;
+  if (outputs !== undefined) spec.outputs = outputs;
   if (input['traceId'] !== undefined) spec.traceId = input['traceId'] as string;
   if (repository !== undefined) spec.repository = repository;
 

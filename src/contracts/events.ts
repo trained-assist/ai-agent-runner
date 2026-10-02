@@ -1,4 +1,13 @@
-import { ErrorCollector, checkKeys, checkObject, checkString, isSafeId, isUtcTimestamp, type ValidationResult } from './validate.js';
+import {
+  ErrorCollector,
+  checkKeys,
+  checkObject,
+  checkPositiveInt,
+  checkString,
+  isSafeId,
+  isUtcTimestamp,
+  type ValidationResult,
+} from './validate.js';
 import type { RunResult } from './result.js';
 
 export const RUNNER_EVENT_SCHEMA_VERSION = 1 as const;
@@ -10,6 +19,9 @@ export const RUNNER_EVENT_TYPES = [
   'log',
   'exit',
   'finalizing',
+  'artifact_exported',
+  'export_committed',
+  'export_failed',
   'succeeded',
   'failed',
   'cancelled',
@@ -62,6 +74,36 @@ export interface FinalizingEvent extends EventEnvelope {
   payload: { reason: string };
 }
 
+export interface ArtifactExportedEvent extends EventEnvelope {
+  type: 'artifact_exported';
+  payload: {
+    artifactId: string;
+    sourcePath: string;
+    size: number;
+    sha256: string;
+    mime: string;
+    version: number;
+  };
+}
+
+export interface ExportCommittedEvent extends EventEnvelope {
+  type: 'export_committed';
+  payload: {
+    version: number;
+    status: 'complete' | 'partial' | 'failed';
+    planned: number;
+    exported: number;
+    failed: number;
+    cleanup: 'nothing_to_prune' | 'pruned' | 'retained_sole_copy';
+    retained: number;
+  };
+}
+
+export interface ExportFailedEvent extends EventEnvelope {
+  type: 'export_failed';
+  payload: { sourcePath: string; reason: string; version: number };
+}
+
 export interface SucceededEvent extends EventEnvelope {
   type: 'succeeded';
   payload: { outcome: 'succeeded'; exitReason: string; exitCode: number | null };
@@ -89,6 +131,9 @@ export type RunnerEvent =
   | LogEvent
   | ExitEvent
   | FinalizingEvent
+  | ArtifactExportedEvent
+  | ExportCommittedEvent
+  | ExportFailedEvent
   | SucceededEvent
   | FailedEvent
   | CancelledEvent
@@ -125,6 +170,9 @@ const PAYLOAD_KEYS: Record<RunnerEventType, readonly string[]> = {
   log: ['stream', 'level', 'message'],
   exit: ['code', 'signal'],
   finalizing: ['reason'],
+  artifact_exported: ['artifactId', 'sourcePath', 'size', 'sha256', 'mime', 'version'],
+  export_committed: ['version', 'status', 'planned', 'exported', 'failed', 'cleanup', 'retained'],
+  export_failed: ['sourcePath', 'reason', 'version'],
   succeeded: ['outcome', 'exitReason', 'exitCode'],
   failed: ['outcome', 'exitReason', 'code', 'safeSummary'],
   cancelled: ['outcome', 'exitReason', 'reason'],
@@ -165,6 +213,37 @@ function validatePayload(type: RunnerEventType, value: unknown, path: string, co
       break;
     case 'finalizing':
       checkString(value['reason'], `${path}.reason`, collector, 200);
+      break;
+    case 'artifact_exported': {
+      checkString(value['artifactId'], `${path}.artifactId`, collector, 200);
+      checkString(value['sourcePath'], `${path}.sourcePath`, collector, 512);
+      if (typeof value['size'] !== 'number' || !Number.isInteger(value['size']) || value['size'] < 0) {
+        collector.push(`${path}.size: expected non-negative integer`);
+      }
+      checkString(value['sha256'], `${path}.sha256`, collector, 64);
+      checkString(value['mime'], `${path}.mime`, collector, 100);
+      checkPositiveInt(value['version'], `${path}.version`, collector);
+      break;
+    }
+    case 'export_committed': {
+      checkPositiveInt(value['version'], `${path}.version`, collector);
+      if (value['status'] !== 'complete' && value['status'] !== 'partial' && value['status'] !== 'failed') {
+        collector.push(`${path}.status: expected complete | partial | failed`);
+      }
+      for (const key of ['planned', 'exported', 'failed', 'retained'] as const) {
+        if (typeof value[key] !== 'number' || !Number.isInteger(value[key]) || value[key] < 0) {
+          collector.push(`${path}.${key}: expected non-negative integer`);
+        }
+      }
+      if (value['cleanup'] !== 'nothing_to_prune' && value['cleanup'] !== 'pruned' && value['cleanup'] !== 'retained_sole_copy') {
+        collector.push(`${path}.cleanup: expected nothing_to_prune | pruned | retained_sole_copy`);
+      }
+      break;
+    }
+    case 'export_failed':
+      checkString(value['sourcePath'], `${path}.sourcePath`, collector, 512);
+      checkString(value['reason'], `${path}.reason`, collector, 300);
+      checkPositiveInt(value['version'], `${path}.version`, collector);
       break;
     case 'succeeded':
       if (value['outcome'] !== 'succeeded') collector.push(`${path}.outcome: expected "succeeded"`);
