@@ -1,6 +1,6 @@
 # AI Agent Runner
 
-Статус: **slice 1 + Serverless Agent API (P04–P06) + slice D1 (storage/артефакты) + E2E acceptance loop (issue #2) реализованы** · 01.10.2026. Код жизненного цикла Run, внешний admission/result adapter, storage-контракт с менеджментом артефактов и цикл приёмки владельца есть в этом репозитории; materialize/sweep и межмашинные leases ещё не вынесены (см. roadmap).
+Статус: **slice 1 + Serverless Agent API (P04–P06) + slice D1 (storage/артефакты) + E2E acceptance loop (issue #2) + MCP lifecycle и scoped bindings (P13, этап I04) реализованы** · 03.10.2026. Код жизненного цикла Run, внешний admission/result adapter, storage-контракт с менеджментом артефактов и цикл приёмки владельца есть в этом репозитории; materialize/sweep и межмашинные leases ещё не вынесены (см. roadmap).
 
 **Agent Runner** управляет запуском **ai-agent-job** на выбранной виртуальной машине: готовит **Agent clean room**, запускает агентский движок с разрешёнными правами, наблюдает выполнение, сохраняет результат и освобождает ресурсы.
 
@@ -193,6 +193,43 @@ Env/константы: `RUNNER_DEFAULT_REPO` (дефолтная репа), `RU
 
 Оговорка: токен хранится только в памяти процесса до clone — после рестарта воркера queued-ран возобновляется уже без токена (для приватной репы это `REPOSITORY_UNAVAILABLE` до нового submit с токеном). Это осознанный обмен: секретов на диске нет.
 
+## MCP lifecycle и scoped bindings (P13, этап I04)
+
+Соответствует карточке [#52](https://github.com/trained-assist/trained-agent-architecture/issues/52) и этапу [SANDBOX · I04](https://github.com/trained-assist/trained-agent-architecture/blob/main/SANDBOX.md#i04--mcp-и-доменные-capabilities). Детали архитектуры — [docs/MCP-LIFECYCLE.md](docs/MCP-LIFECYCLE.md).
+
+| Область | Файл | Что делает |
+|---|---|---|
+| Контракт | `src/contracts/run-spec.ts` | Группа `RunSpec.mcp`: per-run stdio-серверы, `allowedTools`, `bindingRef` (обязан быть в `credentialBindings`), таймауты; имя инструмента уникально в пределах рана |
+| Скоуп | `src/mcp/scope.ts` | `McpRunScope`: приёмка хоста — инструмент вне `allowedTools` не уходит в процесс; binding объявлен/активен; значение binding'а резолвится только хостом |
+| Транспорт | `src/mcp/jsonrpc.ts`, `src/mcp/session.ts` | JSON-RPC по stdio; `McpServerSession` (spawn → `initialize` → `notifications/initialized` → `tools/list` → readiness), таймаут вызова, гашение SIGTERM→SIGKILL с проверкой смерти |
+| Мост | `src/mcp/bridge.ts` | Unix socket (0600) + run token: `tools/list`, `tools/call`, `capability/invoke`. Binding и caller подставляет хост — процесс не выбирает их сам |
+| Handlers | `src/mcp/capabilities.ts`, `src/mcp/demo-capabilities.ts` | Реестр capability handler'ов: один handler на MCP-вызов рана и на `POST /v1/capabilities/invoke`; outcome-виды из спецификации; write без effect receipt наружу не выходит |
+| Интеграция | `src/runner/runner.ts` | Старт MCP до движка, отказ старта → `MCP_STARTUP_FAILED` с причиной в логе, cleanup на выходе/отмене/таймауте/dispose, дочистка осиротевших процессов после рестарта, fault point `mcp` |
+| Фикстуры | `src/mcp/fixtures/`, `scripts/fake-remote-domain-service.mjs` | Per-run stdio MCP-сервер (режимы управляемых сбоев), per-run broker для движка, клиент MCP со стороны движка, общий внешний доменный сервис с auth per operation и квитанциями эффекта |
+| Приёмка | `scripts/mcp-lifecycle-probe.mjs` | Пять сценариев на реальных процессах → sanitized-транскрипт в `docs/evidence/p13-mcp-lifecycle*/` |
+
+Ключевые семантики:
+
+- **Инструмент вызван по-настоящему, а не только перечислен**: доказательство — квитанция
+  эффекта внешнего сервиса (`effectReceiptId`) и строка в журнале сервиса, а не «ок»
+  инструмента (ловушка PR-16).
+- **Чужой binding недоступен**: три слоя приёмки — объявление в `credentialBindings`,
+  `allowedTools` рана, `requiredScopes` handler'а. Отказ фиксируется в логе рана с причиной.
+- **OS-изоляция не заявлена**: per-run процессы MCP стартуют под тем же service UID, что и
+  runner. Записано в логах (`isolation=same_service_uid_not_os_isolated`), в
+  `GET /v1/capabilities` (`mcp.osIsolation: not_proven_service_uid_only`) и в транскрипте.
+- **Значения binding'ов не покидают хост**: в spec/state/events/логах/конфиге движка и
+  окружении дочерних процессов их нет — проверяется пробой и тестом.
+
+### Что покрыто тестами
+
+- [x] Реальный вызов инструмента с квитанцией эффекта; отказы по `tool_not_in_scope` и по scope binding'а — `test/mcp-lifecycle.test.ts`
+- [x] Упавший старт, зависший handshake (readiness timeout), зависший инструмент (tool timeout + гашение сервера) — `test/mcp-lifecycle.test.ts`
+- [x] Отмена рана и рестарт воркера гасят MCP-процессы, осиротевшие не остаются — `test/mcp-lifecycle.test.ts`
+- [x] Значения binding'ов не попадают ни в одну поверхность — `test/mcp-lifecycle.test.ts`
+- [x] Один capability handler на два транспорта (MCP ран + API control plane), отказ по scope одинаков — `test/capability-facade.test.ts`
+- [x] Проба приёмки на песочной VM: 25/25 проверок, транскрипт `docs/evidence/p13-mcp-lifecycle-vm2/`
+
 ## Разработка
 
 ```bash
@@ -234,6 +271,7 @@ curl -X POST localhost:8080/v1/runs \
 3. **Storage/materialize** (детализация D1–D6 в [issue #17](https://github.com/trained-assist/trained-agent-architecture/issues/17)): **D1 сделан** — BlobStore-контракт, бэкенды local-fs/GCS/R2-заготовка, manifest+commit/export, share-by-link (см. «Slice D1»); остаётся materialize при старте, sweep в finalizing, маркер индекса, lease+generation на профиль.
 4. **Live OpenCode на sandbox VM** — reproducible setup (P01/P02), free-only профиль, два synthetic principals, sanitized transcript приёмки.
 5. **Artifact transfer P07–P09** — manifest/export и выдача ссылок есть (D1); остаётся direct signed upload/download-сессии, multipart/resume и реализация R2/S3-бэкенда (I02B).
+6. **MCP lifecycle + scoped bindings (P13, сделано)** — per-run stdio процессы, handshake/readiness/timeout/cleanup, общий capability handler на MCP и API facade; дальше — доменные tools (P14) и интеграционная песочница (P15).
 6. **Worker API и межмашинные leases/fencing** — при переходе к нескольким workers (ARCHITECTURE §9, пп. 5–6).
 7. **Интеграция с GitHub** — текстовой образ профиля выгружается в приватные репозитории `profiles-artifacts` ([trained-assist-agent#1921](https://github.com/trained-assist/trained-assist-agent/issues/1921)); **не в этом slice**, только roadmap-строка — решение за владельцем (PR #13 arch-репо, открытый вопрос §8.3).
 
