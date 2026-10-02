@@ -19,6 +19,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Step, buildIssueDraft, redact, sleep, summarize, validateEventChain } from './e2e-loop/checks.mjs';
 import { ControlClient, request, submitRun, waitForStatus } from './e2e-loop/client.mjs';
+import { isInside, isTempPath, persistentRootDefault, rebootGuards } from './e2e-loop/persistence.mjs';
 import {
   stepArtifactDownload,
   stepCredentialScopes,
@@ -42,7 +43,8 @@ function usage() {
   ./scripts/e2e-loop.sh [опции]          # обёртка
 
 Опции:
-  --root <dir>            рабочий каталог данных (по умолчанию: временный)
+  --root <dir>            рабочий каталог данных (по умолчанию: временный; при --with-reboot —
+                          персистентный /var/lib/e2e-loop/<id>, см. guard ниже)
   --report <path>         путь JSON-отчёта (по умолчанию: ./e2e-loop-report.json)
   --port <n>              фиксированный порт API (по умолчанию: случайный)
   --only <ids>            только перечисленные шаги (id через запятую)
@@ -53,7 +55,9 @@ function usage() {
                           report: зафиксировать, но не валить шаг (нужно только для CI-хостов
                           вроде ubuntu-latest раннера, у которых NOPASSWD sudo штатен)
   --with-opencode         добавить прогон security-проб настоящим opencode (может вызывать модели!)
-  --with-reboot           полный systemctl reboot VM (ТОЛЬКО под root, явно; шаг идёт последним)
+  --with-reboot           полный systemctl reboot VM (ТОЛЬКО под root, явно; шаг идёт последним).
+                          Состояние шага живёт в персистентном каталоге, guard отклоняет --root/--report
+                          под /tmp до старта (issue #6)
   --reboot-resume <file>  внутренний режим продолжения после reboot (systemd unit)
   -h, --help              эта справка
 
@@ -251,6 +255,13 @@ function waitForFile(path, timeoutMs) {
 }
 
 async function rebootResume(statePath) {
+  if (!existsSync(statePath)) {
+    console.error(
+      `reboot-resume: состояние "${statePath}" не найдено — файл не пережил перезагрузку. ` +
+        'reboot-state.json должен лежать в персистентном каталоге (при --with-reboot это /var/lib/e2e-loop/<id>), НЕ в /tmp (issue #6).',
+    );
+    process.exit(1);
+  }
   const state = JSON.parse(readFileSync(statePath, 'utf8'));
   const reportPath = state.reportPath;
   const storeReady = await waitForFile(join(state.rootDir, 'runs', state.runId, 'state.json'), 120000);
@@ -319,6 +330,14 @@ async function rebootResume(statePath) {
     report.summary.finalized = true;
     report.finishedAt = new Date().toISOString();
     writeReportFile(reportPath, report);
+    if (state.keepData !== true && !isInside(state.rootDir, reportPath)) {
+      try {
+        rmSync(state.rootDir, { recursive: true, force: true });
+        console.log(`каталог прогона удалён (без --keep-data): ${state.rootDir}`);
+      } catch (err) {
+        console.error(`не удалось удалить ${state.rootDir}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
     const failedChecks = entry.checks.filter((check) => !check.ok);
     console.log(`${entry.status} ${entry.id} (${entry.durationMs}ms)`);
     for (const check of failedChecks) console.log(`  FAIL ${check.name}${check.detail ? ` — ${check.detail}` : ''}`);
@@ -421,10 +440,12 @@ async function stepRebootPre(ctx, step) {
     preReboot: { admissions: health.admissions, startsFakeTimeout: health.startsByEngine['fake-timeout'] ?? 0 },
     node: process.execPath,
     script: SCRIPT_PATH,
+    keepData: ctx.opts.keepData === true,
     createdAt: new Date().toISOString(),
   };
   writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
   step.check('reboot-state сохранён', existsSync(statePath), statePath);
+  step.check('reboot-state и store вне /tmp (переживут перезагрузку)', !isTempPath(statePath) && !isTempPath(ctx.rootDir), statePath);
 
   const unitPath = '/etc/systemd/system/e2e-loop-resume.service';
   const unit = `[Unit]
@@ -477,13 +498,6 @@ async function main() {
     await rebootResume(opts.rebootResume);
     return 0;
   }
-  if (opts.withReboot) {
-    const uid = process.getuid?.();
-    if (uid !== 0 || !systemctlAvailable()) {
-      console.error('--with-reboot требует root и systemd: запускайте под root явно; в дефолтном прогоне reboot не выполняется.');
-      return 2;
-    }
-  }
 
   const definitions = [
     { id: 'step-1-submit-idempotency', title: 'Submit → receipt: идемпотентный дубль = тот же run', run: stepSubmitIdempotency },
@@ -509,9 +523,32 @@ async function main() {
   if (opts.skip.length > 0) selected = selected.filter((definition) => !opts.skip.some((needle) => definition.id.includes(needle)));
 
   const startedAt = new Date().toISOString();
-  const rootDir = opts.root ? resolve(opts.root) : mkdtempSync(join(tmpdir(), 'ai-agent-runner-e2e-'));
-  mkdirSync(rootDir, { recursive: true });
-  const reportPath = resolve(opts.report ?? join(process.cwd(), 'e2e-loop-report.json'));
+  let rootDir;
+  if (opts.root) rootDir = resolve(opts.root);
+  else if (opts.withReboot) rootDir = persistentRootDefault({ repoRoot: REPO_ROOT });
+  else rootDir = mkdtempSync(join(tmpdir(), 'ai-agent-runner-e2e-'));
+  let reportPath = resolve(opts.report ?? join(process.cwd(), 'e2e-loop-report.json'));
+
+  if (opts.withReboot) {
+    // guard до mkdir/сборки: fail fast вместо тихого ENOENT в resume-юните (issue #6)
+    const problems = rebootGuards({
+      rootDir,
+      reportPath,
+      reportExplicit: opts.report !== null,
+      uid: process.getuid?.() ?? null,
+      systemctlOk: systemctlAvailable(),
+    });
+    if (problems.length > 0) {
+      for (const problem of problems) console.error(problem);
+      return 2;
+    }
+    if (isTempPath(reportPath)) {
+      reportPath = join(rootDir, 'e2e-loop-report.json');
+      console.log(`  отчёт вне /tmp не задан — переносим в персистентный каталог: ${reportPath}`);
+    }
+  }
+
+  mkdirSync(rootDir, { recursive: true, mode: 0o700 });
 
   const dist = ensureDist();
   const controlToken = randomBytes(24).toString('hex');

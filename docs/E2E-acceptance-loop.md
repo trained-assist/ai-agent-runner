@@ -18,7 +18,7 @@ npm ci                 # нужны devDependencies (typescript/vitest)
 | Опция | Что делает |
 |---|---|
 | `--report <path>` | путь JSON-отчёта (дефолт `./e2e-loop-report.json`) |
-| `--root <dir>` | каталог данных прогона (дефолт — временный) |
+| `--root <dir>` | каталог данных прогона (дефолт — временный; при `--with-reboot` — персистентный `/var/lib/e2e-loop/<id>`, см. ниже) |
 | `--only <ids>` / `--skip <ids>` | выбрать/пропустить шаги (перепрогон одного провала) |
 | `--keep-data` | не удалять каталог данных (автоматически остаётся при FAIL) |
 | `--foreign-profile <path>` | цель пробы «чужой профиль» (на VM: напр. `/home/vova`) |
@@ -36,10 +36,28 @@ Exit codes: `0` — все шаги зелёные, `1` — есть FAIL, `2` �
 | 2 | `step-2-events-stream-replay` | SSE-поток с snapshot, обрыв соединения, reconnect по `Last-Event-ID` без повторов; JSON cursor-реплей полной цепочки `claimed→materialized→started→…→succeeded` (sequence без дыр, один claimed); reconnect ≠ rerun |
 | 3 | `step-3-fault-injection` | nonzero exit / startup failure / timeout / crash (fake-сценарии) **и** точки реестра faults (`spawn`, `preflight`, once): каждый кейс = `failed` + ожидаемый `exitReason` + `failure.code`, тот же код в терминальном событии; после очистки реестра обычный run снова `succeeded` |
 | 4 | `step-4-recovery-restart` | run висит → процесс runner убит `SIGKILL` и перезапущен: status/events читаются, `connectionLost=true` при `state=running` (**потеря связи ≠ failed**), `state.json`/`events.jsonl` пережили рестарт, реплей с диска, повторный submit = dedup без второго start, cancel гасит осиротевший процесс до терминала |
-| 4b | `step-4b-reboot` (только `--with-reboot`, root) | полный `systemctl reboot` посреди run'а: после загрузки systemd resume-юнит дочитывает status/events/result (`failed/WORKER_CRASH` — без скрытого rerun), повторный submit = тот же receipt, store содержит один run. В дефолтном прогоне **не выполняется** |
+| 4b | `step-4b-reboot` (только `--with-reboot`, root) | полный `systemctl reboot` посреди run'а: после загрузки systemd resume-юнит дочитывает status/events/result (`failed/WORKER_CRASH` — без скрытого rerun), повторный submit = тот же receipt, store содержит один run. В дефолтном прогоне **не выполняется**; состояние шага живёт в персистентном каталоге — см. «Reboot-прогон и персистентные пути» |
 | 5 | `step-5-security-probes` | изнутри рана: чтение чужого профиля, `sudo -n`, metadata `169.254.169.254`, `secrets.env` → ожидается **DENIED**; каждая попытка видна в scoped events (`E2E_PROBE …`) и в `events.jsonl` на диске; env рана содержит только allowlist; `LEAKED` = FAIL |
 | 6 | `step-6-artifact` | агент создаёт файл в workspace → клиент забирает через `GET /v1/runs/{id}/download` и сверяет sha256/размер с объявленным и с диском; файл `0600`, workspace `0700`; traversal `../` = 400, без ключа = 401, нет файла = 404 |
 | 7 | `step-7-credential-scopes` | синтетические креды: scope `read` → gateway пишет 403 (зафиксирован в попытках), scope `write` → 200; в ран передаются только allowlist-переменные; значения кредов отсутствуют в receipt/status/result/events, в `events.jsonl`, в server log, в `admissions.json`/`operations.json`/`state.json` и в workspace после run |
+
+## Reboot-прогон и персистентные пути (issue #6)
+
+`reboot-state.json`, durable store (`runs/<runId>/…`), ключи и отчёт шага 4b **по определению** должны
+пережить `systemctl reboot`, а `/tmp` при загрузке чистится (Ubuntu 24.04 / tmpfiles). Поэтому при
+`--with-reboot` драйвер ведёт себя так (guard срабатывает **до** mkdir/сборки, exit 2):
+
+- `--root` не задан → каталог данных по умолчанию **персистентный**: `/var/lib/e2e-loop/<id>` под root
+  (0700 на каталог и родителя), вне root — `<repo>/.e2e-state/<id>` (в gitignore);
+- `--root <dir>` под `/tmp` → отказ с понятной ошибкой (вместо тихого ENOENT в resume-юните);
+- `--report <path>` под `/tmp` (задан явно) → отказ; дефолтный отчёт из временного cwd переезжает
+  в `<rootDir>/e2e-loop-report.json`;
+- resume-юнит получает эти пути из `reboot-state.json`; отсутствие состояния при старте resume —
+  явная ошибка с указанием на issue #6, а не stack trace ENOENT;
+- без `--keep-data` resume удаляет каталог прогона после записи отчёта (отчёт — вне каталога данных).
+
+Повтор прогона после фикса: `./scripts/e2e-loop.sh --only step-4b-reboot --with-reboot [--keep-data]`
+из-под root; шаг входит и в полный прогон с тем же флагом (идёт последним).
 
 ## Отчёт
 
@@ -86,7 +104,7 @@ Exit codes: `0` — все шаги зелёные, `1` — есть FAIL, `2` �
 ## Приёмка issue #2
 
 - [x] `scripts/e2e-loop.sh` (эквивалент `npm run e2e`; package.json не менялся — deps не нужны) проходит шаги 1–7 с ожидаемыми отказами, детерминированно, free-only.
-- [x] Reboot-кейс: один run, один receipt, никакого rerun (`--with-reboot` под root; в дефолтном прогоне guard отклоняет флаг без root).
+- [x] Reboot-кейс: один run, один receipt, никакого rerun (`--with-reboot` под root; в дефолтном прогоне guard отклоняет флаг без root; состояние шага — в персистентном каталоге, `--root`/`--report` под `/tmp` отклоняются до старта — issue #6).
 - [x] Security-пробы: 0 успешных выходов за scope; попытки видны в structured logs.
 - [x] Артефакт байт-в-байт у клиента; креды не в логах/events/receipt/workspace.
 - [x] Каждый исторический провал = issue с reproduction (дрейвер формирует черновик; см. открытые issue репо).
@@ -99,10 +117,12 @@ scripts/e2e-loop.mjs         драйвер: аргументы, дист-сбо
 scripts/e2e-loop/
   checks.mjs (+.d.mts)       проверки цепочек событий, секреты, Step/отчёт
   client.mjs                 HTTP + SSE (cursor/Last-Event-ID) + control-клиент
+  persistence.mjs            персистентные пути и guard'ы --with-reboot (issue #6)
   server.mjs                 дочерний API-сервер: src/api + engine-реестр + download/gateway/_e2e
   steps.mjs                  шаги 1–7
   engine-scripts/            probe.mjs, artifact.mjs, cred.mjs, slow.mjs
   tsconfig.build.json        сборка src/ → .e2e-dist (вне package.json)
 test/e2e-loop.test.ts        прогон драйвера целиком + осознанный FAIL + reboot guard
 test/e2e-loop-checks.test.ts юнит-проверки цепочек/шагов/секретов
+test/e2e-loop-persistence.test.ts юнит-проверки персистентных путей/гардов (issue #6)
 ```

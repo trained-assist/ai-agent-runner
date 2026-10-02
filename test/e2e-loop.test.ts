@@ -188,6 +188,29 @@ describe('e2e acceptance loop driver (issue #2)', () => {
     expect(run.stderr).toContain('--with-reboot');
   }, 30000);
 
+  // [[ e2e-reboot-persistent-paths ]]
+  it('--with-reboot + --root под /tmp отклоняется до старта (issue #6, exit 2)', async () => {
+    const dir = tempDir();
+    const run = await runDriver(['--with-reboot', '--root', join(dir, 'data'), '--report', join(dir, 'report.json'), '--only', 'step-4b-reboot']);
+    expect(run.code).toBe(2);
+    expect(run.stderr).toContain('reboot-state.json');
+    expect(run.stderr).toContain('/tmp');
+    expect(run.stderr).toContain('issue #6');
+    // guard сработал до создания каталогов и сборки дистрибутива прогона
+    expect(existsSync(join(dir, 'data'))).toBe(false);
+  }, 60000);
+
+  it('--with-reboot + явный --report под /tmp отклоняется до старта (issue #6, exit 2)', async () => {
+    const dir = tempDir();
+    const persistentRoot = join(repoRoot, '.e2e-state-guard-probe');
+    const run = await runDriver(['--with-reboot', '--root', persistentRoot, '--report', join(dir, 'report.json'), '--only', 'step-4b-reboot']);
+    expect(run.code).toBe(2);
+    expect(run.stderr).toContain('путь отчёта');
+    expect(run.stderr).toContain('/tmp');
+    expect(existsSync(persistentRoot)).toBe(false);
+  }, 60000);
+  // [[/e2e-reboot-persistent-paths ]]
+
   it('scripts/e2e-loop.sh запускает драйвер (обёртка из README)', async () => {
     const dir = tempDir();
     const reportPath = join(dir, 'report.json');
