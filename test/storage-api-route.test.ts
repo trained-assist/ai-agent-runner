@@ -202,3 +202,90 @@ describe('artifact download route', () => {
     expect(logs.some((entry) => entry['status'] === 404)).toBe(true);
   });
 });
+
+// Приёмка M1.3 (arch-репо #109): финализация артефактов работает ПОСЛЕ restart —
+// «рестарт процесса» = новые инстансы ArtifactStore/ShareTokenIssuer/сервера над теми же каталогами.
+describe('artifact route переживает рестарт процесса (M1.3)', () => {
+  async function listen(server: Server): Promise<string> {
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const address = server.address() as AddressInfo;
+    return `http://127.0.0.1:${address.port}`;
+  }
+
+  async function close(server: Server): Promise<void> {
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+
+  const restartBytes = 'artifact bytes across a restart';
+
+  it('share-токен, выданный до рестарта, и Bearer-доступ работают после; повторный put идемпотентен', async () => {
+    const dataRoot = mkdtempSync(join(tmpdir(), 'storage-api-restart-'));
+    const registry = KeyRegistry.fromRecords([keyA.record, keyB.record]);
+    let server: Server | null = null;
+    try {
+      // --- до рестарта
+      const blobBefore = createLocalFsBlobStore({ rootDir: join(dataRoot, 'blobs') });
+      const storeBefore = new ArtifactStore({ rootDir: dataRoot, blob: blobBefore });
+      const manifestBefore = await storeBefore.put({
+        runId: 'run-restart',
+        userTaskId: 'task-restart',
+        profileId: 'profile-a',
+        name: 'restart.txt',
+        mime: 'text/plain',
+        bytes: restartBytes,
+        artifactId: 'art-restart',
+      });
+      const tokensBefore = new ShareTokenIssuer({ secret: 'restart-secret', ttlSeconds: 600 });
+      const tokenBefore = tokensBefore.issue('art-restart').token;
+
+      server = createArtifactServer({ artifacts: storeBefore, keys: registry, tokens: tokensBefore, logger: () => undefined });
+      const baseBefore = await listen(server);
+      const first = await fetch(`${baseBefore}/v1/artifacts/art-restart?t=${encodeURIComponent(tokenBefore)}`);
+      expect(first.status).toBe(200);
+      expect(await first.text()).toBe(restartBytes);
+      await close(server);
+      server = null;
+
+      // --- «рестарт»: новые инстансы над теми же каталогами (secret из env переживает рестарт)
+      const blobAfter = createLocalFsBlobStore({ rootDir: join(dataRoot, 'blobs') });
+      const storeAfter = new ArtifactStore({ rootDir: dataRoot, blob: blobAfter });
+      const tokensAfter = new ShareTokenIssuer({ secret: 'restart-secret', ttlSeconds: 600 });
+      server = createArtifactServer({ artifacts: storeAfter, keys: registry, tokens: tokensAfter, logger: () => undefined });
+      const baseAfter = await listen(server);
+
+      // токен, выданный ДО рестарта, валиден после
+      const byOldToken = await fetch(`${baseAfter}/v1/artifacts/art-restart?t=${encodeURIComponent(tokenBefore)}`);
+      expect(byOldToken.status).toBe(200);
+      expect(byOldToken.headers.get('x-artifact-sha256')).toBe(sha256Hex(restartBytes));
+      expect(await byOldToken.text()).toBe(restartBytes);
+
+      // Bearer: meta (индекс find строится с диска) + скачивание после рестарта
+      const meta = await fetch(`${baseAfter}/v1/artifacts/art-restart/meta`, { headers: auth(keyA) });
+      expect(meta.status).toBe(200);
+      expect(await meta.json()).toMatchObject({ artifactId: 'art-restart', runId: 'run-restart', sha256: sha256Hex(restartBytes) });
+      const byKey = await fetch(`${baseAfter}/v1/artifacts/art-restart`, { headers: auth(keyA) });
+      expect(byKey.status).toBe(200);
+      expect(await byKey.text()).toBe(restartBytes);
+
+      // идемпотентный повтор put тех же байт новым инстансом = тот же manifest, без конфликта
+      const again = await storeAfter.put({
+        runId: 'run-restart',
+        userTaskId: 'task-restart',
+        profileId: 'profile-a',
+        name: 'restart.txt',
+        mime: 'text/plain',
+        bytes: restartBytes,
+        artifactId: 'art-restart',
+      });
+      expect(again).toEqual(manifestBefore);
+
+      // чужой профиль после рестарта по-прежнему 404
+      const foreign = await fetch(`${baseAfter}/v1/artifacts/art-restart`, { headers: auth(keyB) });
+      expect(foreign.status).toBe(404);
+    } finally {
+      if (server) await close(server);
+      rmSync(dataRoot, { recursive: true, force: true });
+    }
+  });
+});
