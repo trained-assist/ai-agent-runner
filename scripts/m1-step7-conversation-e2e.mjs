@@ -429,6 +429,10 @@ async function downloadArtifact(conn, artifactId) {
 }
 
 async function main() {
+  // состояние попытки хода 3 объявляется ДО любых веток: им пользуются и обычный
+  // прогон, и --resume (восстановление из журнала) — иначе ветка resume падает в TDZ
+  let attemptB1 = null;
+  let attemptB1Payload = null;
   const opts = parseArgs(process.argv.slice(2));
   if (opts.help) {
     console.log(USAGE);
@@ -486,9 +490,6 @@ async function main() {
   check('capabilities: continuation policy = new_run_same_user_task', caps.interaction?.continuation?.policy === 'new_run_same_user_task');
 
   const profileId = 'profile-sandbox';
-  // объявляются до любых веток: ими пользуются и путь обычного прогона, и --resume
-  let attemptB1 = null;
-  let attemptB1Payload = null;
   const runTurn = async (turn) => {
     const first = await submitAttempt(conn, {
       taskId: turn.taskId,
