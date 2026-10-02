@@ -209,6 +209,17 @@ describe('e2e acceptance loop driver (issue #2)', () => {
     expect(run.stderr).toContain('/tmp');
     expect(existsSync(persistentRoot)).toBe(false);
   }, 60000);
+
+  it('step-4b-reboot входит в список шагов только с --with-reboot (в полный прогон)', async () => {
+    const withoutFlag = await runDriver(['--only', 'no-such-step']);
+    expect(withoutFlag.code).toBe(2);
+    expect(withoutFlag.stderr).toContain('step-1-submit-idempotency');
+    expect(withoutFlag.stderr).not.toContain('step-4b-reboot');
+
+    const withFlag = await runDriver(['--with-reboot', '--only', 'no-such-step']);
+    expect(withFlag.code).toBe(2);
+    expect(withFlag.stderr).toContain('step-4b-reboot');
+  }, 60000);
   // [[/e2e-reboot-persistent-paths ]]
 
   it('scripts/e2e-loop.sh запускает драйвер (обёртка из README)', async () => {
