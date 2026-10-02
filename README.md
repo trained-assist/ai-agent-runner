@@ -85,7 +85,7 @@ npm ci                 # devDependencies (typescript/vitest)
 # → ./e2e-loop-report.json, exit 0 = все шаги зелёные
 ```
 
-Драйвер сам компилирует `src/` в `.e2e-dist/` (package.json/lock не меняются), поднимает дочерний API-сервер и работает только через его HTTP-контракт. Дефолтный прогон — детерминированный и free-only (fake-движки); `--with-reboot` (только root) и `--with-opencode` включаются явно. Провал шага: `node scripts/e2e-loop.mjs --root <data> --only <step-id>`.
+Драйвер сам компилирует `src/` в `.e2e-dist/` (package.json/lock не меняются), поднимает дочерний API-сервер и работает только через его HTTP-контракт. Дефолтный прогон — детерминированный и free-only (fake-движки); `--with-reboot` (только root) и `--with-opencode` включаются явно. При `--with-reboot` состояние шага живёт в персистентном каталоге (`/var/lib/e2e-loop/<id>`, guard отклоняет `--root`/`--report` под `/tmp` до старта — issue #6). Провал шага: `node scripts/e2e-loop.mjs --root <data> --only <step-id>`.
 
 Подробности, границы harness (download/gateway — e2e-стенд-ины под P07/#30) и ожидания на песочной VM — [docs/E2E-acceptance-loop.md](docs/E2E-acceptance-loop.md).
 
