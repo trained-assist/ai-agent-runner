@@ -11,3 +11,4 @@ tmp/
 .e2e-state/
 e2e-loop-report*.json
 data/
+_scratch/

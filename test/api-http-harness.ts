@@ -13,6 +13,8 @@ import { AgentApi, type AgentApiOptions, type ServiceRecoveryReport } from '../s
 import { FaultRegistry } from '../src/faults/registry.js';
 import { isTerminalState } from '../src/runner/state-machine.js';
 import type { ArtifactStore } from '../src/storage/artifact-store.js';
+import type { CapabilityRegistry } from '../src/mcp/capabilities.js';
+import type { BindingValueResolver } from '../src/mcp/scope.js';
 import { removeDirWithRetry } from './helpers.js';
 
 export const alphaKey = generateApiKey();
@@ -57,6 +59,10 @@ export interface HttpHarnessOptions {
   artifacts?: ArtifactStore;
   /** Свой dataDir вместо временного — нужен, когда store создаётся снаружи на том же корне. */
   rootDir?: string;
+  /** Реестр capability handler'ов (P13): раскрывает POST /v1/capabilities/invoke. */
+  capabilities?: CapabilityRegistry;
+  /** Резолвер значений credential binding'ов (P13). */
+  bindingResolver?: BindingValueResolver;
 }
 
 export interface HttpHarness {
@@ -100,11 +106,22 @@ export async function startHttpHarness(options: HttpHarnessOptions = {}): Promis
     cancelGraceMs: 500,
     logger,
     ...(options.heartbeatIntervalMs !== undefined ? { heartbeatIntervalMs: options.heartbeatIntervalMs } : {}),
+    ...(options.capabilities ? { capabilities: options.capabilities } : {}),
+    ...(options.bindingResolver ? { bindingResolver: options.bindingResolver } : {}),
   };
 
   let service = new AgentApi(serviceOptions);
   await service.recover();
-  const serverOptions = { keys, logger, streamPollMs, keepaliveMs, maxBodyBytes, ...(options.artifacts ? { artifacts: options.artifacts } : {}) };
+  const serverOptions = {
+    keys,
+    logger,
+    streamPollMs,
+    keepaliveMs,
+    maxBodyBytes,
+    ...(options.artifacts ? { artifacts: options.artifacts } : {}),
+    ...(options.capabilities ? { capabilities: options.capabilities } : {}),
+    ...(options.bindingResolver ? { bindingResolver: options.bindingResolver } : {}),
+  };
   let server = createAgentApiServer(service, serverOptions);
   let port = await listen(server);
 

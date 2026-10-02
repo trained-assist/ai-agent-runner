@@ -16,6 +16,14 @@ export interface PersistedExit {
   at: string;
 }
 
+/**
+ * Живые процессы MCP рана (P13). Пишутся в state.json, чтобы перезапуск воркера мог
+ * погасить осиротевшие per-run MCP-процессы, а не оставить их работать вхолостую.
+ */
+export interface PersistedMcpState {
+  serverPids: Array<{ serverId: string; pid: number }>;
+}
+
 export interface PersistedRunState {
   schemaVersion: typeof PERSISTED_STATE_SCHEMA_VERSION;
   runId: string;
@@ -38,6 +46,7 @@ export interface PersistedRunState {
   finalized: boolean;
   result: RunResult | null;
   fencing: { rejected: number };
+  mcp: PersistedMcpState | null;
   createdAt: string;
   updatedAt: string;
 }

@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { EngineStartupError, type ValidationResult } from '../../contracts/validate.js';
 import type { EngineAdapter, EngineHandle, EngineStartContext } from './engine-adapter.js';
 import { handleForChild } from './process-tree.js';
@@ -10,11 +11,18 @@ export const FAKE_SCENARIOS = [
   'timeout',
   'crash',
   'cancel-with-children',
+  'mcp-tools',
 ] as const;
 
 export type FakeScenario = (typeof FAKE_SCENARIOS)[number];
 
-const SCRIPTS: Record<Exclude<FakeScenario, 'startup-failure'>, string> = {
+/**
+ * Клиент MCP со стороны движка для сценария `mcp-tools` (P13): подключается к broker'у
+ * из RUNNER_MCP_CONFIG и выполняет план вызовов, переданный в input.inlinePrompt.
+ */
+const MCP_ENGINE_CLIENT = fileURLToPath(new URL('../../mcp/fixtures/mcp-engine-client.mjs', import.meta.url));
+
+const SCRIPTS: Record<Exclude<FakeScenario, 'startup-failure' | 'mcp-tools'>, string> = {
   success: [
     "const fs = require('node:fs');",
     "fs.writeFileSync('ran.txt', 'ok');",
@@ -50,6 +58,15 @@ export class FakeEngine implements EngineAdapter {
     this.startCalls += 1;
     if (this.scenario === 'startup-failure') {
       throw new EngineStartupError('fake engine failed to start (deterministic scenario)');
+    }
+    if (this.scenario === 'mcp-tools') {
+      const child = spawn(process.execPath, [MCP_ENGINE_CLIENT, ctx.spec.input?.inlinePrompt ?? '{"calls":[],"denied":[]}'], {
+        cwd: ctx.cwd,
+        env: ctx.env,
+        detached: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      return handleForChild(child, { onLog: ctx.onLog, onExit: ctx.onExit });
     }
     const script = SCRIPTS[this.scenario];
     const child = spawn(process.execPath, ['-e', script], {
