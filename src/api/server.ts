@@ -1,6 +1,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { TERMINAL_EVENT_TYPES } from '../contracts/events.js';
 import type { CancelReceipt } from '../runner/runner.js';
+import type { ArtifactStore } from '../storage/artifact-store.js';
 import type { KeyRegistry, Principal, Scope } from './auth.js';
 import { ApiError } from './errors.js';
 import type { AgentApi, ApiLogger } from './service.js';
@@ -11,6 +12,8 @@ export interface AgentApiServerOptions {
   maxBodyBytes?: number;
   streamPollMs?: number;
   keepaliveMs?: number;
+  /** Artifact store для `GET /v1/runs/{id}/artifacts` (ссылки на артефакты рана для приёмника). */
+  artifacts?: ArtifactStore;
 }
 
 interface RequestContext {
@@ -67,6 +70,13 @@ export function createAgentApiServer(service: AgentApi, options: AgentApiServerO
     context.principalId = principal.principalId;
 
     const segments = path.split('/').filter((segment) => segment.length > 0);
+
+    if (segments[0] === 'v1' && segments[1] === 'capabilities' && segments.length === 2) {
+      if (req.method !== 'GET') throw new ApiError('METHOD_NOT_ALLOWED', 'capabilities supports GET only');
+      sendJson(res, 200, service.capabilities());
+      return 200;
+    }
+
     if (segments[0] !== 'v1' || segments[1] !== 'runs') {
       throw new ApiError('ROUTE_NOT_FOUND', `no route for ${path}`);
     }
@@ -83,7 +93,7 @@ export function createAgentApiServer(service: AgentApi, options: AgentApiServerO
 
     const runId = segments[2];
     const action = segments[3];
-    if (!runId || segments.length !== 4 || !action) {
+    if (!runId || !action || segments.length > 4) {
       throw new ApiError('ROUTE_NOT_FOUND', `no route for ${path}`);
     }
 
@@ -98,6 +108,31 @@ export function createAgentApiServer(service: AgentApi, options: AgentApiServerO
         if (req.method !== 'GET') throw new ApiError('METHOD_NOT_ALLOWED', 'result supports GET only');
         requireScope(principal, 'runs:read');
         sendJson(res, 200, service.result(principal, runId));
+        return 200;
+      }
+      case 'artifacts': {
+        if (req.method !== 'GET') throw new ApiError('METHOD_NOT_ALLOWED', 'run artifacts support GET only');
+        requireScope(principal, 'runs:read');
+        const store = options.artifacts;
+        if (!store) throw new ApiError('ROUTE_NOT_FOUND', 'artifact listing is not enabled in this deployment');
+        // status() отдаёт 404 для чужого/неизвестного рана — владение проверено до чтения store
+        const status = service.status(principal, runId);
+        const manifests = store
+          .list(runId)
+          .filter((manifest) => manifest.profileId === principal.profileId)
+          .map((manifest) => ({
+            artifactId: manifest.artifactId,
+            name: manifest.name,
+            mime: manifest.mime,
+            size: manifest.size,
+            sha256: manifest.sha256,
+            storageKey: manifest.storageKey,
+            createdAt: manifest.createdAt,
+            runId: manifest.runId,
+            userTaskId: manifest.userTaskId,
+            profileId: manifest.profileId,
+          }));
+        sendJson(res, 200, { runId, conversationId: status.conversationId, userTaskId: status.userTaskId, count: manifests.length, artifacts: manifests });
         return 200;
       }
       case 'events': {

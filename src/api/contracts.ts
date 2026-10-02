@@ -51,6 +51,7 @@ export interface SubmitResponse extends Receipt {
 export interface RunStatusView {
   requestId: string;
   userTaskId: string;
+  conversationId: string;
   runId: string;
   ownerGeneration: number;
   state: ApiRunState;
@@ -78,6 +79,47 @@ export interface CancelRequest {
   ownerGeneration?: number;
   reason?: string;
 }
+
+/**
+ * Декларация поддержки контракта (SERVERLESS-AGENT-API.md §«Логический API», §«Потеря связи,
+ * повторный запуск и сохранение данных»). Нужна приёмнику, чтобы НЕ угадывать возможности Runner:
+ * resume движка и awaiting_user у нас не поддержаны, продолжение — новая попытка с тем же
+ * userTaskId/conversationId, потеря связи не равна failed и не запускает rerun.
+ */
+export interface ApiCapabilities {
+  schemaVersion: 1;
+  contract: { name: 'ai-agent-runner/serverless-agent-api'; version: number };
+  idempotency: {
+    header: 'Idempotency-Key';
+    repeatWithSameKey: 'same_receipt';
+    newAttemptRequires: 'new_idempotency_key';
+  };
+  states: readonly ApiRunState[];
+  events: { cursor: true; replay: true; sse: true; lastEventId: true };
+  disconnect: { connectionLostIsNotFailed: true; autoRerunOnDisconnect: false; outcomeUnknown: true };
+  interaction: {
+    awaitingUserInput: 'unsupported';
+    engineResume: 'unsupported';
+    continuation: {
+      policy: 'new_run_same_user_task';
+      userTaskIdStable: true;
+      conversationIdStable: true;
+      savedDataRefs: readonly ('run_result' | 'run_events' | 'run_artifacts')[];
+    };
+  };
+  artifacts: {
+    listPerRun: true;
+    download: true;
+    shareLink: true;
+    ingestEndpoint: 'absent';
+    ingestNote: 'artifacts are registered out-of-band (slice D2: POST /v1/artifacts)';
+  };
+  cancel: { requestedReceipt: true; terminalConfirmation: true };
+  engines: string[];
+}
+
+export const API_CAPABILITIES_SCHEMA_VERSION = 1 as const;
+export const API_CONTRACT_VERSION = 1 as const;
 
 const SUBMIT_KEYS = [
   'userTaskId',
