@@ -136,6 +136,7 @@ async function main(): Promise<void> {
     adapters: { fake: new FakeEngine(config.fakeScenario), opencode: new OpenCodeAdapter() },
     host: { region: config.region, environment: config.environment },
     logger: log,
+    blob,
   });
   const recovery = await service.recover();
 

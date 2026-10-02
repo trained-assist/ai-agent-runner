@@ -17,6 +17,8 @@ import { RunStore, type PersistedRunState } from './run-store.js';
 import { cloneRepository, resolveCloneSource } from './repository.js';
 import { ScopedEventLog, type LogSink } from './scoped-log.js';
 import { canTransition, isTerminalState, type RunState } from './state-machine.js';
+import type { BlobStore } from '../storage/blob-store.js';
+import { profileKey } from '../storage/keys.js';
 import { redactSecrets, specHash, truncateLine } from './util.js';
 
 export interface RunnerHostInfo {
@@ -35,6 +37,15 @@ export interface RunnerOptions {
   logSink?: LogSink;
   heartbeatIntervalMs?: number;
   cancelGraceMs?: number;
+  /**
+   * Профильное хранилище: при финализации ран дописывает в `profiles/<profileId>/trace.jsonl`
+   * служебный след (runId, outcome, exitReason, код ошибки). След живёт в storage, а не в
+   * workspace рана — между запусками доступен, тела на диск воркспейса не копятся
+   * (эпик ai-agent-run-api#1, Ф2.3 / кейс E1; issue trained-assist/ai-agent-runner#23).
+   */
+  blob?: BlobStore;
+  /** Выключить запись следов профиля, если хранилище передано по другой причине. */
+  profileTrace?: boolean;
 }
 
 export interface StartReceipt {
@@ -112,6 +123,8 @@ export class Runner {
   private readonly runs = new Map<string, InternalRun>();
   private readonly cloneControllers = new Map<string, AbortController>();
   private disposed = false;
+  /** Сериализует append в profiles/<id>/trace.jsonl — параллельные раны не теряют строки. */
+  private profileTraceChain: Promise<void> = Promise.resolve();
 
   constructor(options: RunnerOptions) {
     this.opts = options;
@@ -808,8 +821,62 @@ export class Runner {
       await waitForProcessDeath(st.pgid, null, 500);
     }
     const result = this.computeResult(st);
+    await this.appendProfileTrace(st, result);
     this.persistResult(st, result);
     return result;
+  }
+
+  /**
+   * След задачи в профильном хранилище (profiles/<profileId>/trace.jsonl).
+   * Ошибка записи НЕ валит ран: это вспомогательная запись — деградация фиксируется
+   * warn-событием `log` в журнале задачи, чтобы не молчала (issue #23, кейс E1).
+   */
+  private async appendProfileTrace(st: PersistedRunState, result: RunResult): Promise<void> {
+    const blob = this.opts.blob;
+    if (!blob || this.opts.profileTrace === false) return;
+    let key: string;
+    try {
+      key = profileKey(st.profileId, 'trace.jsonl');
+    } catch {
+      // идентификатор профиля — не безопасный сегмент ключа: записи не будет
+      return;
+    }
+    const line = JSON.stringify({
+      at: this.nowIso(),
+      runId: st.runId,
+      userTaskId: st.userTaskId,
+      profileId: st.profileId,
+      outcome: result.outcome,
+      exitReason: result.exitReason,
+      failureCode: result.failure?.code ?? null,
+    });
+    let failure: unknown = null;
+    const append = async (): Promise<void> => {
+      let existing = '';
+      try {
+        existing = (await blob.get(key)).toString('utf8');
+      } catch {
+        // первого следа ещё нет
+      }
+      const prefix = existing === '' ? '' : existing.endsWith('\n') ? existing : `${existing}\n`;
+      await blob.put(key, `${prefix}${line}\n`);
+    };
+    const next = this.profileTraceChain.then(() => append()).then(
+      () => undefined,
+      (err: unknown) => {
+        failure = err;
+      },
+    );
+    this.profileTraceChain = next;
+    await next;
+    if (failure) {
+      const message = truncateLine(redactSecrets(failure instanceof Error ? failure.message : String(failure)), 300);
+      try {
+        this.emit(st, 'log', { stream: 'runner', level: 'warn', message: `profile trace append failed: ${message}` });
+      } catch {
+        // не роняем финализацию из-за вспомогательной записи
+      }
+    }
   }
 
   private computeResult(st: PersistedRunState): RunResult {

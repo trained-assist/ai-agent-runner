@@ -11,6 +11,7 @@ import { FaultRegistry } from '../src/faults/registry.js';
 import { Runner, type RunnerHostInfo, type RunnerOptions, type StartReceipt } from '../src/runner/runner.js';
 import { isTerminalState } from '../src/runner/state-machine.js';
 import type { LogSink } from '../src/runner/scoped-log.js';
+import type { BlobStore } from '../src/storage/blob-store.js';
 
 let counter = 0;
 
@@ -58,6 +59,8 @@ export interface HarnessOptions {
   logSink?: LogSink;
   faults?: FaultRegistry;
   adapters?: Record<string, EngineAdapter>;
+  blob?: BlobStore;
+  profileTrace?: boolean;
 }
 
 export interface Harness {
@@ -84,6 +87,8 @@ export function createHarness(options: HarnessOptions = {}): Harness {
   };
   if (options.logSink) base.logSink = options.logSink;
   if (options.heartbeatIntervalMs !== undefined) base.heartbeatIntervalMs = options.heartbeatIntervalMs;
+  if (options.blob) base.blob = options.blob;
+  if (options.profileTrace !== undefined) base.profileTrace = options.profileTrace;
 
   let runner = new Runner(base);
 
