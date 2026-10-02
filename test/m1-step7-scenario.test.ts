@@ -136,4 +136,37 @@ describe('сквозной сценарий шага 7 (control plane ↔ Runner
     expect(run.stderr).toContain('--resume');
     expect(run.stderr).toContain('begin');
   }, 60000);
+
+  // Рестарт VM ловит этот класс дефектов (порядок объявлений в resume-ветке) только на
+  // песочнице; здесь гоняем resume по журналу завершённого прогона и требуем, чтобы он
+  // дошёл до восстановления идентичности БЕЗ падения в инициализации.
+  it('--resume восстанавливает conversationId из журнала и не падает в resume-ветке', async () => {
+    const dir = tempDir();
+    const journalPath = join(dir, 'journal.jsonl');
+    const firstReport = join(dir, 'first.json');
+    const rootDir = join(dir, 'data');
+    const store = new ArtifactStore({ rootDir, blob: createLocalFsBlobStore({ rootDir: join(rootDir, 'blobs') }) });
+    const h = await startHttpHarness({ rootDir, artifacts: store });
+    const env = { RUNNER_API_URL: h.base, RUNNER_API_KEY: alphaKey, RUNNER_API_KEY_FILE: '' };
+    const conversationId = 'conv-step7-resume-test';
+
+    const first = await runScenario(
+      ['--restart-mode', 'none', '--no-artifact', '--conversation', conversationId, '--timeout-ms', '20000', '--report', firstReport, '--journal', journalPath],
+      env,
+    );
+    expect(first.code, `stdout: ${first.stdout.slice(0, 3000)}`).toBe(0);
+    const firstJson = JSON.parse(readFileSync(firstReport, 'utf8')) as ScenarioReport;
+    expect(firstJson.conversationId).toBe(conversationId);
+
+    // Повторный вход в журнал: идентичность (conversationId → idempotency-ключи) обязана
+    // восстановиться, а не сгенерироваться заново.
+    const resumed = await runScenario(
+      ['--resume', '--restart-mode', 'none', '--no-artifact', '--timeout-ms', '20000', '--report', join(dir, 'second.json'), '--journal', journalPath],
+      env,
+    );
+    expect(resumed.stderr).not.toContain('ReferenceError');
+    expect(resumed.stdout).toContain('resume: журнал прочитан, conversationId восстановлен');
+    const secondJson = JSON.parse(readFileSync(join(dir, 'second.json'), 'utf8')) as ScenarioReport;
+    expect(secondJson.conversationId).toBe(conversationId);
+  }, 180000);
 });
