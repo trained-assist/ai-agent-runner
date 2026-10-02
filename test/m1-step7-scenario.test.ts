@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -118,4 +118,22 @@ describe('сквозной сценарий шага 7 (control plane ↔ Runner
     expect(reportText).not.toContain(alphaKey);
     expect(run.stdout).not.toContain(alphaKey);
   }, 180000);
+
+  it('--resume без записи begin в журнале отклоняется, а не начинает новый разговор', async () => {
+    const dir = tempDir();
+    const journalPath = join(dir, 'journal.jsonl');
+    writeFileSync(journalPath, `${JSON.stringify({ at: new Date().toISOString(), event: 'noise' })}\n`);
+    const rootDir = join(dir, 'data');
+    const store = new ArtifactStore({ rootDir, blob: createLocalFsBlobStore({ rootDir: join(rootDir, 'blobs') }) });
+    const h = await startHttpHarness({ rootDir, artifacts: store });
+
+    const run = await runScenario(['--resume', '--restart-mode', 'none', '--no-artifact', '--journal', journalPath, '--report', join(dir, 'report.json')], {
+      RUNNER_API_URL: h.base,
+      RUNNER_API_KEY: alphaKey,
+      RUNNER_API_KEY_FILE: '',
+    });
+    expect(run.code).toBe(2);
+    expect(run.stderr).toContain('--resume');
+    expect(run.stderr).toContain('begin');
+  }, 60000);
 });
