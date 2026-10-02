@@ -51,7 +51,7 @@
 | Контракты API | `src/api/contracts.ts` | Submit body = подмножество RunSpec (server-owned поля запрещены), `Receipt {requestId, userTaskId, runId}`, статусы включая `awaiting_user` (зарезервировано за control plane), payload hash через canonical JSON |
 | Durable store | `src/api/store.ts` | `api/admissions.json` (atomic write как в RunStore): write-ahead запись принятого запроса ДО `runner.start`, индексы по idempotency key/runId/userTaskId, переживает рестарт процесса |
 | Сервис | `src/api/service.ts` | submit → write-ahead admission → `runner.start`; дедуп по (principal, Idempotency-Key) → тот же receipt, другой payload → 409 conflict; heal принятых, но не стартовавших записей; вторая живая попытка задачи → 409, после terminal — новый runId при том же userTaskId/requestId (`ownerGeneration+1`); status/cancel/result/events поверх runner; `recover()` = `runner.recover()` + admission heal |
-| HTTP | `src/api/server.ts` | `POST /v1/runs`, `GET /v1/runs/{id}/status`, `POST .../cancel`, `GET .../result`, `GET .../events` (+`/healthz`); структурированные ошибки `{error:{code,message,details}}`; body cap 413; логи запросов без заголовков и ключей |
+| HTTP | `src/api/server.ts` | `POST /v1/runs`, `GET /v1/runs/{id}/status`, `POST .../cancel`, `GET .../result`, `GET .../events`, `GET .../artifacts`, `GET /v1/capabilities` (+`/healthz`); структурированные ошибки `{error:{code,message,details}}`; body cap 413; логи запросов без заголовков и ключей |
 | SSE replay | `src/api/server.ts` | `GET .../events` с `Accept: text/event-stream`: snapshot + `id/event/data`, cursor из `?cursor` или `Last-Event-ID`, keepalive, завершение потока на терминальном событии |
 
 Ключевые семантики:
@@ -62,6 +62,8 @@
 - **Cancel ≠ stopped** (AC-67): `stop_pending` (HTTP 202) отличается от `stopped`; stale `ownerGeneration` → 409 `STALE_OWNER_GENERATION` без изменения статуса (fencing slice-1).
 - **Recovery API-сессии** (P06): после рестарта клиент дочитывает status/events/receipt без rerun; orphan помечается `connection_lost`, погибший worker — `failed` c `WORKER_CRASH`; ни один путь не запускает вторую копию.
 - `awaiting_user` входит в контракт состояний, но standalone adapter его не производит (durable prompt+response — control plane, P12).
+- **Декларация вместо догадок**: `GET /v1/capabilities` возвращает поддержку контракта — `engineResume: unsupported`, `awaitingUserInput: unsupported`, `autoRerunOnDisconnect: false`, `continuation.policy: new_run_same_user_task` (новая попытка = новый `runId`, тот же `userTaskId`/`conversationId`, сохранённые данные — `run_result`/`run_events`/`run_artifacts`). `status` отдаёт `conversationId`, чтобы приёмник проверял этот инвариант, а не полагался на свою память.
+- **Ссылки на артефакты рана**: `GET /v1/runs/{id}/artifacts` — манифесты своего `profileId`, переживают рестарт процесса (шаг 4 «результат и ссылки на артефакты»).
 
 ### Что покрыто тестами
 
@@ -74,6 +76,7 @@
 - [x] Structured outcomes: missing key, bad spec, budget/credentials denied — `test/api-service.test.ts`, `test/api-http.test.ts`
 - [x] `connection_lost` ≠ failed; cancel requested ≠ stopped — `test/api-service.test.ts`, `test/api-http.test.ts`
 - [x] Два principals изолированы (read/cancel чужого run → 404) — `test/api-service.test.ts`
+- [x] Декларация контракта (`/v1/capabilities`), ссылки на артефакты рана (переживают restart), инвариант попытки (новый `runId`, тот же `userTaskId`/`conversationId`, `TASK_ATTEMPT_ACTIVE`) — `test/api-contract-readiness.test.ts`
 
 ## E2E acceptance loop (issue #2)
 

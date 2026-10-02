@@ -88,10 +88,51 @@ Exit codes: `0` успех · `1` ошибка API/сети · `2` ошибка 
 | Метод | Путь | Auth |
 |---|---|---|
 | GET | `/healthz` | не нужен |
+| GET | `/v1/capabilities` | Bearer (любой валидный ключ) — декларация возможностей |
 | POST | `/v1/runs` (нужен `Idempotency-Key`) | Bearer + `runs:write` |
 | GET | `/v1/runs/{id}/status`, `/events` (SSE при `Accept: text/event-stream`), `/result` | Bearer + `runs:read` |
+| GET | `/v1/runs/{id}/artifacts` | Bearer + `runs:read` (манифесты только своего `profileId`) |
 | POST | `/v1/runs/{id}/cancel` | Bearer + `runs:write` |
 | GET | `/v1/artifacts/{id}[?t=share-token]`, `…/meta`, алиас `/artifact/{id}` | share-токен **или** Bearer + `runs:read` + совпадение `profileId` |
+
+### Декларация возможностей (`GET /v1/capabilities`)
+
+Приёмник (control plane) читает её вместо догадок о том, что умеет Runner — требование
+`SERVERLESS-AGENT-API.md` («resume/checkpoint возможности не объявляются универсальными»):
+
+```jsonc
+{
+  "schemaVersion": 1,
+  "contract": { "name": "ai-agent-runner/serverless-agent-api", "version": 1 },
+  "idempotency": { "header": "Idempotency-Key", "repeatWithSameKey": "same_receipt", "newAttemptRequires": "new_idempotency_key" },
+  "states": ["queued", "starting", "running", "awaiting_user", "finalizing", "succeeded", "failed", "cancelled"],
+  "events": { "cursor": true, "replay": true, "sse": true, "lastEventId": true },
+  "disconnect": { "connectionLostIsNotFailed": true, "autoRerunOnDisconnect": false, "outcomeUnknown": true },
+  "interaction": {
+    "awaitingUserInput": "unsupported",     // ожидание ведёт control plane, не Runner
+    "engineResume": "unsupported",          // --resume движка не поддержан
+    "continuation": {                        // продолжение = НОВАЯ ПОПЫТКА, не повтор всей задачи
+      "policy": "new_run_same_user_task",
+      "userTaskIdStable": true,
+      "conversationIdStable": true,
+      "savedDataRefs": ["run_result", "run_events", "run_artifacts"]
+    }
+  },
+  "artifacts": { "listPerRun": true, "download": true, "shareLink": true, "ingestEndpoint": "absent", "ingestNote": "…" },
+  "cancel": { "requestedReceipt": true, "terminalConfirmation": true },
+  "engines": ["fake", "opencode"]
+}
+```
+
+Дополнительно, что видно из ответов и важно для приёмника:
+
+- `status` возвращает `conversationId` — приёмник проверяет инвариант продолжения
+  «новая попытка = новый `runId`, тот же `userTaskId` и тот же `conversationId`, `ownerGeneration` +1»
+  (`test/api-contract-readiness.test.ts`);
+- одна активная попытка на задачу: `submit` с новым ключом при активной попытке → `409 TASK_ATTEMPT_ACTIVE`
+  (никаких параллельных ран одной задачи);
+- `GET /v1/runs/{id}/artifacts` — ссылки на артефакты рана для шага 4 «результат и ссылки на артефакты»;
+  манифесты фильтруются по `profileId` принципала, переживают restart процесса.
 
 ## Смоук на живой VM — факты прогона
 

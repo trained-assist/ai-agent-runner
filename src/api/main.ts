@@ -141,7 +141,7 @@ async function main(): Promise<void> {
   const recovery = await service.recover();
 
   const artifactDeps: ArtifactRouteDeps = { artifacts, keys, tokens, logger: log };
-  const apiServer = createAgentApiServer(service, { keys, logger: log });
+  const apiServer = createAgentApiServer(service, { keys, logger: log, artifacts });
 
   const server: Server = createServer((req, res) => {
     handleArtifactRequest(req, res, artifactDeps)

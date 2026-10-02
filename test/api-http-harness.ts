@@ -12,21 +12,25 @@ import { createAgentApiServer } from '../src/api/server.js';
 import { AgentApi, type AgentApiOptions, type ServiceRecoveryReport } from '../src/api/service.js';
 import { FaultRegistry } from '../src/faults/registry.js';
 import { isTerminalState } from '../src/runner/state-machine.js';
+import type { ArtifactStore } from '../src/storage/artifact-store.js';
 import { removeDirWithRetry } from './helpers.js';
 
 export const alphaKey = generateApiKey();
 export const betaKey = generateApiKey();
 export const readerKey = generateApiKey();
+export const noScopeKey = generateApiKey();
 
 export const alphaPrincipal: Principal = { principalId: 'p-alpha', profileId: 'profile-a', scopes: ['runs:read', 'runs:write'], engines: ['fake'] };
 export const betaPrincipal: Principal = { principalId: 'p-beta', profileId: 'profile-b', scopes: ['runs:read', 'runs:write'] };
 export const readerPrincipal: Principal = { principalId: 'p-reader', profileId: 'profile-r', scopes: ['runs:read'] };
+export const noScopePrincipal: Principal = { principalId: 'p-noscope', profileId: 'profile-a', scopes: [] };
 
 export function testKeyRegistry(): KeyRegistry {
   return KeyRegistry.fromRecords([
     keyRecordFor(alphaKey, alphaPrincipal),
     keyRecordFor(betaKey, betaPrincipal),
     keyRecordFor(readerKey, readerPrincipal),
+    keyRecordFor(noScopeKey, noScopePrincipal),
   ]);
 }
 
@@ -49,6 +53,10 @@ export interface HttpHarnessOptions {
   streamPollMs?: number;
   keepaliveMs?: number;
   maxBodyBytes?: number;
+  /** Artifact store для маршрута GET /v1/runs/{id}/artifacts (общий с AgentApi rootDir). */
+  artifacts?: ArtifactStore;
+  /** Свой dataDir вместо временного — нужен, когда store создаётся снаружи на том же корне. */
+  rootDir?: string;
 }
 
 export interface HttpHarness {
@@ -73,7 +81,7 @@ async function shutdown(server: Server): Promise<void> {
 }
 
 export async function startHttpHarness(options: HttpHarnessOptions = {}): Promise<HttpHarness> {
-  const rootDir = mkdtempSync(join(tmpdir(), 'ai-agent-runner-api-http-'));
+  const rootDir = options.rootDir ?? mkdtempSync(join(tmpdir(), 'ai-agent-runner-api-http-'));
   const fake = new FakeEngine(options.scenario ?? 'success');
   const faults = new FaultRegistry();
   const logs: Record<string, unknown>[] = [];
@@ -96,7 +104,8 @@ export async function startHttpHarness(options: HttpHarnessOptions = {}): Promis
 
   let service = new AgentApi(serviceOptions);
   await service.recover();
-  let server = createAgentApiServer(service, { keys, logger, streamPollMs, keepaliveMs, maxBodyBytes });
+  const serverOptions = { keys, logger, streamPollMs, keepaliveMs, maxBodyBytes, ...(options.artifacts ? { artifacts: options.artifacts } : {}) };
+  let server = createAgentApiServer(service, serverOptions);
   let port = await listen(server);
 
   const harness: HttpHarness = {
@@ -124,7 +133,7 @@ export async function startHttpHarness(options: HttpHarnessOptions = {}): Promis
       for (const victim of victims) await waitForProcessDeath(victim.pgid, victim.pid, 3000);
       service = new AgentApi(serviceOptions);
       const report = await service.recover();
-      server = createAgentApiServer(service, { keys, logger, streamPollMs, keepaliveMs, maxBodyBytes });
+      server = createAgentApiServer(service, serverOptions);
       port = await listen(server);
       return report;
     },

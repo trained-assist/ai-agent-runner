@@ -10,11 +10,15 @@ import type { LogSink } from '../runner/scoped-log.js';
 import { isTerminalState } from '../runner/state-machine.js';
 import type { Principal } from './auth.js';
 import {
+  API_CAPABILITIES_SCHEMA_VERSION,
+  API_CONTRACT_VERSION,
+  API_RUN_STATES,
   newApiId,
   submitPayloadHash,
   validateCancelRequest,
   validateIdempotencyKey,
   validateSubmitRequest,
+  type ApiCapabilities,
   type EventsPage,
   type RunStatusView,
   type SubmitRequest,
@@ -217,6 +221,7 @@ export class AgentApi {
       return {
         requestId: record.requestId,
         userTaskId: record.userTaskId,
+        conversationId: record.spec.conversationId,
         runId,
         ownerGeneration: record.ownerGeneration,
         state: 'queued',
@@ -230,6 +235,7 @@ export class AgentApi {
     return {
       requestId: record.requestId,
       userTaskId: record.userTaskId,
+      conversationId: record.spec.conversationId,
       runId,
       ownerGeneration: snapshot.ownerGeneration,
       state: snapshot.state,
@@ -238,6 +244,44 @@ export class AgentApi {
       observedAt: snapshot.updatedAt,
       sequence: snapshot.sequence,
       fencing: { rejected: snapshot.fencing.rejected },
+    };
+  }
+
+  /**
+   * Декларация возможностей развёрнутого Runner (см. ApiCapabilities): приёмник читает её
+   * вместо догадок о resume/awaiting_user и о правилах новой попытки.
+   */
+  capabilities(): ApiCapabilities {
+    return {
+      schemaVersion: API_CAPABILITIES_SCHEMA_VERSION,
+      contract: { name: 'ai-agent-runner/serverless-agent-api', version: API_CONTRACT_VERSION },
+      idempotency: {
+        header: 'Idempotency-Key',
+        repeatWithSameKey: 'same_receipt',
+        newAttemptRequires: 'new_idempotency_key',
+      },
+      states: API_RUN_STATES,
+      events: { cursor: true, replay: true, sse: true, lastEventId: true },
+      disconnect: { connectionLostIsNotFailed: true, autoRerunOnDisconnect: false, outcomeUnknown: true },
+      interaction: {
+        awaitingUserInput: 'unsupported',
+        engineResume: 'unsupported',
+        continuation: {
+          policy: 'new_run_same_user_task',
+          userTaskIdStable: true,
+          conversationIdStable: true,
+          savedDataRefs: ['run_result', 'run_events', 'run_artifacts'],
+        },
+      },
+      artifacts: {
+        listPerRun: true,
+        download: true,
+        shareLink: true,
+        ingestEndpoint: 'absent',
+        ingestNote: 'artifacts are registered out-of-band (slice D2: POST /v1/artifacts)',
+      },
+      cancel: { requestedReceipt: true, terminalConfirmation: true },
+      engines: Object.keys(this.opts.adapters).sort(),
     };
   }
 
