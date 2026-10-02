@@ -75,4 +75,31 @@ node scripts/m1-step7-conversation-e2e.mjs \
 `--restart-mode none --no-artifact` (без systemd и без `dist/`) и фиксирует инварианты: пять ходов одной
 conversation, awaiting input израсходован один раз, продолжение = новый `runId` с тем же
 `userTaskId`/`conversationId`, ключи событий в каждом ходе, credentials отсутствуют в отчёте и stdout.
+Отдельно покрыта resume-ветка: `--resume` без записи `begin` отклоняется (exit 2), а по журналу
+завершённого прогона восстанавливает `conversationId` (а значит и idempotency-ключи).
+
 Управляемый сбой и артефакт проверяются на песочной VM (root + `--repo-dir` с `dist/`).
+
+## Прогоны на песочной VM (02.10.2026, main)
+
+| Режим | Результат | Отчёт |
+|---|---|---|
+| `--restart-mode service` (рестарт `agent-runner-api` посреди попытки хода 3) | **PASS 23/23** | `/var/lib/agent-runner/step7-report-04.json` |
+| `--restart-mode vm` (полный `systemctl reboot` + `--resume` после загрузки) | **PASS 21/21** | `/var/lib/agent-runner/step7-report-07.json` |
+
+Прогон `vm`: рестарт VM посреди попытки `run_193be778…` → после загрузки ран терминален
+(`failed`/`WORKER_CRASH`), replay событий полный (`claimed→materialized→started→log→exit→finalizing→failed`,
+`claimed` ровно один), повтор submit = тот же `runId` (`deduplicated: true`); продолжение — **новая
+попытка** `run_4762fa19…` (тот же `userTaskId`/`conversationId`, `ownerGeneration+1`, `succeeded`);
+ожидание `await-3c114c5d` закрыто ровно один раз этой попыткой; артефакт `art-7a48d97c…`
+(sha256 `2689367b…`) виден в `GET /v1/runs/{id}/artifacts` после восстановления, байты совпадают с
+манифестом, share-ссылка отдаёт байты без ключа. Сырой API-ключ: 0 вхождений в отчёте, журнале и
+journalctl; share-токен в отчёт не пишется.
+
+**Что сценарий выловил на живой VM (и почему важно гонять его, а не только тест):** за итерацию были
+найдены и исправлены четыре дефекта сценария, которые юнит-тест в режиме `none` не заходил —
+`ReferenceError` в ветке сброса, конфликт ключей при перезапуске, смена fake-сценария без рестарта
+сервиса, проба дедупа с другим payload и потеря идентичности прогона при `--resume`. Три из них
+закрыты регрессиями в CI. Продуктовый код при этом не менялся: все четыре раза поведение API было
+корректным.
+
