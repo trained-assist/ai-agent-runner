@@ -437,7 +437,18 @@ async function main() {
   const conn = connection();
   const reportPath = resolve(opts.report ?? join(process.cwd(), 'm1-step7-report.json'));
   journalPath = resolve(opts.journal ?? `${reportPath}.journal.jsonl`);
-  const conversationId = opts.conversation ?? `conv-step7-${randomBytes(4).toString('hex')}`;
+  // Журнал читаем до вычисления conversationId: при --resume идентичность прогона
+  // (conversationId, а значит и все idempotency-ключи) восстанавливается ИЗ ЖУРНАЛА,
+  // иначе проба «потерянный ответ» ушла бы с чужим ключом и создала второй ран.
+  const journal = opts.resume ? journalRead() : [];
+  const journalBegin = journal.find((entry) => entry.event === 'begin');
+  if (opts.resume && !journalBegin) {
+    // продолжать нечего: без begin в журнале мы бы молча начали НОВЫЙ разговор с новыми
+    // idempotency-ключами и потеряли связь с прерванной попыткой
+    usageExit(`--resume: в журнале ${journalPath} нет записи begin — нечего продолжать (запустите сценарий заново без --resume)`);
+  }
+  const conversationId =
+    (opts.resume ? journalBegin?.conversationId : undefined) ?? opts.conversation ?? `conv-step7-${randomBytes(4).toString('hex')}`;
   const idem = makeKeyFactory(conversationId);
   const report = {
     schemaVersion: 1,
@@ -460,6 +471,16 @@ async function main() {
 
   const caps = await capabilities(conn);
   report.capabilities = redact(caps);
+  if (!opts.resume) {
+    journalWrite({ event: 'begin', conversationId, options: report.options });
+  } else {
+    report.turns = journal.filter((entry) => entry.event === 'turn').map((entry) => entry.record);
+    report.awaitingInput = journal.find((entry) => entry.event === 'awaiting_input')?.awaitingInput ?? null;
+    report.controlledFailure = journal.find((entry) => entry.event === 'controlled_failure')?.controlledFailure ?? null;
+    const replayed = journal.find((entry) => entry.event === 'turn' && entry.record?.replayPrompt);
+    if (replayed) attemptB1Payload = replayed.record.replayPrompt;
+    check('resume: журнал прочитан, conversationId восстановлен', conversationId === journalBegin?.conversationId, conversationId);
+  }
   check('capabilities: engineResume объявлен unsupported (продолжение = новая попытка)', caps.interaction?.engineResume === 'unsupported', caps.interaction?.engineResume);
   check('capabilities: авто-rerun при потере связи выключен', caps.disconnect?.autoRerunOnDisconnect === false);
   check('capabilities: continuation policy = new_run_same_user_task', caps.interaction?.continuation?.policy === 'new_run_same_user_task');
@@ -547,14 +568,7 @@ async function main() {
     journalWrite({ event: 'awaiting_input', awaitingInput: report.awaitingInput });
     console.log(`  ожидание открыто: ${report.awaitingInput.awaitingInputId}`);
   } else {
-    const journal = journalRead();
-    for (const entry of journal) {
-      if (entry.event === 'turn') report.turns.push(entry.record);
-      if (entry.event === 'awaiting_input') report.awaitingInput = entry.awaitingInput;
-      if (entry.event === 'controlled_failure') report.controlledFailure = entry.controlledFailure;
-      if (entry.event === 'turn' && entry.record?.replayPrompt) attemptB1Payload = entry.record.replayPrompt;
-    }
-    check('resume: журнал прогресса прочитан', report.turns.length > 0, `ходов в журнале: ${report.turns.length}`);
+    check('resume: ходы 1–2 восстановлены из журнала', report.turns.length >= 2, `ходов в журнале: ${report.turns.length}`);
   }
 
   // ---------------------------------------------------------------- ход 3: ответ + управляемый сбой посреди попытки
