@@ -1,6 +1,7 @@
 import { join } from 'node:path';
 import type { EngineAdapter } from '../adapters/engine/engine-adapter.js';
 import { killProcessTree } from '../adapters/engine/process-tree.js';
+import type { BlobStore } from '../storage/blob-store.js';
 import type { RunResult } from '../contracts/result.js';
 import { stripRepositoryToken, validateRunSpec, type InputSpec, type RunSpec } from '../contracts/run-spec.js';
 import type { FaultRegistry } from '../faults/registry.js';
@@ -34,6 +35,8 @@ export interface AgentApiOptions {
   logger?: ApiLogger;
   heartbeatIntervalMs?: number;
   cancelGraceMs?: number;
+  /** Профильное хранилище для следов задач (profiles/<id>/trace.jsonl) — см. RunnerOptions.blob. */
+  blob?: BlobStore;
 }
 
 export interface ServiceRecoveryReport extends RecoveryReport {
@@ -62,6 +65,7 @@ export class AgentApi {
       adapters: options.adapters,
     };
     if (options.host) runnerOptions.host = options.host;
+    if (options.blob) runnerOptions.blob = options.blob;
     if (options.clock) runnerOptions.clock = options.clock;
     if (options.faults) runnerOptions.faults = options.faults;
     if (options.logSink) runnerOptions.logSink = options.logSink;
