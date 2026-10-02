@@ -540,6 +540,7 @@ async function main() {
 
   // ---------------------------------------------------------------- ход 3: ответ + управляемый сбой посреди попытки
   const turn3 = CONVERSATION_TURNS[2];
+  let attemptB1 = null;
   if (!opts.resume && opts.restartMode === 'none') {
     // без управляемого сбоя ход 3 — обычная попытка; явное продолжение (новая попытка) всё равно проверяем ниже
     const turn3plain = await runTurn(turn3);
