@@ -2,8 +2,13 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { TERMINAL_EVENT_TYPES } from '../contracts/events.js';
 import type { CancelReceipt } from '../runner/runner.js';
 import type { ArtifactStore } from '../storage/artifact-store.js';
+import type { RunExportStore } from '../storage/export.js';
+import type { ShareTokenIssuer } from '../storage/share.js';
+import type { UploadSessionStore } from '../storage/upload-session.js';
 import type { KeyRegistry, Principal, Scope } from './auth.js';
 import { ApiError } from './errors.js';
+import { handleExportAction, type ExportRouteDeps } from './export-route.js';
+import { handleUploadAction, handleUploadSessionAction, type UploadRouteDeps } from './upload-route.js';
 import type { AgentApi, ApiLogger } from './service.js';
 
 export interface AgentApiServerOptions {
@@ -14,6 +19,13 @@ export interface AgentApiServerOptions {
   keepaliveMs?: number;
   /** Artifact store для `GET /v1/runs/{id}/artifacts` (ссылки на артефакты рана для приёмника). */
   artifacts?: ArtifactStore;
+  /** Манифест экспорта для `GET|POST /v1/runs/{id}/export` (P07). */
+  exports?: RunExportStore;
+  /** Короткоживущие share-ссылки в представлении экспорта. */
+  tokens?: ShareTokenIssuer;
+  baseUrl?: string;
+  /** Сессии прямой загрузки артефактов для `POST|GET /v1/runs/{id}/artifacts/upload` (P08). */
+  uploads?: UploadSessionStore;
 }
 
 interface RequestContext {
@@ -97,6 +109,83 @@ export function createAgentApiServer(service: AgentApi, options: AgentApiServerO
       throw new ApiError('ROUTE_NOT_FOUND', `no route for ${path}`);
     }
 
+    if (action === 'export') {
+      const store = options.exports;
+      if (!store) throw new ApiError('ROUTE_NOT_FOUND', 'artifact export is not enabled in this deployment');
+      if (req.method !== 'GET' && req.method !== 'POST') {
+        throw new ApiError('METHOD_NOT_ALLOWED', 'run export supports GET and POST only');
+      }
+      requireScope(principal, 'runs:read');
+      // владение ран проверяется до чтения манифеста экспорта
+      service.status(principal, runId);
+      const body = req.method === 'POST' ? await readJsonBody(req, maxBodyBytes) : {};
+      const deps: ExportRouteDeps = { service, exports: store, keys: options.keys };
+      if (options.tokens) deps.tokens = options.tokens;
+      if (options.baseUrl !== undefined) deps.baseUrl = options.baseUrl;
+      const { status, view } = await handleExportAction(deps, principal, runId, req.method, body);
+      logger({
+        event: 'run_export',
+        method: req.method,
+        runId,
+        userTaskId: view.userTaskId,
+        profileId: view.profileId,
+        exportVersion: view.version,
+        exportStatus: view.status,
+        exportPartial: view.partial,
+        cleanup: view.cleanup.decision,
+        retained: view.cleanup.retained.length,
+        reason: view.status === 'complete' ? 'export_committed' : 'export_incomplete',
+      });
+      sendJson(res, status, view);
+      return status;
+    }
+
+    if (action === 'upload') {
+      const store = options.uploads;
+      if (!store) throw new ApiError('ROUTE_NOT_FOUND', 'artifact upload is not enabled in this deployment');
+      if (req.method !== 'GET' && req.method !== 'POST') {
+        throw new ApiError('METHOD_NOT_ALLOWED', 'upload session supports GET and POST only');
+      }
+      requireScope(principal, 'runs:write');
+      const deps: UploadRouteDeps = { service, uploads: store, artifacts: options.artifacts!, keys: options.keys };
+      const body = req.method === 'POST' ? await readJsonBody(req, maxBodyBytes) : {};
+      const { status, view } = await handleUploadAction(deps, principal, runId, req.method, body);
+      logger({
+        event: 'upload_session',
+        method: req.method,
+        runId,
+        userTaskId: runId,
+        profileId: principal.profileId,
+        reason: req.method === 'POST' ? 'session_created' : 'session_listed',
+      });
+      sendJson(res, status, view);
+      return status;
+    }
+
+    if (action === 'upload-session') {
+      const store = options.uploads;
+      if (!store) throw new ApiError('ROUTE_NOT_FOUND', 'artifact upload is not enabled in this deployment');
+      if (req.method !== 'GET' && req.method !== 'POST') {
+        throw new ApiError('METHOD_NOT_ALLOWED', 'upload session supports GET and POST only');
+      }
+      requireScope(principal, 'runs:write');
+      const sessionId = segments[4];
+      if (!sessionId) throw new ApiError('ROUTE_NOT_FOUND', `no route for ${path}`);
+      const deps: UploadRouteDeps = { service, uploads: store, artifacts: options.artifacts!, keys: options.keys };
+      const body = req.method === 'POST' ? await readJsonBody(req, maxBodyBytes) : {};
+      const { status, view } = await handleUploadSessionAction(deps, principal, runId, sessionId, req.method, body);
+      logger({
+        event: 'upload_session_action',
+        method: req.method,
+        runId,
+        sessionId,
+        userTaskId: sessionId,
+        profileId: principal.profileId,
+      });
+      sendJson(res, status, view);
+      return status;
+    }
+
     switch (action) {
       case 'status': {
         if (req.method !== 'GET') throw new ApiError('METHOD_NOT_ALLOWED', 'status supports GET only');
@@ -132,7 +221,27 @@ export function createAgentApiServer(service: AgentApi, options: AgentApiServerO
             userTaskId: manifest.userTaskId,
             profileId: manifest.profileId,
           }));
-        sendJson(res, 200, { runId, conversationId: status.conversationId, userTaskId: status.userTaskId, count: manifests.length, artifacts: manifests });
+        const exportManifest = options.exports?.read(runId);
+        sendJson(res, 200, {
+          runId,
+          conversationId: status.conversationId,
+          userTaskId: status.userTaskId,
+          count: manifests.length,
+          artifacts: manifests,
+          export: exportManifest
+            ? {
+                version: exportManifest.version,
+                attempts: exportManifest.attempts,
+                status: exportManifest.status,
+                partial: exportManifest.partial,
+                planned: exportManifest.totals.planned,
+                exported: exportManifest.totals.exported,
+                failed: exportManifest.totals.failed,
+                cleanup: exportManifest.cleanup.decision,
+                retained: exportManifest.cleanup.retained,
+              }
+            : null,
+        });
         return 200;
       }
       case 'events': {

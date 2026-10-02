@@ -2,6 +2,8 @@ import { join } from 'node:path';
 import type { EngineAdapter } from '../adapters/engine/engine-adapter.js';
 import { killProcessTree } from '../adapters/engine/process-tree.js';
 import type { BlobStore } from '../storage/blob-store.js';
+import type { RunExportStore } from '../storage/export.js';
+import type { UploadSessionStore } from '../storage/upload-session.js';
 import type { RunResult } from '../contracts/result.js';
 import { stripRepositoryToken, validateRunSpec, type InputSpec, type RunSpec } from '../contracts/run-spec.js';
 import type { FaultRegistry } from '../faults/registry.js';
@@ -41,6 +43,10 @@ export interface AgentApiOptions {
   cancelGraceMs?: number;
   /** Профильное хранилище для следов задач (profiles/<id>/trace.jsonl) — см. RunnerOptions.blob. */
   blob?: BlobStore;
+  /** Манифесты экспорта артефактов — см. RunnerOptions.exports (P07). */
+  exports?: RunExportStore;
+  /** Сессии прямой загрузки артефактов — см. RunnerOptions.uploads (P08). */
+  uploads?: UploadSessionStore;
 }
 
 export interface ServiceRecoveryReport extends RecoveryReport {
@@ -70,6 +76,8 @@ export class AgentApi {
     };
     if (options.host) runnerOptions.host = options.host;
     if (options.blob) runnerOptions.blob = options.blob;
+    if (options.exports) runnerOptions.exports = options.exports;
+    if (options.uploads) runnerOptions.uploads = options.uploads;
     if (options.clock) runnerOptions.clock = options.clock;
     if (options.faults) runnerOptions.faults = options.faults;
     if (options.logSink) runnerOptions.logSink = options.logSink;
@@ -279,6 +287,23 @@ export class AgentApi {
         shareLink: true,
         ingestEndpoint: 'absent',
         ingestNote: 'artifacts are registered out-of-band (slice D2: POST /v1/artifacts)',
+        export: {
+          enabled: this.opts.exports !== undefined,
+          declaredOutputs: true,
+          manifest: true,
+          partialManifestDeclared: true,
+          engineRerunOnRecommit: false,
+          soleCopyRetainedUntilDurable: true,
+        },
+        upload: {
+          enabled: this.opts.uploads !== undefined,
+          scopedSessions: true,
+          presignedUrl: true,
+          multipartResume: true,
+          abortCleanup: true,
+          maxTotalBytes: this.opts.uploads?.maxTotalBytes ?? 512 * 1024 * 1024,
+          ttlSeconds: this.opts.uploads?.ttlSeconds ?? 300,
+        },
       },
       cancel: { requestedReceipt: true, terminalConfirmation: true },
       engines: Object.keys(this.opts.adapters).sort(),

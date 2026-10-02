@@ -12,6 +12,9 @@ import { Runner, type RunnerHostInfo, type RunnerOptions, type StartReceipt } fr
 import { isTerminalState } from '../src/runner/state-machine.js';
 import type { LogSink } from '../src/runner/scoped-log.js';
 import type { BlobStore } from '../src/storage/blob-store.js';
+import { createBlobStore } from '../src/storage/create-blob-store.js';
+import { ArtifactStore } from '../src/storage/artifact-store.js';
+import { RunExportStore } from '../src/storage/export.js';
 
 let counter = 0;
 
@@ -61,6 +64,10 @@ export interface HarnessOptions {
   adapters?: Record<string, EngineAdapter>;
   blob?: BlobStore;
   profileTrace?: boolean;
+  /** Включить стадию экспорта артефактов (P07). */
+  artifactExport?: boolean;
+  /** Отключить удаление локальных копий после подтверждённого сохранения. */
+  pruneLocalCopies?: boolean;
 }
 
 export interface Harness {
@@ -68,6 +75,7 @@ export interface Harness {
   fake: FakeEngine;
   faults: FaultRegistry;
   readonly runner: Runner;
+  exports: RunExportStore | null;
   makeSpec: (over?: Partial<RunSpec>) => RunSpec;
   start: (over?: Partial<RunSpec>) => { receipt: StartReceipt; spec: RunSpec };
   reopen: () => Runner;
@@ -89,6 +97,17 @@ export function createHarness(options: HarnessOptions = {}): Harness {
   if (options.heartbeatIntervalMs !== undefined) base.heartbeatIntervalMs = options.heartbeatIntervalMs;
   if (options.blob) base.blob = options.blob;
   if (options.profileTrace !== undefined) base.profileTrace = options.profileTrace;
+  let exports: RunExportStore | null = null;
+  if (options.artifactExport) {
+    const blob = options.blob ?? createBlobStore({ backend: 'local-fs', localRoot: join(rootDir, 'blobs') });
+    if (!options.blob) base.blob = blob;
+    exports = new RunExportStore({
+      rootDir,
+      artifacts: new ArtifactStore({ rootDir, blob }),
+      ...(options.pruneLocalCopies !== undefined ? { pruneLocalCopies: options.pruneLocalCopies } : {}),
+    });
+    base.exports = exports;
+  }
 
   let runner = new Runner(base);
 
@@ -96,6 +115,7 @@ export function createHarness(options: HarnessOptions = {}): Harness {
     rootDir,
     fake,
     faults,
+    exports,
     get runner() {
       return runner;
     },

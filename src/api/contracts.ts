@@ -9,6 +9,7 @@ import {
   type CredentialBinding,
   type EngineSpec,
   type InputSpec,
+  type OutputSpec,
   type RegionConstraints,
   type RepositorySpec,
   type ResultPolicy,
@@ -33,6 +34,7 @@ export interface SubmitRequest {
   credentialBindings?: CredentialBinding[];
   budget?: BudgetSpec;
   result?: ResultPolicy;
+  outputs?: OutputSpec[];
   traceId?: string;
   instructions?: string;
   repository?: RepositorySpec;
@@ -113,6 +115,25 @@ export interface ApiCapabilities {
     shareLink: true;
     ingestEndpoint: 'absent';
     ingestNote: 'artifacts are registered out-of-band (slice D2: POST /v1/artifacts)';
+    /** Экспорт объявленных выходов рана в object storage с закоммиченным манифестом. */
+    export: {
+      enabled: boolean;
+      declaredOutputs: boolean;
+      manifest: boolean;
+      partialManifestDeclared: boolean;
+      engineRerunOnRecommit: false;
+      soleCopyRetainedUntilDurable: true;
+    };
+    /** Прямая загрузка артефактов через скопированные сессии и presigned URL. */
+    upload: {
+      enabled: boolean;
+      scopedSessions: true;
+      presignedUrl: boolean;
+      multipartResume: true;
+      abortCleanup: true;
+      maxTotalBytes: number;
+      ttlSeconds: number;
+    };
   };
   cancel: { requestedReceipt: true; terminalConfirmation: true };
   engines: string[];
@@ -133,6 +154,7 @@ const SUBMIT_KEYS = [
   'credentialBindings',
   'budget',
   'result',
+  'outputs',
   'traceId',
   'instructions',
   'repository',
@@ -174,7 +196,7 @@ export function validateSubmitRequest(input: unknown): ValidationResult<SubmitRe
     envAllowlist: input['envAllowlist'] ?? [],
     limits: input['limits'],
   };
-  for (const key of ['input', 'deadline', 'regionConstraints', 'credentialBindings', 'budget', 'result', 'traceId', 'repository'] as const) {
+  for (const key of ['input', 'deadline', 'regionConstraints', 'credentialBindings', 'budget', 'result', 'outputs', 'traceId', 'repository'] as const) {
     if (input[key] !== undefined) specLike[key] = input[key];
   }
 
@@ -196,6 +218,7 @@ export function validateSubmitRequest(input: unknown): ValidationResult<SubmitRe
   if (spec.credentialBindings !== undefined) request.credentialBindings = spec.credentialBindings;
   if (spec.budget !== undefined) request.budget = spec.budget;
   if (spec.result !== undefined) request.result = spec.result;
+  if (spec.outputs !== undefined) request.outputs = spec.outputs;
   if (spec.traceId !== undefined) request.traceId = spec.traceId;
   if (spec.repository !== undefined) request.repository = spec.repository;
   if (typeof input['userTaskId'] === 'string') request.userTaskId = input['userTaskId'];

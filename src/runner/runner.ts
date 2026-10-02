@@ -1,4 +1,5 @@
 import { mkdirSync } from 'node:fs';
+import { readFile } from 'node:fs/promises';
 import type { EngineAdapter, EngineHandle } from '../adapters/engine/engine-adapter.js';
 import { isProcessAlive, isProcessGroupAlive, killProcessGroup, killProcessTree, sleep, waitForProcessDeath } from '../adapters/engine/process-tree.js';
 import {
@@ -18,6 +19,11 @@ import { cloneRepository, resolveCloneSource } from './repository.js';
 import { ScopedEventLog, type LogSink } from './scoped-log.js';
 import { canTransition, isTerminalState, type RunState } from './state-machine.js';
 import type { BlobStore } from '../storage/blob-store.js';
+import { RunExportStore, type PlannedOutput } from '../storage/export.js';
+import type { UploadSessionStore } from '../storage/upload-session.js';
+import { artifactNameFor, mimeForName } from '../storage/export-manifest.js';
+import type { RunExportManifest } from '../storage/export-manifest.js';
+import { isRegularFile, resolveExistingInsideRoot } from '../storage/local-paths.js';
 import { profileKey } from '../storage/keys.js';
 import { redactSecrets, specHash, truncateLine } from './util.js';
 
@@ -46,6 +52,19 @@ export interface RunnerOptions {
   blob?: BlobStore;
   /** Выключить запись следов профиля, если хранилище передано по другой причине. */
   profileTrace?: boolean;
+  /**
+   * Манифесты экспорта артефактов. Экспорт объявленных выходов — отдельная стадия
+   * финализации: она не запускает движок заново, переживает рестарт воркера и
+   * повторный commit, а локальную копию удаляет только после подтверждённого
+   * сохранения в object storage (P07 / AC-76).
+   */
+  exports?: RunExportStore;
+  /**
+   * Сессии прямой загрузки артефактов (P08). Позволяют клиенту загружать
+   * артефакты напрямую в object storage через scoped upload sessions
+   * и короткоживущие signed URLs.
+   */
+  uploads?: UploadSessionStore;
 }
 
 export interface StartReceipt {
@@ -87,9 +106,23 @@ export interface RunSnapshot {
   exit: PersistedRunState['exit'];
   finalized: boolean;
   result: RunResult | null;
+  /** Снимок манифеста экспорта на момент последнего чтения (null — экспорт не открывался). */
+  export: RunExportSnapshot | null;
   fencing: { rejected: number };
   createdAt: string;
   updatedAt: string;
+}
+
+export interface RunExportSnapshot {
+  version: number;
+  attempts: number;
+  status: RunExportManifest['status'];
+  partial: boolean;
+  planned: number;
+  exported: number;
+  failed: number;
+  cleanup: RunExportManifest['cleanup']['decision'];
+  retained: string[];
 }
 
 export interface RecoveryReport {
@@ -99,6 +132,7 @@ export interface RecoveryReport {
   lost: number;
   finalizingResumed: number;
   terminal: number;
+  exportRetried: number;
 }
 
 interface InternalRun {
@@ -179,6 +213,7 @@ export class Runner {
       exit: st.exit ? { ...st.exit } : null,
       finalized: st.finalized,
       result: st.result ? { ...st.result } : null,
+      export: this.exportSnapshot(runId),
       fencing: { rejected: st.fencing.rejected },
       createdAt: st.createdAt,
       updatedAt: st.updatedAt,
@@ -189,6 +224,22 @@ export class Runner {
     const run = this.runs.get(runId);
     if (!run) return [];
     return run.events.filter((event) => event.sequence > afterSequence);
+  }
+
+  /** Текущий манифест экспорта рана; null, если выходы не объявлялись или экспорт не открывался. */
+  exportManifest(runId: string): RunExportManifest | null {
+    if (!this.opts.exports) return null;
+    return this.opts.exports.read(runId);
+  }
+
+  /**
+   * Повторный commit экспорта без запуска движка: engine уже завершён, повторно
+   * исполнять его нельзя (P07 — «повторный commit не запускает движок заново»).
+   */
+  async recommitExport(runId: string): Promise<RunExportManifest | null> {
+    const run = this.runs.get(runId);
+    if (!run) return null;
+    return this.runExport(run.state, { force: true });
   }
 
   start(input: unknown, operationIdArg?: string): StartReceipt {
@@ -391,7 +442,7 @@ export class Runner {
   }
 
   async recover(): Promise<RecoveryReport> {
-    const report: RecoveryReport = { scanned: 0, resumedQueued: 0, orphaned: 0, lost: 0, finalizingResumed: 0, terminal: 0 };
+    const report: RecoveryReport = { scanned: 0, resumedQueued: 0, orphaned: 0, lost: 0, finalizingResumed: 0, terminal: 0, exportRetried: 0 };
     await this.fireFault('recovery');
     for (const run of [...this.runs.values()]) {
       if (this.disposed) break;
@@ -447,16 +498,21 @@ export class Runner {
           }
           if (st.workerCrashed) report.lost += 1;
           else report.finalizingResumed += 1;
+          if (this.exportManifest(st.runId)) report.exportRetried += 1;
           break;
         }
-        case 'finalizing':
+        case 'finalizing': {
+          const before = this.exportManifest(st.runId)?.version ?? null;
           try {
             await this.finalize(st.runId);
             report.finalizingResumed += 1;
+            const after = this.exportManifest(st.runId)?.version ?? null;
+            if (before !== after) report.exportRetried += 1;
           } catch {
             // export fault persists; operator or next recover retries
           }
           break;
+        }
       }
     }
     return report;
@@ -820,10 +876,138 @@ export class Runner {
       killProcessGroup(st.pgid, 'SIGKILL');
       await waitForProcessDeath(st.pgid, null, 500);
     }
-    const result = this.computeResult(st);
+    const exportManifest = await this.runExport(st);
+    const result = this.computeResult(st, exportManifest);
     await this.appendProfileTrace(st, result);
     this.persistResult(st, result);
     return result;
+  }
+
+  private exportSnapshot(runId: string): RunExportSnapshot | null {
+    const manifest = this.exportManifest(runId);
+    if (!manifest) return null;
+    return {
+      version: manifest.version,
+      attempts: manifest.attempts,
+      status: manifest.status,
+      partial: manifest.partial,
+      planned: manifest.totals.planned,
+      exported: manifest.totals.exported,
+      failed: manifest.totals.failed,
+      cleanup: manifest.cleanup.decision,
+      retained: [...manifest.cleanup.retained],
+    };
+  }
+
+  /**
+   * Стадия экспорта артефактов — отдельно от исполнения движка.
+   *
+   * Инварианты (P07 / AC-76):
+   *  - движок здесь не запускается ни при краше, ни при рестарте, ни при повторном commit;
+   *  - каждый выход сначала уезжает в object storage и проверяется чтением, и только потом
+   *    его локальная копия может быть удалена;
+   *  - сбой экспорта объявляется частичным манифестом, а не молчанием;
+   *  - прогресс и решение по очистке видны клиенту (события + манифест).
+   */
+  private async runExport(st: PersistedRunState, options: { force?: boolean } = {}): Promise<RunExportManifest | null> {
+    const exports = this.opts.exports;
+    if (!exports) return null;
+    const plan: PlannedOutput[] = (st.spec.outputs ?? []).map((output) => ({
+      path: output.path,
+      ...(output.name !== undefined ? { name: output.name } : {}),
+      ...(output.mime !== undefined ? { mime: output.mime } : {}),
+    }));
+    if (plan.length === 0 && !options.force) return null;
+
+    const previous = exports.read(st.runId);
+    if (previous && previous.status === 'complete' && !options.force) return previous;
+
+    const ctx = {
+      runId: st.runId,
+      userTaskId: st.userTaskId,
+      profileId: st.profileId,
+      ownerGeneration: st.ownerGeneration,
+    };
+    // начало попытки фиксируется на диске до загрузки байтов: рестарт видит in_progress
+    const draft = exports.begin(ctx, plan);
+
+    if (plan.length > 0) {
+      await this.fireFault('export', st.runId);
+      for (const [index, output] of plan.entries()) {
+        await this.exportOne(ctx, output, index, st.spec.cwd);
+      }
+    }
+
+    const committed = await exports.commit(ctx, { cwd: st.spec.cwd });
+    this.emit(st, 'export_committed', {
+      version: committed.version,
+      status: committed.status,
+      planned: committed.totals.planned,
+      exported: committed.totals.exported,
+      failed: committed.totals.failed,
+      cleanup: committed.cleanup.decision,
+      retained: committed.cleanup.retained.length,
+    });
+    return committed;
+  }
+
+  private async exportOne(
+    ctx: { runId: string; userTaskId: string; profileId: string; ownerGeneration: number },
+    output: PlannedOutput,
+    index: number,
+    cwd: string,
+  ): Promise<void> {
+    const exports = this.opts.exports;
+    if (!exports) return;
+    const st = this.runs.get(ctx.runId)?.state;
+    const field = `spec.outputs[${index}].path`;
+    try {
+      // граница workspace: абсолютный путь, ".." и symlink наружу отвергаются
+      const absolute = resolveExistingInsideRoot(cwd, output.path, field);
+      if (!isRegularFile(absolute)) {
+        const reason = 'declared output is not a regular file in the workspace';
+        const progress = exports.recordMissing(ctx, output.path, reason);
+        this.emitExportFailed(ctx, output.path, reason, progress.version);
+        return;
+      }
+      const bytes = await readFile(absolute);
+      const name = output.name ?? artifactNameFor(output.path);
+      const manifest = await exports.artifacts.put({
+        runId: ctx.runId,
+        userTaskId: ctx.userTaskId,
+        profileId: ctx.profileId,
+        name,
+        mime: output.mime ?? mimeForName(name),
+        bytes,
+      });
+      const progress = exports.recordExported(ctx, output.path, manifest);
+      if (st) {
+        this.emit(st, 'artifact_exported', {
+          artifactId: manifest.artifactId,
+          sourcePath: output.path,
+          size: manifest.size,
+          sha256: manifest.sha256,
+          mime: manifest.mime,
+          version: progress.version,
+        });
+      }
+    } catch (err) {
+      const reason = truncateLine(redactSecrets(err instanceof Error ? err.message : String(err)), 300);
+      const message = `${err instanceof Error && err.name ? err.name : 'Error'}: ${reason}`;
+      const progress = exports.recordFailure(ctx, output.path, message);
+      this.emitExportFailed(ctx, output.path, message, progress.version);
+    }
+  }
+
+  private emitExportFailed(
+    ctx: { runId: string },
+    sourcePath: string,
+    reason: string,
+    version: number,
+  ): void {
+    const st = this.runs.get(ctx.runId)?.state;
+    if (!st) return;
+    this.emit(st, 'export_failed', { sourcePath, reason, version });
   }
 
   /**
@@ -879,7 +1063,7 @@ export class Runner {
     }
   }
 
-  private computeResult(st: PersistedRunState): RunResult {
+  private computeResult(st: PersistedRunState, exportManifest: RunExportManifest | null = null): RunResult {
     let exitReason: RunResult['exitReason'];
     let failure: RunResult['failure'] | undefined;
 
@@ -921,6 +1105,9 @@ export class Runner {
 
     const outcome: RunResult['outcome'] = exitReason === 'completed' ? 'succeeded' : exitReason === 'cancelled' ? 'cancelled' : 'failed';
     const groupGone = !isProcessAlive(st.pid) && !isProcessGroupAlive(st.pgid);
+    const outputRefs = (exportManifest?.entries ?? [])
+      .filter((entry) => entry.status === 'exported' && entry.artifactId !== null)
+      .map((entry) => entry.artifactId as string);
 
     const result: RunResult = {
       schemaVersion: 1,
@@ -937,13 +1124,23 @@ export class Runner {
       startedAt: st.startedAt ?? st.createdAt,
       finishedAt: this.nowIso(),
       usage: { status: 'unknown' },
-      outputRefs: [],
+      outputRefs,
       persistence: 'persisted',
-      cleanup: groupGone ? 'completed' : 'pending',
+      cleanup: this.cleanupStatus(groupGone, exportManifest),
       logPath: this.store.relLogPath(st.runId),
     };
     if (failure) result.failure = failure;
     return result;
+  }
+
+  /**
+   * `cleanup: completed` означает «локальных копий, за которые мы отвечаем, не осталось».
+   * Если экспорт оставил единственную копию на диске, очистка не выдаёт себя за завершённую.
+   */
+  private cleanupStatus(groupGone: boolean, exportManifest: RunExportManifest | null): RunResult['cleanup'] {
+    if (!groupGone) return 'pending';
+    if (exportManifest && exportManifest.cleanup.decision === 'retained_sole_copy') return 'pending';
+    return 'completed';
   }
 
   private persistResult(st: PersistedRunState, result: RunResult): void {
