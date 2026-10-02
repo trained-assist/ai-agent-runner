@@ -235,6 +235,35 @@ function writeReportFile(path, report) {
   renameSync(tmp, path);
 }
 
+/**
+ * Security-пробы кладут фикстуры в mode 000 — recursive rm без возврата прав
+ * падает ENOTEMPTY/EACCES. Возвращаем владельцу права перед удалением (issue #31).
+ */
+function unlockForRemoval(path) {
+  try {
+    chmodSync(path, 0o700);
+  } catch {
+    return;
+  }
+  let entries;
+  try {
+    entries = readdirSync(path, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    const full = join(path, entry.name);
+    if (entry.isDirectory()) unlockForRemoval(full);
+    else {
+      try {
+        chmodSync(full, 0o600);
+      } catch {
+        // лучший effort
+      }
+    }
+  }
+}
+
 // ---------------------------------------------------------------- reboot resume
 
 function systemctlAvailable() {
@@ -322,7 +351,12 @@ async function rebootResume(statePath) {
   step.reproduction = pending.reproduction ?? `node scripts/e2e-loop.mjs --root ${state.rootDir} --with-reboot --only step-4b-reboot`;
   step.startedAt = Date.now();
 
-  const finish = (exitCode) => {
+  let serverExited = server.exitCode !== null || server.signalCode !== null;
+  server.on('exit', () => {
+    serverExited = true;
+  });
+
+  const finish = async (exitCode) => {
     const entry = step.finish();
     if (pendingIndex >= 0) report.steps[pendingIndex] = entry;
     else report.steps.push(entry);
@@ -330,8 +364,29 @@ async function rebootResume(statePath) {
     report.summary.finalized = true;
     report.finishedAt = new Date().toISOString();
     writeReportFile(reportPath, report);
+
+    // Сначала гасим дочерний сервер (и дожидаемся его смерти), потом чистим каталог данных:
+    // rmSync при живом сервере гоняется с его записями в store → ENOTEMPTY (issue #31).
+    try {
+      server.kill('SIGTERM');
+    } catch {
+      // child уже завершился
+    }
+    let waitDeadline = Date.now() + 3000;
+    while (!serverExited && Date.now() < waitDeadline) await sleep(25);
+    if (!serverExited) {
+      try {
+        server.kill('SIGKILL');
+      } catch {
+        // ignore
+      }
+      waitDeadline = Date.now() + 1000;
+      while (!serverExited && Date.now() < waitDeadline) await sleep(25);
+    }
+
     if (state.keepData !== true && !isInside(state.rootDir, reportPath)) {
       try {
+        unlockForRemoval(state.rootDir);
         rmSync(state.rootDir, { recursive: true, force: true });
         console.log(`каталог прогона удалён (без --keep-data): ${state.rootDir}`);
       } catch (err) {
@@ -344,8 +399,9 @@ async function rebootResume(statePath) {
     console.log('----');
     console.log(`E2E LOOP RESULT: ${report.summary.ok ? 'PASS' : 'FAIL'} ${report.summary.passed}/${report.summary.total} шагов, отчёт: ${reportPath}`);
     if (!report.summary.ok) console.log(`reproduction: ${entry.reproduction}`);
-    server.kill('SIGTERM');
-    setTimeout(() => process.exit(exitCode), 500).unref();
+    // Выходим ЯВНО с кодом шага: раньше unref-таймер + смерть дочернего процесса давали
+    // естественный exit 0 — systemd видел «успешно» при проваленном шаге (issue #31).
+    process.exit(exitCode);
   };
 
   try {
@@ -374,10 +430,14 @@ async function rebootResume(statePath) {
 
     const health = await control.health();
     step.check('admissions не выросли (нет второго run)', health.admissions === state.preReboot.admissions, `${state.preReboot.admissions}→${health.admissions}`);
+    // startsByEngine — счётчик в ПАМЯТИ процесса: после reboot он пуст у нового процесса.
+    // Сверять «до/посре» нельзя; инвариант — движок в новом процессе НЕ стартовал (нет rerun),
+    // «ровно один запуск» обеспечивают claimed ровно один + цепочка событий + одна запись в store (issue #31).
+    const postRebootStarts = health.startsByEngine['fake-timeout'] ?? 0;
     step.check(
-      'engine стартовал ровно 1 раз',
-      (health.startsByEngine['fake-timeout'] ?? 0) === state.preReboot.startsFakeTimeout,
-      `${state.preReboot.startsFakeTimeout} vs ${health.startsByEngine['fake-timeout']}`,
+      'движок не стартовал повторно после reboot',
+      postRebootStarts === 0 && state.preReboot.startsFakeTimeout >= 1,
+      `pre-reboot=${state.preReboot.startsFakeTimeout} post-reboot=${postRebootStarts}`,
     );
     step.check('ровно одна запись этого run в store', health.runsDetail.filter((entry) => entry.runId === state.runId).length === 1);
 
@@ -392,12 +452,13 @@ async function rebootResume(statePath) {
     spawnSync('systemctl', ['disable', 'e2e-loop-resume.service'], { stdio: 'ignore', timeout: 15000 });
     rmSync('/etc/systemd/system/e2e-loop-resume.service', { force: true });
     spawnSync('systemctl', ['daemon-reload'], { stdio: 'ignore', timeout: 15000 });
+    // прошлый FAIL мог оставить юнит в failed-состоянии — сбрасываем до следующего прогона
+    spawnSync('systemctl', ['reset-failed', 'e2e-loop-resume.service'], { stdio: 'ignore', timeout: 15000 });
   } catch {
     // unit cleanup is best-effort
   }
 
-  finish(step.status === 'PASS' ? 0 : 1);
-  await new Promise(() => {});
+  await finish(step.status === 'PASS' ? 0 : 1);
 }
 
 // ---------------------------------------------------------------- reboot step
@@ -747,7 +808,7 @@ async function main() {
     console.log(`  --keep-data: каталог ${rootDir} не удалён`);
   } else {
     try {
-      if (!opts.foreignProfile && existsSync(foreignProfile)) chmodSync(foreignProfile, 0o700);
+      unlockForRemoval(rootDir);
       rmSync(rootDir, { recursive: true, force: true });
     } catch (err) {
       console.error(`  не удалось удалить ${rootDir}: ${err instanceof Error ? err.message : String(err)}`);

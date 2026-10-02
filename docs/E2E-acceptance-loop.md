@@ -54,7 +54,10 @@ Exit codes: `0` — все шаги зелёные, `1` — есть FAIL, `2` �
   в `<rootDir>/e2e-loop-report.json`;
 - resume-юнит получает эти пути из `reboot-state.json`; отсутствие состояния при старте resume —
   явная ошибка с указанием на issue #6, а не stack trace ENOENT;
-- без `--keep-data` resume удаляет каталог прогона после записи отчёта (отчёт — вне каталога данных).
+- resume выходит **явно с кодом шага**: FAIL-отчёт → exit 1 юнита (systemd видит провал; раньше
+  unref-таймер + смерть дочернего процесса давали естественный exit 0 — issue #31);
+- без `--keep-data` resume сначала гасит дочерний сервер, потом удаляет каталог прогона
+  (фикс-фикстуры mode 000 поднимаются в 0700; отчёт — вне каталога данных).
 
 Повтор прогона после фикса: `./scripts/e2e-loop.sh --only step-4b-reboot --with-reboot [--keep-data]`
 из-под root; шаг входит и в полный прогон с тем же флагом (идёт последним).
@@ -125,4 +128,5 @@ scripts/e2e-loop/
 test/e2e-loop.test.ts        прогон драйвера целиком + осознанный FAIL + reboot guard
 test/e2e-loop-checks.test.ts юнит-проверки цепочек/шагов/секретов
 test/e2e-loop-persistence.test.ts юнит-проверки персистентных путей/гардов (issue #6)
+test/e2e-loop-resume.test.ts интеграция --reboot-resume: exit-код FAIL, проверки после рестарта процесса, cleanup (issue #31)
 ```
