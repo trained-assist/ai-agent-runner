@@ -110,6 +110,10 @@ describe('artifact export during finalization (P07 / AC-75, AC-76)', () => {
 
   it('краш воркера в финализации не запускает движок заново и не теряет экспорт', async () => {
     const harness = createHarness({ artifactExport: true });
+    // Детерминированно держим ран в `finalizing`: сбой экспорта (once) оставляет
+    // ран не-терминальным ровно в этой фазе. Без инжекта `finalizing` — транзитное
+    // состояние, и поллинг `waitFor` гоняет (тест был флаки в CI).
+    harness.faults.inject('export', { kind: 'throw', once: true });
     const { receipt } = harness.start({ outputs: [{ path: 'ran.txt' }] });
     await waitFor(() => harness.runner.getRun(receipt.runId)?.state === 'finalizing');
 
