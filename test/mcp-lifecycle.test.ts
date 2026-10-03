@@ -137,8 +137,11 @@ describe('mcp lifecycle: реальный вызов инструмента и s
     'инструмент вызван по-настоящему: handshake, вызов, receipt внешнего сервиса, отказы вне scope',
     async () => {
       await withRemote(async (remote) => {
+        // Каталог рана сохраняется: приёмка читает конфиг MCP и след вызовов после ранa
+        // (обычно рабочий каталог снимается вместе с уборкой — issue #52).
         const harness = createHarness({
           scenario: 'mcp-tools',
+          retainWorkspaces: true,
           capabilities: demoRegistry(remote.baseUrl),
           bindingResolver: fixtureBindingResolver({ [WRITE_BINDING]: remote.token, [READ_BINDING]: remote.token, [READONLY_BINDING]: remote.token }),
         });
@@ -228,8 +231,11 @@ describe('mcp lifecycle: реальный вызов инструмента и s
     'значения binding-ов не попадают ни в spec, ни в state, ни в логи, ни в конфиг движка',
     async () => {
       await withRemote(async (remote) => {
+        // Каталог рана сохраняется: приёмка читает конфиг MCP и след вызовов после ранa
+        // (обычно рабочий каталог снимается вместе с уборкой — issue #52).
         const harness = createHarness({
           scenario: 'mcp-tools',
+          retainWorkspaces: true,
           capabilities: demoRegistry(remote.baseUrl),
           bindingResolver: fixtureBindingResolver({ [WRITE_BINDING]: remote.token, [READ_BINDING]: remote.token, [READONLY_BINDING]: remote.token }),
         });

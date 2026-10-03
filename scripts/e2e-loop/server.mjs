@@ -95,6 +95,11 @@ const service = new AgentApi({
   faults,
   cancelGraceMs: 500,
   logger: logToStdout,
+  // Рабочие каталоги ранов в этом цикле сохраняются намеренно: шаг 6 проверяет байты и
+  // права файла, который движок создал в workspace, а маршрут /download этого harness'а
+  // читает именно его. Уборка workspace (issue #52) проверяется отдельно — на обычных
+  // настройках в тестах жизненного цикла и в пробе границы на песочной VM.
+  retainWorkspaces: true,
 });
 await service.recover();
 const keys = KeyRegistry.loadFile(keysPath);

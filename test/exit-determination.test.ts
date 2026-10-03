@@ -148,7 +148,8 @@ describe('определение выхода рана: объявленные �
       },
       'агент: ответ',
     );
-    const h = harnessWith(engine);
+    // Каталоги намеренно оставлены: проверка — про то, что НЕ попало в хранилище.
+    const h = harnessWith(engine, { retainWorkspaces: true });
     const { receipt, spec } = h.start();
     await h.runner.waitFor(receipt.runId);
 

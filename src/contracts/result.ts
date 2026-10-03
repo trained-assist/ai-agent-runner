@@ -42,8 +42,22 @@ export interface RunResult {
   failure?: RunFailure;
   usage: UsageReport;
   outputRefs: string[];
-  persistence: 'pending' | 'persisted' | 'failed';
+  /**
+   * Сохранение выходов — отдельный от движка статус (issue #52, шаг 3/5).
+   * `persisted` означает «каждый байт подтверждён чтением из долговечного хранилища»,
+   * `not_required` — выходы не объявлялись, `failed` — ни один выход не сохранён.
+   */
+  persistence: 'pending' | 'persisted' | 'failed' | 'not_required';
+  /** Причина статуса сохранения (какой выход остался единственной копией и почему). */
+  persistenceReason?: string;
+  /**
+   * Уборка чистой среды — тоже отдельный статус (issue #52, шаг 5).
+   * `completed` означает проверенный контракт уборки (каталоги и сокет рана сняты,
+   * идентичность освобождена), а НЕ отсутствие процессной группы.
+   */
   cleanup: 'pending' | 'completed' | 'failed';
+  /** Причина статуса уборки: что осталось на диске или почему слот не освобождён. */
+  cleanupReason?: string;
   logPath: string;
 }
 
@@ -78,7 +92,9 @@ const RESULT_KEYS = [
   'usage',
   'outputRefs',
   'persistence',
+  'persistenceReason',
   'cleanup',
+  'cleanupReason',
   'logPath',
 ] as const;
 
@@ -91,7 +107,8 @@ const OUTCOME_EXIT_REASONS: Record<RunOutcome, readonly ExitReason[]> = {
 export function validateRunResult(input: unknown): ValidationResult<RunResult> {
   const collector = new ErrorCollector();
   if (!checkObject(input, 'result', collector)) return collector.finish(undefined as never);
-  const required = RESULT_KEYS.filter((key) => key !== 'failure');
+  const optional = new Set(['failure', 'persistenceReason', 'cleanupReason']);
+  const required = RESULT_KEYS.filter((key) => !optional.has(key));
   checkKeys(input, RESULT_KEYS, required, 'result', collector);
 
   if (input['schemaVersion'] !== RUN_RESULT_SCHEMA_VERSION) collector.push('result.schemaVersion: expected 1');
@@ -152,11 +169,25 @@ export function validateRunResult(input: unknown): ValidationResult<RunResult> {
   if (!Array.isArray(input['outputRefs'])) collector.push('result.outputRefs: expected array');
   else input['outputRefs'].forEach((ref, i) => checkString(ref, `result.outputRefs[${i}]`, collector, 500));
 
-  if (input['persistence'] !== 'pending' && input['persistence'] !== 'persisted' && input['persistence'] !== 'failed') {
-    collector.push('result.persistence: expected pending | persisted | failed');
+  if (
+    input['persistence'] !== 'pending' &&
+    input['persistence'] !== 'persisted' &&
+    input['persistence'] !== 'failed' &&
+    input['persistence'] !== 'not_required'
+  ) {
+    collector.push('result.persistence: expected not_required | pending | persisted | failed');
   }
   if (input['cleanup'] !== 'pending' && input['cleanup'] !== 'completed' && input['cleanup'] !== 'failed') {
     collector.push('result.cleanup: expected pending | completed | failed');
+  }
+  // согласованность: сохранение обязано объясняться, иначе «почему не persisted» не прочитать
+  if (input['persistenceReason'] !== undefined) checkString(input['persistenceReason'], 'result.persistenceReason', collector, 500);
+  if (input['cleanupReason'] !== undefined) checkString(input['cleanupReason'], 'result.cleanupReason', collector, 500);
+  if (input['persistence'] === 'failed' && typeof input['cleanupReason'] !== 'string') {
+    collector.push('result.cleanupReason: a failed persistence must carry the cleanup reason');
+  }
+  if (input['cleanup'] === 'completed' && typeof input['cleanupReason'] !== 'string') {
+    collector.push('result.cleanupReason: a completed cleanup must state what was verified');
   }
   checkString(input['logPath'], 'result.logPath', collector, 500);
 

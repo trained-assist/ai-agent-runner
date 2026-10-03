@@ -112,7 +112,9 @@ function validResult(over: Record<string, unknown> = {}): Record<string, unknown
     usage: { status: 'unknown' },
     outputRefs: [],
     persistence: 'persisted',
+    persistenceReason: '1/1 output(s) verified by read-back from durable storage',
     cleanup: 'completed',
+    cleanupReason: 'clean room lease released and every run directory is gone',
     logPath: 'runs/run-1/events.jsonl',
     ...over,
   };

@@ -49,6 +49,8 @@ describe('runner lifecycle', () => {
       'agent_exit_resolved',
       // Намерение уборки записано до самой уборки (issue #52, шаг 4).
       'checkpoint_written',
+      // Сам sweep с числом снятых каталогов — после намерения, до терминального события.
+      'log',
       'succeeded',
     ]);
     const resolved = events.find((event) => event.type === 'agent_exit_resolved');
@@ -90,14 +92,20 @@ describe('runner lifecycle', () => {
     expect(envKeys).not.toContain('PATH');
     delete process.env['AIR_TEST_FORBIDDEN'];
 
-    expect(existsSync(join(spec.cwd, 'ran.txt'))).toBe(true);
+    // Каталог рана снят вместе с уборкой (issue #52), а результат и лог — нет.
+    expect(existsSync(spec.cwd)).toBe(false);
 
     const stored = JSON.parse(readFileSync(join(h.rootDir, 'runs', receipt.runId, 'result.json'), 'utf8')) as unknown;
     expect(validateRunResult(stored).ok).toBe(true);
+    const status = stored as { cleanup: string; cleanupReason: string; persistence: string };
+    expect(status.cleanup).toBe('completed');
+    expect(status.cleanupReason).toContain('workspace');
   });
 
   it('two runs keep separate workspaces and separate log files', async () => {
-    const h = createHarness({ scenario: 'success' });
+    // retainWorkspaces: тест читает содержимое обоих рабочих каталогов после ранов
+    // (обычно каталоги снимаются вместе с уборкой чистой среды — issue #52).
+    const h = createHarness({ scenario: 'success', retainWorkspaces: true });
     const first = h.start();
     const second = h.start();
     await h.runner.waitFor(first.receipt.runId);
