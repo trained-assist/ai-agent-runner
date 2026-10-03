@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { isProcessAlive, sleep } from '../src/adapters/engine/process-tree.js';
@@ -218,5 +218,34 @@ describe('accepted requests survive an api restart (P06)', () => {
     expect(h.fake.startCalls).toBe(1);
     await sleep(100);
     expect(h.fake.startCalls).toBe(1);
+  });
+
+  it('kill -9 между записью события и state.json не оставляет дыру в нумерации replay', async () => {
+    const h = await startHttpHarness({ scenario: 'timeout' });
+    const submit = await postSubmit(h.base, alphaKey, 'idem-seq-window', submitBody({ userTaskId: 'task-seq-window', limits: { timeoutMs: 60000 } }));
+    const receipt = (await submit.json()) as { runId: string };
+    await waitFor(async () => {
+      const response = await getStatus(h.base, alphaKey, receipt.runId);
+      return ((await response.json()) as { state: string }).state === 'running';
+    }, 8000, 'run to be running');
+
+    // Окно аварии: событие уже в журнале, а state.json с его счётчиком — ещё нет.
+    // Воспроизводится ровно это состояние, иначе дыра появляется только по таймингу.
+    const statePath = join(h.rootDir, 'runs', receipt.runId, 'state.json');
+    const eventsPath = join(h.rootDir, 'runs', receipt.runId, 'events.jsonl');
+    const persisted = JSON.parse(readFileSync(statePath, 'utf8')) as { sequence: number };
+    const logged = readFileSync(eventsPath, 'utf8')
+      .split('\n')
+      .filter((line) => line.trim() !== '')
+      .map((line) => JSON.parse(line) as { sequence: number });
+    const lastSequence = logged[logged.length - 1]!.sequence;
+    expect(persisted.sequence).toBe(lastSequence);
+    writeFileSync(statePath, `${JSON.stringify({ ...persisted, sequence: lastSequence - 1 })}\n`);
+
+    await h.restart({ killProcesses: true });
+    const after = await fetch(`${h.base}/v1/runs/${receipt.runId}/events?cursor=0`, { headers: authHeader(alphaKey) });
+    const page = (await after.json()) as { events: Array<{ type: string; sequence: number }> };
+    expect(page.events.map((event) => event.sequence)).toEqual(page.events.map((_event, index) => index + 1));
+    expect(new Set(page.events.map((event) => event.sequence)).size).toBe(page.events.length);
   });
 });

@@ -290,9 +290,18 @@ export class Runner {
     for (const runId of this.store.listRunIds()) {
       const state = this.store.loadState(runId);
       if (!state) continue;
+      const events = this.store.readEvents(runId);
+      // state.json мог отстать от журнала (kill -9 между append и saveState): счётчик
+      // обязан опираться на журнал, иначе следующее событие получило бы уже занятую
+      // версию и в replay появилась бы дубликат.
+      const lastSequence = events.length > 0 ? events[events.length - 1]!.sequence : 0;
+      if (lastSequence > state.sequence) {
+        state.sequence = lastSequence;
+        this.store.saveState(state);
+      }
       this.runs.set(runId, {
         state,
-        events: this.store.readEvents(runId),
+        events,
         waiters: [],
         handle: null,
         timers: [],
@@ -801,10 +810,15 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
   private appendEvent(st: PersistedRunState, event: RunnerEvent): void {
     const run = this.runs.get(st.runId);
     run?.events.push(event);
+    // Журнал событий ДО state.json: иначе kill -9 между двумя записями оставлял бы
+    // state.sequence впереди журнала, и после рестарта в replay навсегда оставалась бы
+    // дыра в нумерации (счётчик продолжил бы с версии из state, а события той версии
+    // в файле уже нет). Порядок «сначала журнал, потом state» даёт обратное окно —
+    // state может отстать, но не перегнать журнал; счётчик на старте сверяется с журналом.
+    this.eventLog.append(this.store.logPath(st.runId), event);
     st.sequence = event.sequence;
     st.updatedAt = this.nowIso();
     this.store.saveState(st);
-    this.eventLog.append(this.store.logPath(st.runId), event);
   }
 
   private async fireFault(point: FaultPoint, runId?: string): Promise<void> {
