@@ -175,6 +175,20 @@ export interface ApiCapabilities {
     partitionIsNotFailover: true;
     retentionPolicy: { mainEventsDays: number; verboseLogsDays: number } | null;
     releaseEndpoint: string;
+    /**
+     * Размещение (P30): регион × провайдер × credentials × резидентность. null = политика
+     * не подключена, региональных ограничений у воркера нет.
+     */
+    placement: {
+      policyId: string;
+      authority: 'sandbox_probe' | 'owner_decision';
+      workerRegion: string;
+      allowedEngines: string[];
+      dataResidencyDecided: boolean;
+      dataResidencyDecisionRef: string | null;
+      checkedBefore: 'paid_profile_and_cohort';
+      runnerRechecksEngineRegion: true;
+    } | null;
   };
   engines: string[];
 }

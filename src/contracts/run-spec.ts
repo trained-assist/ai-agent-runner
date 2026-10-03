@@ -12,6 +12,7 @@ import {
   type ValidationResult,
 } from './validate.js';
 import { isSafeRelativePath } from '../storage/local-paths.js';
+import { isRegionId } from '../release/placement.js';
 
 export const RUN_SPEC_CONTRACT_VERSION = 1 as const;
 
@@ -78,6 +79,12 @@ export interface BudgetSpec {
 
 export interface RegionConstraints {
   allowedRegions?: string[];
+  /**
+   * Где должны оставаться данные рана (`sandbox-ru`, `sandbox-eu`, …) или `none`, если
+   * требования к резидентности нет. Решение о хранении утверждается отдельно (P30): пока
+   * оно не принято, такой ран отказывается с DATA_RESIDENCY_UNDECIDED, а не угадывает регион.
+   */
+  dataResidency?: string;
 }
 
 export interface RepositorySpec {
@@ -552,7 +559,7 @@ export function validateRunSpec(input: unknown): ValidationResult<RunSpec> {
   if ('regionConstraints' in input && input['regionConstraints'] !== undefined) {
     const rc = input['regionConstraints'];
     if (checkObject(rc, 'spec.regionConstraints', collector)) {
-      checkKeys(rc, ['allowedRegions'], [], 'spec.regionConstraints', collector);
+      checkKeys(rc, ['allowedRegions', 'dataResidency'], [], 'spec.regionConstraints', collector);
       if (rc['allowedRegions'] !== undefined) {
         const list = rc['allowedRegions'];
         if (checkArray(list, 'spec.regionConstraints.allowedRegions', collector)) {
@@ -561,8 +568,16 @@ export function validateRunSpec(input: unknown): ValidationResult<RunSpec> {
             checkString(entry, `spec.regionConstraints.allowedRegions[${i}]`, collector, 50);
             if (typeof entry === 'string') allowed.push(entry);
           });
-          regionConstraints = { allowedRegions: allowed };
+          regionConstraints = { ...(regionConstraints ?? {}), allowedRegions: allowed };
         }
+      }
+      if (rc['dataResidency'] !== undefined) {
+        const residency = rc['dataResidency'];
+        checkString(residency, 'spec.regionConstraints.dataResidency', collector, 50);
+        if (typeof residency === 'string' && residency !== 'none' && !isRegionId(residency)) {
+          collector.push('spec.regionConstraints.dataResidency: expected a region id like "sandbox-ru" or "none"');
+        }
+        if (typeof residency === 'string') regionConstraints = { ...(regionConstraints ?? {}), dataResidency: residency };
       }
     }
   }

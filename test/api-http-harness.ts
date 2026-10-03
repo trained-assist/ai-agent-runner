@@ -63,6 +63,8 @@ export interface HttpHarnessOptions {
   capabilities?: CapabilityRegistry;
   /** Резолвер значений credential binding'ов (P13). */
   bindingResolver?: BindingValueResolver;
+  /** Регион воркера (P30): по умолчанию sandbox-eu; для симуляции двух воркеров задаётся явно. */
+  hostRegion?: string;
   /**
    * Промоушен-контур (P29). Фабрика, а не готовый объект: рестарт сервиса должен заново
    * прочитать файл состояния релиза — иначе откат нельзя было бы проверить перезапуском.
@@ -106,7 +108,7 @@ export async function startHttpHarness(options: HttpHarnessOptions = {}): Promis
   const serviceOptions: AgentApiOptions = {
     rootDir,
     adapters: { fake, opencode: new OpenCodeAdapter() },
-    host: { region: 'sandbox-eu', environment: 'sandbox' },
+    host: { region: options.hostRegion ?? 'sandbox-eu', environment: 'sandbox' },
     faults,
     cancelGraceMs: 500,
     logger,

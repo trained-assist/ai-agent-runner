@@ -16,6 +16,8 @@ export const PROMOTION_EVENT_KINDS = [
   'rollback',
   'rollback_resumed',
   'admission_refused',
+  'placement_admitted',
+  'placement_refused',
   'drain',
   'failover',
   'fenced',
