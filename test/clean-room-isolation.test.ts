@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHarness, waitFor } from './helpers.js';
@@ -19,7 +19,7 @@ import { Runner } from '../src/runner/runner.js';
 import { BRIDGE_SOCKET_PATH_LIMIT, bridgeSocketPath } from '../src/mcp/bridge.js';
 import { UnixCleanRoomProvider } from '../src/isolation/clean-room.js';
 import { detectHostIsolationCapabilities, hostCapabilitySkipReason } from '../src/isolation/host-capabilities.js';
-import { RUN_ISOLATION_SCHEMA_VERSION, type CleanRoomLeaseStatus, type CleanRoomProvider } from '../src/isolation/contract.js';
+import { RUN_ISOLATION_SCHEMA_VERSION, type CleanRoomLeaseStatus, type CleanRoomProvider, type RunIdentity } from '../src/isolation/contract.js';
 import type { Principal } from '../src/api/auth.js';
 import type { Harness, HarnessOptions } from './helpers.js';
 
@@ -537,6 +537,86 @@ it('единственная копия выхода: workspace остаётся
  * Реестр слотов настоящего провайдера: без привилегий рана не запустить, но правило
  * «закрытая аренда освобождает слот» проверяется целиком — это чистый ввод/вывод.
  */
+/** Лаунчер, который только записывает вызов и ничего не выполняет: уборку проверяем отдельно. */
+function recordingNoopLauncher(calls: Array<{ identity: RunIdentity; command: string; args: string[] }>) {
+  return {
+    kind: 'setpriv' as const,
+    wrap(identity: RunIdentity, command: string, args: string[]) {
+      calls.push({ identity, command, args });
+      return { command: '/usr/bin/true', args: [] as string[] };
+    },
+    async selfTest() {
+      return { ok: true, detail: 'recording launcher: команда не выполняется' };
+    },
+  };
+}
+
+describe("уборка дерева рана идентичностью рана (issue #52, найдено на VM2)", () => {
+  it("дерево удаляется под слотом, а не процессом Runner: каталоги движка 0700 недоступны Runner'у", async () => {
+    const rootDir = mkdtempSync(join(tmpdir(), 'clean-room-sweep-identity-'));
+    const calls: Array<{ identity: RunIdentity; command: string; args: string[] }> = [];
+    const provider = new UnixCleanRoomProvider({
+      rootDir,
+      policy: { mode: 'per_run_unix_identity', slots: ['ta-agent-9', 'ta-agent-8'], toolPaths: ['/usr/bin', '/bin'] },
+      launcher: recordingNoopLauncher(calls),
+      probeScript: join(rootDir, 'probe.mjs'),
+      log: () => undefined,
+    });
+    const paths = provider.pathsFor('run_sweep', join(rootDir, 'workspaces', 'run_sweep'));
+    // Каталог, который движок закрыл под собой: даже владелец-Runner в него не войдёт.
+    const engineLocked = join(paths.home, '.local', 'state', 'opencode', 'locks');
+    mkdirSync(engineLocked, { recursive: true });
+    writeFileSync(join(engineLocked, 'lock'), 'x');
+    chmodSync(engineLocked, 0o000);
+    mkdirSync(paths.cwd, { recursive: true });
+    const room = {
+      runId: 'run_sweep',
+      identity: { slotId: 'ta-agent-9', username: 'ta-agent-9', uid: 40009, gid: 40009 },
+      paths,
+      env: {},
+      probe: null,
+      acl: 'posix_0700',
+    };
+
+    const removed = await provider.sweep(room as never, 'test');
+    // Удаление ушло через лаунчер идентичности рана: rm под слотом, а не rmSync в Runner'е.
+    const rmCalls = calls.filter((call) => call.args.includes('-rf'));
+    expect(rmCalls.length).toBe(2);
+    expect(rmCalls.every((call) => call.identity.slotId === 'ta-agent-9')).toBe(true);
+    expect(rmCalls.map((call) => call.args[call.args.length - 1]).sort()).toEqual([paths.cwd, paths.root].sort());
+    // Команда не выполнялась, поэтому каталоги на месте — и удаление не объявлено выполненным.
+    expect(removed).toEqual([]);
+
+    chmodSync(engineLocked, 0o700);
+    rmSync(rootDir, { recursive: true, force: true });
+  });
+
+  it('без лаунчера удаление остаётся силами Runner (одиночная установка)', async () => {
+    const rootDir = mkdtempSync(join(tmpdir(), 'clean-room-sweep-nolauncher-'));
+    const provider = new UnixCleanRoomProvider({
+      rootDir,
+      policy: { mode: 'per_run_unix_identity', slots: ['ta-agent-9'], toolPaths: ['/usr/bin'] },
+      launcher: null,
+      log: () => undefined,
+    });
+    const paths = provider.pathsFor('run_plain', join(rootDir, 'workspaces', 'run_plain'));
+    mkdirSync(join(paths.root, 'home'), { recursive: true });
+    writeFileSync(join(paths.root, 'home', 'file.txt'), 'x');
+    const room = {
+      runId: 'run_plain',
+      identity: { slotId: 'ta-agent-9', username: 'ta-agent-9', uid: 40009, gid: 40009 },
+      paths,
+      env: {},
+      probe: null,
+      acl: 'posix_0700',
+    };
+    const removed = await provider.sweep(room as never, 'test');
+    expect(removed).toEqual([paths.root]);
+    expect(existsSync(paths.root)).toBe(false);
+    rmSync(rootDir, { recursive: true, force: true });
+  });
+});
+
 describe('реестр аренд слотов настоящего провайдера', () => {
   function providerAt(rootDir: string): UnixCleanRoomProvider {
     return new UnixCleanRoomProvider({
