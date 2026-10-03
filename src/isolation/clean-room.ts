@@ -175,12 +175,13 @@ export class UnixCleanRoomProvider implements CleanRoomProvider {
       const at = this.now().toISOString();
 
       // Каталоги среды создаются под служебным uid, и только потом отдаются слоту. Создать
-      // каталог ВНУТРИ уже отданного слота каталога может только root или DAC_OVERRIDE, а
-      // Runner намеренно без них работает (User=sandbox + CAP_SETUID/SETGID/CHOWN/FOWNER):
-      // порядок «создать всё → затем отдать» позволяет поднять границу без расширенных прав.
+      // каталог ВНУТРИ уже отданного слота каталога (и тем более дойти до него по пути,
+      // чтобы передать владение) может только root или DAC_OVERRIDE, а Runner намеренно без
+      // них работает (User=sandbox + CAP_SETUID/SETGID/CHOWN/FOWNER). Поэтому: сначала всё
+      // создаётся, потом владение передаётся снизу вверх — корень среды последним.
       const runDirs = [paths.root, paths.home, paths.config, paths.cache, paths.data, paths.tmp, paths.mcp];
       for (const dir of runDirs) mkdirSync(dir, { recursive: true, mode: 0o700 });
-      for (const dir of runDirs) chownSync(dir, identity.uid, identity.gid);
+      for (const dir of [...runDirs].reverse()) chownSync(dir, identity.uid, identity.gid);
       this.adoptTree(paths.cwd, identity);
 
       // Каталоги рана у слота, но путь к ним лежит под сервисным dataDir: без явного
@@ -452,24 +453,24 @@ export class UnixCleanRoomProvider implements CleanRoomProvider {
     return chain.reverse();
   }
 
+  /**
+   * Владение каталогом workspace отдаётся слоту СНИЗУ ВВЕРХ: пока каталог ещё наш, в
+   * него можно пройти, а `chown` требует проходимости по всем родителям. Обратный порядок
+   * (сначала корень) закрывает каталог слотом (0700) и делает невозможным даже дойти до
+   * его содержимого — на хосте с root это проходило молча, оставляя файлы workspace
+   * принадлежащими Runner'у.
+   */
   private adoptTree(path: string, identity: RunIdentity): void {
     if (!existsSync(path)) {
-      this.prepareDirectory(path, identity, 0o700);
+      mkdirSync(path, { recursive: true, mode: 0o700 });
+      chownSync(path, identity.uid, identity.gid);
       return;
-    }
-    chownSync(path, identity.uid, identity.gid);
-    // Workspace развернут materialize'ом под сервисным uid и с правами по umask (0755):
-    // оставленный таким, он читался бы соседним слотом. Для чистой среды каталог закрыт.
-    try {
-      if (statSync(path).mode & 0o077) chmodSync(path, 0o700);
-    } catch {
-      // если снять права не удалось — это поймает проба границы ниже
     }
     let entries: string[] = [];
     try {
       entries = readdirSync(path);
     } catch {
-      return;
+      entries = [];
     }
     for (const entry of entries) {
       const child = join(path, entry);
@@ -481,6 +482,14 @@ export class UnixCleanRoomProvider implements CleanRoomProvider {
       }
       if (stat.isDirectory()) this.adoptTree(child, identity);
       else chownSync(child, identity.uid, identity.gid);
+    }
+    chownSync(path, identity.uid, identity.gid);
+    // Workspace развернут materialize'ом под сервисным uid и с правами по umask (0755):
+    // оставленный таким, он читался бы соседним слотом. Для чистой среды каталог закрыт.
+    try {
+      if (statSync(path).mode & 0o077) chmodSync(path, 0o700);
+    } catch {
+      // если снять права не удалось — это поймает проба границы ниже
     }
   }
 
