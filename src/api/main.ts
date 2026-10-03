@@ -15,6 +15,7 @@ import { DispatchOwnerStore } from '../release/dispatch-owner.js';
 import { releaseIdentity, releaseManifestFromEnv, type ReleaseManifest } from '../release/manifest.js';
 import { allowedEnginesForRegion, parsePlacementPolicyText, type PlacementPolicy } from '../release/placement.js';
 import { PromotionJournal, ReleaseStateController } from '../release/promotion.js';
+import { faultRegistry, parseFaultPoints } from '../faults/env.js';
 import { KeyRegistry } from './auth.js';
 import { handleArtifactRequest, type ArtifactRouteDeps } from './artifact-route.js';
 import { ApiError } from './errors.js';
@@ -37,6 +38,13 @@ export interface AgentApiProcessConfig {
   region: string;
   environment: string;
   fakeScenario: FakeScenario;
+  /**
+   * Управляемые точки сбоя для приёмки lifecycle (#52), по образцу `AGENT_API_FAKE_SCENARIO`:
+   * список `точка` или `точка:count`, где count = сколько раз сработает отказ (`once` при
+   * отсутствии). Нужны, чтобы упасть в конкретный момент (например, в sweep) по-настоящему,
+   * а не «примерно тогда, когда процесс уже умер». Пустой список = отказов нет.
+   */
+  faults: string[];
   releaseManifestPath: string;
   cohort: CohortPolicy;
   /** Файл состояния релиза: вход отката, читается при старте (AC-324). */
@@ -104,6 +112,7 @@ export function loadAgentApiConfig(env: Record<string, string | undefined> = pro
   if (!fakeScenario.ok) throw new Error(`AGENT_API_FAKE_SCENARIO: ${fakeScenario.errors.join('; ')}`);
 
   const host = env['AGENT_API_HOST']?.trim() || DEFAULT_API_HOST;
+  const faults = parseFaultPoints(env['AGENT_API_FAULTS']);
   const shareSecret = env['ARTIFACT_SHARE_SECRET']?.trim();
   const isolationSlots = splitList(env['AGENT_API_ISOLATION_SLOTS']);
   const isolationToolPaths = splitList(env['AGENT_API_ISOLATION_TOOL_PATHS']);
@@ -120,6 +129,7 @@ export function loadAgentApiConfig(env: Record<string, string | undefined> = pro
     region: env['AGENT_API_REGION']?.trim() || 'sandbox',
     environment: env['AGENT_API_ENVIRONMENT']?.trim() || 'sandbox',
     fakeScenario: fakeScenario.value,
+    faults,
     releaseManifestPath: describePath(releaseManifestPath),
     cohort: cohortFromEnv(env),
     releaseStatePath: describePath(env['AGENT_API_RELEASE_STATE']?.trim() || join(dataDir, 'release-state.json')),
@@ -137,6 +147,11 @@ function splitList(raw: string | undefined): string[] {
     .map((entry) => entry.trim())
     .filter((entry) => entry.length > 0);
 }
+
+/**
+ * Управляемые точки сбоя из env (`AGENT_API_FAULTS=cleanup:1,export`): разбор и реестр живут
+ * в `src/faults/env.ts`, чтобы правило формата проверялось тестом, а не только на старте сервиса.
+ */
 
 function requireKeyRegistry(path: string): KeyRegistry {
   if (!exists(path)) throw new Error(`key registry not found: ${path}`);
@@ -273,6 +288,8 @@ async function main(): Promise<void> {
     });
   }
 
+  const faults = faultRegistry(config.faults);
+  if (faults) log({ event: 'faults_injected', points: config.faults, note: 'managed failures for lifecycle acceptance (#52)' });
   const service = new AgentApi({
     rootDir: config.dataDir,
     adapters: { fake: new FakeEngine(config.fakeScenario), opencode: new OpenCodeAdapter() },
@@ -289,6 +306,7 @@ async function main(): Promise<void> {
     uploads,
     snapshots,
     promotion,
+    ...(faults ? { faults } : {}),
     ...(isolation ? { isolation } : {}),
     ...(engineConfigTemplates ? { engineConfigTemplates } : {}),
   });
