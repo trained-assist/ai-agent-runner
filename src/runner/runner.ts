@@ -1693,8 +1693,23 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
     // единственной копией.
     if (!keep) {
       if (existsSync(st.spec.cwd)) {
-        rmSync(st.spec.cwd, { recursive: true, force: true });
-        removed.push(st.spec.cwd);
+        // Удаление ПРОВЕРЯЕТСЯ, а не предполагается. Каталог может быть недоступен Runner'у
+        // (права слота, потерянный ACL после смены хоста), и раньше такая ошибка
+        // поднималась из восстановления и роняла старт воркера целиком: нечитаемая уборка
+        // одного прошлого рана делала недоступным и чтение всех остальных. Теперь это
+        // «уборка не завершена» с причиной — слот остаётся заблокированным, сервис жив.
+        try {
+          rmSync(st.spec.cwd, { recursive: true, force: true });
+          removed.push(st.spec.cwd);
+        } catch (error) {
+          const detail = truncateLine(redactSecrets(error instanceof Error ? error.message : String(error)), 200);
+          this.emit(st, 'log', {
+            stream: 'runner',
+            level: 'error',
+            message: `clean_room.sweep_failed runId=${st.runId} path=${st.spec.cwd} detail=${detail}`,
+          });
+          return { status: 'pending', reason: `workspace ${st.spec.cwd} could not be removed: ${detail}`, removed };
+        }
       }
       const socket = this.runSocketPath(st.runId, null);
       if (socket && existsSync(socket)) {
