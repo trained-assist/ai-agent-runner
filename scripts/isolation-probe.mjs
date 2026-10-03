@@ -738,12 +738,15 @@ async function main() {
 
     check('управляемый сбой воркера выполнен', worker.killHard(), '');
     await worker.waitExit();
-    await waitFor(async () => !pidAlive(view.pid), 10_000, 'engine process to be gone').catch(() => undefined);
-    check('процесс движка не пережил воркер', !pidAlive(view.pid), String(view.pid));
+    // Процесс движка detached и переживает SIGKILL воркера: после рестарта некому наблюдать
+    // за его выходом. Гасит его новый воркер при recover() — поэтому проверка идёт ПОСЛЕ
+    // рестарта, иначе она измеряла бы не дефект, а порядок шагов.
     const eventsBefore = worker.events(holder.body.runId).map((event) => event.type);
 
     const restarted = new Worker({ ...spec, port }, clientKey, env).start();
     await restarted.waitHealthy();
+    await waitFor(async () => !pidAlive(view.pid), 10_000, 'engine process to be gone').catch(() => undefined);
+    check('переживший воркер движок погашен восстановлением', !pidAlive(view.pid), String(view.pid));
     const capabilities = (await restarted.get('/v1/capabilities')).body;
     const leaseAfter = restarted.lease(holder.body.runId);
     const cleanrooms = join(spec.dataDir, 'cleanrooms');
@@ -769,11 +772,12 @@ async function main() {
 
   await runStep('storage_failure_keeps_sole_copy', async () => {
     const port = await freePort(spec.port + 50);
-    // Хранилище заведомо нерабочее (r2 — ещё не реализованный backend): каждый put
-    // отвергается, поэтому единственная копия выхода остаётся в workspace рана.
+    // Хранилище заведомо нерабочее (r2 без credentials: каждый put отвергается), поэтому
+    // единственная копия выхода остаётся в workspace рана. Слот ОДИН: иначе следующий ран
+    // законно получил бы второй свободный слот и ничего не доказывал бы.
     const worker = new Worker({ ...spec, port }, clientKey, {
       AGENT_API_PORT: String(port),
-      ...isolationEnv(slotsFlag, { STORAGE_BACKEND: 'r2' }),
+      ...isolationEnv([slotsFlag[0]], { STORAGE_BACKEND: 'r2' }),
     }).start();
     try {
       await worker.waitHealthy();
@@ -794,6 +798,7 @@ async function main() {
         outcome: result.outcome,
         cleanup: result.cleanup,
         lease: { status: lease?.status ?? null, reason: lease?.reason ?? null },
+        slotsConfigured: [slotsFlag[0]],
         freeSlots: capabilities.isolation.freeSlots,
         retainedWorkspace: state.spec.cwd,
         refused: { runId: nextRun.body.runId, failureCode: refused.failure?.code ?? null },
