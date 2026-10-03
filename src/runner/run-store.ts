@@ -4,6 +4,7 @@ import { validateRunnerEvent, type RunnerEvent } from '../contracts/events.js';
 import type { RunResult } from '../contracts/result.js';
 import { redactRepositoryToken, type RunSpec } from '../contracts/run-spec.js';
 import { isSafeId } from '../contracts/validate.js';
+import { validateRunCheckpoint, type RunCheckpoint } from './checkpoint.js';
 import { writeFileAtomic } from './util.js';
 import type { RunState } from './state-machine.js';
 import type { CleanRoomPaths, RunIdentity } from '../isolation/contract.js';
@@ -115,6 +116,35 @@ export class RunStore {
 
   logPath(runId: string): string {
     return join(this.runDir(runId), 'events.jsonl');
+  }
+
+  /**
+   * Checkpoint лежит рядом с `state.json`, а не в workspace рана: после sweep чистой
+   * среды именно он остаётся читаемым ответом на «что сделано и что осталось».
+   */
+  checkpointPath(runId: string): string {
+    return join(this.runDir(runId), 'checkpoint.json');
+  }
+
+  saveCheckpoint(checkpoint: RunCheckpoint): RunCheckpoint {
+    const validated = validateRunCheckpoint(checkpoint);
+    if (!validated.ok) {
+      throw new Error(`refusing to persist an invalid run checkpoint: ${validated.errors.join('; ')}`);
+    }
+    writeFileAtomic(this.checkpointPath(checkpoint.runId), `${JSON.stringify(validated.value, null, 2)}\n`);
+    return validated.value;
+  }
+
+  readCheckpoint(runId: string): RunCheckpoint | null {
+    const path = this.checkpointPath(runId);
+    if (!existsSync(path)) return null;
+    try {
+      const validated = validateRunCheckpoint(JSON.parse(readFileSync(path, 'utf8')));
+      return validated.ok ? validated.value : null;
+    } catch {
+      // оборванная запись после kill -9: state.json остаётся источником истины
+      return null;
+    }
   }
 
   relLogPath(runId: string): string {

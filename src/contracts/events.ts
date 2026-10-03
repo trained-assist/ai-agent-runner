@@ -27,6 +27,9 @@ export const RUNNER_EVENT_TYPES = [
   'cancelled',
   'connection_lost',
   'isolation_prepared',
+  'agent_exit_resolved',
+  'agent_answer_saved',
+  'checkpoint_written',
 ] as const;
 
 export type RunnerEventType = (typeof RUNNER_EVENT_TYPES)[number];
@@ -132,6 +135,50 @@ export interface IsolationPreparedEvent extends EventEnvelope {
   };
 }
 
+/**
+ * Выход рана определён (issue #52, шаг 2): что считается результатом — объявленные
+ * выходы, манифест агента, текст ответа. Содержимое ответа в событие не попадает:
+ * в журнале рана живут источник и размер, а не персональные данные и секреты.
+ */
+export interface AgentExitResolvedEvent extends EventEnvelope {
+  type: 'agent_exit_resolved';
+  payload: {
+    manifest: 'absent' | 'ok' | 'invalid';
+    declared: number;
+    fromManifest: number;
+    answerSource: 'agent_file' | 'engine_stdout' | null;
+    answerChars: number;
+    planned: number;
+    reason: string;
+  };
+}
+
+/**
+ * Текст ответа агента сохранён в долговечном хранилище отдельным артефактом.
+ * Содержимое в событие не попадает: только источник, размер и id артефакта.
+ */
+export interface AgentAnswerSavedEvent extends EventEnvelope {
+  type: 'agent_answer_saved';
+  payload: {
+    artifactId: string;
+    source: 'agent_file' | 'engine_stdout';
+    chars: number;
+    size: number;
+  };
+}
+
+/** Обязательный checkpoint lifecycle записан на диск: фаза, сохранение, уборка. */
+export interface CheckpointWrittenEvent extends EventEnvelope {
+  type: 'checkpoint_written';
+  payload: {
+    phase: 'engine_terminal' | 'persisted' | 'cleanup_pending' | 'complete';
+    persistence: 'not_required' | 'pending' | 'persisted' | 'failed';
+    cleanup: 'pending' | 'sweeping' | 'completed' | 'blocked';
+    outputRefs: number;
+    reason: string;
+  };
+}
+
 export interface ConnectionLostEvent extends EventEnvelope {
   type: 'connection_lost';
   payload: { detectedAt: string; detail: string; engineAlive: boolean };
@@ -150,7 +197,10 @@ export type RunnerEvent =
   | SucceededEvent
   | FailedEvent
   | CancelledEvent
-  | ConnectionLostEvent;
+  | ConnectionLostEvent
+  | AgentExitResolvedEvent
+  | AgentAnswerSavedEvent
+  | CheckpointWrittenEvent;
 
 export interface EventInput {
   type: RunnerEventType;
@@ -191,6 +241,9 @@ const PAYLOAD_KEYS: Record<RunnerEventType, readonly string[]> = {
   cancelled: ['outcome', 'exitReason', 'reason'],
   connection_lost: ['detectedAt', 'detail', 'engineAlive'],
   isolation_prepared: ['slotId', 'username', 'uid', 'gid', 'acl', 'probe'],
+  agent_exit_resolved: ['manifest', 'declared', 'fromManifest', 'answerSource', 'answerChars', 'planned', 'reason'],
+  agent_answer_saved: ['artifactId', 'source', 'chars', 'size'],
+  checkpoint_written: ['phase', 'persistence', 'cleanup', 'outputRefs', 'reason'],
 };
 
 function validatePayload(type: RunnerEventType, value: unknown, path: string, collector: ErrorCollector): void {

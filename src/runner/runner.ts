@@ -1,4 +1,4 @@
-import { chmodSync, chownSync, mkdirSync, readFileSync } from 'node:fs';
+import { chmodSync, chownSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { EngineAdapter, EngineHandle } from '../adapters/engine/engine-adapter.js';
@@ -28,6 +28,14 @@ import type { RunExportManifest } from '../storage/export-manifest.js';
 import { isRegularFile, resolveExistingInsideRoot } from '../storage/local-paths.js';
 import { profileKey } from '../storage/keys.js';
 import { redactSecrets, specHash, truncateLine, writeFileAtomic } from './util.js';
+import {
+  AGENT_MANIFEST_PATH,
+  mergeOutputPlan,
+  readAgentAnswer,
+  readAgentFinalManifest,
+  type AgentFinalManifest,
+} from './agent-manifest.js';
+import { ANSWER_MAX_CHARS, type CheckpointPersistence, type RunCheckpoint } from './checkpoint.js';
 import { CleanRoomError, type CleanRoom, type CleanRoomLease, type CleanRoomProvider, type RunIdentity } from '../isolation/contract.js';
 import type { CapabilityRegistry } from '../mcp/capabilities.js';
 import { newBridgeToken } from '../mcp/bridge.js';
@@ -160,6 +168,8 @@ export interface RunSnapshot {
     root: string;
     status: CleanRoomLease['status'];
   } | null;
+  /** Обязательный checkpoint lifecycle (issue #52): null, если ещё не записан. */
+  checkpoint: RunCheckpoint | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -188,6 +198,8 @@ export interface RecoveryReport {
   orphanedMcp: number;
   /** Аренды чистых сред, дочищенные после рестарта воркера (issue #51). */
   cleanRoomsReconciled: number;
+  /** Checkpoint'ы, достроенные после рестарта для терминальных ранов (issue #52). */
+  checkpointsRebuilt: number;
 }
 
 interface InternalRun {
@@ -205,7 +217,24 @@ interface InternalRun {
   mcpConfigPath: string | null;
   /** Чистая среда рана (issue #51): идентичность, каталоги, статус аренды. */
   room: CleanRoom | null;
+  /**
+   * Хвост stdout движка (issue #52): если агент не оставил `answerFile`, текстом ответа
+   * считается то, что движок напечатало последним. Накопитель ограничен, в журнал рана
+   * содержимое не попадает — только источник и размер.
+   */
+  answerTail: string[];
 }
+
+/** Итог определения выхода рана: план экспорта и текст ответа. */
+interface ExitResolution {
+  plan: PlannedOutput[];
+  answer: { present: boolean; source: 'agent_file' | 'engine_stdout' | null; chars: number; text: string };
+}
+
+/** Потолок накопителя ответа: хвост, а не архив вывода движка. */
+const ANSWER_TAIL_MAX_LINES = 200;
+const ANSWER_TAIL_MAX_LINE = 2000;
+
 
 const DEFAULT_CANCEL_GRACE_MS = 1000;
 const DEFAULT_MAX_LOG_LINE = 4096;
@@ -311,6 +340,7 @@ export class Runner {
         mcpCleanup: null,
         mcpConfigPath: null,
         room: null,
+        answerTail: [],
       });
     }
   }
@@ -352,6 +382,7 @@ export class Runner {
         st.mcp && st.mcp.serverPids.length > 0
           ? { serverPids: st.mcp.serverPids.map((entry) => ({ serverId: entry.serverId, pid: entry.pid })) }
           : null,
+      checkpoint: this.store.readCheckpoint(st.runId),
       isolation: st.cleanRoom
         ? {
             slotId: st.cleanRoom.identity.slotId,
@@ -474,6 +505,7 @@ export class Runner {
       mcpCleanup: null,
       mcpConfigPath: null,
       room: null,
+      answerTail: [],
     });
     this.emit(state, 'claimed', { operationId });
     void this.execute(spec.runId).catch(() => undefined);
@@ -596,7 +628,7 @@ export class Runner {
   }
 
   async recover(): Promise<RecoveryReport> {
-    const report: RecoveryReport = { scanned: 0, resumedQueued: 0, orphaned: 0, lost: 0, finalizingResumed: 0, terminal: 0, exportRetried: 0, orphanedMcp: 0, cleanRoomsReconciled: 0 };
+    const report: RecoveryReport = { scanned: 0, resumedQueued: 0, orphaned: 0, lost: 0, finalizingResumed: 0, terminal: 0, exportRetried: 0, orphanedMcp: 0, cleanRoomsReconciled: 0, checkpointsRebuilt: 0 };
     await this.fireFault('recovery');
     for (const run of [...this.runs.values()]) {
       if (this.disposed) break;
@@ -604,6 +636,9 @@ export class Runner {
       report.scanned += 1;
       if (isTerminalState(st.state)) {
         report.terminal += 1;
+        // Checkpoint обязан существовать для терминального рана: восстановление читает
+        // его, чтобы повторить persist/sweep без запуска движка.
+        if (this.ensureCheckpoint(run)) report.checkpointsRebuilt += 1;
         if (await this.reconcileCleanRoom(run)) report.cleanRoomsReconciled += 1;
         continue;
       }
@@ -1367,7 +1402,19 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
     const limit = st.spec.limits.maxOutputBytes ?? st.spec.limits.maxLogBytes ?? DEFAULT_MAX_LOG_LINE;
     const sanitized = redactSecrets(truncateLine(rawLine, limit)).replace(/[\x00-\x1f]/g, ' ');
     if (sanitized.length === 0) return;
+    if (stream === 'stdout') this.rememberAnswerLine(run, sanitized);
     this.emit(st, 'log', { stream, level: 'info', message: sanitized });
+  }
+
+  /**
+   * Хвост stdout движка — запасной источник текста ответа (issue #52, шаг 2). Накопитель
+   * ограничен и живёт только в памяти воркера: после выхода движка хвост либо становится
+   * ответом, либо теряется вместе с процессом.
+   */
+  private rememberAnswerLine(run: InternalRun, line: string): void {
+    const tail = run.answerTail;
+    tail.push(line.length > ANSWER_TAIL_MAX_LINE ? line.slice(0, ANSWER_TAIL_MAX_LINE) : line);
+    while (tail.length > ANSWER_TAIL_MAX_LINES) tail.shift();
   }
 
   private async onEngineExit(runId: string, code: number | null, signal: string | null): Promise<void> {
@@ -1439,6 +1486,19 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
     // Граница снимается и на стартовом отказе: иначе слот занят до следующего recover().
     const run = this.runs.get(st.runId);
     if (run?.room) void this.releaseCleanRoom(run, `start_refused_${exitReason}`);
+    // Checkpoint обязателен и на стартовом отказе: без него восстановление не отличит
+    // «движок не запускался» от «ран не дожил до записи факта».
+    // Молча: терминальное событие рана обязано остаться последним в потоке клиента.
+    this.writeCheckpoint(
+      st,
+      result,
+      null,
+      null,
+      null,
+      'cleanup_pending',
+      { status: 'pending', reason: null, intentAt: this.nowIso(), finishedAt: null },
+      { silent: true },
+    );
   }
 
   private failStartPath(st: PersistedRunState, err: unknown, phase: 'preflight' | 'isolation' | 'mcp' | 'spawn'): void {
@@ -1474,13 +1534,30 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
       killProcessGroup(st.pgid, 'SIGKILL');
       await waitForProcessDeath(st.pgid, null, 500);
     }
-    const exportManifest = await this.runExport(st);
+    // Выход определяется здесь: объявленные выходы плюс явный манифест агента, а текст
+    // ответа сохраняется отдельным выходом до того, как начнётся экспорт (issue #52).
+    const run = this.runs.get(st.runId);
+    const exit = run ? this.resolveExit(run, st) : null;
+    // Ответ агента уходит в хранилище до экспорта объявленных выходов: сбой экспорта
+    // не должен стоить клиенту текста ответа.
+    const answerArtifactId = await this.saveAnswerArtifact(st, exit?.answer ?? { present: false, source: null, chars: 0, text: '' });
+    const exportManifest = await this.runExport(st, exit ? { plan: exit.plan } : {});
     const result = this.computeResult(st, exportManifest);
     await this.appendProfileTrace(st, result);
+    // Намерение уборки фиксируется на диске ДО самой уборки: сбой в момент sweep не
+    // должен оставить каталоги рана без записанного намерения их вычистить.
+    this.writeCheckpoint(
+      st,
+      result,
+      exportManifest,
+      exit,
+      answerArtifactId,
+      'cleanup_pending',
+      { status: 'pending', reason: null, intentAt: this.nowIso(), finishedAt: null },
+    );
     this.persistResult(st, result);
     // Чистая среда освобождается только после того, как результат записан: слот переиспользуется
     // лишь после проверенного удаления каталогов рана (issue #51, иначе #52).
-    const run = this.runs.get(st.runId);
     if (run?.room) {
       const retained = exportManifest?.cleanup.decision === 'retained_sole_copy';
       // Единственная копия выхода остаётся на диске: чистим только эфемерные каталоги
@@ -1489,7 +1566,50 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
         ...(retained ? { keepWorkspace: true } : {}),
       });
     }
+    // Финальный checkpoint несёт проверенный факт уборки: аренда снята или слот остался
+    // занят с причиной. Именно его читает восстановление, не перезапуская движок.
+    if (run) this.finishCheckpointAfterCleanup(run, st, result, exportManifest, exit, answerArtifactId, { silent: true });
     return result;
+  }
+
+  /**
+   * Закрытие checkpoint после уборки: статус аренды — единственный проверяемый факт
+   * «каталоги рана вычищены». Отсутствие процессной группы таким фактом не является.
+   */
+  private finishCheckpointAfterCleanup(
+    run: InternalRun,
+    st: PersistedRunState,
+    result: RunResult,
+    exportManifest: RunExportManifest | null,
+    exit: ExitResolution | null,
+    answerArtifactId: string | null,
+    options: { silent?: boolean } = {},
+  ): void {
+    const lease = this.opts.isolation?.lease(st.runId) ?? null;
+    const status = lease?.status ?? 'released';
+    const completed = status === 'released';
+    this.writeCheckpoint(
+      st,
+      result,
+      exportManifest,
+      exit,
+      answerArtifactId,
+      completed ? 'complete' : 'cleanup_pending',
+      {
+        status: completed ? 'completed' : 'blocked',
+        reason: completed ? 'lease released after a verified sweep' : (lease?.reason ?? 'clean room lease is not released'),
+        intentAt: null,
+        finishedAt: completed ? this.nowIso() : null,
+      },
+      options,
+    );
+    if (!completed) {
+      this.emit(st, 'log', {
+        stream: 'runner',
+        level: 'warn',
+        message: `clean_room.cleanup_blocked runId=${st.runId} status=${status} reason=${truncateLine(lease?.reason ?? 'lease is not released', 300)}`,
+      });
+    }
   }
 
   private exportSnapshot(runId: string): RunExportSnapshot | null {
@@ -1518,14 +1638,19 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
    *  - сбой экспорта объявляется частичным манифестом, а не молчанием;
    *  - прогресс и решение по очистке видны клиенту (события + манифест).
    */
-  private async runExport(st: PersistedRunState, options: { force?: boolean } = {}): Promise<RunExportManifest | null> {
+  private async runExport(
+    st: PersistedRunState,
+    options: { force?: boolean; plan?: PlannedOutput[] } = {},
+  ): Promise<RunExportManifest | null> {
     const exports = this.opts.exports;
     if (!exports) return null;
-    const plan: PlannedOutput[] = (st.spec.outputs ?? []).map((output) => ({
-      path: output.path,
-      ...(output.name !== undefined ? { name: output.name } : {}),
-      ...(output.mime !== undefined ? { mime: output.mime } : {}),
-    }));
+    const plan: PlannedOutput[] =
+      options.plan ??
+      (st.spec.outputs ?? []).map((output) => ({
+        path: output.path,
+        ...(output.name !== undefined ? { name: output.name } : {}),
+        ...(output.mime !== undefined ? { mime: output.mime } : {}),
+      }));
     if (plan.length === 0 && !options.force) return null;
 
     const previous = exports.read(st.runId);
@@ -1558,6 +1683,107 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
       retained: committed.cleanup.retained.length,
     });
     return committed;
+  }
+
+  /**
+   * Определение выхода рана (issue #52, шаг 2).
+   *
+   * Источников ровно два: объявленные клиентом `spec.outputs` и явный финальный
+   * манифест агента. Сканирование HOME/секретов «вслепую» запрещено: ран не должен
+   * попадать в чужие данные, а хранилище — наполняться тем, что никто не объявлял.
+   *
+   * Текст ответа сохраняется отдельным выходом `.runner/answer.txt`: он проходит тот же
+   * путь экспорта (upload → read-back → prune), что и остальные выходы, и поэтому
+   * переживает sweep чистой среды. Содержимое в журнал рана не попадает.
+   */
+  private resolveExit(run: InternalRun, st: PersistedRunState): ExitResolution {
+    const declared = st.spec.outputs ?? [];
+    const read = readAgentFinalManifest(st.spec.cwd);
+    const manifest = read.status === 'ok' ? read.manifest : null;
+    if (read.status === 'invalid') {
+      this.emit(st, 'log', {
+        stream: 'runner',
+        level: 'warn',
+        message: `agent.final_manifest_invalid path=${AGENT_MANIFEST_PATH} reason=${truncateLine(read.reason, 300)}`,
+      });
+    }
+    const { plan, merged } = mergeOutputPlan(declared, manifest?.outputs ?? []);
+    if (merged.length > 0) {
+      this.emit(st, 'log', {
+        stream: 'runner',
+        level: 'info',
+        message: `agent.final_manifest_merged paths=${merged.join(',')} reason=declared outputs win on conflict`,
+      });
+    }
+
+    const answer = readAgentAnswer(st.spec.cwd, manifest);
+    let answerText = answer.source === 'agent_file' ? answer.text : '';
+    let answerSource: 'agent_file' | 'engine_stdout' | null = answer.source;
+    if (answerText.length === 0 && run.answerTail.length > 0) {
+      answerText = run.answerTail.join('\n');
+      answerSource = 'engine_stdout';
+    }
+    if (answerText.length > ANSWER_MAX_CHARS) {
+      answerText = answerText.slice(0, ANSWER_MAX_CHARS);
+    }
+
+    this.emit(st, 'agent_exit_resolved', {
+      manifest: read.status,
+      declared: declared.length,
+      fromManifest: manifest?.outputs.length ?? 0,
+      answerSource,
+      answerChars: answerText.length,
+      planned: plan.length,
+      reason:
+        read.status === 'invalid'
+          ? `final manifest rejected: ${read.reason}`
+          : read.status === 'ok'
+            ? read.reason
+            : 'the agent declared no final manifest',
+    });
+    return { plan, answer: { present: answerText.length > 0, source: answerSource, chars: answerText.length, text: answerText } };
+  }
+
+  /**
+   * Текст ответа агента — отдельный долговечный артефакт `answer.txt` (issue #52, шаг 2).
+   *
+   * Он не входит в план экспорта: план — это контракт клиента (объявленные выходы) плюс
+   * манифест агента, а ответ пишет хост. Отдельный артефакт читается через тот же
+   * `GET /v1/runs/{id}/artifacts`, не требует файла в workspace и не зависит от того,
+   * откроется ли экспорт объявленных выходов.
+   */
+  private async saveAnswerArtifact(
+    st: PersistedRunState,
+    answer: { present: boolean; source: 'agent_file' | 'engine_stdout' | null; chars: number; text: string },
+  ): Promise<string | null> {
+    if (!answer.present || !this.opts.exports) return null;
+    const text = answer.text;
+    if (text.length === 0) return null;
+    try {
+      const manifest = await this.opts.exports.artifacts.put({
+        runId: st.runId,
+        userTaskId: st.userTaskId,
+        profileId: st.profileId,
+        name: 'answer.txt',
+        mime: 'text/plain',
+        bytes: text.slice(0, ANSWER_MAX_CHARS),
+      });
+      this.emit(st, 'agent_answer_saved', {
+        artifactId: manifest.artifactId,
+        source: answer.source,
+        chars: text.length,
+        size: manifest.size,
+      });
+      return manifest.artifactId;
+    } catch (error) {
+      // Ответ не сохранился — ран не падает: причина в журнале, а выходы объявлены отдельно.
+      this.emit(st, 'log', {
+        stream: 'runner',
+        level: 'warn',
+        message: `agent.answer_save_failed detail=${truncateLine(redactSecrets(error instanceof Error ? error.message : String(error)), 200)}`,
+      });
+      return null;
+    }
   }
 
   private async exportOne(
@@ -1750,6 +1976,130 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
     if (!groupGone) return 'pending';
     if (exportManifest && exportManifest.cleanup.decision === 'retained_sole_copy') return 'pending';
     return 'completed';
+  }
+
+  /**
+   * Обязательный checkpoint рана (issue #52). Пишется ДО уборки чистой среды: намерение
+   * уборки обязано пережить сбой в момент sweep, иначе восстановление не узнает, что
+   * каталоги рана ещё надо вычистить. Содержимое ответа агента в checkpoint не входит —
+   * только источник и размер.
+   */
+  private writeCheckpoint(
+    st: PersistedRunState,
+    result: RunResult,
+    exportManifest: RunExportManifest | null,
+    exit: ExitResolution | null,
+    answerArtifactId: string | null,
+    phase: 'engine_terminal' | 'persisted' | 'cleanup_pending' | 'complete',
+    cleanup: { status: 'pending' | 'sweeping' | 'completed' | 'blocked'; reason: string | null; intentAt: string | null; finishedAt: string | null },
+    options: { silent?: boolean } = {},
+  ): RunCheckpoint {
+    const at = this.nowIso();
+    const previous = this.store.readCheckpoint(st.runId);
+    const answerText = exit?.answer.present ? exit.answer.text : '';
+    const cappedAnswer = answerText.length > ANSWER_MAX_CHARS ? answerText.slice(0, ANSWER_MAX_CHARS) : answerText;
+    const persistence: CheckpointPersistence =
+      exportManifest === null
+        ? 'not_required'
+        : exportManifest.status === 'complete'
+          ? 'persisted'
+          : exportManifest.status === 'failed'
+            ? 'failed'
+            : 'pending';
+    const checkpoint: RunCheckpoint = {
+      schemaVersion: 1,
+      runId: st.runId,
+      jobId: st.jobId,
+      userTaskId: st.userTaskId,
+      profileId: st.profileId,
+      ownerGeneration: st.ownerGeneration,
+      phase,
+      updatedAt: at,
+      engine: {
+        state: st.state,
+        exitObserved: st.exit?.observed ?? false,
+        exitCode: st.exit?.code ?? null,
+        exitSignal: st.exit?.signal ?? null,
+        exitReason: result.exitReason,
+        startedAt: st.startedAt ?? st.createdAt,
+        finishedAt: result.finishedAt,
+      },
+      answer: {
+        present: exit?.answer.present ?? false,
+        source: exit?.answer.source ?? null,
+        chars: exit?.answer.chars ?? 0,
+        text: cappedAnswer,
+        artifactId: answerArtifactId,
+        reason:
+          exit === null
+            ? 'engine never started: no answer to capture'
+            : exit.answer.present
+              ? `answer captured from ${exit.answer.source}`
+              : 'the agent produced no answer text',
+      },
+      outputs: {
+        declared: st.spec.outputs?.length ?? 0,
+        fromAgentManifest: previous?.outputs.fromAgentManifest ?? 0,
+        planned: exportManifest?.totals.planned ?? exit?.plan.length ?? 0,
+        exported: exportManifest?.totals.exported ?? 0,
+        failed: exportManifest?.totals.failed ?? 0,
+        retained: [...(exportManifest?.cleanup.retained ?? [])],
+        outputRefs: [...result.outputRefs],
+        exportStatus: exportManifest?.status ?? null,
+        exportVersion: exportManifest?.version ?? null,
+      },
+      persistence,
+      cleanup: { ...cleanup },
+    };
+    const saved = this.store.saveCheckpoint(checkpoint);
+    // Финальный checkpoint пишется молча: терминальное событие рана обязано остаться
+    // последним в потоке клиента, а факт уборки живёт в checkpoint.json.
+    if (!options.silent) {
+      this.emit(st, 'checkpoint_written', {
+        phase,
+        persistence,
+        cleanup: cleanup.status,
+        outputRefs: saved.outputs.outputRefs.length,
+        reason: cleanup.reason ?? `checkpoint phase=${phase}`,
+      });
+    }
+    return saved;
+  }
+
+  /**
+   * Восстановление checkpoint после рестарта: если ран терминален, а checkpoint не
+   * дожил до записи (сбой между persist и checkpoint), он достраивается из долговечного
+   * состояния. Движок при этом не запускается — только запись факта.
+   */
+  private ensureCheckpoint(run: InternalRun): RunCheckpoint | null {
+    const st = run.state;
+    const existing = this.store.readCheckpoint(st.runId);
+    if (existing) return null;
+    const result = st.result;
+    if (!result) return null;
+    const manifest = this.exportManifest(st.runId);
+    const lease = this.opts.isolation?.lease(st.runId) ?? null;
+    // Ран без чистой среды: уборкой считается отсутствие аренды — нечего освобождать.
+    const cleanupStatus = lease === null ? 'completed' : lease.status === 'released' ? 'completed' : 'pending';
+    // Байты не подтверждены чтением — уборка не может быть завершённой: единственная
+    // копия остаётся на диске, и checkpoint обязан это показать, а не выдать за успех.
+    const persistence: CheckpointPersistence =
+      manifest === null ? 'not_required' : manifest.status === 'complete' ? 'persisted' : manifest.status === 'failed' ? 'failed' : 'pending';
+    const phase: 'complete' | 'cleanup_pending' = cleanupStatus === 'completed' && persistence !== 'failed' ? 'complete' : 'cleanup_pending';
+    return this.writeCheckpoint(
+      st,
+      result,
+      manifest,
+      null,
+      null,
+      phase,
+      {
+        status: cleanupStatus,
+        reason: lease?.reason ?? (phase === 'complete' ? 'lease released after a verified sweep' : 'checkpoint rebuilt after a worker restart'),
+        intentAt: null,
+        finishedAt: phase === 'complete' ? result.finishedAt : null,
+      },
+    );
   }
 
   private persistResult(st: PersistedRunState, result: RunResult): void {
