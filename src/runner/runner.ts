@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync } from 'node:fs';
+import { chmodSync, chownSync, mkdirSync, readFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { EngineAdapter, EngineHandle } from '../adapters/engine/engine-adapter.js';
@@ -28,6 +28,7 @@ import type { RunExportManifest } from '../storage/export-manifest.js';
 import { isRegularFile, resolveExistingInsideRoot } from '../storage/local-paths.js';
 import { profileKey } from '../storage/keys.js';
 import { redactSecrets, specHash, truncateLine, writeFileAtomic } from './util.js';
+import { CleanRoomError, type CleanRoom, type CleanRoomLease, type CleanRoomProvider, type RunIdentity } from '../isolation/contract.js';
 import type { CapabilityRegistry } from '../mcp/capabilities.js';
 import { newBridgeToken } from '../mcp/bridge.js';
 import { McpRunSession, McpStartupError, type EngineMcpConfig, type McpLogFields, type McpLogLevel } from '../mcp/session.js';
@@ -90,6 +91,14 @@ export interface RunnerOptions {
    */
   capabilities?: CapabilityRegistry;
   /**
+   * Граница Agent clean room (issue #51): per-run Unix-идентичность, run-scoped HOME/config/
+   * cache/tmp и минимальный env/credential binding. Без провайдера движок идёт под
+   * service UID — это честно объявляется в capabilities, но не является доказанной границей.
+   * Отказ границы (нет привилегий, нет слотов, проба не прошла) валит старт ДО спавна:
+   * fallback к service UID запрещён.
+   */
+  isolation?: CleanRoomProvider;
+  /**
    * Резолвер значений credential binding'ов (P13). В песочнице — фикстура, в бою —
    * Credential Broker / Secret Manager. Значение binding'а не попадает в spec/state/events.
    */
@@ -142,6 +151,15 @@ export interface RunSnapshot {
   fencing: { rejected: number };
   /** Живые per-run MCP-процессы (P13): null, если сессия MCP не поднималась или погашена. */
   mcp: { serverPids: Array<{ serverId: string; pid: number }> } | null;
+  /** Граница рана (issue #51): null, если граница не настроена или не поднималась. */
+  isolation: {
+    slotId: string;
+    username: string;
+    uid: number;
+    gid: number;
+    root: string;
+    status: CleanRoomLease['status'];
+  } | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -168,6 +186,8 @@ export interface RecoveryReport {
   exportRetried: number;
   /** Per-run MCP-процессы, погашенные после рестарта воркера (P13). */
   orphanedMcp: number;
+  /** Аренды чистых сред, дочищенные после рестарта воркера (issue #51). */
+  cleanRoomsReconciled: number;
 }
 
 interface InternalRun {
@@ -183,6 +203,8 @@ interface InternalRun {
   mcpCleanup: Promise<void> | null;
   /** Путь к per-run конфигу MCP для движка (секретов не содержит). */
   mcpConfigPath: string | null;
+  /** Чистая среда рана (issue #51): идентичность, каталоги, статус аренды. */
+  room: CleanRoom | null;
 }
 
 const DEFAULT_CANCEL_GRACE_MS = 1000;
@@ -192,6 +214,19 @@ const MCP_CONFIG_DIR = '.runner';
 const MCP_CONFIG_ENV = 'RUNNER_MCP_CONFIG';
 
 /** Плоские поля MCP-события в текст лога рана: `mcp.<event> key=value ...`. */
+/** UID процесса по /proc/<pid>/status; null, если прочитать нельзя (процесс умер или нет прав). */
+function readProcUid(pid: number): number | null {
+  try {
+    const status = readFileSync(`/proc/${pid}/status`, 'utf8');
+    const line = status.split('\n').find((entry) => entry.startsWith('Uid:'));
+    if (!line) return null;
+    const uid = Number(line.slice('Uid:'.length).trim().split(/\s+/)[0]);
+    return Number.isInteger(uid) ? uid : null;
+  } catch {
+    return null;
+  }
+}
+
 function formatMcpFields(fields: McpLogFields): string {
   return Object.entries(fields)
     .map(([key, value]) => `${key}=${value === null ? '-' : String(value)}`)
@@ -231,6 +266,7 @@ export class Runner {
         mcp: null,
         mcpCleanup: null,
         mcpConfigPath: null,
+        room: null,
       });
     }
   }
@@ -272,6 +308,16 @@ export class Runner {
         st.mcp && st.mcp.serverPids.length > 0
           ? { serverPids: st.mcp.serverPids.map((entry) => ({ serverId: entry.serverId, pid: entry.pid })) }
           : null,
+      isolation: st.cleanRoom
+        ? {
+            slotId: st.cleanRoom.identity.slotId,
+            username: st.cleanRoom.identity.username,
+            uid: st.cleanRoom.identity.uid,
+            gid: st.cleanRoom.identity.gid,
+            root: st.cleanRoom.paths.root,
+            status: st.cleanRoom.status,
+          }
+        : null,
       createdAt: st.createdAt,
       updatedAt: st.updatedAt,
     };
@@ -366,6 +412,7 @@ export class Runner {
       result: null,
       fencing: { rejected: 0 },
       mcp: null,
+      cleanRoom: null,
       createdAt: now,
       updatedAt: now,
     };
@@ -382,6 +429,7 @@ export class Runner {
       mcp: null,
       mcpCleanup: null,
       mcpConfigPath: null,
+      room: null,
     });
     this.emit(state, 'claimed', { operationId });
     void this.execute(spec.runId).catch(() => undefined);
@@ -504,7 +552,7 @@ export class Runner {
   }
 
   async recover(): Promise<RecoveryReport> {
-    const report: RecoveryReport = { scanned: 0, resumedQueued: 0, orphaned: 0, lost: 0, finalizingResumed: 0, terminal: 0, exportRetried: 0, orphanedMcp: 0 };
+    const report: RecoveryReport = { scanned: 0, resumedQueued: 0, orphaned: 0, lost: 0, finalizingResumed: 0, terminal: 0, exportRetried: 0, orphanedMcp: 0, cleanRoomsReconciled: 0 };
     await this.fireFault('recovery');
     for (const run of [...this.runs.values()]) {
       if (this.disposed) break;
@@ -512,6 +560,7 @@ export class Runner {
       report.scanned += 1;
       if (isTerminalState(st.state)) {
         report.terminal += 1;
+        if (await this.reconcileCleanRoom(run)) report.cleanRoomsReconciled += 1;
         continue;
       }
       switch (st.state) {
@@ -698,7 +747,7 @@ export class Runner {
     if (isTerminalState(st.state) || !this.transition(st, 'starting')) return;
 
     let handle: EngineHandle | null = null;
-    let phase: 'preflight' | 'mcp' | 'spawn' = 'preflight';
+    let phase: 'preflight' | 'isolation' | 'mcp' | 'spawn' = 'preflight';
     try {
       await this.fireFault('preflight', runId);
       if (this.disposed) return;
@@ -713,6 +762,20 @@ export class Runner {
       if (st.cancelRequested) {
         this.completeWithoutEngine(st, 'cancelled', 'cancelled');
         return;
+      }
+      // P51: граница поднимается ДО MCP и движка. Отказ здесь валит старт рана, а
+      // не «тихо» запускает движок под service UID.
+      if (this.opts.isolation || st.spec.isolation?.mode === 'per_run_unix_identity') {
+        phase = 'isolation';
+        await this.fireFault('isolation', runId);
+        if (this.disposed) return;
+        await this.prepareCleanRoom(run, st);
+        if (this.disposed) return;
+        if (st.cancelRequested) {
+          await this.releaseCleanRoom(run, 'cancelled');
+          this.completeWithoutEngine(st, 'cancelled', 'cancelled');
+          return;
+        }
       }
       const adapter = this.opts.adapters[st.spec.engine.name];
       if (!adapter) throw new PreflightError('ENGINE_UNSUPPORTED', `engine "${st.spec.engine.name}" is not registered on this worker`);
@@ -744,6 +807,12 @@ export class Runner {
         spec: st.spec,
         cwd: st.spec.cwd,
         env: this.buildEngineEnv(run, st.spec),
+        ...(run.room
+          ? {
+              identity: run.room.identity,
+              ...(this.opts.isolation?.launcher ? { launcher: this.opts.isolation.launcher } : {}),
+            }
+          : {}),
         onLog: (stream, line) => this.onEngineLog(runId, stream, line),
         onExit: (code, signal) => {
           void this.onEngineExit(runId, code, signal);
@@ -755,6 +824,7 @@ export class Runner {
         return;
       }
       if (!handle.pid) throw new Error('engine adapter did not return a live process id');
+      if (run.room) this.assertEngineIdentity(run, st, handle.pid);
       st.pid = handle.pid;
       st.pgid = handle.pgid ?? handle.pid;
       st.startedAt = this.nowIso();
@@ -782,6 +852,14 @@ export class Runner {
     const spec = st.spec;
     if (spec.budget && !spec.budget.approved) {
       throw new PreflightError('BUDGET_UNAVAILABLE', spec.budget.reason ?? 'no approved budget for this run', { retryable: true });
+    }
+    // Ран, запросивший границу, на хосте без провайдера отказывается: запуск под
+    // service UID был бы расширением прав относительно запроса.
+    if (spec.isolation?.mode === 'per_run_unix_identity' && !this.opts.isolation) {
+      throw new PreflightError(
+        'ISOLATION_UNAVAILABLE',
+        'run requests per_run_unix_identity but this host has no clean room isolation provider configured',
+      );
     }
     for (const binding of spec.credentialBindings ?? []) {
       if (binding.status === 'missing') {
@@ -833,6 +911,136 @@ export class Runner {
     this.emit(st, 'materialized', { inputs: st.spec.input?.refs?.length ?? 0 });
   }
 
+  /**
+   * Подъём границы рана (issue #51): аренда слота, run-scoped каталоги с правами 0700,
+   * ACL для Runner'а и проба границы под идентичностью рана. Fail-closed: любой отказ
+   * поднимается как CleanRoomError и валит старт до спавна движка.
+   */
+  private async prepareCleanRoom(run: InternalRun, st: PersistedRunState): Promise<void> {
+    const provider = this.opts.isolation;
+    if (!provider) return;
+    const room = await provider.acquire(st.runId, st.userTaskId, st.profileId, st.spec.cwd);
+    run.room = room;
+    st.cleanRoom = {
+      identity: room.identity,
+      paths: room.paths,
+      status: 'active',
+    };
+    this.store.saveState(st);
+    this.emit(st, 'isolation_prepared', {
+      slotId: room.identity.slotId,
+      username: room.identity.username,
+      uid: room.identity.uid,
+      gid: room.identity.gid,
+      acl: room.acl,
+      probe: {
+        checks: room.probe?.checks.length ?? 0,
+        failures: room.probe?.failures.length ?? 0,
+      },
+    });
+  }
+
+  /**
+   * Сверка, что процесс движка реально исполняется под идентичностью рана. Хост читает
+   * /proc/<pid>/status: если UID не совпал со слотом, процесс убивается, а ран отказывает —
+   * запускать движок с более широкими правами, чем у рана, нельзя.
+   */
+  private assertEngineIdentity(run: InternalRun, st: PersistedRunState, pid: number): void {
+    const room = run.room;
+    if (!room) return;
+    const uid = readProcUid(pid);
+    if (uid === null) {
+      this.emit(st, 'log', {
+        stream: 'runner',
+        level: 'warn',
+        message: `engine.identity_unknown pid=${pid} slot=${room.identity.slotId}`,
+      });
+      return;
+    }
+    if (uid !== room.identity.uid) {
+      this.emit(st, 'log', {
+        stream: 'runner',
+        level: 'error',
+        message: `engine.identity_mismatch pid=${pid} uid=${uid} expected=${room.identity.slotId}:${room.identity.uid}`,
+      });
+      throw new CleanRoomError('ISOLATION_IDENTITY_MISMATCH', `engine process ${pid} runs as uid ${uid}, expected slot ${room.identity.slotId} (uid ${room.identity.uid})`);
+    }
+    this.emit(st, 'log', {
+      stream: 'runner',
+      level: 'info',
+      message: `engine.identity_verified pid=${pid} uid=${uid} slot=${room.identity.slotId}`,
+    });
+  }
+
+  /**
+   * Дочистка чистой среды терминального рана после рестарта воркера (issue #51).
+   *
+   * Движок здесь не запускается: повторяется только persist/sweep. Если экспорт оставил
+   * единственную копию выхода, workspace не трогаем, а слот остаётся `blocked` — иначе
+   * переиспользование открыло бы прежние данные рана.
+   */
+  private async reconcileCleanRoom(run: InternalRun): Promise<boolean> {
+    const provider = this.opts.isolation;
+    if (!provider) return false;
+    const st = run.state;
+    if (!st.cleanRoom) return false;
+    const lease = provider.lease(st.runId);
+    if (!lease || lease.status === 'released') return false;
+    const manifest = this.exportManifest(st.runId);
+    const retained = manifest?.cleanup.decision === 'retained_sole_copy';
+    try {
+      await provider.reconcile(lease, retained ? { keepWorkspace: true } : {});
+    } catch (error) {
+      this.emit(st, 'log', {
+        stream: 'runner',
+        level: 'error',
+        message: `clean_room.reconcile_failed runId=${st.runId} detail=${truncateLine(redactSecrets(error instanceof Error ? error.message : String(error)), 300)}`,
+      });
+      return false;
+    }
+    const after = provider.lease(st.runId);
+    st.cleanRoom.status = after?.status ?? st.cleanRoom.status;
+    this.store.saveState(st);
+    this.emit(st, 'log', {
+      stream: 'runner',
+      level: 'info',
+      message: `clean_room.reconciled runId=${st.runId} status=${st.cleanRoom.status} reason=${after?.reason ?? 'verified_sweep'}`,
+    });
+    return true;
+  }
+
+  /**
+   * Освобождение границы: sweep каталогов рана + снятие аренды слота. Слот освобождается
+   * только после проверенного удаления — иначе аренда остаётся `blocked` и слот не
+   * переиспользуется.
+   */
+  private async releaseCleanRoom(run: InternalRun, reason: string, options: { keepWorkspace?: boolean } = {}): Promise<void> {
+    const room = run.room;
+    if (!room) return;
+    run.room = null;
+    const st = run.state;
+    if (st.cleanRoom) {
+      st.cleanRoom.status = 'sweeping';
+      this.store.saveState(st);
+    }
+    const provider = this.opts.isolation;
+    if (!provider) return;
+    try {
+      await provider.release(room, reason, options);
+    } catch (error) {
+      this.emit(st, 'log', {
+        stream: 'runner',
+        level: 'error',
+        message: `clean_room.release_failed reason=${reason} detail=${truncateLine(redactSecrets(error instanceof Error ? error.message : String(error)), 300)}`,
+      });
+    }
+    if (st.cleanRoom) {
+      const lease = provider.lease(st.runId);
+      st.cleanRoom.status = lease?.status ?? 'released';
+      this.store.saveState(st);
+    }
+  }
+
   private buildEnv(spec: RunSpec): Record<string, string> {
     const env: Record<string, string> = {};
     for (const name of spec.envAllowlist) {
@@ -849,6 +1057,12 @@ export class Runner {
    */
   private buildEngineEnv(run: InternalRun, spec: RunSpec): Record<string, string> {
     const env = this.buildEnv(spec);
+    const room = run.room;
+    if (room) {
+      // run-scoped HOME/config/cache/tmp: движок не видит и не пишет пользовательский
+      // конфиг и кэш ни своего профиля, ни соседнего рана, ни Runner'а.
+      for (const [name, value] of Object.entries(room.env)) env[name] = value;
+    }
     const config = run.mcpConfigPath;
     if (config) env[MCP_CONFIG_ENV] = config;
     return env;
@@ -911,17 +1125,27 @@ export class Runner {
       log,
       ...(this.opts.capabilities ? { registry: this.opts.capabilities } : {}),
       bridgeToken: newBridgeToken(),
-      bridgeDir: join(this.opts.rootDir, 'mcp'),
+      // Сокет моста живёт внутри чистой среды рана: к нему подключается и движок, и
+      // per-run MCP-серверы — все под идентичностью рана, поэтому каталог обязан быть
+      // их собственным (0700, владелец — слот).
+      bridgeDir: run.room ? run.room.paths.mcp : join(this.opts.rootDir, 'mcp'),
       ...(this.opts.mcpBrokerCommand ? { brokerCommand: this.opts.mcpBrokerCommand } : {}),
+      ...(this.opts.isolation?.launcher ? { launcher: this.opts.isolation.launcher } : {}),
+      ...(run.room ? { identity: run.room.identity, runEnv: run.room.env } : {}),
     });
     run.mcp = session;
     st.mcp = { serverPids: session.servers.map((server) => ({ serverId: server.serverId, pid: server.pid ?? -1 })).filter((entry) => entry.pid > 0) };
     this.store.saveState(st);
-    run.mcpConfigPath = this.writeMcpConfig(st.spec.cwd, session.engineConfig(), log);
+    run.mcpConfigPath = this.writeMcpConfig(st.spec.cwd, session.engineConfig(), log, run.room);
   }
 
   /** Конфиг для движка пишется в workspace рана с правами 0600 и без значений binding'ов. */
-  private writeMcpConfig(cwd: string, config: EngineMcpConfig, log: (level: McpLogLevel, event: string, fields: McpLogFields) => void): string {
+  private writeMcpConfig(
+    cwd: string,
+    config: EngineMcpConfig,
+    log: (level: McpLogLevel, event: string, fields: McpLogFields) => void,
+    room: CleanRoom | null,
+  ): string {
     const path = join(cwd, MCP_CONFIG_DIR, 'mcp.json');
     mkdirSync(join(cwd, MCP_CONFIG_DIR), { recursive: true, mode: 0o700 });
     writeFileAtomic(path, `${JSON.stringify(config, null, 2)}\n`);
@@ -930,11 +1154,20 @@ export class Runner {
     } catch {
       // право 0600 усиливаем chmod'ом ниже; ошибка не должна валить старт рана
     }
+    // Движок читает конфиг под идентичностью рана: владелец обязан быть слотом, иначе
+    // он не сможет прочитать собственный конфиг (0600, владелец — Runner).
+    if (room) {
+      try {
+        chownSync(path, room.identity.uid, room.identity.gid);
+      } catch {
+        // chown без привилегий не должен ронять старт: права 0600 уже выставлены
+      }
+    }
     log('info', 'mcp.engine_config', {
       configPath: path,
       servers: config.serverIds.length,
       bindingValues: false,
-      isolation: 'bridge_token_visible_to_engine_not_os_isolation',
+      isolation: room ? `per_run_unix_identity uid=${room.identity.uid}` : 'bridge_token_visible_to_engine_not_os_isolation',
     });
     return path;
   }
@@ -1102,24 +1335,34 @@ export class Runner {
     if (failure) result.failure = failure;
     stripRepositoryToken(st.spec);
     this.persistResult(st, result);
+    // Граница снимается и на стартовом отказе: иначе слот занят до следующего recover().
+    const run = this.runs.get(st.runId);
+    if (run?.room) void this.releaseCleanRoom(run, `start_refused_${exitReason}`);
   }
 
-  private failStartPath(st: PersistedRunState, err: unknown, phase: 'preflight' | 'mcp' | 'spawn'): void {
+  private failStartPath(st: PersistedRunState, err: unknown, phase: 'preflight' | 'isolation' | 'mcp' | 'spawn'): void {
     const message = err instanceof Error ? err.message : String(err);
     const safeSummary = truncateLine(redactSecrets(message), 500);
     const failure: RunResult['failure'] =
-      phase === 'mcp'
+      phase === 'isolation'
         ? {
-            code: err instanceof McpStartupError ? err.code : err instanceof McpScopeError ? err.code : 'MCP_STARTUP_FAILED',
+            code: err instanceof CleanRoomError ? err.code : 'ISOLATION_UNAVAILABLE',
             failureClass: 'runtime',
             safeSummary,
-            retryable: true,
+            retryable: err instanceof CleanRoomError ? err.retryable : true,
           }
-        : phase === 'spawn'
-          ? { code: 'ENGINE_STARTUP_FAILED', failureClass: 'engine', safeSummary, retryable: true }
-          : err instanceof PreflightError
-            ? { code: err.code, failureClass: err.failureClass, safeSummary, retryable: err.retryable }
-            : { code: 'PREFLIGHT_FAILED', failureClass: 'preflight', safeSummary, retryable: true };
+        : phase === 'mcp'
+          ? {
+              code: err instanceof McpStartupError ? err.code : err instanceof McpScopeError ? err.code : 'MCP_STARTUP_FAILED',
+              failureClass: 'runtime',
+              safeSummary,
+              retryable: true,
+            }
+          : phase === 'spawn'
+            ? { code: 'ENGINE_STARTUP_FAILED', failureClass: 'engine', safeSummary, retryable: true }
+            : err instanceof PreflightError
+              ? { code: err.code, failureClass: err.failureClass, safeSummary, retryable: err.retryable }
+              : { code: 'PREFLIGHT_FAILED', failureClass: 'preflight', safeSummary, retryable: true };
     const exitReason = phase === 'spawn' || phase === 'mcp' ? 'startup_failure' : 'preflight_refused';
     this.completeWithoutEngine(st, 'failed', exitReason, failure);
   }
@@ -1134,6 +1377,17 @@ export class Runner {
     const result = this.computeResult(st, exportManifest);
     await this.appendProfileTrace(st, result);
     this.persistResult(st, result);
+    // Чистая среда освобождается только после того, как результат записан: слот переиспользуется
+    // лишь после проверенного удаления каталогов рана (issue #51, иначе #52).
+    const run = this.runs.get(st.runId);
+    if (run?.room) {
+      const retained = exportManifest?.cleanup.decision === 'retained_sole_copy';
+      // Единственная копия выхода остаётся на диске: чистим только эфемерные каталоги
+      // рана и НЕ отдаём слот — переиспользование открыло бы прежние данные.
+      await this.releaseCleanRoom(run, retained ? 'sole_copy_retained' : `finalized_${st.exit ? 'engine_exit' : 'startup_failure'}`, {
+        ...(retained ? { keepWorkspace: true } : {}),
+      });
+    }
     return result;
   }
 

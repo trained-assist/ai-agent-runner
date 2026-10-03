@@ -13,3 +13,4 @@ e2e-loop-report*.json
 data/
 _scratch/
 .p29-fleet/
+.npm-cache/

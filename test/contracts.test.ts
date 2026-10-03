@@ -50,6 +50,14 @@ const EVENT_PAYLOADS: Record<RunnerEventType, unknown> = {
   failed: { outcome: 'failed', exitReason: 'timeout', code: 'TIMEOUT', safeSummary: 'run exceeded limits' },
   cancelled: { outcome: 'cancelled', exitReason: 'cancelled', reason: 'cancelled' },
   connection_lost: { detectedAt: '2026-10-01T10:00:00.000Z', detail: 'partition', engineAlive: true },
+  isolation_prepared: {
+    slotId: 'ta-agent-1',
+    username: 'ta-agent-1',
+    uid: 999,
+    gid: 988,
+    acl: 'posix_0700',
+    probe: { checks: 4, failures: 0 },
+  },
 };
 
 function validEvent(type: RunnerEventType, over: Record<string, unknown> = {}): Record<string, unknown> {

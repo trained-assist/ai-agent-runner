@@ -10,7 +10,7 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "build": "tsc -p tsconfig.build.json && node scripts/copy-mcp-fixtures.mjs",
+    "build": "tsc -p tsconfig.build.json && node scripts/copy-mcp-fixtures.mjs && node scripts/copy-isolation-probe.mjs",
     "start": "node dist/api/main.js",
     "test": "vitest run",
     "test:watch": "vitest"

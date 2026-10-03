@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process';
 import { EngineStartupError } from '../../contracts/validate.js';
 import type { RunSpec } from '../../contracts/run-spec.js';
 import type { EngineAdapter, EngineHandle, EngineStartContext } from './engine-adapter.js';
+import { launchCommand } from './launch.js';
 import { findOnPath, handleForChild, isExecutableFile } from './process-tree.js';
 
 export interface OpenCodeAdapterOptions {
@@ -40,7 +41,8 @@ export class OpenCodeAdapter implements EngineAdapter {
       throw new EngineStartupError('opencode binary is not available on this host');
     }
     const argv = this.options.argv ?? defaultArgv(ctx.spec);
-    const child = spawn(binary, argv, {
+    const launch = launchCommand(ctx, binary, argv);
+    const child = spawn(launch.command, launch.args, {
       cwd: ctx.cwd,
       env: ctx.env,
       detached: true,

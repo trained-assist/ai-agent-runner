@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { EngineStartupError, type ValidationResult } from '../../contracts/validate.js';
 import type { EngineAdapter, EngineHandle, EngineStartContext } from './engine-adapter.js';
+import { launchCommand } from './launch.js';
 import { handleForChild } from './process-tree.js';
 
 export const FAKE_SCENARIOS = [
@@ -60,7 +61,8 @@ export class FakeEngine implements EngineAdapter {
       throw new EngineStartupError('fake engine failed to start (deterministic scenario)');
     }
     if (this.scenario === 'mcp-tools') {
-      const child = spawn(process.execPath, [MCP_ENGINE_CLIENT, ctx.spec.input?.inlinePrompt ?? '{"calls":[],"denied":[]}'], {
+      const launch = launchCommand(ctx, process.execPath, [MCP_ENGINE_CLIENT, ctx.spec.input?.inlinePrompt ?? '{"calls":[],"denied":[]}']);
+      const child = spawn(launch.command, launch.args, {
         cwd: ctx.cwd,
         env: ctx.env,
         detached: true,
@@ -69,7 +71,8 @@ export class FakeEngine implements EngineAdapter {
       return handleForChild(child, { onLog: ctx.onLog, onExit: ctx.onExit });
     }
     const script = SCRIPTS[this.scenario];
-    const child = spawn(process.execPath, ['-e', script], {
+    const launch = launchCommand(ctx, process.execPath, ['-e', script]);
+    const child = spawn(launch.command, launch.args, {
       cwd: ctx.cwd,
       env: ctx.env,
       detached: true,

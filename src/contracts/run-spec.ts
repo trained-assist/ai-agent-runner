@@ -13,6 +13,7 @@ import {
 } from './validate.js';
 import { isSafeRelativePath } from '../storage/local-paths.js';
 import { isRegionId } from '../release/placement.js';
+import { isIsolationMode, type IsolationMode } from '../isolation/contract.js';
 
 export const RUN_SPEC_CONTRACT_VERSION = 1 as const;
 
@@ -137,7 +138,7 @@ export interface RunSpec {
   limits: RunLimits;
   deadline?: string;
   input?: InputSpec;
-  isolation?: { mode: string };
+  isolation?: { mode: IsolationMode };
   regionConstraints?: RegionConstraints;
   credentialBindings?: CredentialBinding[];
   mcp?: McpSpec;
@@ -545,13 +546,17 @@ export function validateRunSpec(input: unknown): ValidationResult<RunSpec> {
   let inputSpec: InputSpec | undefined;
   if ('input' in input && input['input'] !== undefined) inputSpec = validateInput(input['input'], 'spec.input', collector);
 
-  let isolation: { mode: string } | undefined;
+  let isolation: { mode: IsolationMode } | undefined;
   if ('isolation' in input && input['isolation'] !== undefined) {
     const iso = input['isolation'];
     if (checkObject(iso, 'spec.isolation', collector)) {
       checkKeys(iso, ['mode'], ['mode'], 'spec.isolation', collector);
       checkString(iso['mode'], 'spec.isolation.mode', collector, 100);
-      if (typeof iso['mode'] === 'string') isolation = { mode: iso['mode'] };
+      if (typeof iso['mode'] === 'string' && !isIsolationMode(iso['mode'])) {
+        collector.push('spec.isolation.mode: expected per_run_unix_identity | none');
+      } else if (typeof iso['mode'] === 'string') {
+        isolation = { mode: iso['mode'] as IsolationMode };
+      }
     }
   }
 

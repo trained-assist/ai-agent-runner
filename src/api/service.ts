@@ -38,6 +38,7 @@ import {
 } from './contracts.js';
 import { ApiError, type ApiErrorCode } from './errors.js';
 import { ApiStore, API_STORE_SCHEMA_VERSION, type AdmissionRecord } from './store.js';
+import type { CleanRoomProvider } from '../isolation/contract.js';
 
 export type ApiLogger = (entry: Record<string, unknown>) => void;
 
@@ -111,6 +112,8 @@ export interface AgentApiOptions {
   capabilities?: CapabilityRegistry;
   /** Резолвер значений credential binding'ов (P13). */
   bindingResolver?: BindingValueResolver;
+  /** Граница Agent clean room (issue #51): per-run Unix-идентичность вместо service UID. */
+  isolation?: CleanRoomProvider;
   /** Промоушен-контур P29: pinned release, когорта, откат, журнал, реестр владельцев. */
   promotion?: PromotionRuntime;
 }
@@ -152,6 +155,7 @@ export class AgentApi {
     if (options.cancelGraceMs !== undefined) runnerOptions.cancelGraceMs = options.cancelGraceMs;
     if (options.capabilities) runnerOptions.capabilities = options.capabilities;
     if (options.bindingResolver) runnerOptions.bindingResolver = options.bindingResolver;
+    if (options.isolation) runnerOptions.isolation = options.isolation;
     this.runner = new Runner(runnerOptions);
   }
 
@@ -484,10 +488,10 @@ export class AgentApi {
         capabilityHandlersSharedWithMcp: this.opts.capabilities !== undefined,
         capabilityInvokeEndpoint: this.opts.capabilities !== undefined,
         remoteTransport: 'absent',
-        osIsolation: 'not_proven_service_uid_only',
-        osIsolationNote:
-          'per-run MCP processes are spawned by this worker under the same service UID; a service UID is not a proven OS isolation boundary (ARCHITECTURE §9, карточка P13)',
+        osIsolation: this.isolationCapability(),
+        osIsolationNote: this.isolationNote(),
       },
+      isolation: this.isolationView(),
       cancel: { requestedReceipt: true, terminalConfirmation: true },
       /**
        * Промоушен (P29). Объявляется честно: без promotion-контура когорты и отката нет,
@@ -540,6 +544,37 @@ export class AgentApi {
             placement: null,
           },
       engines: Object.keys(this.opts.adapters).sort(),
+    };
+  }
+
+  private isolationCapability(): ApiCapabilities['isolation']['capability'] {
+    return this.opts.isolation?.capability() ?? 'not_proven_service_uid_only';
+  }
+
+  private isolationNote(): string {
+    const isolation = this.opts.isolation;
+    if (!isolation) {
+      return 'no clean room isolation provider is configured on this host: the engine runs under the service UID, which is not a proven OS isolation boundary (ARCHITECTURE §9, карточка P13)';
+    }
+    const capability = isolation.capability();
+    if (capability === 'per_run_unix_identity_verified') {
+      return `every run executes under its own leased unix identity (slots: ${isolation.policy.slots.join(', ')}), with run-scoped HOME/config/cache/tmp and a boundary probe before spawn; per-run MCP processes run under the same identity`;
+    }
+    return 'isolation provider is configured but its self-test failed: runs are refused instead of falling back to the service UID';
+  }
+
+  private isolationView(): ApiCapabilities['isolation'] {
+    const isolation = this.opts.isolation;
+    if (!isolation) {
+      return { mode: 'none', slots: [], freeSlots: [], capability: 'not_proven_service_uid_only', launcher: null, failClosed: true };
+    }
+    return {
+      mode: isolation.policy.mode,
+      slots: [...isolation.policy.slots],
+      freeSlots: isolation.freeSlots(),
+      capability: isolation.capability(),
+      launcher: isolation.launcher?.kind ?? null,
+      failClosed: true,
     };
   }
 
