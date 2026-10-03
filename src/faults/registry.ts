@@ -1,6 +1,6 @@
-export type FaultPoint = 'preflight' | 'mcp' | 'spawn' | 'heartbeat' | 'finalization' | 'export' | 'log_sink' | 'recovery';
+export type FaultPoint = 'preflight' | 'isolation' | 'mcp' | 'spawn' | 'heartbeat' | 'finalization' | 'export' | 'log_sink' | 'recovery';
 
-export const FAULT_POINTS: readonly FaultPoint[] = ['preflight', 'mcp', 'spawn', 'heartbeat', 'finalization', 'export', 'log_sink', 'recovery'];
+export const FAULT_POINTS: readonly FaultPoint[] = ['preflight', 'isolation', 'mcp', 'spawn', 'heartbeat', 'finalization', 'export', 'log_sink', 'recovery'];
 
 export interface FaultContext {
   point: FaultPoint;

@@ -1,0 +1,138 @@
+name: isolation-probe
+
+# Приёмка границы Agent clean room (issue #51): per-run Unix-идентичность на настоящем
+# Linux-хосте с привилегиями. Проба создаёт собственных непривилегированных пользователей
+# (слоты), поднимает API/Runner поверх них и проверяет отрицательные свойства границы на
+# живых одновременных ранах, управляемые отказы (сломанный слот, занятый слот, отказ
+# хранилища) и переживание аренды идентичности рестартом воркера.
+#
+# Почему workflow_dispatch, а не pull_request: проба требует root (useradd/chown/setfacl),
+# а решение об OS-границе принимается на привилегированной песочной VM. Обычный CI-раннер
+# не может ни доказать, ни честно опровергнуть границу, поэтому он её не запускает: вместо
+# зелёного шага «изоляция проверена» там был бы шаг с привилегиями, случайно выданными CI.
+# Доказательство границы — транскрипт в docs/evidence/p51-clean-room-vm2.
+#
+# Прод и настоящие RU/EU-воркеры не используются: у пробы свой namespace и свои слоты.
+# Если возможностей хоста не хватает, job честно отмечает SKIP, а не PASS.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  isolation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci --no-audit --no-fund
+      - run: npm run typecheck
+      - run: npm run build
+
+      - name: Возможности хоста для OS-границы рана
+        id: caps
+        run: |
+          set -uo pipefail
+          enforced=true
+          reasons=""
+          if [ "$(id -u)" != "0" ]; then
+            enforced=false
+            reasons="${reasons} uid=$(id -u) is not root (needs useradd/chown/setfacl/setpriv);"
+          fi
+          for cmd in setpriv runuser; do
+            if ! command -v "$cmd" >/dev/null 2>&1; then
+              enforced=false
+              reasons="${reasons} no $cmd on PATH;"
+            fi
+          done
+          if ! command -v setfacl >/dev/null 2>&1; then
+            enforced=false
+            reasons="${reasons} no setfacl on PATH;"
+          fi
+          echo "enforced=$enforced" >> "$GITHUB_OUTPUT"
+          echo "reasons=${reasons}" >> "$GITHUB_OUTPUT"
+          if [ "$enforced" = "true" ]; then
+            echo "хост пригоден для пробы границы"
+          else
+            {
+              echo '### Проба границы Agent clean room — пропущена (не провалена)'
+              echo 'Хост не может доказать OS-границу рана:'
+              echo '```'
+              echo "${reasons}"
+              echo '```'
+              echo 'Доказательство берётся с привилегированной песочной VM: docs/evidence/p51-clean-room-vm2.'
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning::граница рана не проверялась на этом хосте:${reasons}"
+          fi
+
+      - name: Слоты и песочница пробы
+        if: steps.caps.outputs.enforced == 'true'
+        run: |
+          set -euo pipefail
+          # Слоты — обычные непривилегированные пользователи хоста; создаются здесь же,
+          # удаляются вместе с runner'ом CI. Общий read-only каталог бинарей инструментов.
+          for slot in ta-agent-1 ta-agent-2; do
+            sudo useradd --no-create-home --shell /usr/sbin/nologin "$slot" 2>/dev/null || echo "slot $slot already exists"
+          done
+          getent passwd ta-agent-1 ta-agent-2
+          scripts/recreate-sandbox.sh \
+            --namespace iso-ci \
+            --fleet-root "$PWD/.iso-probe" \
+            --workers a \
+            --client-engines fake,opencode \
+            --owner "$(id -un)"
+
+      - name: Проба границы чистой среды (issue #51)
+        if: steps.caps.outputs.enforced == 'true'
+        run: |
+          set -euo pipefail
+          sudo --preserve-env=PATH,HOME \
+            node scripts/isolation-probe.mjs \
+              --fleet-root "$PWD/.iso-probe" \
+              --namespace iso-ci \
+              --engine "${PROBE_ENGINE:-fake}" \
+              --out "$PWD/.iso-probe/out"
+
+      - name: Транскрипт в артефакт job
+        if: always()
+        run: |
+          set -uo pipefail
+          if [ -f .iso-probe/out/transcript.sha256 ]; then
+            (cd .iso-probe/out && sha256sum -c transcript.sha256)
+            {
+              echo '### Проба границы Agent clean room (issue #51)'
+              echo '```'
+              cat .iso-probe/out/transcript.sha256
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            # Наружу уходит только транскрипт: в .iso-probe лежат свежие ключи песочницы.
+            tar -czf "$RUNNER_TEMP/isolation-transcript.tgz" -C .iso-probe/out .
+          else
+            echo 'транскрипт не собран' >&2
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: p51-clean-room-transcript
+          path: ${{ runner.temp }}/isolation-transcript.tgz
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Секреты песочницы не попали в транскрипт (повторная проверка в CI)
+        if: steps.caps.outputs.enforced == 'true'
+        run: |
+          set -euo pipefail
+          if [ ! -f .iso-probe/out/transcript.json ]; then
+            echo 'транскрипт не собран' >&2
+            exit 1
+          fi
+          if grep -q 'ak_' .iso-probe/out/transcript.json; then
+            echo 'в транскрипте есть значение ключа' >&2
+            exit 1
+          fi
+          echo 'значений ключей в транскрипте нет'

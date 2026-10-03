@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type { RunnerEvent } from '../contracts/events.js';
 import type { RunResult } from '../contracts/result.js';
+import type { IsolationCapability } from '../isolation/contract.js';
 import {
   canonicalJson,
   redactRepositoryToken,
@@ -38,6 +39,8 @@ export interface SubmitRequest {
   traceId?: string;
   instructions?: string;
   repository?: RepositorySpec;
+  /** Требование границы рана (issue #51): per_run_unix_identity | none. */
+  isolation?: { mode: 'per_run_unix_identity' | 'none' };
 }
 
 export interface Receipt {
@@ -153,8 +156,20 @@ export interface ApiCapabilities {
     capabilityHandlersSharedWithMcp: boolean;
     capabilityInvokeEndpoint: boolean;
     remoteTransport: 'absent';
-    osIsolation: 'not_proven_service_uid_only';
+    osIsolation: IsolationCapability;
     osIsolationNote: string;
+  };
+  /**
+   * Граница Agent clean room (issue #51). Объявляется честно: без настроенного провайдера
+   * движок идёт под service UID, и это НЕ доказанная OS-граница.
+   */
+  isolation: {
+    mode: 'none' | 'per_run_unix_identity';
+    slots: string[];
+    freeSlots: string[];
+    capability: IsolationCapability;
+    launcher: 'setpriv' | 'runuser' | null;
+    failClosed: boolean;
   };
   /**
    * Промоушен (P29, этап I10): закреплённый релиз, флаг когорты, возможность отката,
@@ -212,6 +227,7 @@ const SUBMIT_KEYS = [
   'traceId',
   'instructions',
   'repository',
+  'isolation',
 ] as const;
 
 const SUBMIT_REQUIRED = ['engine', 'limits'] as const;
@@ -234,6 +250,15 @@ export function validateSubmitRequest(input: unknown): ValidationResult<SubmitRe
   if (input['userTaskId'] !== undefined) checkString(input['userTaskId'], 'request.userTaskId', collector, 200);
   if (input['conversationId'] !== undefined) checkString(input['conversationId'], 'request.conversationId', collector, 200);
   if (input['instructions'] !== undefined) checkString(input['instructions'], 'request.instructions', collector, 10_000);
+  if (input['isolation'] !== undefined) {
+    const isolation = input['isolation'];
+    if (checkObject(isolation, 'request.isolation', collector)) {
+      checkKeys(isolation, ['mode'], ['mode'], 'request.isolation', collector);
+      if (isolation['mode'] !== 'per_run_unix_identity' && isolation['mode'] !== 'none') {
+        collector.push('request.isolation.mode: expected per_run_unix_identity | none');
+      }
+    }
+  }
   if (!collector.ok) return collector.finish(undefined as never);
 
   const specLike: Record<string, unknown> = {
@@ -250,7 +275,7 @@ export function validateSubmitRequest(input: unknown): ValidationResult<SubmitRe
     envAllowlist: input['envAllowlist'] ?? [],
     limits: input['limits'],
   };
-  for (const key of ['input', 'deadline', 'regionConstraints', 'credentialBindings', 'budget', 'result', 'outputs', 'traceId', 'repository'] as const) {
+  for (const key of ['input', 'deadline', 'regionConstraints', 'credentialBindings', 'budget', 'result', 'outputs', 'traceId', 'repository', 'isolation'] as const) {
     if (input[key] !== undefined) specLike[key] = input[key];
   }
 
@@ -278,6 +303,7 @@ export function validateSubmitRequest(input: unknown): ValidationResult<SubmitRe
   if (typeof input['userTaskId'] === 'string') request.userTaskId = input['userTaskId'];
   if (typeof input['conversationId'] === 'string') request.conversationId = input['conversationId'];
   if (typeof input['instructions'] === 'string') request.instructions = input['instructions'];
+  if (spec.isolation !== undefined) request.isolation = spec.isolation;
 
   return collector.finish(request);
 }

@@ -215,9 +215,12 @@ Env/константы: `RUNNER_DEFAULT_REPO` (дефолтная репа), `RU
   инструмента (ловушка PR-16).
 - **Чужой binding недоступен**: три слоя приёмки — объявление в `credentialBindings`,
   `allowedTools` рана, `requiredScopes` handler'а. Отказ фиксируется в логе рана с причиной.
-- **OS-изоляция не заявлена**: per-run процессы MCP стартуют под тем же service UID, что и
-  runner. Записано в логах (`isolation=same_service_uid_not_os_isolated`), в
-  `GET /v1/capabilities` (`mcp.osIsolation: not_proven_service_uid_only`) и в транскрипте.
+- **Изоляция MCP объявляется честно и зависит от настройки хоста**: без провайдера границы
+  per-run процессы MCP стартуют под тем же service UID, что и runner
+  (`isolation=same_service_uid_not_os_isolated`,
+  `GET /v1/capabilities: mcp.osIsolation = not_proven_service_uid_only`); с настроенной
+  границей [чистой среды](#agent-clean-room-граница-рана-и-lifecycle-issue-5152) они
+  стартуют под идентичностью своего рана.
 - **Значения binding'ов не покидают хост**: в spec/state/events/логах/конфиге движка и
   окружении дочерних процессов их нет — проверяется пробой и тестом.
 
@@ -294,6 +297,43 @@ Env/константы: `RUNNER_DEFAULT_REPO` (дефолтная репа), `RU
 - [x] Внешний контракт поверх HTTP на двух воркерах в разных регионах + failover без двойного исполнения — `test/placement-api.test.ts`
 - [x] Проба приёмки на песочной VM2: 67/67 проверок, транскрипт `docs/evidence/p30-fleet-vm2/`
 - [x] Проба в CI на каждом PR: `.github/workflows/p30-fleet-probe.yml`
+
+## Agent clean room: граница рана и lifecycle (issue #51/#52)
+
+Отдельный cwd — ещё не граница. Слот — эксклюзивно арендуемый Unix-пользователь пула
+(`ta-agent-N`), а не процесс: он существует до рана и переиспользуется только после
+проверенной очистки. Никакого нового управляющего сервиса и никакой VM на ран — граница
+живёт на хосте Runner'а.
+
+| Область | Файл | Что делает |
+|---|---|---|
+| Контракт | `src/isolation/contract.ts` | `CleanRoomProvider`: аренда слота, run-scoped каталоги, проба границы, sweep/release/reconcile, честная декларация `IsolationCapability` |
+| Граница | `src/isolation/clean-room.ts` | Каталоги рана 0700 с владельцем-слотом, ACL для Runner'а, run-scoped HOME/config/cache/data/tmp, долговечная аренда `identity/leases/<runId>.json`, блокировка слота при неполной очистке |
+| Переключение | `src/isolation/launcher.ts` | `setpriv --clear-groups` / `runuser`: меняется uid/gid И дополнительные группы — иначе дочерний процесс унаследовал бы права Runner'а |
+| Проба | `src/isolation/probe/boundary-probe.mjs` | Отрицательные свойства ДО спавна движка: чужой ран, корень Runner'а и его credentials недоступны; свои HOME/tmp и общие read-only бинари доступны |
+| Runner | `src/runner/runner.ts` | Стадия границы между materialize и MCP/спавном, fail-closed отказ до спавна, сверка uid процесса движка по `/proc`, дочистка аренды в `recover()` |
+| Приёмка | `scripts/isolation-probe.mjs`, `.github/workflows/isolation-probe.yml` | Живые одновременные раны, матрица «свой/чужой», управляемые отказы и рестарт воркера → sanitized-транскрипт + sha256 |
+
+Ключевые семантики:
+
+- **Fallback к service UID запрещён.** Нет `setpriv`/`runuser`, нет свободного слота, слот не
+  на хосте или проба не прошла — ран отказывается ДО спавна движка (`ISOLATION_UNAVAILABLE`,
+  `ISOLATION_SLOT_BUSY`, `ISOLATION_IDENTITY_UNAVAILABLE`, `ISOLATION_PROBE_FAILED`).
+- **Аренда переживает рестарт воркера** и снимается только после проверенного удаления
+  каталогов рана; если выход остался единственной копией, аренда `blocked` и слот не
+  переиспользуется — иначе следующий ран прочитал бы прежние данные.
+- **Единственная копия важнее чистоты**: при отказе хранилища workspace не удаляется,
+  `cleanup: pending`, причина — в логе рана и в аренде.
+- **Возможности объявляются честно**: без настроенной границы `osIsolation =
+  not_proven_service_uid_only`, с нерабочей настройкой — `configured_but_refusing_runs`.
+
+### Что покрыто тестами
+
+- [x] Слот, run-scoped HOME, движок и per-run MCP под идентичностью рана, сокет моста внутри среды — `test/clean-room-isolation.test.ts`
+- [x] Поломанная граница и отсутствие слота отказывают до спавна, без расширения прав — `test/clean-room-isolation.test.ts`
+- [x] Аренда переживает рестарт воркера; блокировка слота дочекается sweep — `test/clean-room-isolation.test.ts`
+- [x] Единственная копия выхода: `cleanup: pending`, слот заблокирован, после рестарта блокировка держится — `test/clean-room-isolation.test.ts`
+- [x] Проба приёмки на настоящем Linux-хосте: `.github/workflows/isolation-probe.yml`
 
 ## Разработка
 

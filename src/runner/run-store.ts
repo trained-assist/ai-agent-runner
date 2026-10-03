@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { validateRunnerEvent, type RunnerEvent } from '../contracts/events.js';
 import type { RunResult } from '../contracts/result.js';
@@ -6,6 +6,7 @@ import { redactRepositoryToken, type RunSpec } from '../contracts/run-spec.js';
 import { isSafeId } from '../contracts/validate.js';
 import { writeFileAtomic } from './util.js';
 import type { RunState } from './state-machine.js';
+import type { CleanRoomPaths, RunIdentity } from '../isolation/contract.js';
 
 export const PERSISTED_STATE_SCHEMA_VERSION = 1 as const;
 
@@ -47,6 +48,16 @@ export interface PersistedRunState {
   result: RunResult | null;
   fencing: { rejected: number };
   mcp: PersistedMcpState | null;
+  /**
+   * Граница Agent clean room (issue #51). Пишется в state.json, поэтому аренда идентичности
+   * переживает рестарт воркера: recover() дочищает слот, не переиспользуя его до
+   * проверенного удаления каталогов рана.
+   */
+  cleanRoom: {
+    identity: RunIdentity;
+    paths: CleanRoomPaths;
+    status: 'active' | 'sweeping' | 'released' | 'blocked';
+  } | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -71,6 +82,14 @@ export class RunStore {
 
   init(): void {
     mkdirSync(this.runsDir, { recursive: true });
+    // 0700: каталог состояния ранов лежит под тем же dataDir, куда слоту выдаётся
+    // проходимость ACL. Если каталог останется 0755, слот прочитает state.json чужого
+    // рана — состояние рана это его credentials-эквивалент.
+    try {
+      chmodSync(this.runsDir, 0o700);
+    } catch {
+      // платформа без posix-прав: тогда граница не настроена и раны не идут через слот
+    }
     if (existsSync(this.operationsPath)) {
       try {
         const parsed = JSON.parse(readFileSync(this.operationsPath, 'utf8')) as Record<string, OperationEntry>;

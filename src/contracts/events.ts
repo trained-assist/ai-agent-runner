@@ -26,6 +26,7 @@ export const RUNNER_EVENT_TYPES = [
   'failed',
   'cancelled',
   'connection_lost',
+  'isolation_prepared',
 ] as const;
 
 export type RunnerEventType = (typeof RUNNER_EVENT_TYPES)[number];
@@ -119,6 +120,18 @@ export interface CancelledEvent extends EventEnvelope {
   payload: { outcome: 'cancelled'; exitReason: string; reason: string };
 }
 
+export interface IsolationPreparedEvent extends EventEnvelope {
+  type: 'isolation_prepared';
+  payload: {
+    slotId: string;
+    username: string;
+    uid: number;
+    gid: number;
+    acl: 'posix_0700' | 'posix_0700_acl';
+    probe: { checks: number; failures: number };
+  };
+}
+
 export interface ConnectionLostEvent extends EventEnvelope {
   type: 'connection_lost';
   payload: { detectedAt: string; detail: string; engineAlive: boolean };
@@ -177,6 +190,7 @@ const PAYLOAD_KEYS: Record<RunnerEventType, readonly string[]> = {
   failed: ['outcome', 'exitReason', 'code', 'safeSummary'],
   cancelled: ['outcome', 'exitReason', 'reason'],
   connection_lost: ['detectedAt', 'detail', 'engineAlive'],
+  isolation_prepared: ['slotId', 'username', 'uid', 'gid', 'acl', 'probe'],
 };
 
 function validatePayload(type: RunnerEventType, value: unknown, path: string, collector: ErrorCollector): void {
@@ -261,6 +275,27 @@ function validatePayload(type: RunnerEventType, value: unknown, path: string, co
       checkString(value['exitReason'], `${path}.exitReason`, collector, 100);
       checkString(value['reason'], `${path}.reason`, collector, 100);
       break;
+    case 'isolation_prepared': {
+      checkString(value['slotId'], `${path}.slotId`, collector, 100);
+      checkString(value['username'], `${path}.username`, collector, 100);
+      for (const key of ['uid', 'gid'] as const) {
+        if (typeof value[key] !== 'number' || !Number.isInteger(value[key]) || (value[key] as number) <= 0) {
+          collector.push(`${path}.${key}: expected positive integer`);
+        }
+      }
+      if (value['acl'] !== 'posix_0700' && value['acl'] !== 'posix_0700_acl') {
+        collector.push(`${path}.acl: expected posix_0700 | posix_0700_acl`);
+      }
+      const probe = value['probe'];
+      if (!checkObject(probe, `${path}.probe`, collector)) break;
+      checkKeys(probe, ['checks', 'failures'], ['checks', 'failures'], `${path}.probe`, collector);
+      for (const key of ['checks', 'failures'] as const) {
+        if (typeof probe[key] !== 'number' || !Number.isInteger(probe[key]) || (probe[key] as number) < 0) {
+          collector.push(`${path}.probe.${key}: expected non-negative integer`);
+        }
+      }
+      break;
+    }
     case 'connection_lost':
       if (!isUtcTimestamp(value['detectedAt'])) collector.push(`${path}.detectedAt: expected UTC ISO timestamp`);
       checkString(value['detail'], `${path}.detail`, collector, 500);

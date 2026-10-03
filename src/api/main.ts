@@ -20,6 +20,8 @@ import { handleArtifactRequest, type ArtifactRouteDeps } from './artifact-route.
 import { ApiError } from './errors.js';
 import { createAgentApiServer } from './server.js';
 import { AgentApi, type ApiLogger, type PromotionRuntime } from './service.js';
+import type { CleanRoomProvider } from '../isolation/contract.js';
+import { UnixCleanRoomProvider } from '../isolation/clean-room.js';
 
 export const DEFAULT_API_PORT = 8787;
 export const DEFAULT_API_HOST = '0.0.0.0';
@@ -42,6 +44,12 @@ export interface AgentApiProcessConfig {
   ownerStorePath: string;
   /** Политика размещения (P30): регион × провайдер × credentials × резидентность. */
   placementPolicyPath: string;
+  /**
+   * Граница Agent clean room (issue #51). Пустой слот `slots` = провайдер не настроен:
+   * движок идёт под service UID, и capabilities это объявляют честно. Непустой список
+   * поднимает per-run Unix-идентичности; отказ границы валит раны, а не расширяет права.
+   */
+  isolation: { slots: string[]; toolPaths: string[] };
 }
 
 function envValue(name: string): string | undefined {
@@ -90,6 +98,11 @@ export function loadAgentApiConfig(env: Record<string, string | undefined> = pro
 
   const host = env['AGENT_API_HOST']?.trim() || DEFAULT_API_HOST;
   const shareSecret = env['ARTIFACT_SHARE_SECRET']?.trim();
+  const isolationSlots = splitList(env['AGENT_API_ISOLATION_SLOTS']);
+  const isolationToolPaths = splitList(env['AGENT_API_ISOLATION_TOOL_PATHS']);
+  if (isolationSlots.length > 0 && isolationToolPaths.length === 0) {
+    throw new Error('AGENT_API_ISOLATION_TOOL_PATHS is required when AGENT_API_ISOLATION_SLOTS is set: shared read-only tool directories');
+  }
   return {
     host,
     port,
@@ -105,7 +118,16 @@ export function loadAgentApiConfig(env: Record<string, string | undefined> = pro
     releaseStatePath: describePath(env['AGENT_API_RELEASE_STATE']?.trim() || join(dataDir, 'release-state.json')),
     ownerStorePath: env['AGENT_API_OWNER_STORE']?.trim() ? describePath(env['AGENT_API_OWNER_STORE'].trim()) : '',
     placementPolicyPath: env['AGENT_API_PLACEMENT_POLICY']?.trim() ? describePath(env['AGENT_API_PLACEMENT_POLICY'].trim()) : '',
+    isolation: { slots: isolationSlots, toolPaths: isolationToolPaths },
   };
+}
+
+/** Список из env-переменной: запятые и пробелы как разделители, пустые элементы отброшены. */
+function splitList(raw: string | undefined): string[] {
+  return (raw ?? '')
+    .split(/[,\s]+/)
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
 }
 
 function requireKeyRegistry(path: string): KeyRegistry {
@@ -136,6 +158,10 @@ function writeJson(res: ServerResponse, status: number, data: unknown): void {
 }
 
 async function main(): Promise<void> {
+  // API держит ключи и состояние ранов: umask по умолчанию оставлял бы файлы 0644, а слоту
+  // выдаётся проходимость к dataDir. Слот не должен получить на чтение то, что Runner
+  // создаёт рядом со своим каталогом, поэтому процесс стартует с закрытым umask.
+  process.umask(0o077);
   const config = loadAgentApiConfig();
   const manifest: ReleaseManifest = releaseManifestFromEnv(process.env);
   const identity = releaseIdentity(manifest);
@@ -209,6 +235,25 @@ async function main(): Promise<void> {
   const tokens = new ShareTokenIssuer(shareSecret !== undefined ? { secret: shareSecret } : {});
   const baseUrl = process.env['ARTIFACT_BASE_URL']?.trim();
 
+  // Граница Agent clean room (issue #51). Настроена только явным списком слотов: без него
+  // движок идёт под service UID, и capabilities объявляют это честно. С настроенной
+  // границей отказ (нет setpriv/runuser, слот не на хосте, проба не прошла) валит раны.
+  let isolation: CleanRoomProvider | undefined;
+  if (config.isolation.slots.length > 0) {
+    const provider = new UnixCleanRoomProvider({
+      rootDir: config.dataDir,
+      policy: {
+        mode: 'per_run_unix_identity',
+        slots: config.isolation.slots,
+        toolPaths: config.isolation.toolPaths,
+      },
+      log: (message) => log({ event: 'clean_room', message }),
+    });
+    const selfTest = await provider.selfTest();
+    log({ event: 'clean_room_self_test', ok: selfTest.ok, detail: selfTest.detail, slots: config.isolation.slots.length });
+    isolation = provider;
+  }
+
   const service = new AgentApi({
     rootDir: config.dataDir,
     adapters: { fake: new FakeEngine(config.fakeScenario), opencode: new OpenCodeAdapter() },
@@ -225,6 +270,7 @@ async function main(): Promise<void> {
     uploads,
     snapshots,
     promotion,
+    ...(isolation ? { isolation } : {}),
   });
   const recovery = await service.recover();
 

@@ -17,6 +17,7 @@ import { ArtifactStore } from '../src/storage/artifact-store.js';
 import { RunExportStore } from '../src/storage/export.js';
 import type { CapabilityRegistry } from '../src/mcp/capabilities.js';
 import type { BindingValueResolver } from '../src/mcp/scope.js';
+import type { CleanRoomProvider } from '../src/isolation/contract.js';
 
 let counter = 0;
 
@@ -57,6 +58,11 @@ export async function waitFor(cond: () => boolean, timeoutMs = 8000, label = 'co
 }
 
 export interface HarnessOptions {
+  /**
+   * Каталог состояния. По умолчанию — свежий временный каталог; явный rootDir нужен,
+   * чтобы эмулировать рестарт воркера поверх ДОЛГОВЕЧНЫХ данных (identity-аренды, сокеты).
+   */
+  rootDir?: string;
   scenario?: FakeScenario;
   host?: RunnerHostInfo;
   heartbeatIntervalMs?: number;
@@ -74,11 +80,18 @@ export interface HarnessOptions {
   capabilities?: CapabilityRegistry;
   /** Резолвер значений credential binding'ов (P13). */
   bindingResolver?: BindingValueResolver;
+  /**
+   * Граница Agent clean room (issue #51): per-run Unix-идентичность. Фабрика получает
+   * rootDir харнесса — каталоги аренд и чистых сред обязаны лежать рядом с состоянием ранов.
+   */
+  isolation?: CleanRoomProvider | ((rootDir: string) => CleanRoomProvider);
 }
 
 export interface Harness {
   rootDir: string;
   fake: FakeEngine;
+  /** Каталог с чистыми средами (identity/leases, cleanrooms/<runId>) — граница issue #51. */
+  isolationRoot(): string;
   faults: FaultRegistry;
   readonly runner: Runner;
   exports: RunExportStore | null;
@@ -90,7 +103,8 @@ export interface Harness {
 }
 
 export function createHarness(options: HarnessOptions = {}): Harness {
-  const rootDir = mkdtempSync(join(tmpdir(), 'ai-agent-runner-harness-'));
+  const ownsRoot = options.rootDir === undefined;
+  const rootDir = options.rootDir ?? mkdtempSync(join(tmpdir(), 'ai-agent-runner-harness-'));
   const faults = options.faults ?? new FaultRegistry();
   const fake = new FakeEngine(options.scenario ?? 'success');
   const adapters = options.adapters ?? { fake, opencode: new OpenCodeAdapter() };
@@ -107,6 +121,7 @@ export function createHarness(options: HarnessOptions = {}): Harness {
   if (options.profileTrace !== undefined) base.profileTrace = options.profileTrace;
   if (options.capabilities) base.capabilities = options.capabilities;
   if (options.bindingResolver) base.bindingResolver = options.bindingResolver;
+  if (options.isolation) base.isolation = typeof options.isolation === 'function' ? options.isolation(rootDir) : options.isolation;
   let exports: RunExportStore | null = null;
   if (options.artifactExport) {
     const blob = options.blob ?? createBlobStore({ backend: 'local-fs', localRoot: join(rootDir, 'blobs') });
@@ -125,6 +140,7 @@ export function createHarness(options: HarnessOptions = {}): Harness {
     rootDir,
     fake,
     faults,
+    isolationRoot: () => rootDir,
     exports,
     get runner() {
       return runner;
@@ -164,7 +180,8 @@ export function createHarness(options: HarnessOptions = {}): Harness {
       if (snap && !isTerminalState(snap.state)) killProcessTree(snap.pgid, snap.pid, 'SIGKILL');
     }
     runner.dispose();
-    await removeDirWithRetry(rootDir);
+    // Явный rootDir переживает тест: следующий харнесс эмулирует рестарт воркера поверх него.
+    if (ownsRoot) await removeDirWithRetry(rootDir);
   });
 
   return harness;

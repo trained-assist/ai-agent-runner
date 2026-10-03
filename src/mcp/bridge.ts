@@ -67,11 +67,25 @@ export interface McpBridgeListenOptions {
   callTool: (request: McpBridgeCallRequest) => Promise<McpBridgeCallResult>;
 }
 
-/** Короткий путь сокета: unix-sock лимит ~104 байт, длинный rootDir уводит его в tmpdir. */
-export function bridgeSocketPath(rootDir: string, runId: string): string {
+/**
+ * Предел длины пути unix-сокета: ядро ограничивает sun_path ~104 байтами, поэтому имена
+ * берутся короткими, а каталог — как можно ближе к корню.
+ */
+export const BRIDGE_SOCKET_PATH_LIMIT = 100;
+
+/**
+ * Путь сокета моста рана.
+ *
+ * Граница рана объявлена (`scoped`) — сокет обязан лежать внутри чистой среды: к нему
+ * подключаются движок и per-run MCP-серверы, а run token на сокете это credentials-эквивалент.
+ * Общий tmpdir хоста принадлежит всем ранам и всем пользователям, поэтому запасного варианта
+ * нет: слишком длинный путь — отказ (`null`), а не сокет вне границы.
+ */
+export function bridgeSocketPath(rootDir: string, runId: string, options: { scoped?: boolean } = {}): string | null {
   const digest = createHash('sha256').update(runId).digest('hex').slice(0, 10);
   const direct = join(rootDir, 'mcp', `b-${digest}.sock`);
-  if (direct.length <= 100) return direct;
+  if (direct.length <= BRIDGE_SOCKET_PATH_LIMIT) return direct;
+  if (options.scoped) return null;
   return join(tmpdir(), `mcp-${digest}.sock`);
 }
 

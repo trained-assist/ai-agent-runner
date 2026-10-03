@@ -2,9 +2,11 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { isProcessAlive, killProcessTree, waitForProcessDeath } from '../adapters/engine/process-tree.js';
+import type { ProcessLauncher } from '../isolation/launcher.js';
+import type { RunIdentity } from '../isolation/contract.js';
 import type { RunSpec } from '../contracts/run-spec.js';
 import type { CapabilityRegistry } from './capabilities.js';
-import { McpBridgeServer, bridgeSocketPath, type McpBridgeCallRequest, type McpBridgeCaller, type McpBridgeCallResult } from './bridge.js';
+import { BRIDGE_SOCKET_PATH_LIMIT, McpBridgeServer, bridgeSocketPath, type McpBridgeCallRequest, type McpBridgeCaller, type McpBridgeCallResult } from './bridge.js';
 import { RPC_ERROR_CODES, StdioJsonRpcClient, StdioRpcError } from './jsonrpc.js';
 import type { McpDenyReason, McpRunScope, ScopedServer, ScopedToolView } from './scope.js';
 
@@ -46,7 +48,8 @@ export type McpStartupFailure =
   | 'readiness_failed'
   | 'transport_closed'
   | 'capability_unknown'
-  | 'binding_unavailable';
+  | 'binding_unavailable'
+  | 'socket_path_too_long';
 
 export class McpStartupError extends Error {
   readonly code = 'MCP_STARTUP_FAILED' as const;
@@ -92,8 +95,13 @@ function spawnStdioProcess(
   env: Record<string, string>,
   cwd: string,
   onStderr: (line: string) => void,
+  launcher?: ProcessLauncher | null,
+  identity?: RunIdentity | null,
 ): SpawnedProcess {
-  const child = spawn(command, args, { cwd, env, detached: true, stdio: ['pipe', 'pipe', 'pipe'] });
+  // Per-run MCP-процессы исполняются под той же идентичностью, что и движок (issue #51):
+  // иначе сервер остался бы под service UID и читал бы чужие данные рана.
+  const launch = launcher && identity ? launcher.wrap(identity, command, args) : { command, args };
+  const child = spawn(launch.command, launch.args, { cwd, env, detached: true, stdio: ['pipe', 'pipe', 'pipe'] });
   const holder: SpawnedProcess = { child, client: undefined as unknown as StdioJsonRpcClient, spawnError: null };
   child.once('error', (err) => {
     holder.spawnError = err;
@@ -122,6 +130,8 @@ interface McpServerSessionDeps {
   killGraceMs: number;
   readinessTimeoutMs: number;
   toolTimeoutMs: number;
+  launcher?: ProcessLauncher | null;
+  identity?: RunIdentity | null;
 }
 
 /** Один объявленный MCP-сервер рана: спавн, handshake, readiness, вызовы, гашение. */
@@ -160,6 +170,8 @@ export class McpServerSession {
       deps.env,
       deps.cwd,
       (line) => deps.log('warn', 'mcp.server_stderr', { serverId: deps.scoped.serverId, line }),
+      deps.launcher ?? null,
+      deps.identity ?? null,
     );
     const session = new McpServerSession(deps, spawned);
     await session.handshake();
@@ -270,7 +282,10 @@ export class McpServerSession {
       bindingScope: scoped.binding?.scope ?? null,
       commandRef: this.commandRef,
       pid: this.pid ?? -1,
-      isolation: 'same_service_uid_not_os_isolated',
+      isolation:
+        this.deps.identity && this.deps.launcher
+          ? `per_run_unix_identity uid=${this.deps.identity.uid}`
+          : 'same_service_uid_not_os_isolated',
     });
     if (notOffered.length > 0) {
       this.deps.log('warn', 'mcp.server_tool_missing', { serverId: this.serverId, tools: notOffered.join(',') });
@@ -450,6 +465,11 @@ export interface McpRunSessionDeps {
   killGraceMs?: number;
   brokerCommand?: { command: string; args: string[] };
   caller?: McpBridgeCaller;
+  /** Идентичность рана (issue #51): MCP-серверы исполняются под ней, а не под service UID. */
+  launcher?: ProcessLauncher | null;
+  identity?: RunIdentity | null;
+  /** run-scoped HOME/config/cache/tmp рана: сервер пишет только внутрь своей среды. */
+  runEnv?: Record<string, string>;
 }
 
 /**
@@ -489,7 +509,23 @@ export class McpRunSession {
     // Сессии серверов наполняются ниже, но мост должен существовать до их спавна:
     // дочерние процессы подключаются к нему сразу (hello + capability/invoke).
     const servers: McpServerSession[] = [];
-    const socketPath = bridgeSocketPath(deps.bridgeDir ?? deps.spec.cwd, deps.spec.runId);
+    // Сокет моста — внутри чистой среды рана, когда граница объявлена. Слишком длинный путь
+    // для unix-сокета — отказ старта, а не уход сокета в общий tmpdir хоста.
+    const socketPath = bridgeSocketPath(deps.bridgeDir ?? deps.spec.cwd, deps.spec.runId, { scoped: Boolean(deps.identity) });
+    if (!socketPath) {
+      const limit = BRIDGE_SOCKET_PATH_LIMIT;
+      deps.log('error', 'mcp.bridge_socket_unavailable', {
+        runId: deps.spec.runId,
+        reason: 'path_too_long',
+        limit,
+        bridgeDir: deps.bridgeDir ?? deps.spec.cwd,
+      });
+      throw new McpStartupError(
+        deps.scope.servers[0]?.serverId ?? 'bridge',
+        'socket_path_too_long',
+        `the run clean room path is longer than the unix-socket limit (${limit}); the bridge socket cannot live outside the run boundary`,
+      );
+    }
     const bridge = await McpBridgeServer.listen({
       socketPath,
       runToken: deps.bridgeToken,
@@ -520,12 +556,13 @@ export class McpRunSession {
       runId: deps.spec.runId,
       serverCount: deps.scope.size,
       scopedTools: declared.length,
+      socketPath,
     });
 
     const killGraceMs = deps.killGraceMs ?? DEFAULT_MCP_KILL_GRACE_MS;
     try {
       for (const scoped of deps.scope.servers) {
-        const env: Record<string, string> = {};
+        const env: Record<string, string> = { ...(deps.runEnv ?? {}) };
         for (const name of scoped.spec.envAllowlist ?? []) {
           const value = process.env[name];
           if (value !== undefined) env[name] = value;
@@ -544,6 +581,8 @@ export class McpRunSession {
             killGraceMs,
             readinessTimeoutMs: scoped.spec.readinessTimeoutMs ?? DEFAULT_MCP_READINESS_TIMEOUT_MS,
             toolTimeoutMs: scoped.spec.toolTimeoutMs ?? DEFAULT_MCP_TOOL_TIMEOUT_MS,
+            launcher: deps.launcher ?? null,
+            identity: deps.identity ?? null,
           }),
         );
       }
