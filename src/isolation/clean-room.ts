@@ -206,7 +206,9 @@ export class UnixCleanRoomProvider implements CleanRoomProvider {
         // читает выходы из cwd и пишет конфиг движка в HOME/config, sweep удаляет всё
         // дерево. Раньше ACL выдавался на {root, cwd}, и persist/sweep падали с EPERM,
         // как только ран шёл не под service UID.
-        acl = (await this.applyAcl([...runDirs, paths.cwd], runnerUid)) ? 'posix_0700_acl' : 'posix_0700';
+        const granted = await this.applyAcl(runDirs, runnerUid);
+        const grantedWorkspace = await this.applyAcl([paths.cwd], runnerUid, true);
+        acl = granted && grantedWorkspace ? 'posix_0700_acl' : 'posix_0700';
       }
 
       const probe = await this.runProbe(runId, identity, paths);
@@ -493,19 +495,26 @@ export class UnixCleanRoomProvider implements CleanRoomProvider {
     }
   }
 
-  private async applyAcl(targets: string[], runnerUid: number): Promise<boolean> {
+  /**
+   * Доступ Runner'а к каталогам рана: явный (rwx) и по умолчанию (default), чтобы
+   * файлы, созданные позже, тоже были доступны. `recursive` нужен для workspace:
+   * к моменту подъёма границы там уже лежит развёрнутый репозиторий, и без рекурсии
+   * sweep не мог удалить его подкаталоги (EACCES на scandir), уборка не завершалась,
+   * а слот оставался заблокированным. Новые файлы ран получат доступ по default ACL.
+   */
+  private async applyAcl(targets: string[], runnerUid: number, recursive = false): Promise<boolean> {
     const setfacl = findSetfacl();
     if (!setfacl) return false;
     let applied = true;
+    const invoke = async (args: string[]): Promise<void> => {
+      const child = spawn(setfacl, args, { stdio: ['ignore', 'ignore', 'pipe'] });
+      if ((await exitCode(child)) !== 0) applied = false;
+    };
     for (const target of targets) {
       if (!existsSync(target)) continue;
-      for (const args of [
-        ['-m', `u:${runnerUid}:rwx`, target],
-        ['-d', '-m', `u:${runnerUid}:rwx`, target],
-      ]) {
-        const child = spawn(setfacl, args, { stdio: ['ignore', 'ignore', 'pipe'] });
-        if ((await exitCode(child)) !== 0) applied = false;
-      }
+      const scope = recursive ? ['-R'] : [];
+      await invoke([...scope, '-m', `u:${runnerUid}:rwx`, target]);
+      await invoke([...scope, '-d', '-m', `u:${runnerUid}:rwx`, target]);
     }
     return applied;
   }

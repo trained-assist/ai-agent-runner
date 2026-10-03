@@ -130,6 +130,15 @@ export function materializeEngineConfig(
   const dir = join(room.paths.config, layout.dir);
   const path = join(dir, layout.file);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
+  // Каталог конфигурации — тоже часть среды рана: он создаётся Runner'ом, поэтому
+  // принадлежать слоту он должен до того, как движок его прочитает. Иначе opencode
+  // не находит свой конфиг (каталог 0700 чужого uid) и уходит на модель по умолчанию.
+  try {
+    chmodSync(dir, 0o700);
+    chownSync(dir, room.identity.uid, room.identity.gid);
+  } catch {
+    /* chown требует привилегий; каталог остаётся 0700 и не читается соседним слотом */
+  }
   writeFileAtomic(path, text);
   try {
     // 0600 + владелец-слот: движок читает конфиг под идентичностью рана, соседний ран под
