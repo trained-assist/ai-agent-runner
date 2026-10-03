@@ -1,4 +1,4 @@
-import { chmodSync, chownSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, chownSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { EngineAdapter, EngineHandle } from '../adapters/engine/engine-adapter.js';
@@ -39,7 +39,7 @@ import { ANSWER_MAX_CHARS, type CheckpointPersistence, type RunCheckpoint } from
 import { CleanRoomError, type CleanRoom, type CleanRoomLease, type CleanRoomProvider, type RunIdentity } from '../isolation/contract.js';
 import { materializeEngineConfig, type EngineConfigTemplate } from '../isolation/engine-config.js';
 import type { CapabilityRegistry } from '../mcp/capabilities.js';
-import { newBridgeToken } from '../mcp/bridge.js';
+import { bridgeSocketPath, newBridgeToken } from '../mcp/bridge.js';
 import { McpRunSession, McpStartupError, type EngineMcpConfig, type McpLogFields, type McpLogLevel } from '../mcp/session.js';
 import { McpRunScope, McpScopeError, type BindingValueResolver } from '../mcp/scope.js';
 
@@ -75,6 +75,13 @@ export interface RunnerOptions {
   blob?: BlobStore;
   /** Выключить запись следов профиля, если хранилище передано по другой причине. */
   profileTrace?: boolean;
+  /**
+   * Оставлять каталоги ранов после финализации (диагностика/отладка). По умолчанию
+   * каталоги снимаются вместе с идентичностью рана, а `cleanup: completed` означает
+   * проверенное отсутствие этих каталогов (issue #52). С этим флагом уборка честно
+   * остаётся `pending`: каталоги на месте.
+   */
+  retainWorkspaces?: boolean;
   /**
    * Манифесты экспорта артефактов. Экспорт объявленных выходов — отдельная стадия
    * финализации: она не запускает движок заново, переживает рестарт воркера и
@@ -208,6 +215,8 @@ export interface RecoveryReport {
   cleanRoomsReconciled: number;
   /** Checkpoint'ы, достроенные после рестарта для терминальных ранов (issue #52). */
   checkpointsRebuilt: number;
+  /** Уборки, доведённые до конца при восстановлении: persist/sweep без движка (issue #52). */
+  cleanupsResumed: number;
 }
 
 interface InternalRun {
@@ -231,6 +240,16 @@ interface InternalRun {
    * содержимое не попадает — только источник и размер.
    */
   answerTail: string[];
+}
+
+/**
+ * Проверенный результат уборки среды рана (issue #52, шаг 4/5). `completed` означает, что
+ * каталоги рана и его сокет сняты, а идентичность освобождена — не то, что процессы умерли.
+ */
+export interface CleanupOutcome {
+  status: 'completed' | 'pending' | 'failed';
+  reason: string;
+  removed: string[];
 }
 
 /** Итог определения выхода рана: план экспорта и текст ответа. */
@@ -636,7 +655,7 @@ export class Runner {
   }
 
   async recover(): Promise<RecoveryReport> {
-    const report: RecoveryReport = { scanned: 0, resumedQueued: 0, orphaned: 0, lost: 0, finalizingResumed: 0, terminal: 0, exportRetried: 0, orphanedMcp: 0, cleanRoomsReconciled: 0, checkpointsRebuilt: 0 };
+    const report: RecoveryReport = { scanned: 0, resumedQueued: 0, orphaned: 0, lost: 0, finalizingResumed: 0, terminal: 0, exportRetried: 0, orphanedMcp: 0, cleanRoomsReconciled: 0, checkpointsRebuilt: 0, cleanupsResumed: 0 };
     await this.fireFault('recovery');
     for (const run of [...this.runs.values()]) {
       if (this.disposed) break;
@@ -648,6 +667,8 @@ export class Runner {
         // его, чтобы повторить persist/sweep без запуска движка.
         if (this.ensureCheckpoint(run)) report.checkpointsRebuilt += 1;
         if (await this.reconcileCleanRoom(run)) report.cleanRoomsReconciled += 1;
+        // Движок уже отработал: незавершённые persist/sweep дожимаются здесь, без rerun.
+        if (await this.resumeCleanup(run)) report.cleanupsResumed += 1;
         continue;
       }
       switch (st.state) {
@@ -1506,8 +1527,12 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
       finishedAt: this.nowIso(),
       usage: { status: 'unknown' },
       outputRefs: [],
-      persistence: 'persisted',
+      // Движок не запускался: сохранять нечего, но уборка обязана быть объяснена —
+      // статус без причины читался бы как «мы не знаем, что произошло».
+      persistence: 'not_required',
+      persistenceReason: 'the engine never started: there is nothing to persist',
       cleanup: 'completed',
+      cleanupReason: 'no clean room was acquired and no run directory is left behind',
       logPath: this.store.relLogPath(st.runId),
     };
     if (failure) result.failure = failure;
@@ -1572,34 +1597,140 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
     // не должен стоить клиенту текста ответа.
     const answerArtifactId = await this.saveAnswerArtifact(st, exit?.answer ?? { present: false, source: null, chars: 0, text: '' });
     const exportManifest = await this.runExport(st, exit ? { plan: exit.plan } : {});
-    const result = this.computeResult(st, exportManifest);
-    await this.appendProfileTrace(st, result);
+    const soleCopies = this.soleCopiesOnDisk(st, exportManifest);
     // Намерение уборки фиксируется на диске ДО самой уборки: сбой в момент sweep не
     // должен оставить каталоги рана без записанного намерения их вычистить.
     this.writeCheckpoint(
       st,
-      result,
+      this.computeResult(st, exportManifest),
       exportManifest,
       exit,
       answerArtifactId,
       'cleanup_pending',
       { status: 'pending', reason: null, intentAt: this.nowIso(), finishedAt: null },
     );
+
+    // Уборка идёт ДО терминального события (issue #52, шаг 5): когда клиент читает
+    // результат, уборка уже проверена, а статус cleanup — это факт, а не обещание.
+    // Единственная копия выхода остаётся на диске: слот не отдаём, переиспользование
+    // открыло бы прежние данные рана.
+    const cleanup = await this.sweepRunEnvironment(run, soleCopies.length > 0 ? 'sole_copy_retained' : `finalized_${st.exit ? 'engine_exit' : 'startup_failure'}`, {
+      keepWorkspace: soleCopies.length > 0,
+    });
+
+    const result = this.computeResult(st, exportManifest, cleanup);
+    await this.appendProfileTrace(st, result);
     this.persistResult(st, result);
-    // Чистая среда освобождается только после того, как результат записан: слот переиспользуется
-    // лишь после проверенного удаления каталогов рана (issue #51, иначе #52).
-    if (run?.room) {
-      const retained = exportManifest?.cleanup.decision === 'retained_sole_copy';
-      // Единственная копия выхода остаётся на диске: чистим только эфемерные каталоги
-      // рана и НЕ отдаём слот — переиспользование открыло бы прежние данные.
-      await this.releaseCleanRoom(run, retained ? 'sole_copy_retained' : `finalized_${st.exit ? 'engine_exit' : 'startup_failure'}`, {
-        ...(retained ? { keepWorkspace: true } : {}),
-      });
-    }
     // Финальный checkpoint несёт проверенный факт уборки: аренда снята или слот остался
     // занят с причиной. Именно его читает восстановление, не перезапуская движок.
-    if (run) this.finishCheckpointAfterCleanup(run, st, result, exportManifest, exit, answerArtifactId, { silent: true });
+    if (run) this.finishCheckpointAfterCleanup(run, st, result, exportManifest, exit, answerArtifactId, cleanup, { silent: true });
     return result;
+  }
+
+  /**
+   * Локальные копии выходов, которые остались ЕДИНСТВЕННОЙ копией и действительно
+   * лежат на диске (issue #52, шаг 4).
+   *
+   * Манифест помечает `retained` и пропавший файл: тот-то вышел не сохранённым, но
+   * копии-то нет. Держать ради него весь рабочий каталог — значит держать впустую и
+   * вечно, поэтому решение об уборке принимается по факту наличия файла, а не по
+   * флагу манифеста.
+   */
+  private soleCopiesOnDisk(st: PersistedRunState, exportManifest: RunExportManifest | null): string[] {
+    if (!exportManifest || exportManifest.cleanup.decision !== 'retained_sole_copy') return [];
+    return exportManifest.cleanup.retained.filter((relative) => existsSync(join(st.spec.cwd, relative)));
+  }
+
+  /**
+   * Уборка среды рана (issue #52, шаг 4): workspace, HOME/config/cache/tmp, конфиг и сокет
+   * MCP, идентичность слота. Возвращает ПРОВЕРЕННЫЙ результат: `completed` только если
+   * после удаления на диске не осталось ни каталогов рана, ни его сокета.
+   *
+   * С границей уборку делает провайдер (слот освобождается только после проверки), без
+   * границы хост убирает рабочий каталог и сокет сам — иначе каталоги ранов копились бы
+   * вечно, а ран объявлял бы уборку выполненной по отсутствию процессов.
+   */
+  private async sweepRunEnvironment(
+    run: InternalRun | undefined,
+    reason: string,
+    options: { keepWorkspace?: boolean } = {},
+  ): Promise<CleanupOutcome> {
+    if (!run) {
+      return { status: 'pending', reason: 'run is not tracked in this worker process', removed: [] };
+    }
+    const st = run.state;
+    const removed: string[] = [];
+    const keep = options.keepWorkspace === true || this.opts.retainWorkspaces === true;
+    // Намерение уборки к этому моменту уже записано на диск вызывающим кодом, поэтому
+    // сбой здесь — честный «сбой во время sweep»: восстановление найдёт намерение и
+    // доведёт уборку до конца, не перезапуская движок.
+    await this.fireFault('cleanup', st.runId);
+    if (run.room) {
+      await this.releaseCleanRoom(run, reason, { ...(keep ? { keepWorkspace: true } : {}) });
+      const lease = this.opts.isolation?.lease(st.runId) ?? null;
+      const socket = this.runSocketPath(st.runId, null);
+      if (socket && !existsSync(socket)) removed.push(socket);
+      const missing = st.cleanRoom === null ? [] : [st.cleanRoom.paths.root, st.cleanRoom.paths.cwd];
+      const leftovers = missing.filter((target) => existsSync(target));
+      if (lease?.status === 'released' && leftovers.length === 0) {
+        return { status: 'completed', reason: 'clean room lease released and every run directory is gone', removed };
+      }
+      const blocked = {
+        status: 'pending' as const,
+        reason: lease?.reason ?? `cleanup is not verified: ${leftovers.length > 0 ? `left ${leftovers.join(', ')}` : 'lease is not released'}`,
+        removed,
+      };
+      // Причина невыполненной уборки видна в логе рана ДО терминального события.
+      this.emit(st, 'log', {
+        stream: 'runner',
+        level: 'warn',
+        message: `clean_room.cleanup_blocked runId=${st.runId} status=${lease?.status ?? 'unknown'} reason=${truncateLine(blocked.reason, 300)}`,
+      });
+      return blocked;
+    }
+
+    // Без чистой среды: убираем рабочий каталог и сокет MCP рана, если выходы не остались
+    // единственной копией.
+    if (!keep) {
+      if (existsSync(st.spec.cwd)) {
+        rmSync(st.spec.cwd, { recursive: true, force: true });
+        removed.push(st.spec.cwd);
+      }
+      const socket = this.runSocketPath(st.runId, null);
+      if (socket && existsSync(socket)) {
+        rmSync(socket, { force: true });
+        removed.push(socket);
+      }
+      this.emit(st, 'log', {
+        stream: 'runner',
+        level: 'info',
+        message: `clean_room.swept runId=${st.runId} reason=${reason} removed=${removed.length} room=none`,
+      });
+    }
+    if (existsSync(st.spec.cwd)) {
+      const pending = {
+        status: 'pending' as const,
+        reason: keep
+          ? this.opts.retainWorkspaces === true
+            ? 'run workspace is retained on purpose: this worker runs with retainWorkspaces'
+            : 'run workspace retained as the only copy of its output'
+          : `workspace ${st.spec.cwd} is still present`,
+        removed,
+      };
+      this.emit(st, 'log', {
+        stream: 'runner',
+        level: 'warn',
+        message: `clean_room.cleanup_blocked runId=${st.runId} status=pending reason=${truncateLine(pending.reason, 300)}`,
+      });
+      return pending;
+    }
+    return { status: 'completed', reason: 'run workspace and its MCP socket are gone', removed };
+  }
+
+  /** Путь сокета MCP рана: в чистой среде или в каталоге dataDir, если границы нет. */
+  private runSocketPath(runId: string, room: CleanRoom | null): string | null {
+    const root = room ? room.paths.root : join(this.opts.rootDir, 'mcp');
+    return bridgeSocketPath(root, runId, { scoped: room !== null });
   }
 
   /**
@@ -1613,11 +1744,12 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
     exportManifest: RunExportManifest | null,
     exit: ExitResolution | null,
     answerArtifactId: string | null,
+    outcome: CleanupOutcome,
     options: { silent?: boolean } = {},
   ): void {
     const lease = this.opts.isolation?.lease(st.runId) ?? null;
     const status = lease?.status ?? 'released';
-    const completed = status === 'released';
+    const completed = outcome.status === 'completed' && status === 'released';
     this.writeCheckpoint(
       st,
       result,
@@ -1626,20 +1758,13 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
       answerArtifactId,
       completed ? 'complete' : 'cleanup_pending',
       {
-        status: completed ? 'completed' : 'blocked',
-        reason: completed ? 'lease released after a verified sweep' : (lease?.reason ?? 'clean room lease is not released'),
+        status: completed ? 'completed' : outcome.status === 'failed' ? 'blocked' : 'blocked',
+        reason: completed ? outcome.reason : (lease?.reason ?? outcome.reason),
         intentAt: null,
         finishedAt: completed ? this.nowIso() : null,
       },
       options,
     );
-    if (!completed) {
-      this.emit(st, 'log', {
-        stream: 'runner',
-        level: 'warn',
-        message: `clean_room.cleanup_blocked runId=${st.runId} status=${status} reason=${truncateLine(lease?.reason ?? 'lease is not released', 300)}`,
-      });
-    }
   }
 
   private exportSnapshot(runId: string): RunExportSnapshot | null {
@@ -1928,7 +2053,11 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
     }
   }
 
-  private computeResult(st: PersistedRunState, exportManifest: RunExportManifest | null = null): RunResult {
+  private computeResult(
+    st: PersistedRunState,
+    exportManifest: RunExportManifest | null = null,
+    cleanup: CleanupOutcome | null = null,
+  ): RunResult {
     let exitReason: RunResult['exitReason'];
     let failure: RunResult['failure'] | undefined;
 
@@ -1969,10 +2098,11 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
     }
 
     const outcome: RunResult['outcome'] = exitReason === 'completed' ? 'succeeded' : exitReason === 'cancelled' ? 'cancelled' : 'failed';
-    const groupGone = !isProcessAlive(st.pid) && !isProcessGroupAlive(st.pgid);
     const outputRefs = (exportManifest?.entries ?? [])
       .filter((entry) => entry.status === 'exported' && entry.artifactId !== null)
       .map((entry) => entry.artifactId as string);
+    const persistence = this.persistenceStatus(exportManifest);
+    const cleanupStatus = this.cleanupStatus(this.soleCopiesOnDisk(st, exportManifest), cleanup);
 
     const result: RunResult = {
       schemaVersion: 1,
@@ -1990,8 +2120,10 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
       finishedAt: this.nowIso(),
       usage: { status: 'unknown' },
       outputRefs,
-      persistence: 'persisted',
-      cleanup: this.cleanupStatus(groupGone, exportManifest),
+      persistence: persistence.status,
+      persistenceReason: persistence.reason,
+      cleanup: cleanupStatus.status,
+      cleanupReason: cleanupStatus.reason,
       logPath: this.store.relLogPath(st.runId),
     };
     if (failure) result.failure = failure;
@@ -1999,13 +2131,54 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
   }
 
   /**
-   * `cleanup: completed` означает «локальных копий, за которые мы отвечаем, не осталось».
-   * Если экспорт оставил единственную копию на диске, очистка не выдаёт себя за завершённую.
+   * Статус сохранения (issue #52, шаг 3) выводится из манифеста экспорта, а не
+   * предполагается: `persisted` означает, что каждый байт подтверждён чтением из
+   * долговечного хранилища, `failed` — что не сохранён ни один выход.
    */
-  private cleanupStatus(groupGone: boolean, exportManifest: RunExportManifest | null): RunResult['cleanup'] {
-    if (!groupGone) return 'pending';
-    if (exportManifest && exportManifest.cleanup.decision === 'retained_sole_copy') return 'pending';
-    return 'completed';
+  private persistenceStatus(exportManifest: RunExportManifest | null): {
+    status: RunResult['persistence'];
+    reason: string;
+  } {
+    if (exportManifest === null) {
+      return { status: 'not_required', reason: 'no output was declared by the client or the agent manifest' };
+    }
+    if (exportManifest.status === 'complete') {
+      return {
+        status: 'persisted',
+        reason: `${exportManifest.totals.exported}/${exportManifest.totals.planned} output(s) verified by read-back from durable storage`,
+      };
+    }
+    if (exportManifest.status === 'failed') {
+      return {
+        status: 'failed',
+        reason: `${exportManifest.totals.failed}/${exportManifest.totals.planned} output(s) are not in durable storage; local copies were kept`,
+      };
+    }
+    return {
+      status: 'pending',
+      reason: `${exportManifest.totals.exported}/${exportManifest.totals.planned} output(s) verified; retained as sole copy: ${exportManifest.cleanup.retained.join(', ') || 'none'}`,
+    };
+  }
+
+  /**
+   * Статус уборки (issue #52, шаг 5) — только проверенный контракт: каталоги рана и его
+   * сокет сняты, а идентичность освобождена. Отсутствие процессной группы таким
+   * контрактом не является, поэтому оно больше не влияет на статус.
+   *
+   * Пока на диске лежит локальная копия несохранённого выхода, уборка не может быть
+   * объявлена выполненной даже при снятых каталогах: этот файл — единственная копия.
+   */
+  private cleanupStatus(soleCopies: readonly string[], outcome: CleanupOutcome | null): { status: RunResult['cleanup']; reason: string } {
+    if (outcome === null) {
+      return { status: 'pending', reason: 'cleanup has not been attempted yet' };
+    }
+    if (soleCopies.length > 0) {
+      return {
+        status: 'pending',
+        reason: `${soleCopies.length} output(s) are still on local disk as the only copy: ${soleCopies.join(', ')}`,
+      };
+    }
+    return { status: outcome.status, reason: outcome.reason };
   }
 
   /**
@@ -2130,6 +2303,78 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
         finishedAt: phase === 'complete' ? result.finishedAt : null,
       },
     );
+  }
+
+  /**
+   * Доведение lifecycle до конца после рестарта воркера (issue #52, шаг 4).
+   *
+   * Движок не запускается: повторяются только persist (повторный commit экспорта, если
+   * байты не подтверждены) и sweep. Намерение уборки лежит в checkpoint, поэтому
+   * восстановление знает, что именно осталось сделать, и делает это ровно один раз.
+   */
+  private async resumeCleanup(run: InternalRun): Promise<boolean> {
+    const st = run.state;
+    const checkpoint = this.store.readCheckpoint(st.runId);
+    if (!checkpoint || checkpoint.cleanup.status === 'completed') return false;
+    const result = st.result;
+    if (!result) return false;
+
+    let exportManifest = this.exportManifest(st.runId);
+    // Persist: выходы, которые не подтверждены чтением, пробуем сохранить ещё раз.
+    if (this.opts.exports && (checkpoint.persistence === 'pending' || checkpoint.persistence === 'failed')) {
+      try {
+        exportManifest = await this.runExport(st, { force: true });
+      } catch (error) {
+        this.emit(st, 'log', {
+          stream: 'runner',
+          level: 'error',
+          message: `export.retry_failed runId=${st.runId} detail=${truncateLine(redactSecrets(error instanceof Error ? error.message : String(error)), 300)}`,
+        });
+      }
+    }
+    const soleCopies = this.soleCopiesOnDisk(st, exportManifest);
+    if (exportManifest !== null) {
+      // Терминальное событие рана уже опубликовано: обновляется только сохранённый
+      // результат, повторного терминального события не будет.
+      this.updateTerminalResult(st, this.computeResult(st, exportManifest, null));
+    }
+
+    // Sweep: то же, что делает финализация, с тем же правилом про единственную копию.
+    const fresh = this.runs.get(st.runId) ?? run;
+    const cleanup = await this.sweepRunEnvironment(fresh, 'recovered_cleanup', { keepWorkspace: soleCopies.length > 0 });
+    const next = this.updateTerminalResult(st, this.computeResult(st, exportManifest, cleanup));
+    this.writeCheckpoint(
+      st,
+      next,
+      exportManifest,
+      null,
+      null,
+      cleanup.status === 'completed' ? 'complete' : 'cleanup_pending',
+      {
+        status: cleanup.status === 'completed' ? 'completed' : 'blocked',
+        reason: cleanup.reason,
+        intentAt: checkpoint.cleanup.intentAt ?? checkpoint.updatedAt,
+        finishedAt: cleanup.status === 'completed' ? this.nowIso() : null,
+      },
+      { silent: true },
+    );
+    this.emit(st, 'log', {
+      stream: 'runner',
+      level: 'info',
+      message: `lifecycle.resumed runId=${st.runId} persistence=${next.persistence} cleanup=${cleanup.status} reason=${truncateLine(cleanup.reason, 200)}`,
+    });
+    return true;
+  }
+
+  /**
+   * Обновление результата УЖЕ терминального рана (восстановление после сбоя). Событие
+   * терминала не публикуется повторно: клиент видел его один раз, а на диске результат
+   * обязан отражать доведённое состояние сохранения и уборки.
+   */
+  private updateTerminalResult(st: PersistedRunState, result: RunResult): RunResult {
+    st.result = result;
+    this.store.saveResult(st.runId, result);
+    return result;
   }
 
   private persistResult(st: PersistedRunState, result: RunResult): void {

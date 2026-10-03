@@ -117,6 +117,12 @@ export interface AgentApiOptions {
   isolation?: CleanRoomProvider;
   /** Хостовые шаблоны конфигурации движка для run-scoped HOME — см. RunnerOptions. */
   engineConfigTemplates?: EngineConfigTemplate | null;
+  /**
+   * Оставлять рабочие каталоги ранов после финализации (диагностика/отладка). По
+   * умолчанию каталог снимается вместе с уборкой, и `cleanup: completed` означает
+   * проверенное его отсутствие (issue #52).
+   */
+  retainWorkspaces?: boolean;
   /** Промоушен-контур P29: pinned release, когорта, откат, журнал, реестр владельцев. */
   promotion?: PromotionRuntime;
 }
@@ -160,6 +166,7 @@ export class AgentApi {
     if (options.bindingResolver) runnerOptions.bindingResolver = options.bindingResolver;
     if (options.isolation) runnerOptions.isolation = options.isolation;
     if (options.engineConfigTemplates) runnerOptions.engineConfigTemplates = options.engineConfigTemplates;
+    if (options.retainWorkspaces !== undefined) runnerOptions.retainWorkspaces = options.retainWorkspaces;
     this.runner = new Runner(runnerOptions);
   }
 

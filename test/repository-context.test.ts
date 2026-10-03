@@ -108,7 +108,7 @@ describe('repository context: clone перед спавном движка', () 
     openServers.push(server);
     setEnv('RUNNER_REPOSITORY_BASE_URL', server.baseUrl);
 
-    const h = createHarness();
+    const h = createHarness({ retainWorkspaces: true });
     const spec = h.makeSpec({ repository: { fullName: 'owner/name', token: SECRET_TOKEN } });
     const receipt = h.runner.start(spec);
     const result = await h.runner.waitFor(receipt.runId, 15000);
@@ -138,7 +138,7 @@ describe('repository context: clone перед спавном движка', () 
     createBareRepo(source, join(rootDir, 'owner', 'name.git'));
     setEnv('RUNNER_REPOSITORY_BASE_URL', `file://${rootDir}`);
 
-    const h = createHarness();
+    const h = createHarness({ retainWorkspaces: true });
     const spec = h.makeSpec({ repository: { fullName: 'owner/name' } });
     const receipt = h.runner.start(spec);
     const result = await h.runner.waitFor(receipt.runId, 15000);
@@ -151,7 +151,7 @@ describe('repository context: clone перед спавном движка', () 
     const fixture = createSourceRepo('default-repo-marker.txt', 'default repo\n');
     setEnv('RUNNER_DEFAULT_REPO', fixture);
 
-    const h = createHarness();
+    const h = createHarness({ retainWorkspaces: true });
     const { receipt, spec } = h.start();
     const result = await h.runner.waitFor(receipt.runId, 15000);
 
@@ -164,7 +164,7 @@ describe('repository context: clone перед спавном движка', () 
     const fixture = createSourceRepo('empty-group-marker.txt', 'empty group\n');
     setEnv('RUNNER_DEFAULT_REPO', fixture);
 
-    const h = createHarness();
+    const h = createHarness({ retainWorkspaces: true });
     const { receipt, spec } = h.start({ repository: {} as RunSpec['repository'] });
     const result = await h.runner.waitFor(receipt.runId, 15000);
 
@@ -176,7 +176,7 @@ describe('repository context: clone перед спавном движка', () 
     const missing = join(makeTempDir('ai-agent-runner-missing-'), 'no-such-repo.git');
     setEnv('RUNNER_DEFAULT_REPO', missing);
 
-    const h = createHarness();
+    const h = createHarness({ retainWorkspaces: true });
     const { receipt, spec } = h.start();
     const result = await h.runner.waitFor(receipt.runId, 15000);
 
@@ -195,7 +195,7 @@ describe('repository context: clone перед спавном движка', () 
     openServers.push(server);
     setEnv('RUNNER_REPOSITORY_BASE_URL', server.baseUrl);
 
-    const h = createHarness();
+    const h = createHarness({ retainWorkspaces: true });
     const spec = h.makeSpec({ repository: { fullName: 'owner/name', token: 'wrong-token-should-be-rejected' } });
     const receipt = h.runner.start(spec);
     const result = await h.runner.waitFor(receipt.runId, 15000);

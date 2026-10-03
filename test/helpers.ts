@@ -77,6 +77,12 @@ export interface HarnessOptions {
   artifactExport?: boolean;
   /** Отключить удаление локальных копий после подтверждённого сохранения. */
   pruneLocalCopies?: boolean;
+  /**
+   * Оставить каталоги ранов после финализации (диагностика). Тесты, которые проверяют
+   * содержимое workspace после ранa, обязаны включать его явно: по умолчанию рабочий
+   * каталог снимается вместе с уборкой чистой среды (issue #52).
+   */
+  retainWorkspaces?: boolean;
   /** Реестр capability handler'ов (P13): общий для MCP-вызовов рана и API. */
   capabilities?: CapabilityRegistry;
   /** Резолвер значений credential binding'ов (P13). */
@@ -122,6 +128,7 @@ export function createHarness(options: HarnessOptions = {}): Harness {
   if (options.heartbeatIntervalMs !== undefined) base.heartbeatIntervalMs = options.heartbeatIntervalMs;
   if (options.blob) base.blob = options.blob;
   if (options.profileTrace !== undefined) base.profileTrace = options.profileTrace;
+  if (options.retainWorkspaces !== undefined) base.retainWorkspaces = options.retainWorkspaces;
   if (options.capabilities) base.capabilities = options.capabilities;
   if (options.bindingResolver) base.bindingResolver = options.bindingResolver;
   if (options.isolation) base.isolation = typeof options.isolation === 'function' ? options.isolation(rootDir) : options.isolation;
