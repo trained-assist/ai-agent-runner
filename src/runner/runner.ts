@@ -39,6 +39,12 @@ export interface RunnerHostInfo {
   environment?: string;
   release?: string;
   workerId?: string;
+  /**
+   * Движки, разрешённые в регионе этого воркера политикой размещения (P30). Повторная
+   * проверка на стороне Runner'а: admission решает по политике, но запускает движок именно
+   * Runner, и он обязан отказать сам, а не доверять вызывающему.
+   */
+  allowedEngines?: string[];
 }
 
 export interface RunnerOptions {
@@ -791,6 +797,13 @@ export class Runner {
       if (!region || !allowed.includes(region)) {
         throw new PreflightError('REGION_FORBIDDEN', `host region "${region ?? 'unknown'}" is outside allowed regions [${allowed.join(', ')}]`);
       }
+    }
+    const allowedEngines = this.opts.host?.allowedEngines;
+    if (allowedEngines && !allowedEngines.includes(spec.engine.name)) {
+      throw new PreflightError(
+        'REGION_FORBIDDEN',
+        `engine "${spec.engine.name}" is not allowed in host region "${this.opts.host?.region ?? 'unknown'}" by the placement policy`,
+      );
     }
     if (!this.opts.adapters[spec.engine.name]) {
       throw new PreflightError('ENGINE_UNSUPPORTED', `engine "${spec.engine.name}" is not registered on this worker`);

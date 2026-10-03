@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync, statSync } from 'node:fs';
+import { chmodSync, mkdirSync, readFileSync, statSync } from 'node:fs';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join, resolve, sep } from 'node:path';
@@ -13,6 +13,7 @@ import { WorkspaceSnapshotStore } from '../storage/workspace-snapshot.js';
 import { cohortFromEnv, type CohortPolicy } from '../release/cohort.js';
 import { DispatchOwnerStore } from '../release/dispatch-owner.js';
 import { releaseIdentity, releaseManifestFromEnv, type ReleaseManifest } from '../release/manifest.js';
+import { allowedEnginesForRegion, parsePlacementPolicyText, type PlacementPolicy } from '../release/placement.js';
 import { PromotionJournal, ReleaseStateController } from '../release/promotion.js';
 import { KeyRegistry } from './auth.js';
 import { handleArtifactRequest, type ArtifactRouteDeps } from './artifact-route.js';
@@ -39,6 +40,8 @@ export interface AgentApiProcessConfig {
   releaseStatePath: string;
   /** Общий реестр владения задачами флота; без него установка одиночная. */
   ownerStorePath: string;
+  /** Политика размещения (P30): регион × провайдер × credentials × резидентность. */
+  placementPolicyPath: string;
 }
 
 function envValue(name: string): string | undefined {
@@ -101,6 +104,7 @@ export function loadAgentApiConfig(env: Record<string, string | undefined> = pro
     cohort: cohortFromEnv(env),
     releaseStatePath: describePath(env['AGENT_API_RELEASE_STATE']?.trim() || join(dataDir, 'release-state.json')),
     ownerStorePath: env['AGENT_API_OWNER_STORE']?.trim() ? describePath(env['AGENT_API_OWNER_STORE'].trim()) : '',
+    placementPolicyPath: env['AGENT_API_PLACEMENT_POLICY']?.trim() ? describePath(env['AGENT_API_PLACEMENT_POLICY'].trim()) : '',
   };
 }
 
@@ -157,11 +161,33 @@ async function main(): Promise<void> {
     ? new DispatchOwnerStore({
         path: config.ownerStorePath,
         workerId: manifest.host.workerId,
-        onEvent: (event) => log({ ...event, event: `ownership_${event.event}` }),
+        onEvent: (event) => {
+          log({ ...event, event: `ownership_${event.event}` });
+          // drain/failover/fenced — переходы состояния флота: они обязаны жить в durable-журнале
+          // с причиной, иначе «почему задача сменила владельца» читается только из логов процесса.
+          const kind = ownerEventKind(event.event);
+          if (kind !== null) {
+            journal.append({
+              kind,
+              reason: event.reason,
+              ownerGeneration: event.ownerGeneration,
+              detail: {
+                principalId: event.principalId,
+                userTaskId: event.userTaskId,
+                ...(event.previousOwnerWorkerId !== undefined ? { previousOwnerWorkerId: event.previousOwnerWorkerId } : {}),
+              },
+            });
+          }
+        },
       })
     : undefined;
   const promotion: PromotionRuntime = { manifest, cohort: config.cohort, state: releaseState, journal };
   if (owners) promotion.owners = owners;
+  let placement: PlacementPolicy | undefined;
+  if (config.placementPolicyPath !== '') {
+    placement = parsePlacementPolicyText(readFileSync(config.placementPolicyPath, 'utf8'));
+    promotion.placement = placement;
+  }
 
   mkdirSync(config.dataDir, { recursive: true, mode: 0o700 });
   chmodSync(config.dataDir, 0o700);
@@ -186,7 +212,13 @@ async function main(): Promise<void> {
   const service = new AgentApi({
     rootDir: config.dataDir,
     adapters: { fake: new FakeEngine(config.fakeScenario), opencode: new OpenCodeAdapter() },
-    host: { region: config.region, environment: config.environment, release: manifest.releaseId, workerId: manifest.host.workerId },
+    host: {
+      region: config.region,
+      environment: config.environment,
+      release: manifest.releaseId,
+      workerId: manifest.host.workerId,
+      ...(placement ? { allowedEngines: allowedEnginesForRegion(placement, manifest.host.region) } : {}),
+    },
     logger: log,
     blob,
     exports,
@@ -316,6 +348,20 @@ async function main(): Promise<void> {
 function envPreviousReleaseId(): string | null {
   const previous = process.env['AGENT_API_PREVIOUS_RELEASE']?.trim();
   return previous === undefined || previous === '' ? null : previous;
+}
+
+/** События реестра владения, которые являются переходами состояния флота (P29/P30). */
+function ownerEventKind(event: string): 'drain' | 'failover' | 'fenced' | null {
+  switch (event) {
+    case 'drained':
+      return 'drain';
+    case 'failover_granted':
+      return 'failover';
+    case 'fenced':
+      return 'fenced';
+    default:
+      return null;
+  }
 }
 
 main().catch((err: unknown) => {

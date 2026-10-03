@@ -6,6 +6,10 @@
 правило 8 [ENGINEERING-APPROACH](https://github.com/trained-assist/trained-agent-architecture/blob/main/ENGINEERING-APPROACH.md)
 («test bindings/data не становятся production»).
 
+Соседняя карточка этапа — [P30 · Multi-worker/region contract](MULTI-WORKER-REGION.md):
+политика размещения (регион × провайдер × credentials × резидентность) и failover без
+двойного исполнения. Реестр владения и семантика partition ≠ failover общие.
+
 Идея: промоушен здесь — не «выкатили и посмотрели», а **проверяемый переход с файлом состояния
 на входе**. Один и тот же код обслуживает новую машину с кандидатным релизом и машину с
 предыдущим; переключение между ними — две операции с записью причины в durable-журнал:
@@ -20,7 +24,7 @@
 | `src/release/promotion.ts` | Durable-журнал переходов, контроллер отката/возврата и `checkPromotionBoundary` — правило «эксперимент нельзя выдать за прод» |
 | `src/release/dispatch-owner.ts` | Одна задача — один владелец. Общий для воркеров одной VM файл под file-lock; partition ≠ failover; прежний владелец после перехвата fenced |
 | `src/release/retention.ts` | Retention-здоровье: что под очистку и какие нетерминальные раны защищены |
-| `src/release/admission.ts` | Порядок отказов: откат → платный профиль → когорта → владение |
+| `src/release/admission.ts` | Порядок отказов: откат → платный профиль → когорта → владение (P30 вставляет placement между откатом и платным флагом) |
 
 API: `GET /v1/release` (релиз, когорта, откат, retention, fleet — требует `auth` и `runs:read`),
 блок `promotion` в `GET /v1/capabilities`, admission-логи с полями release/cohort.

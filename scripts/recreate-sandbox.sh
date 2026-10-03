@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
-# Пересоздание чистой песочницы для приёмки P29 (промоушен, этап I10).
+# Пересоздание чистой песочницы для приёмки I10: P29 (промоушен) и P30
+# (multi-worker/region contract).
 #
 # Скрипт создаёт НОВЫЙ namespace эксперимента: отдельные data/config корни на каждый
 # воркер, свежие ключи, закреплённые манифесты релиза и общий реестр владения задачами.
 # Ничего за пределами namespace не создаётся и не удаляется; существующий namespace
 # не переиспользуется, а откладывается в сторону (<ns>.replaced-<ts>) — «чистое» здесь
 # означает «пустое», а не «снесённое».
+#
+# P30 добавляет два параметра: регион на воркер (--regions) и политику размещения
+# (--placement). Без них поведение прежнее — одиночная/двухворкерная симуляция P29.
 #
 # Usage: sudo scripts/recreate-sandbox.sh --namespace <id> [options]
 #   --namespace <id>       имя namespace (обязательно), напр. p29-20261003
@@ -16,7 +20,13 @@
 #   --config-version <n>   configVersion кандидата (по умолчанию 2), предыдущий = на единицу меньше
 #   --release-id <id>      релиз кандидата (по умолчанию <ns>-r2)
 #   --previous-release <id> предыдущий релиз для отката (по умолчанию <ns>-r1)
-#   --region <r>           регион в host-manifest (по умолчанию sandbox-eu)
+#   --region <r>           регион в host-manifest для обоих воркеров (по умолчанию sandbox-eu)
+#   --regions <r1,r2>      регион на воркер (P30; перекрывает --region)
+#   --placement <file>     политика размещения P30 (JSON) — копируется в config каждого
+#                          воркера и включается через AGENT_API_PLACEMENT_POLICY
+#   --client-engines <l>   движки, разрешённые клиентскому ключу control plane
+#                          (по умолчанию fake; для приёмки региональных отказов P30:
+#                          fake,opencode,claude,codex)
 #   --owner <user>         владелец файлов (по умолчанию текущий пользователь)
 #   --replace              отложить существующий namespace в сторону и создать новый
 #   -h, --help             эта справка
@@ -32,11 +42,23 @@ CONFIG_VERSION=2
 RELEASE_ID=""
 PREVIOUS_RELEASE=""
 REGION="sandbox-eu"
+REGIONS=""
+PLACEMENT=""
+CLIENT_ENGINES="fake"
 OWNER=""
 REPLACE=0
 
 log() { printf '[recreate-sandbox] %s\n' "$*"; }
 die() { printf '[recreate-sandbox] ERROR: %s\n' "$*" >&2; exit 1; }
+
+# JSON-массив из списка слов без висячей запятой: key-registry и provisioning — валидный JSON.
+json_list() {
+  local out="" first=1 item
+  for item in "$@"; do
+    if [[ $first -eq 1 ]]; then out="\"$item\""; first=0; else out="$out,\"$item\""; fi
+  done
+  printf '%s' "$out"
+}
 
 usage() { sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
@@ -51,6 +73,9 @@ while [[ $# -gt 0 ]]; do
     --release-id) RELEASE_ID="${2:-}"; shift 2 ;;
     --previous-release) PREVIOUS_RELEASE="${2:-}"; shift 2 ;;
     --region) REGION="${2:-}"; shift 2 ;;
+    --regions) REGIONS="${2:-}"; shift 2 ;;
+    --placement) PLACEMENT="${2:-}"; shift 2 ;;
+    --client-engines) CLIENT_ENGINES="${2:-}"; shift 2 ;;
     --owner) OWNER="${2:-}"; shift 2 ;;
     --replace) REPLACE=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -66,6 +91,12 @@ BASE_PORT=$((10#$BASE_PORT))
 [[ "$CONFIG_VERSION" =~ ^[0-9]+$ ]] && CONFIG_VERSION=$((10#$CONFIG_VERSION)) || die "--config-version: expected a number"
 (( CONFIG_VERSION >= 2 )) || die "--config-version: expected at least 2 (the previous release carries a lower config version)"
 command -v openssl >/dev/null || die "openssl not found (used for fresh sandbox keys)"
+[[ -n "$CLIENT_ENGINES" ]] || die "--client-engines: expected at least one engine name"
+if [[ -n "$PLACEMENT" ]]; then
+  [[ -f "$PLACEMENT" ]] || die "--placement: file not found: $PLACEMENT"
+  python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$PLACEMENT" 2>/dev/null \
+    || die "--placement: file is not valid JSON: $PLACEMENT"
+fi
 OWNER="${OWNER:-$(id -un)}"
 id "$OWNER" >/dev/null || die "owner $OWNER does not exist"
 
@@ -101,7 +132,7 @@ printf '%s\n' "$outsider_key" > "$NS_ROOT/config/outsider-api-key"
 chmod 0600 "$NS_ROOT/config/client-api-key" "$NS_ROOT/config/outsider-api-key"
 client_hash="$(printf '%s' "$client_key" | sha256sum | awk '{print $1}')"
 outsider_hash="$(printf '%s' "$outsider_key" | sha256sum | awk '{print $1}')"
-log "client key (principal p29-client) и outsider key (p29-outsider, вне когорты) выпущены для namespace"
+log "client key (principal fleet-client) и outsider key (p29-outsider, вне когорты) выпущены для namespace"
 
 # Локальный fixture-репозиторий: ран клонирует его вместо GitHub — прогон не зависит от
 # сети и не тянет чужой репозиторий в песочницу (SANDBOX: свои данные, свои зависимости).
@@ -125,10 +156,22 @@ IFS=',' read -r -a WORKER_LIST <<< "$WORKERS"
 [[ ${#WORKER_LIST[@]} -gt 0 ]] || die "--workers: expected at least one worker id"
 [[ "${#WORKER_LIST[@]}" -le 2 ]] || die "--workers: the sandbox simulation covers one or two workers"
 
+# Регион на воркер: P30 симулирует два региона на одной машине (RU и EU). Без --regions
+# оба воркера остаются в одном регионе — это прежнее поведение P29.
+REGION_LIST=()
+if [[ -n "$REGIONS" ]]; then
+  IFS=',' read -r -a REGION_LIST <<< "$REGIONS"
+  [[ ${#REGION_LIST[@]} -eq ${#WORKER_LIST[@]} ]] \
+    || die "--regions: expected one region per worker (${#WORKER_LIST[@]}), got ${#REGION_LIST[@]}"
+fi
+
 WORKERS_JSON=""
 index=0
 for worker in "${WORKER_LIST[@]}"; do
   [[ "$worker" =~ ^[a-z0-9][a-z0-9-]{0,15}$ ]] || die "--workers: bad worker id \"$worker\""
+  worker_region="$REGION"
+  if [[ ${#REGION_LIST[@]} -gt $index ]]; then worker_region="${REGION_LIST[$index]}"; fi
+  [[ "$worker_region" =~ ^[a-z0-9][a-z0-9-]{0,49}$ ]] || die "--regions: bad region \"$worker_region\""
   port=$((BASE_PORT + index))
   # Кандидат и предыдущий релиз: воркер b обслуживает предыдущий релиз — это и есть
   # «прежний владелец», к которому возвращается приём после отката.
@@ -158,10 +201,10 @@ for worker in "${WORKER_LIST[@]}"; do
     },
     {
       "keyHash": "$client_hash",
-      "principalId": "p29-client",
-      "profileId": "profile-p29-client",
+      "principalId": "fleet-client",
+      "profileId": "profile-fleet-client",
       "scopes": ["runs:read", "runs:write"],
-      "engines": ["fake"]
+      "engines": [$(json_list ${CLIENT_ENGINES//,/ })]
     },
     {
       "keyHash": "$outsider_hash",
@@ -190,7 +233,7 @@ JSON
   "retention": { "mainEventsDays": 30, "verboseLogsDays": 7 },
   "host": {
     "workerId": "sandbox-$worker",
-    "region": "$REGION",
+    "region": "$worker_region",
     "environment": "sandbox",
     "roles": { "schedule": false, "delivery": false },
     "roots": { "dataDir": "$data_dir", "configDir": "$config_dir" },
@@ -207,19 +250,28 @@ AGENT_API_DATA_DIR=$data_dir
 AGENT_API_KEY_REGISTRY=$config_dir/key-registry.json
 AGENT_API_RELEASE_MANIFEST=$config_dir/release.json
 AGENT_API_RELEASE_STATE=$config_dir/release-state.json
-AGENT_API_REGION=$REGION
+AGENT_API_REGION=$worker_region
 AGENT_API_ENVIRONMENT=sandbox
 AGENT_API_OWNER_STORE=$NS_ROOT/fleet/owners.json
 AGENT_API_COHORT_ID=p29
 AGENT_API_COHORT_MODE=allowlist
-AGENT_API_COHORT_PRINCIPALS=p29-client,sandbox-$worker
+AGENT_API_COHORT_PRINCIPALS=fleet-client,sandbox-$worker
 ARTIFACT_SHARE_SECRET=$share_secret
 ARTIFACT_BASE_URL=http://127.0.0.1:$port
 RUNNER_DEFAULT_REPO=file://$FIXTURE_REPO
 ENV
 
+  # Политика размещения (P30): копируется в config воркера и включается через env.
+  # Значений секретов в ней нет — только регионы, провайдеры и credential scopes.
+  if [[ -n "$PLACEMENT" ]]; then
+    cp "$PLACEMENT" "$config_dir/placement.json"
+    chmod 0600 "$config_dir/placement.json"
+    printf 'AGENT_API_PLACEMENT_POLICY=%s\n' "$config_dir/placement.json" >> "$config_dir/worker.env"
+    log "placement policy: $PLACEMENT → $config_dir/placement.json"
+  fi
+
   printf '{"releaseId":"%s","sourceCommit":"%s","configVersion":%s,"workerId":"sandbox-%s","region":"%s","configVersionHost":%s,"port":%s,"previousReleaseId":"%s"}\n' \
-    "$release_id" "$SOURCE_COMMIT" "$config_version" "$worker" "$REGION" "$config_version" "$port" "$PREVIOUS_RELEASE" > "$config_dir/pinned.json"
+    "$release_id" "$SOURCE_COMMIT" "$config_version" "$worker" "$worker_region" "$config_version" "$port" "$PREVIOUS_RELEASE" > "$config_dir/pinned.json"
   chmod 0600 "$config_dir"/api-key "$config_dir"/key-registry.json "$config_dir"/release.json "$config_dir"/worker.env "$config_dir"/pinned.json
 
   [[ -n "$WORKERS_JSON" ]] && WORKERS_JSON+=","
@@ -239,6 +291,9 @@ cat > "$NS_ROOT/provisioning.json" <<JSON
   "fleetRoot": "$NS_ROOT",
   "ownerStore": "$NS_ROOT/fleet/owners.json",
   "region": "$REGION",
+  "regions": [$(json_list ${REGION_LIST[@]})],
+  "placementPolicy": "${PLACEMENT:-none}",
+  "clientEngines": [$(json_list ${CLIENT_ENGINES//,/ })],
   "environment": "sandbox",
   "note": "экспериментальные данные и ключи только здесь; значения секретов в этот файл не попадают",
   "workers": [$WORKERS_JSON]

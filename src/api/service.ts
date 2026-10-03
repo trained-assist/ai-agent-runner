@@ -10,10 +10,11 @@ import { stripRepositoryToken, validateRunSpec, type InputSpec, type RunSpec } f
 import type { FaultRegistry } from '../faults/registry.js';
 import type { CapabilityRegistry } from '../mcp/capabilities.js';
 import type { BindingValueResolver } from '../mcp/scope.js';
-import { claimOwnership, decideAdmission, type AdmissionRefusalCode } from '../release/admission.js';
+import { claimOwnership, decideAdmission, isPlacementRefusalCode, type AdmissionRefusalCode, type PlacementContext } from '../release/admission.js';
 import type { CohortPolicy } from '../release/cohort.js';
 import type { DispatchOwnerStore } from '../release/dispatch-owner.js';
 import type { ReleaseManifest } from '../release/manifest.js';
+import { allowedEnginesForRegion, placementSummary, type PlacementPolicy } from '../release/placement.js';
 import type { PromotionJournal, ReleaseStateController } from '../release/promotion.js';
 import { retentionHealth, type RetentionHealth } from '../release/retention.js';
 import { Runner, type CancelReceipt, type RecoveryReport, type RunnerHostInfo, type RunSnapshot } from '../runner/runner.js';
@@ -51,6 +52,8 @@ export interface PromotionRuntime {
   state: ReleaseStateController;
   journal: PromotionJournal;
   owners?: DispatchOwnerStore;
+  /** Политика размещения (P30): регион × провайдер × credentials × резидентность. */
+  placement?: PlacementPolicy;
 }
 
 export interface ReleaseView {
@@ -82,6 +85,8 @@ export interface ReleaseView {
   retention: RetentionHealth;
   fleet: ReturnType<DispatchOwnerStore['view']> | null;
   journal: { entries: number; lastSeq: number; lastKind: string | null };
+  /** Политика размещения (P30): что этот воркер вообще имеет право запускать. */
+  placement: Record<string, unknown> | null;
 }
 
 export interface AgentApiOptions {
@@ -303,6 +308,16 @@ export class AgentApi {
             cohortReason: admission.cohortReason,
             cohortBucket: admission.bucket,
             servingReleaseId: admission.servingReleaseId,
+            ...(admission.placement
+              ? {
+                  placement: {
+                    workerId: admission.placement.workerId,
+                    region: admission.placement.region,
+                    provider: admission.placement.provider,
+                    policyId: admission.placement.policyId,
+                  },
+                }
+              : {}),
           }
         : {}),
     });
@@ -369,6 +384,7 @@ export class AgentApi {
         lastSeq: journal.length > 0 ? journal[journal.length - 1]!.seq : 0,
         lastKind: journal.length > 0 ? journal[journal.length - 1]!.kind : null,
       },
+      placement: promotion.placement ? placementSummary(promotion.placement) : null,
     };
   }
 
@@ -495,6 +511,18 @@ export class AgentApi {
             partitionIsNotFailover: true,
             retentionPolicy: this.opts.promotion.manifest.retention,
             releaseEndpoint: '/v1/release',
+            placement: this.opts.promotion.placement
+              ? {
+                  policyId: this.opts.promotion.placement.policyId,
+                  authority: this.opts.promotion.placement.authority,
+                  workerRegion: this.opts.promotion.manifest.host.region,
+                  allowedEngines: allowedEnginesForRegion(this.opts.promotion.placement, this.opts.promotion.manifest.host.region),
+                  dataResidencyDecided: this.opts.promotion.placement.dataResidency.decided,
+                  dataResidencyDecisionRef: this.opts.promotion.placement.dataResidency.decisionRef,
+                  checkedBefore: 'paid_profile_and_cohort',
+                  runnerRechecksEngineRegion: true,
+                }
+              : null,
           }
         : {
             pinnedRelease: null,
@@ -509,6 +537,7 @@ export class AgentApi {
             partitionIsNotFailover: true,
             retentionPolicy: null,
             releaseEndpoint: 'absent',
+            placement: null,
           },
       engines: Object.keys(this.opts.adapters).sort(),
     };
@@ -638,40 +667,79 @@ export class AgentApi {
  */
   private decideAdmission(principal: Principal, request: SubmitRequest) {
     const promotion = this.opts.promotion;
-    if (!promotion) return { admit: true as const, cohortId: 'none', cohortReason: 'cohort_off' as const, bucket: 0, releaseId: '', servingReleaseId: '' };
+    if (!promotion) {
+      return {
+        admit: true as const,
+        cohortId: 'none',
+        cohortReason: 'cohort_off' as const,
+        bucket: 0,
+        releaseId: '',
+        servingReleaseId: '',
+        placement: null,
+      };
+    }
+    const placementContext: PlacementContext | undefined = promotion.placement
+      ? { policy: promotion.placement, workerId: promotion.manifest.host.workerId, region: promotion.manifest.host.region }
+      : undefined;
     const decision = decideAdmission(
-      { manifest: promotion.manifest, cohort: promotion.cohort, state: promotion.state.snapshot() },
-      { principalId: principal.principalId, engineName: request.engine.name },
+      {
+        manifest: promotion.manifest,
+        cohort: promotion.cohort,
+        state: promotion.state.snapshot(),
+        ...(placementContext ? { placement: placementContext } : {}),
+      },
+      {
+        principalId: principal.principalId,
+        engineName: request.engine.name,
+        placement: {
+          engineName: request.engine.name,
+          ...(request.engine.modelSettings?.model !== undefined ? { model: request.engine.modelSettings.model } : {}),
+          ...(request.credentialBindings !== undefined
+            ? { credentialBindings: request.credentialBindings.map((binding) => ({ ref: binding.ref, scope: binding.scope })) }
+            : {}),
+          ...(request.regionConstraints !== undefined ? { regionConstraints: request.regionConstraints } : {}),
+        },
+      },
     );
     if (decision.admit) {
       this.log({
-        event: 'admission_accepted',
+        event: 'placement_admitted',
         principalId: principal.principalId,
         engine: request.engine.name,
-        cohortId: decision.cohortId,
-        cohortReason: decision.cohortReason,
-        cohortBucket: decision.bucket,
-        releaseId: decision.releaseId,
-        servingReleaseId: decision.servingReleaseId,
+        ...(decision.placement
+          ? {
+              placement: {
+                workerId: decision.placement.workerId,
+                region: decision.placement.region,
+                provider: decision.placement.provider,
+                policyId: decision.placement.policyId,
+                reasons: decision.placement.reasons,
+              },
+            }
+          : {}),
       });
       return decision;
     }
-    this.refuseAdmission(decision, principal.principalId);
+    // Отказ по размещению — отдельный вид журнала: «почему воркер не взял задачу» должно
+    // читаться без request'а и отличаться от отказов по когорте/оплате (P30, AC-175).
+    const kind = isPlacementRefusalCode(decision.code) ? 'placement_refused' : 'admission_refused';
+    this.refuseAdmission(decision, principal.principalId, kind);
   }
 
   private refuseAdmission(
     refusal: { admit: false; code: AdmissionRefusalCode; reason: string; detail: Record<string, unknown> },
     principalId: string,
+    kind: 'admission_refused' | 'placement_refused' = 'admission_refused',
   ): never {
     const promotion = this.opts.promotion;
     promotion?.journal.append({
-      kind: 'admission_refused',
+      kind,
       reason: refusal.reason,
       cohortId: promotion?.cohort.cohortId,
       detail: { code: refusal.code, principalId, ...refusal.detail },
     });
     this.log({
-      event: 'admission_refused',
+      event: kind,
       principalId,
       code: refusal.code,
       reason: refusal.reason,

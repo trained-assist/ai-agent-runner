@@ -1,0 +1,37 @@
+{
+  "schemaVersion": 1,
+  "policyId": "p30-sandbox-placement",
+  "authority": "sandbox_probe",
+  "decisionRef": "https://github.com/trained-assist/trained-agent-architecture/issues/69 (симуляция P30; это НЕ утверждённая владельцем политика регионов RU/EU)",
+  "engines": {
+    "fake": {
+      "allowedRegions": ["sandbox-ru", "sandbox-eu"],
+      "explicitProfileRef": "sandbox-free-profile (детерминированный движок приёмки, бесплатный)"
+    },
+    "opencode": {
+      "allowedRegions": ["sandbox-ru", "sandbox-eu"],
+      "explicitProfileRef": "sandbox-free-profile (opencode в песочнице: free-ladder без paid fallback)",
+      "providers": {
+        "free-ladder": { "allowedRegions": ["sandbox-ru", "sandbox-eu"] },
+        "zen": { "allowedRegions": ["sandbox-eu"] }
+      }
+    },
+    "claude": {
+      "allowedRegions": ["sandbox-eu"],
+      "explicitProfileRef": null
+    },
+    "codex": {
+      "allowedRegions": ["sandbox-eu"],
+      "explicitProfileRef": null
+    }
+  },
+  "credentialScopes": {
+    "llm:call": { "regions": ["sandbox-eu"] },
+    "sandbox:fixture": { "regions": ["sandbox-ru", "sandbox-eu"] }
+  },
+  "dataResidency": {
+    "decided": false,
+    "decisionRef": null,
+    "regions": []
+  }
+}

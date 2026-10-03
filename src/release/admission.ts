@@ -1,10 +1,12 @@
 import { cohortDecision, type CohortPolicy, type CohortReason } from './cohort.js';
 import type { DispatchOwnerStore } from './dispatch-owner.js';
 import { isPaidProfile, type ReleaseManifest } from './manifest.js';
+import { decidePlacement, type PlacementPolicy, type PlacementRefusalCode, type PlacementSubject } from './placement.js';
 import type { ReleaseState } from './promotion.js';
 
 export type AdmissionRefusalCode =
   | 'PROMOTION_PAUSED'
+  | PlacementRefusalCode
   | 'PAID_PROFILE_DISABLED'
   | 'COHORT_NOT_ENABLED'
   | 'TASK_OWNED_BY_OTHER_WORKER'
@@ -13,6 +15,14 @@ export type AdmissionRefusalCode =
 export interface AdmissionSubject {
   principalId: string;
   engineName: string;
+  /** Региональный/credential-контекст рана (P30). Без него placement решает только по движку. */
+  placement?: PlacementSubject;
+}
+
+export interface PlacementContext {
+  policy: PlacementPolicy;
+  workerId: string;
+  region: string;
 }
 
 export interface AdmissionAcceptance {
@@ -22,6 +32,8 @@ export interface AdmissionAcceptance {
   bucket: number;
   releaseId: string;
   servingReleaseId: string;
+  /** Регион и провайдер, выбранные политикой размещения (P30); null — политики нет. */
+  placement: { workerId: string; region: string; provider: string | null; policyId: string; reasons: string[] } | null;
 }
 
 export interface AdmissionRefusal {
@@ -37,14 +49,19 @@ export interface AdmissionPolicy {
   manifest: ReleaseManifest;
   cohort: CohortPolicy;
   state: ReleaseState;
+  /** Политика размещения (P30): регион × провайдер × credentials × резидентность. */
+  placement?: PlacementContext;
 }
 
 /**
  * Порядок проверок — часть контракта и попадает в логи:
  * 1) rollback: пока релиз откатан, новые задачи не принимаются вообще;
- * 2) paid-профили выключены по умолчанию — проверка до когорты, потому что она не зависит от флага;
- * 3) когорта: только её principal'ы идут на кандидатный релиз;
- * 4) владение задачей (claim) — отдельно, когда уже известен `runId`.
+ * 2) placement: регион/провайдер/credentials/резидентность воркера. Проверяется ДО платного
+ *    флага намеренно: отказ «платно» маскировал бы нарушение региональной политики, и включение
+ *    paid-профилей позже молча запустило бы Claude/Codex в RU;
+ * 3) paid-профили выключены по умолчанию — проверка после placement, потому что она зависит от флага;
+ * 4) когорта: только её principal'ы идут на кандидатный релиз;
+ * 5) владение задачей (claim) — отдельно, когда уже известен `runId`.
  */
 export function decideAdmission(policy: AdmissionPolicy, subject: AdmissionSubject): AdmissionDecision {
   if (policy.state.rolledBack) {
@@ -60,6 +77,24 @@ export function decideAdmission(policy: AdmissionPolicy, subject: AdmissionSubje
         acceptedRuns: 'stay_with_current_owner',
       },
     };
+  }
+
+  let placement: AdmissionAcceptance['placement'] = null;
+  if (policy.placement) {
+    const decision = decidePlacement(
+      policy.placement.policy,
+      { workerId: policy.placement.workerId, region: policy.placement.region },
+      subject.placement ?? { engineName: subject.engineName },
+    );
+    if (!decision.place) {
+      return {
+        admit: false,
+        code: decision.code,
+        reason: decision.reason,
+        detail: { ...decision.detail, workerId: policy.placement.workerId, region: policy.placement.region },
+      };
+    }
+    placement = { workerId: decision.workerId, region: decision.region, provider: decision.provider, policyId: decision.policyId, reasons: [...decision.reasons] };
   }
 
   if (!policy.manifest.paid.allowed && isPaidProfile(policy.manifest, subject.engineName)) {
@@ -93,7 +128,16 @@ export function decideAdmission(policy: AdmissionPolicy, subject: AdmissionSubje
     bucket: cohort.bucket,
     releaseId: policy.manifest.releaseId,
     servingReleaseId: policy.state.servingReleaseId,
+    placement,
   };
+}
+
+/**
+ * Отказ по размещению (P30) — отдельный вид журнала и отдельная причина в логах: регион,
+ * провайдер, credentials и резидентность решаются до платного флага и когорты.
+ */
+export function isPlacementRefusalCode(code: AdmissionRefusalCode): boolean {
+  return code.startsWith('REGION_') || code.startsWith('PROVIDER_') || code.startsWith('CREDENTIAL_') || code.startsWith('DATA_RESIDENCY_');
 }
 
 /**

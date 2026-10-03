@@ -109,10 +109,23 @@ export class DispatchOwnerStore {
         return { outcome: 'granted', generation: record.ownerGeneration, previousOwnerWorkerId: null } satisfies ClaimOutcome;
       }
       if (existing.ownerWorkerId === this.workerId) {
-        if (runId !== null && existing.runId === runId) {
+        if (runId !== null && (existing.runId === runId || existing.runId === null)) {
+          // Первая попытка после передачи владения (takeover по явному сигналу оставил
+          // запись без попытки): поколение уже учтено перехватом, второй increment сдвинул бы
+          // fencing на поколение, у которого не было ни одного рана.
+          const handOver = existing.runId === null;
+          existing.runId = runId;
           existing.state = 'owned';
           existing.updatedAt = this.now();
-          this.emit('claim_granted', principalId, userTaskId, existing.ownerGeneration, 'idempotent re-claim of the same run by the current owner');
+          this.emit(
+            'claim_granted',
+            principalId,
+            userTaskId,
+            existing.ownerGeneration,
+            handOver
+              ? 'first attempt by the new owner after a hand-over'
+              : 'idempotent re-claim of the same run by the current owner',
+          );
           return { outcome: 'granted', generation: existing.ownerGeneration, previousOwnerWorkerId: existing.previousOwnerWorkerId } satisfies ClaimOutcome;
         }
         // Новый runId для той же задачи = новая попытка: поколение обязано вырасти.
@@ -218,6 +231,15 @@ export class DispatchOwnerStore {
         }
       }
       this.emit('drained', '', '', 0, reason);
+    });
+  }
+
+  /** Отмена drain: воркер снова принимает новые задачи (уже принятые остаются его). */
+  undrain(reason: string): void {
+    this.withLock((file) => {
+      const index = file.drains.indexOf(this.workerId);
+      if (index >= 0) file.drains.splice(index, 1);
+      this.emit('drained', '', '', 0, `undrain: ${reason}`);
     });
   }
 
