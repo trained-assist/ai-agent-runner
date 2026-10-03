@@ -10,6 +10,7 @@ import { demoRegistry, fixtureBindingResolver, logMessages as mcpLogMessages, mc
 import { validateRunSpec } from '../src/contracts/run-spec.js';
 import { AgentApi } from '../src/api/service.js';
 import { FakeEngine } from '../src/adapters/engine/fake-engine.js';
+import { isProcessAlive } from '../src/adapters/engine/process-tree.js';
 import { OpenCodeAdapter } from '../src/adapters/engine/opencode-adapter.js';
 import { createBlobStore } from '../src/storage/create-blob-store.js';
 import { ArtifactStore } from '../src/storage/artifact-store.js';
@@ -242,7 +243,50 @@ describe('clean room isolation (issue #51)', () => {
     expect(first.h.fake.startCalls).toBe(fakeStartsBefore);
   });
 
-  it('единственная копия выхода: workspace остаётся, слот не освобождается', async () => {
+  it('переживший воркер движок не держит слот: аренда дочищается без повторного запуска', async () => {
+    const launcher = new RecordingLauncher();
+    const rootDir = harnessRootFor('orphan');
+    // Живой ран с висящим движком: воркер умирает, процесс движка остаётся.
+    const first = harnessWith(launcher, { provider: { slots: ['slot-a'] }, harness: { rootDir, scenario: 'timeout' } });
+    const holder = first.h.start();
+    await waitFor(
+      () => {
+        const run = first.h.runner.getRun(holder.receipt.runId);
+        return run !== null && run.state === 'running' && run.pid !== null;
+      },
+      5000,
+      'run to be running',
+    );
+    const enginePid = first.h.runner.getRun(holder.receipt.runId)?.pid as number;
+    expect(first.provider.freeSlots()).toEqual([]);
+
+    // Воркер действительно умирает: его таймеры и обработчики выхода больше не работают,
+    // поэтому завершение рана может прийти только от нового воркера при recover().
+    const fakeStartsBefore = first.h.fake.startCalls;
+    first.h.runner.dispose();
+    const restarted = harnessWith(launcher, { provider: { slots: ['slot-a'] }, harness: { rootDir } });
+    const report = await restarted.h.runner.recover();
+
+    expect(report.orphaned).toBe(1);
+    expect(report.cleanRoomsReconciled).toBeGreaterThanOrEqual(1);
+    // Процесс движка гасится, слот возвращается в пул, движок НЕ запускается заново.
+    await waitFor(() => !isProcessAlive(enginePid), 8000, 'orphaned engine to die');
+    expect(isProcessAlive(enginePid)).toBe(false);
+    expect(restarted.provider.freeSlots()).toEqual(['slot-a']);
+    expect(restarted.provider.lease(holder.receipt.runId)?.status).toBe('released');
+    expect(listDir(join(rootDir, 'cleanrooms'))).toEqual([]);
+    expect(restarted.h.fake.startCalls).toBe(0);
+    expect(first.h.fake.startCalls).toBe(fakeStartsBefore);
+
+    // Причина дочистки видна в логе рана, а результат финализирован по факту смерти процесса.
+    const messages = logMessages(rootDir, holder.receipt.runId);
+    expect(messages.some((line) => line.startsWith('clean_room.orphan_terminated') && line.includes('slot=slot-a'))).toBe(true);
+    const result = restarted.h.runner.getRun(holder.receipt.runId)?.result;
+    expect(result?.outcome).toBe('failed');
+    expect(result?.failure?.code).toBe('WORKER_CRASH');
+  });
+
+it('единственная копия выхода: workspace остаётся, слот не освобождается', async () => {
     const launcher = new RecordingLauncher();
     const rootDir = harnessRootFor('sole-copy');
     const blob = createBlobStore({ backend: 'local-fs', localRoot: join(rootDir, 'blobs') });
