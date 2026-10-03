@@ -161,10 +161,13 @@ describe('artifact export during finalization (P07 / AC-75, AC-76)', () => {
     harness.faults.inject('export', { kind: 'throw', once: true });
     const { receipt } = harness.start({ outputs: [{ path: 'ran.txt' }] });
 
-    await waitFor(() => {
-      const snap = harness.runner.getRun(receipt.runId);
-      return snap !== null && snap.state === 'finalizing';
-    });
+    // Барьер по самому сбою, а не по состоянию рана: одноразовый сбой исчезает из
+    // реестра ровно тогда, когда его съела финализация. Наблюдение `state ===
+    // 'finalizing'` ничего не говорит о том, дошло ли дело до точки export, поэтому
+    // гонять тест с обработчиком выхода движка за это право — верный способ получить
+    // плавающий тест, а не проверку контракта.
+    await waitFor(() => !harness.faults.has('export'));
+
     // движок уже завершён, но ран не терминален: сбой экспорта не роняет ран молча
     const stuck = harness.runner.getRun(receipt.runId);
     expect(stuck?.state).toBe('finalizing');

@@ -182,12 +182,8 @@ describe('lifecycle рана: persist → проверенная уборка (i
     // Ран доходит до финализации, но уборка падает ПОСЛЕ записи намерения на диск.
     h.faults.inject('cleanup', { kind: 'throw', once: true });
     const { receipt, spec } = h.start({ outputs: [{ path: 'ran.txt' }] });
-    await waitFor(
-      () => h.runner.getRun(receipt.runId)?.state === 'finalizing' || h.runner.getRun(receipt.runId)?.state === 'succeeded',
-      8000,
-      'run to reach finalization',
-    );
-    await waitFor(() => existsSync(join(h.rootDir, 'runs', receipt.runId, 'checkpoint.json')), 8000, 'checkpoint on disk');
+    // Барьер — по самому сбою: одноразовый сбой исчезает из реестра, когда его съела уборка.
+    await waitFor(() => !h.faults.has('cleanup'), 8000, 'cleanup fault to be consumed');
     // Каталог рана на месте: sweep не состоялся.
     expect(existsSync(spec.cwd)).toBe(true);
     expect(checkpointOnDisk(h.rootDir, receipt.runId).cleanup.status).not.toBe('completed');
