@@ -1673,6 +1673,11 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
    * С границей уборку делает провайдер (слот освобождается только после проверки), без
    * границы хост убирает рабочий каталог и сокет сам — иначе каталоги ранов копились бы
    * вечно, а ран объявлял бы уборку выполненной по отсутствию процессов.
+   *
+   * Граница, поднятая ПРЕЖДУМ воркером, переживает рестарт: в этом процессе `run.room`
+   * уже пуст, но аренда и каталоги лежат на диске. Уборка обязана довести их до конца и
+   * здесь — иначе слот остался бы занятым навсегда, а `cleanup: completed` — неправдой
+   * (дефект, найденный пробой на песочной VM2).
    */
   private async sweepRunEnvironment(
     run: InternalRun | undefined,
@@ -1689,26 +1694,59 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
     // сбой здесь — честный «сбой во время sweep»: восстановление найдёт намерение и
     // доведёт уборку до конца, не перезапуская движок.
     await this.fireFault('cleanup', st.runId);
-    if (run.room) {
-      await this.releaseCleanRoom(run, reason, { ...(keep ? { keepWorkspace: true } : {}) });
-      const lease = this.opts.isolation?.lease(st.runId) ?? null;
+    const provider = this.opts.isolation ?? null;
+    const room = run.room;
+    const lease = provider?.lease(st.runId) ?? null;
+    if (room || (provider && lease && lease.status !== 'released' && st.cleanRoom)) {
+      if (room) {
+        await this.releaseCleanRoom(run, reason, { ...(keep ? { keepWorkspace: true } : {}) });
+      } else {
+        // Аренда с прошлого воркера: тот же проверенный sweep+release, только по аренде.
+        if (st.cleanRoom) {
+          st.cleanRoom.status = 'sweeping';
+          this.store.saveState(st);
+        }
+        try {
+          await provider?.reconcile(lease as CleanRoomLease, keep ? { keepWorkspace: true } : {});
+        } catch (error) {
+          this.emit(st, 'log', {
+            stream: 'runner',
+            level: 'error',
+            message: `clean_room.reconcile_failed runId=${st.runId} reason=${reason} detail=${truncateLine(redactSecrets(error instanceof Error ? error.message : String(error)), 300)}`,
+          });
+        }
+        const after = provider?.lease(st.runId) ?? null;
+        if (st.cleanRoom) {
+          st.cleanRoom.status = after?.status ?? 'released';
+          this.store.saveState(st);
+        }
+        this.emit(st, 'log', {
+          stream: 'runner',
+          level: 'info',
+          message: `clean_room.reconciled_sweep runId=${st.runId} reason=${reason} lease=${after?.status ?? 'absent'}`,
+        });
+      }
+      const current = provider?.lease(st.runId) ?? null;
       const socket = this.runSocketPath(st.runId, null);
       if (socket && !existsSync(socket)) removed.push(socket);
       const missing = st.cleanRoom === null ? [] : [st.cleanRoom.paths.root, st.cleanRoom.paths.cwd];
       const leftovers = missing.filter((target) => existsSync(target));
-      if (lease?.status === 'released' && leftovers.length === 0) {
+      const released = current === null || current.status === 'released';
+      if (released && leftovers.length === 0) {
         return { status: 'completed', reason: 'clean room lease released and every run directory is gone', removed };
       }
       const blocked = {
         status: 'pending' as const,
-        reason: lease?.reason ?? `cleanup is not verified: ${leftovers.length > 0 ? `left ${leftovers.join(', ')}` : 'lease is not released'}`,
+        reason:
+          current?.reason ??
+          `cleanup is not verified: ${leftovers.length > 0 ? `left ${leftovers.join(', ')}` : 'lease is not released'}`,
         removed,
       };
       // Причина невыполненной уборки видна в логе рана ДО терминального события.
       this.emit(st, 'log', {
         stream: 'runner',
         level: 'warn',
-        message: `clean_room.cleanup_blocked runId=${st.runId} status=${lease?.status ?? 'unknown'} reason=${truncateLine(blocked.reason, 300)}`,
+        message: `clean_room.cleanup_blocked runId=${st.runId} status=${current?.status ?? 'unknown'} reason=${truncateLine(blocked.reason, 300)}`,
       });
       return blocked;
     }
