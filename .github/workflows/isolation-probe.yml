@@ -1,0 +1,99 @@
+name: isolation-probe
+
+# Приёмка границы Agent clean room (issue #51): per-run Unix-идентичность на настоящем
+# Linux-хосте. Проба создаёт собственных непривилегированных пользователей (слоты),
+# поднимает API/Runner поверх них и проверяет отрицательные свойства границы на живых
+# одновременных ранах, управляемые отказы (сломанный слот, занятый слот, отказ хранилища)
+# и переживание аренды идентичности рестартом воркера.
+#
+# ubuntu-latest даёт парольless sudo, поэтому useradd/chown/setpriv/setfacl доступны.
+# Прод и настоящие RU/EU-воркеры не используются: у пробы свой namespace и свои слоты.
+#
+# Состояние прогона изолировано в .iso-probe этого job; наружу уходит только транскрипт.
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  isolation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci --no-audit --no-fund
+      - run: npm run typecheck
+      - run: npm run build
+
+      - name: Слоты и песочница пробы
+        run: |
+          set -euo pipefail
+          # Слоты — обычные непривилегированные пользователи хоста; создаются здесь же,
+          # удаляются вместе с runner'ом CI. Общий read-only каталог бинарей инструментов.
+          for slot in ta-agent-1 ta-agent-2; do
+            sudo useradd --no-create-home --shell /usr/sbin/nologin "$slot" 2>/dev/null || echo "slot $slot already exists"
+          done
+          getent passwd ta-agent-1 ta-agent-2
+          scripts/recreate-sandbox.sh \
+            --namespace iso-ci \
+            --fleet-root "$PWD/.iso-probe" \
+            --workers a \
+            --client-engines fake,opencode \
+            --owner "$(id -un)"
+
+      - name: Проба границы чистой среды (issue #51)
+        run: |
+          set -euo pipefail
+          sudo --preserve-env=PATH,HOME \
+            node scripts/isolation-probe.mjs \
+              --fleet-root "$PWD/.iso-probe" \
+              --namespace iso-ci \
+              --engine "${PROBE_ENGINE:-fake}" \
+              --out "$PWD/.iso-probe/out"
+
+      - name: Транскрипт в артефакт job
+        if: always()
+        run: |
+          set -uo pipefail
+          if [ -f .iso-probe/out/transcript.sha256 ]; then
+            (cd .iso-probe/out && sha256sum -c transcript.sha256)
+            {
+              echo '### Проба границы Agent clean room (issue #51)'
+              echo '```'
+              cat .iso-probe/out/transcript.sha256
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            # Наружу уходит только транскрипт: в .iso-probe лежат свежие ключи песочницы.
+            tar -czf "$RUNNER_TEMP/isolation-transcript.tgz" -C .iso-probe/out .
+          else
+            echo 'транскрипт не собран' >&2
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: p51-clean-room-transcript
+          path: ${{ runner.temp }}/isolation-transcript.tgz
+          retention-days: 14
+
+      - name: Секреты песочницы не попали в транскрипт (повторная проверка в CI)
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ ! -f .iso-probe/out/transcript.json ]; then
+            echo 'транскрипт не собран' >&2
+            exit 1
+          fi
+          if grep -q 'ak_' .iso-probe/out/transcript.json; then
+            echo 'в транскрипте есть значение ключа' >&2
+            exit 1
+          fi
+          echo 'значений ключей в транскрипте нет'

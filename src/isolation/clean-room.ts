@@ -29,7 +29,6 @@ export interface UnixCleanRoomOptions {
   log?: (message: string) => void;
 }
 
-const SELF_TEST_TTL_MS = 30_000;
 const PROBE_DEFAULT_TIMEOUT_MS = 15_000;
 
 function defaultProbeScript(): string {
@@ -62,7 +61,8 @@ export class UnixCleanRoomProvider implements CleanRoomProvider {
   private readonly probeScript: string;
   private readonly now: () => Date;
   private readonly log: (message: string) => void;
-  private selfTestCache: { at: number; result: { ok: boolean; detail: string } } | null = null;
+  /** Последнее подтверждение границы на этом хосте: selfTest при старте или проба рана. */
+  private verification: { ok: boolean; detail: string; at: number } | null = null;
 
   constructor(options: UnixCleanRoomOptions) {
     this.rootDir = options.rootDir;
@@ -75,27 +75,27 @@ export class UnixCleanRoomProvider implements CleanRoomProvider {
 
   capability(): IsolationCapability {
     if (!this.launcher) return 'configured_but_refusing_runs';
-    const cached = this.selfTestCache;
-    if (cached && Date.now() - cached.at < SELF_TEST_TTL_MS) {
-      return cached.result.ok ? 'per_run_unix_identity_verified' : 'configured_but_refusing_runs';
-    }
-    // Без свежего self-test честно не объявляем проверенную границу: первый acquire()
-    // всё равно выполнит selfTest и откажет при неудаче.
-    return 'configured_but_refusing_runs';
+    // Объявляем ровно то, что подтверждено на этом хосте: selfTest при старте или проба
+    // границы последнего рана. Неподтверждённая граница объявляется как отказ, а не как
+    // «probably работает» — иначе клиент получил бы ложное обещание.
+    return this.verification?.ok ? 'per_run_unix_identity_verified' : 'configured_but_refusing_runs';
   }
 
   async selfTest(): Promise<{ ok: boolean; detail: string }> {
-    if (!this.launcher) return { ok: false, detail: 'no identity launcher (setpriv/runuser) on this host' };
+    if (!this.launcher) return this.record({ ok: false, detail: 'no identity launcher (setpriv/runuser) on this host' });
     const slot = this.policy.slots[0];
-    if (!slot) return { ok: false, detail: 'no slots configured' };
+    if (!slot) return this.record({ ok: false, detail: 'no slots configured' });
     let identity: RunIdentity;
     try {
       identity = await this.resolveSlot(slot);
     } catch (error) {
-      return { ok: false, detail: error instanceof Error ? error.message : String(error) };
+      return this.record({ ok: false, detail: error instanceof Error ? error.message : String(error) });
     }
-    const result = await this.launcher.selfTest(identity);
-    this.selfTestCache = { at: Date.now(), result };
+    return this.record(await this.launcher.selfTest(identity));
+  }
+
+  private record(result: { ok: boolean; detail: string }): { ok: boolean; detail: string } {
+    this.verification = { ...result, at: Date.now() };
     return result;
   }
 
@@ -147,7 +147,15 @@ export class UnixCleanRoomProvider implements CleanRoomProvider {
       );
     }
     const slotId = free[0] as string;
-    const identity = await this.resolveSlot(slotId);
+    let identity: RunIdentity;
+    try {
+      identity = await this.resolveSlot(slotId);
+    } catch (error) {
+      // Слота нет на хосте — это поломка настройки границы, а не отсутствие ёмкости:
+      // capabilities перестают объявлять проверенную границу.
+      this.record({ ok: false, detail: error instanceof Error ? error.message : String(error) });
+      throw error;
+    }
     const paths = this.pathsFor(runId, cwd);
     const at = this.now().toISOString();
 
@@ -168,13 +176,16 @@ export class UnixCleanRoomProvider implements CleanRoomProvider {
       // Проба не смогла выполниться — граница не доказана, ран не запускаем.
       this.removeTree(paths.root);
       this.removeTree(paths.cwd);
+      this.record({ ok: false, detail: `boundary probe produced no verdict for slot "${slotId}"` });
       throw new CleanRoomError('ISOLATION_PROBE_UNAVAILABLE', `boundary probe could not run for slot "${slotId}"`);
     }
     if (!probe.ok) {
       this.removeTree(paths.root);
       this.removeTree(paths.cwd);
+      this.record({ ok: false, detail: `boundary probe failed for slot "${slotId}": ${probe.failures.join('; ')}` });
       throw new CleanRoomError('ISOLATION_PROBE_FAILED', `boundary probe failed for slot "${slotId}": ${probe.failures.join('; ')}`);
     }
+    this.record({ ok: true, detail: `boundary probe passed for slot "${slotId}" (${probe.checks.length} checks)` });
 
     const lease: CleanRoomLease = {
       schemaVersion: RUN_ISOLATION_SCHEMA_VERSION,
