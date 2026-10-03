@@ -231,6 +231,9 @@ function readProcUid(pid: number): number | null {
 const IDENTITY_SETTLE_TIMEOUT_MS = 3000;
 const IDENTITY_SETTLE_POLL_MS = 25;
 
+/** Сколько ждём смерти осиротевшего процесса движка при дочистке после рестарта воркера. */
+const ORPHAN_TERM_TIMEOUT_MS = 5000;
+
 type IdentitySettle =
   | { kind: 'matched'; uid: number; waitedMs: number }
   | { kind: 'mismatch'; uid: number; waitedMs: number }
@@ -287,9 +290,18 @@ export class Runner {
     for (const runId of this.store.listRunIds()) {
       const state = this.store.loadState(runId);
       if (!state) continue;
+      const events = this.store.readEvents(runId);
+      // state.json мог отстать от журнала (kill -9 между append и saveState): счётчик
+      // обязан опираться на журнал, иначе следующее событие получило бы уже занятую
+      // версию и в replay появилась бы дубликат.
+      const lastSequence = events.length > 0 ? events[events.length - 1]!.sequence : 0;
+      if (lastSequence > state.sequence) {
+        state.sequence = lastSequence;
+        this.store.saveState(state);
+      }
       this.runs.set(runId, {
         state,
-        events: this.store.readEvents(runId),
+        events,
         waiters: [],
         handle: null,
         timers: [],
@@ -603,7 +615,7 @@ export class Runner {
         case 'starting':
           report.orphanedMcp += await this.reapOrphanedMcp(run);
           if (st.pid && isProcessAlive(st.pid)) {
-            this.markOrphaned(run, report);
+            await this.markOrphaned(run, report);
           } else {
             st.workerCrashed = true;
             this.store.saveState(st);
@@ -620,7 +632,7 @@ export class Runner {
           report.orphanedMcp += await this.reapOrphanedMcp(run);
           if (run.handle) break;
           if (st.pid && isProcessAlive(st.pid)) {
-            this.markOrphaned(run, report);
+            await this.markOrphaned(run, report);
             break;
           }
           if (!st.exit) {
@@ -712,19 +724,59 @@ export class Runner {
     return reaped;
   }
 
-  private markOrphaned(run: InternalRun, report: RecoveryReport): void {
+  /**
+ * Ран, чей процесс движка пережил рестарт воркера.
+ *
+ * Без аренды идентичности поведение прежнее: ран помечается осиротевшим, наблюдение
+ * теряется, повторного запуска нет, клиент может отменить ран.
+ *
+ * С арендой идентичности граница обязана быть ограничена во времени, а после рестарта ни
+ * таймер рана, ни наблюдатель выхода уже не работают: переживший воркер процесс ждал бы
+ * завершения вечно, удерживая слот и каталоги рана — то есть одна авария воркера навсегда
+ * отнимала бы слот из пула. Поэтому процесс гасится, ран дочищается (persist + sweep) и
+ * слот возвращается в пул. Повторного запуска движка при этом нет: результат
+ * финализируется по факту смерти процесса, а не переигрыванием рана.
+ */
+private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<void> {
     const st = run.state;
     st.connectionLost = true;
     st.orphanedPid = st.pid;
     this.store.saveState(st);
-    if (!isTerminalState(st.state)) {
-      this.emit(st, 'connection_lost', {
-        detectedAt: this.nowIso(),
-        detail: 'engine process survived a worker restart; supervision is lost, no automatic rerun',
-        engineAlive: true,
-      });
-    }
     report.orphaned += 1;
+    const holdsIdentity = run.room !== null || st.cleanRoom !== null;
+    if (!holdsIdentity) {
+      if (!isTerminalState(st.state)) {
+        this.emit(st, 'connection_lost', {
+          detectedAt: this.nowIso(),
+          detail: 'engine process survived a worker restart; supervision is lost, no automatic rerun',
+          engineAlive: true,
+        });
+      }
+      return;
+    }
+    const pid = st.pid;
+    const pgid = st.pgid;
+    const slotId = st.cleanRoom?.identity?.slotId ?? run.room?.identity.slotId ?? null;
+    killProcessTree(pgid, pid, 'SIGKILL');
+    const gone = await waitForProcessDeath(pgid, pid, ORPHAN_TERM_TIMEOUT_MS);
+    this.emit(st, 'log', {
+      stream: 'runner',
+      level: 'warn',
+      message: `clean_room.orphan_terminated runId=${st.runId} pid=${String(pid)} slot=${String(slotId)} gone=${String(gone)} reason=engine_survived_worker_restart`,
+    });
+    st.workerCrashed = true;
+    // `running` не переходит сразу в терминальное состояние: сначала finalizing, как и при
+    // штатном выходе движка, иначе ран остался бы навсегда в running без наблюдателя.
+    if (this.transition(st, 'finalizing')) {
+      this.emit(st, 'finalizing', { reason: 'worker_crash' });
+    }
+    this.completeWithoutEngine(st, 'failed', 'worker_crash', {
+      code: 'WORKER_CRASH',
+      failureClass: 'runtime',
+      safeSummary: 'the engine process survived a worker restart under a leased run identity and was terminated during recovery; the run was not re-executed',
+      retryable: true,
+    });
+    if (await this.reconcileCleanRoom(run)) report.cleanRoomsReconciled += 1;
   }
 
   private transition(st: PersistedRunState, to: RunState): boolean {
@@ -758,10 +810,15 @@ export class Runner {
   private appendEvent(st: PersistedRunState, event: RunnerEvent): void {
     const run = this.runs.get(st.runId);
     run?.events.push(event);
+    // Журнал событий ДО state.json: иначе kill -9 между двумя записями оставлял бы
+    // state.sequence впереди журнала, и после рестарта в replay навсегда оставалась бы
+    // дыра в нумерации (счётчик продолжил бы с версии из state, а события той версии
+    // в файле уже нет). Порядок «сначала журнал, потом state» даёт обратное окно —
+    // state может отстать, но не перегнать журнал; счётчик на старте сверяется с журналом.
+    this.eventLog.append(this.store.logPath(st.runId), event);
     st.sequence = event.sequence;
     st.updatedAt = this.nowIso();
     this.store.saveState(st);
-    this.eventLog.append(this.store.logPath(st.runId), event);
   }
 
   private async fireFault(point: FaultPoint, runId?: string): Promise<void> {

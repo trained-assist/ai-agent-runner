@@ -10,18 +10,24 @@ import { demoRegistry, fixtureBindingResolver, logMessages as mcpLogMessages, mc
 import { validateRunSpec } from '../src/contracts/run-spec.js';
 import { AgentApi } from '../src/api/service.js';
 import { FakeEngine } from '../src/adapters/engine/fake-engine.js';
+import { isProcessAlive } from '../src/adapters/engine/process-tree.js';
 import { OpenCodeAdapter } from '../src/adapters/engine/opencode-adapter.js';
 import { createBlobStore } from '../src/storage/create-blob-store.js';
+import { ArtifactStore } from '../src/storage/artifact-store.js';
+import { RunExportStore } from '../src/storage/export.js';
 import { Runner } from '../src/runner/runner.js';
 import { BRIDGE_SOCKET_PATH_LIMIT, bridgeSocketPath } from '../src/mcp/bridge.js';
 import { UnixCleanRoomProvider } from '../src/isolation/clean-room.js';
 import { detectHostIsolationCapabilities, hostCapabilitySkipReason } from '../src/isolation/host-capabilities.js';
 import { RUN_ISOLATION_SCHEMA_VERSION, type CleanRoomLeaseStatus, type CleanRoomProvider } from '../src/isolation/contract.js';
+import type { Principal } from '../src/api/auth.js';
 import type { Harness, HarnessOptions } from './helpers.js';
 
 /** Слоты для настоящей границы: на непривилегированном CI их нет, и блок пропускается. */
 const hostCapabilities = detectHostIsolationCapabilities({ slots: ['ta-agent-1', 'ta-agent-2'] });
 const hostSkipReason = hostCapabilitySkipReason(hostCapabilities);
+
+const principal: Principal = { principalId: 'p-iso', profileId: 'profile-a', scopes: ['runs:read', 'runs:write'], engines: ['fake'] };
 
 function events(rootDir: string, runId: string): Array<Record<string, unknown>> {
   const path = join(rootDir, 'runs', runId, 'events.jsonl');
@@ -50,11 +56,16 @@ function harnessWith(
   return { h, provider };
 }
 
-function apiFor(options: { rootDir: string; isolation?: CleanRoomProvider }): AgentApi {
+function apiFor(options: { rootDir: string; isolation?: CleanRoomProvider; artifactExport?: boolean }): AgentApi {
+  const blob = createBlobStore({ backend: 'local-fs', localRoot: join(options.rootDir, 'blobs') });
   return new AgentApi({
     rootDir: options.rootDir,
     adapters: { fake: new FakeEngine('success'), opencode: new OpenCodeAdapter() },
     host: { region: 'sandbox-eu', environment: 'sandbox' },
+    blob,
+    ...(options.artifactExport
+      ? { exports: new RunExportStore({ rootDir: options.rootDir, artifacts: new ArtifactStore({ rootDir: options.rootDir, blob }) }) }
+      : {}),
     ...(options.isolation ? { isolation: options.isolation } : {}),
   });
 }
@@ -232,7 +243,50 @@ describe('clean room isolation (issue #51)', () => {
     expect(first.h.fake.startCalls).toBe(fakeStartsBefore);
   });
 
-  it('единственная копия выхода: workspace остаётся, слот не освобождается', async () => {
+  it('переживший воркер движок не держит слот: аренда дочищается без повторного запуска', async () => {
+    const launcher = new RecordingLauncher();
+    const rootDir = harnessRootFor('orphan');
+    // Живой ран с висящим движком: воркер умирает, процесс движка остаётся.
+    const first = harnessWith(launcher, { provider: { slots: ['slot-a'] }, harness: { rootDir, scenario: 'timeout' } });
+    const holder = first.h.start();
+    await waitFor(
+      () => {
+        const run = first.h.runner.getRun(holder.receipt.runId);
+        return run !== null && run.state === 'running' && run.pid !== null;
+      },
+      5000,
+      'run to be running',
+    );
+    const enginePid = first.h.runner.getRun(holder.receipt.runId)?.pid as number;
+    expect(first.provider.freeSlots()).toEqual([]);
+
+    // Воркер действительно умирает: его таймеры и обработчики выхода больше не работают,
+    // поэтому завершение рана может прийти только от нового воркера при recover().
+    const fakeStartsBefore = first.h.fake.startCalls;
+    first.h.runner.dispose();
+    const restarted = harnessWith(launcher, { provider: { slots: ['slot-a'] }, harness: { rootDir } });
+    const report = await restarted.h.runner.recover();
+
+    expect(report.orphaned).toBe(1);
+    expect(report.cleanRoomsReconciled).toBeGreaterThanOrEqual(1);
+    // Процесс движка гасится, слот возвращается в пул, движок НЕ запускается заново.
+    await waitFor(() => !isProcessAlive(enginePid), 8000, 'orphaned engine to die');
+    expect(isProcessAlive(enginePid)).toBe(false);
+    expect(restarted.provider.freeSlots()).toEqual(['slot-a']);
+    expect(restarted.provider.lease(holder.receipt.runId)?.status).toBe('released');
+    expect(listDir(join(rootDir, 'cleanrooms'))).toEqual([]);
+    expect(restarted.h.fake.startCalls).toBe(0);
+    expect(first.h.fake.startCalls).toBe(fakeStartsBefore);
+
+    // Причина дочистки видна в логе рана, а результат финализирован по факту смерти процесса.
+    const messages = logMessages(rootDir, holder.receipt.runId);
+    expect(messages.some((line) => line.startsWith('clean_room.orphan_terminated') && line.includes('slot=slot-a'))).toBe(true);
+    const result = restarted.h.runner.getRun(holder.receipt.runId)?.result;
+    expect(result?.outcome).toBe('failed');
+    expect(result?.failure?.code).toBe('WORKER_CRASH');
+  });
+
+it('единственная копия выхода: workspace остаётся, слот не освобождается', async () => {
     const launcher = new RecordingLauncher();
     const rootDir = harnessRootFor('sole-copy');
     const blob = createBlobStore({ backend: 'local-fs', localRoot: join(rootDir, 'blobs') });
@@ -412,6 +466,40 @@ describe('clean room isolation (issue #51)', () => {
     expect(validateRunSpec({ ...base, isolation: { mode: 'per_run_unix_identity' } }).ok).toBe(true);
     expect(validateRunSpec({ ...base, isolation: { mode: 'none' } }).ok).toBe(true);
     expect(validateRunSpec({ ...base, isolation: { mode: 'container' } }).ok).toBe(false);
+  });
+
+  it('требование границы клиента доходит до рана: без провайдера такой ран отказывается', async () => {
+    const apiRoot = harnessRootFor('request-wiring');
+    // Хост БЕЗ провайдера границы: клиент запросил per_run_unix_identity.
+    const api = apiFor({ rootDir: apiRoot });
+    const receipt = api.submit(principal, 'idem-iso-required', {
+      userTaskId: 'task-iso',
+      engine: { name: 'fake', adapterVersion: '1' },
+      envAllowlist: [],
+      limits: { timeoutMs: 10_000 },
+      isolation: { mode: 'per_run_unix_identity' },
+    });
+    await waitFor(() => api.status(principal, receipt.runId).state === 'failed', 8000, 'run to be refused');
+    // Отказ до спавна движка: запуск под service UID был бы расширением прав.
+    expect(api.result(principal, receipt.runId).failure?.code).toBe('ISOLATION_UNAVAILABLE');
+  });
+
+  it('объявленные выходы клиента доходят до рана и сохраняются', async () => {
+    const launcher = new RecordingLauncher();
+    const rootDir = harnessRootFor('outputs-wiring');
+    const provider = new StubCleanRoomProvider({ rootDir }, launcher);
+    const api = apiFor({ rootDir, isolation: provider, artifactExport: true });
+    const receipt = api.submit(principal, 'idem-outputs', {
+      userTaskId: 'task-outputs',
+      engine: { name: 'fake', adapterVersion: '1' },
+      envAllowlist: [],
+      limits: { timeoutMs: 10_000 },
+      outputs: [{ path: 'ran.txt' }],
+    });
+    await waitFor(() => api.status(principal, receipt.runId).state === 'succeeded', 8000, 'run to succeed');
+    // spec.outputs переносится в RunSpec, иначе экспортировать нечего: манифест пуст.
+    expect(api.runner.getRun(receipt.runId)?.export?.exported).toBe(1);
+    expect(api.result(principal, receipt.runId).outputRefs).toHaveLength(1);
   });
 });
 

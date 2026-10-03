@@ -1,0 +1,1041 @@
+{
+  "schemaVersion": 1,
+  "probe": "Граница Agent clean room: per-run Unix-идентичность (issue #51)",
+  "generatedAt": "2026-10-03T20:24:49.500Z",
+  "host": {
+    "platform": "linux",
+    "kernel": "6.8.0-142-generic",
+    "apiProcessUid": 0
+  },
+  "topology": "API/Runner (service UID) → арендованный на ран Unix-слот (ta-agent-N) → процесс движка и per-run MCP-процессы; проба границы исполняется под идентичностью рана ДО спавна",
+  "engine": "fake",
+  "engineNote": "fake-движок: свойства OS-границы проверяются под идентичностью рана и от движка не зависят, но строка «настоящий OpenCode Run» остаётся открытой без бинаря opencode и разрешённого бесплатного профиля песочницы",
+  "slots": [
+    {
+      "slotId": "ta-agent-1",
+      "uid": 999,
+      "gid": 988
+    },
+    {
+      "slotId": "ta-agent-2",
+      "uid": 997,
+      "gid": 988
+    }
+  ],
+  "toolDir": "/var/lib/agent-runner/iso-20261003b/iso-probe/tools",
+  "namespace": "iso-20261003b",
+  "steps": [
+    {
+      "at": "2026-10-03T20:24:44.203Z",
+      "step": "prerequisites_state",
+      "leases": [],
+      "freeSlots": null
+    },
+    {
+      "at": "2026-10-03T20:24:44.329Z",
+      "step": "prerequisites",
+      "launcher": "setpriv",
+      "setfacl": true,
+      "slots": [
+        {
+          "slotId": "ta-agent-1",
+          "uid": 999,
+          "gid": 988
+        },
+        {
+          "slotId": "ta-agent-2",
+          "uid": 997,
+          "gid": 988
+        }
+      ],
+      "toolDir": "/var/lib/agent-runner/iso-20261003b/iso-probe/tools",
+      "toolDirMode": "0555",
+      "engine": "fake",
+      "kernel": "6.8.0-142-generic"
+    },
+    {
+      "at": "2026-10-03T20:24:44.329Z",
+      "step": "capabilities_state",
+      "leases": [],
+      "freeSlots": null
+    },
+    {
+      "at": "2026-10-03T20:24:44.645Z",
+      "step": "capabilities",
+      "isolation": {
+        "mode": "per_run_unix_identity",
+        "slots": [
+          "ta-agent-1",
+          "ta-agent-2"
+        ],
+        "freeSlots": [
+          "ta-agent-1",
+          "ta-agent-2"
+        ],
+        "capability": "per_run_unix_identity_verified",
+        "launcher": "setpriv",
+        "failClosed": true
+      },
+      "osIsolationNote": "every run executes under its own leased unix identity (slots: ta-agent-1, ta-agent-2), with run-scoped HOME/config/cache/tmp and a boundary probe before spawn; per-run MCP processes run under the same identity"
+    },
+    {
+      "at": "2026-10-03T20:24:44.645Z",
+      "step": "two_concurrent_runs_state",
+      "leases": [],
+      "freeSlots": null
+    },
+    {
+      "at": "2026-10-03T20:24:45.804Z",
+      "step": "two_concurrent_runs",
+      "runs": [
+        {
+          "runId": "run_7e6240d1-5377-4c9e-9667-937ee6aa0a71",
+          "pid": 140035,
+          "slot": "ta-agent-1",
+          "uid": 999,
+          "gid": 988,
+          "cwd": "/var/lib/agent-runner/iso-20261003b/worker-a/data/workspaces/run_7e6240d1-5377-4c9e-9667-937ee6aa0a71",
+          "roomRoot": "/var/lib/agent-runner/iso-20261003b/worker-a/data/cleanrooms/run_7e6240d1-5377-4c9e-9667-937ee6aa0a71",
+          "home": "/var/lib/agent-runner/iso-20261003b/worker-a/data/cleanrooms/run_7e6240d1-5377-4c9e-9667-937ee6aa0a71/home",
+          "tmp": "/var/lib/agent-runner/iso-20261003b/worker-a/data/cleanrooms/run_7e6240d1-5377-4c9e-9667-937ee6aa0a71/tmp",
+          "mcp": "/var/lib/agent-runner/iso-20261003b/worker-a/data/cleanrooms/run_7e6240d1-5377-4c9e-9667-937ee6aa0a71/mcp",
+          "status": "active"
+        },
+        {
+          "runId": "run_2ad8124b-90de-4f8b-9828-4bf2dd3c4f98",
+          "pid": 140036,
+          "slot": "ta-agent-2",
+          "uid": 997,
+          "gid": 988,
+          "cwd": "/var/lib/agent-runner/iso-20261003b/worker-a/data/workspaces/run_2ad8124b-90de-4f8b-9828-4bf2dd3c4f98",
+          "roomRoot": "/var/lib/agent-runner/iso-20261003b/worker-a/data/cleanrooms/run_2ad8124b-90de-4f8b-9828-4bf2dd3c4f98",
+          "home": "/var/lib/agent-runner/iso-20261003b/worker-a/data/cleanrooms/run_2ad8124b-90de-4f8b-9828-4bf2dd3c4f98/home",
+          "tmp": "/var/lib/agent-runner/iso-20261003b/worker-a/data/cleanrooms/run_2ad8124b-90de-4f8b-9828-4bf2dd3c4f98/tmp",
+          "mcp": "/var/lib/agent-runner/iso-20261003b/worker-a/data/cleanrooms/run_2ad8124b-90de-4f8b-9828-4bf2dd3c4f98/mcp",
+          "status": "active"
+        }
+      ],
+      "engineUids": [
+        999,
+        997
+      ],
+      "engineGroups": [
+        [],
+        []
+      ],
+      "envSource": "/proc/<pid>/environ",
+      "envNames": [
+        [
+          "HOME",
+          "TMPDIR",
+          "XDG_CACHE_HOME",
+          "XDG_CONFIG_HOME",
+          "XDG_DATA_HOME"
+        ],
+        [
+          "HOME",
+          "TMPDIR",
+          "XDG_CACHE_HOME",
+          "XDG_CONFIG_HOME",
+          "XDG_DATA_HOME"
+        ]
+      ],
+      "credentialFilesProbed": 2,
+      "matrix": [
+        {
+          "name": "victim_cwd_denied",
+          "target": "/var/lib/agent-runner/iso-20261003b/worker-a/data/workspaces/run_2ad8124b-90de-4f8b-9828-4bf2dd3c4f98",
+          "expect": "denied",
+          "ok": true,
+          "detail": "2: /usr/bin/ls: cannot open directory '/var/lib/agent-runner/iso-20261003b/worker-a/data/workspaces/run_2ad8124b-90de-4f8b-9828-4bf2dd3c4f98': Permission denied"
+        },
+        {
+          "name": "victim_home_denied",
+          "target": "/var/lib/agent-runner/iso-20261003b/worker-a/data/cleanrooms/run_2ad8124b-90de-4f8b-9828-4bf2dd3c4f98/home",
+          "expect": "denied",
+          "ok": true,
+          "detail": "2: /usr/bin/ls: cannot access '/var/lib/agent-runner/iso-20261003b/worker-a/data/cleanrooms/run_2ad8124b-90de-4f8b-9828-4bf2dd3c4f98/home': Permission denied"
+        },
+        {
+          "name": "victim_tmp_denied",
+          "target": "/var/lib/agent-runner/iso-20261003b/worker-a/data/cleanrooms/run_2ad8124b-90de-4f8b-9828-4bf2dd3c4f98/tmp",
+          "expect": "denied",
+          "ok": true,
+          "detail": "2: /usr/bin/ls: cannot access '/var/lib/agent-runner/iso-20261003b/worker-a/data/cleanrooms/run_2ad8124b-90de-4f8b-9828-4bf2dd3c4f98/tmp': Permission denied"
+        },
+        {
+          "name": "victim_state_denied",
+          "target": "/var/lib/agent-runner/iso-20261003b/worker-a/data/runs/run_2ad8124b-90de-4f8b-9828-4bf2dd3c4f98/state.json",
+          "expect": "denied",
+          "ok": true,
+          "detail": "1: /usr/bin/cat: /var/lib/agent-runner/iso-20261003b/worker-a/data/runs/run_2ad8124b-90de-4f8b-9828-4bf2dd3c4f98/state.json: Permission denied"
+        },
+        {
+          "name": "runner_root_denied",
+          "target": "/var/lib/agent-runner/iso-20261003b/worker-a/data",
+          "expect": "denied",
+          "ok": true,
+          "detail": "2: /usr/bin/ls: cannot open directory '/var/lib/agent-runner/iso-20261003b/worker-a/data': Permission denied"
+        },
+        {
+          "name": "runner_credential_denied",
+          "target": "/var/lib/agent-runner/iso-20261003b/worker-a/config/api-key",
+          "expect": "denied",
+          "ok": true,
+          "detail": "1: /usr/bin/cat: /var/lib/agent-runner/iso-20261003b/worker-a/config/api-key: Permission denied"
+        },
+        {
+          "name": "runner_credential_denied",
+          "target": "/var/lib/agent-runner/iso-20261003b/worker-a/config/key-registry.json",
+          "expect": "denied",
+          "ok": true,
+          "detail": "1: /usr/bin/cat: /var/lib/agent-runner/iso-20261003b/worker-a/config/key-registry.json: Permission denied"
+        },
+        {
+          "name": "victim_engine_kill_denied",
+          "target": "pid 140036",
+          "expect": "denied",
+          "ok": true,
+          "detail": "1: /usr/bin/kill: (140036): Operation not permitted"
+        },
+        {
+          "name": "own_cwd_writable",
+          "target": "/var/lib/agent-runner/iso-20261003b/worker-a/data/workspaces/run_7e6240d1-5377-4c9e-9667-937ee6aa0a71",
+          "expect": "allowed",
+          "ok": true,
+          "detail": "0: "
+        },
+        {
+          "name": "own_home_writable",
+          "target": "/var/lib/agent-runner/iso-20261003b/worker-a/data/cleanrooms/run_7e6240d1-5377-4c9e-9667-937ee6aa0a71/home",
+          "expect": "allowed",
+          "ok": true,
+          "detail": "0: "
+        },
+        {
+          "name": "own_tmp_writable",
+          "target": "/var/lib/agent-runner/iso-20261003b/worker-a/data/cleanrooms/run_7e6240d1-5377-4c9e-9667-937ee6aa0a71/tmp",
+          "expect": "allowed",
+          "ok": true,
+          "detail": "0: "
+        },
+        {
+          "name": "shared_tool_executable",
+          "target": "/var/lib/agent-runner/iso-20261003b/iso-probe/tools/node",
+          "expect": "allowed",
+          "ok": true,
+          "detail": "0: v20.20.2"
+        },
+        {
+          "name": "shared_tool_write_denied",
+          "target": "/var/lib/agent-runner/iso-20261003b/iso-probe/tools",
+          "expect": "denied",
+          "ok": true,
+          "detail": "1: /usr/bin/touch: cannot touch '/var/lib/agent-runner/iso-20261003b/iso-probe/tools/.probe-999': Permission denied"
+        },
+        {
+          "name": "victim_cwd_denied",
+          "target": "/var/lib/agent-runner/iso-20261003b/worker-a/data/workspaces/run_7e6240d1-5377-4c9e-9667-937ee6aa0a71",
+          "expect": "denied",
+          "ok": true,
+          "detail": "2: /usr/bin/ls: cannot open directory '/var/lib/agent-runner/iso-20261003b/worker-a/data/workspaces/run_7e6240d1-5377-4c9e-9667-937ee6aa0a71': Permission denied"
+        },
+        {
+          "name": "victim_home_denied",
+          "target": "/var/lib/agent-runner/iso-20261003b/worker-a/data/cleanrooms/run_7e6240d1-5377-4c9e-9667-937ee6aa0a71/home",
+          "expect": "denied",
+          "ok": true,
+          "detail": "2: /usr/bin/ls: cannot access '/var/lib/agent-runner/iso-20261003b/worker-a/data/cleanrooms/run_7e6240d1-5377-4c9e-9667-937ee6aa0a71/home': Permission denied"
+        },
+        {
+          "name": "victim_tmp_denied",
+          "target": "/var/lib/agent-runner/iso-20261003b/worker-a/data/cleanrooms/run_7e6240d1-5377-4c9e-9667-937ee6aa0a71/tmp",
+          "expect": "denied",
+          "ok": true,
+          "detail": "2: /usr/bin/ls: cannot access '/var/lib/agent-runner/iso-20261003b/worker-a/data/cleanrooms/run_7e6240d1-5377-4c9e-9667-937ee6aa0a71/tmp': Permission denied"
+        },
+        {
+          "name": "victim_state_denied",
+          "target": "/var/lib/agent-runner/iso-20261003b/worker-a/data/runs/run_7e6240d1-5377-4c9e-9667-937ee6aa0a71/state.json",
+          "expect": "denied",
+          "ok": true,
+          "detail": "1: /usr/bin/cat: /var/lib/agent-runner/iso-20261003b/worker-a/data/runs/run_7e6240d1-5377-4c9e-9667-937ee6aa0a71/state.json: Permission denied"
+        },
+        {
+          "name": "runner_root_denied",
+          "target": "/var/lib/agent-runner/iso-20261003b/worker-a/data",
+          "expect": "denied",
+          "ok": true,
+          "detail": "2: /usr/bin/ls: cannot open directory '/var/lib/agent-runner/iso-20261003b/worker-a/data': Permission denied"
+        },
+        {
+          "name": "runner_credential_denied",
+          "target": "/var/lib/agent-runner/iso-20261003b/worker-a/config/api-key",
+          "expect": "denied",
+          "ok": true,
+          "detail": "1: /usr/bin/cat: /var/lib/agent-runner/iso-20261003b/worker-a/config/api-key: Permission denied"
+        },
+        {
+          "name": "runner_credential_denied",
+          "target": "/var/lib/agent-runner/iso-20261003b/worker-a/config/key-registry.json",
+          "expect": "denied",
+          "ok": true,
+          "detail": "1: /usr/bin/cat: /var/lib/agent-runner/iso-20261003b/worker-a/config/key-registry.json: Permission denied"
+        },
+        {
+          "name": "victim_engine_kill_denied",
+          "target": "pid 140035",
+          "expect": "denied",
+          "ok": true,
+          "detail": "1: /usr/bin/kill: (140035): Operation not permitted"
+        },
+        {
+          "name": "own_cwd_writable",
+          "target": "/var/lib/agent-runner/iso-20261003b/worker-a/data/workspaces/run_2ad8124b-90de-4f8b-9828-4bf2dd3c4f98",
+          "expect": "allowed",
+          "ok": true,
+          "detail": "0: "
+        },
+        {
+          "name": "own_home_writable",
+          "target": "/var/lib/agent-runner/iso-20261003b/worker-a/data/cleanrooms/run_2ad8124b-90de-4f8b-9828-4bf2dd3c4f98/home",
+          "expect": "allowed",
+          "ok": true,
+          "detail": "0: "
+        },
+        {
+          "name": "own_tmp_writable",
+          "target": "/var/lib/agent-runner/iso-20261003b/worker-a/data/cleanrooms/run_2ad8124b-90de-4f8b-9828-4bf2dd3c4f98/tmp",
+          "expect": "allowed",
+          "ok": true,
+          "detail": "0: "
+        },
+        {
+          "name": "shared_tool_executable",
+          "target": "/var/lib/agent-runner/iso-20261003b/iso-probe/tools/node",
+          "expect": "allowed",
+          "ok": true,
+          "detail": "0: v20.20.2"
+        },
+        {
+          "name": "shared_tool_write_denied",
+          "target": "/var/lib/agent-runner/iso-20261003b/iso-probe/tools",
+          "expect": "denied",
+          "ok": true,
+          "detail": "1: /usr/bin/touch: cannot touch '/var/lib/agent-runner/iso-20261003b/iso-probe/tools/.probe-997': Permission denied"
+        }
+      ]
+    },
+    {
+      "at": "2026-10-03T20:24:45.934Z",
+      "step": "refuse_when_slots_busy_state",
+      "leases": [
+        {
+          "runId": "run_2ad8124b-90de-4f8b-9828-4bf2dd3c4f98",
+          "slot": "ta-agent-2",
+          "status": "released",
+          "reason": null
+        },
+        {
+          "runId": "run_7e6240d1-5377-4c9e-9667-937ee6aa0a71",
+          "slot": "ta-agent-1",
+          "status": "released",
+          "reason": null
+        }
+      ],
+      "freeSlots": null
+    },
+    {
+      "at": "2026-10-03T20:24:46.497Z",
+      "step": "refuse_when_slots_busy",
+      "holder": {
+        "runId": "run_6c4049fe-47f9-4eb3-8ff6-54201d0ae7ea",
+        "slot": "ta-agent-1"
+      },
+      "refused": {
+        "runId": "run_fd83fcc8-1f5b-49c6-ac53-678f457aeb5a",
+        "failureCode": "ISOLATION_SLOT_BUSY",
+        "retryable": true,
+        "enginePid": null,
+        "eventTypes": [
+          "claimed",
+          "materialized",
+          "failed"
+        ]
+      }
+    },
+    {
+      "at": "2026-10-03T20:24:46.614Z",
+      "step": "refuse_without_boundary_state",
+      "leases": [
+        {
+          "runId": "run_2ad8124b-90de-4f8b-9828-4bf2dd3c4f98",
+          "slot": "ta-agent-2",
+          "status": "released",
+          "reason": null
+        },
+        {
+          "runId": "run_6c4049fe-47f9-4eb3-8ff6-54201d0ae7ea",
+          "slot": "ta-agent-1",
+          "status": "released",
+          "reason": null
+        },
+        {
+          "runId": "run_7e6240d1-5377-4c9e-9667-937ee6aa0a71",
+          "slot": "ta-agent-1",
+          "status": "released",
+          "reason": null
+        }
+      ],
+      "freeSlots": null
+    },
+    {
+      "at": "2026-10-03T20:24:46.984Z",
+      "step": "refuse_without_boundary",
+      "slotConfigured": "ta-agent-1-missing",
+      "capability": "configured_but_refusing_runs",
+      "refused": {
+        "runId": "run_98531dad-f5bd-4597-b7b1-ea15143f012c",
+        "failureCode": "ISOLATION_IDENTITY_UNAVAILABLE",
+        "eventTypes": [
+          "claimed",
+          "materialized",
+          "failed"
+        ],
+        "enginePid": null
+      }
+    },
+    {
+      "at": "2026-10-03T20:24:47.034Z",
+      "step": "lease_survives_worker_restart_state",
+      "leases": [
+        {
+          "runId": "run_2ad8124b-90de-4f8b-9828-4bf2dd3c4f98",
+          "slot": "ta-agent-2",
+          "status": "released",
+          "reason": null
+        },
+        {
+          "runId": "run_6c4049fe-47f9-4eb3-8ff6-54201d0ae7ea",
+          "slot": "ta-agent-1",
+          "status": "released",
+          "reason": null
+        },
+        {
+          "runId": "run_7e6240d1-5377-4c9e-9667-937ee6aa0a71",
+          "slot": "ta-agent-1",
+          "status": "released",
+          "reason": null
+        }
+      ],
+      "freeSlots": null
+    },
+    {
+      "at": "2026-10-03T20:24:47.876Z",
+      "step": "lease_survives_worker_restart",
+      "runId": "run_fd1da29b-c13f-4e74-88fc-d7a182777362",
+      "slot": "ta-agent-1",
+      "leaseBefore": {
+        "status": "active",
+        "slot": "ta-agent-1"
+      },
+      "leaseAfter": {
+        "status": "released",
+        "reason": null
+      },
+      "eventTypesBeforeCrash": [
+        "claimed",
+        "materialized",
+        "isolation_prepared",
+        "log",
+        "started"
+      ],
+      "startedEventsAfterRecovery": 1,
+      "freeSlotsAfterRestart": [
+        "ta-agent-1",
+        "ta-agent-2"
+      ],
+      "leftoverCleanRooms": []
+    },
+    {
+      "at": "2026-10-03T20:24:47.926Z",
+      "step": "storage_failure_keeps_sole_copy_state",
+      "leases": [
+        {
+          "runId": "run_2ad8124b-90de-4f8b-9828-4bf2dd3c4f98",
+          "slot": "ta-agent-2",
+          "status": "released",
+          "reason": null
+        },
+        {
+          "runId": "run_6c4049fe-47f9-4eb3-8ff6-54201d0ae7ea",
+          "slot": "ta-agent-1",
+          "status": "released",
+          "reason": null
+        },
+        {
+          "runId": "run_7e6240d1-5377-4c9e-9667-937ee6aa0a71",
+          "slot": "ta-agent-1",
+          "status": "released",
+          "reason": null
+        },
+        {
+          "runId": "run_fd1da29b-c13f-4e74-88fc-d7a182777362",
+          "slot": "ta-agent-1",
+          "status": "released",
+          "reason": null
+        }
+      ],
+      "freeSlots": null
+    },
+    {
+      "at": "2026-10-03T20:24:48.684Z",
+      "step": "storage_failure_keeps_sole_copy",
+      "runId": "run_03c9d5f3-254c-47fe-9791-7ca9e37a9380",
+      "outcome": "succeeded",
+      "cleanup": "pending",
+      "lease": {
+        "status": "blocked",
+        "reason": "workspace /var/lib/agent-runner/iso-20261003b/worker-a/data/workspaces/run_03c9d5f3-254c-47fe-9791-7ca9e37a9380 retained as the only copy of a run output"
+      },
+      "slotsConfigured": [
+        "ta-agent-1"
+      ],
+      "freeSlots": [],
+      "retainedWorkspace": "/var/lib/agent-runner/iso-20261003b/worker-a/data/workspaces/run_03c9d5f3-254c-47fe-9791-7ca9e37a9380",
+      "refused": {
+        "runId": "run_81473fc0-d785-40e2-8e66-6fff1927c2b5",
+        "failureCode": "ISOLATION_SLOT_BUSY"
+      }
+    },
+    {
+      "at": "2026-10-03T20:24:48.737Z",
+      "step": "cleanup_after_success_state",
+      "leases": [
+        {
+          "runId": "run_03c9d5f3-254c-47fe-9791-7ca9e37a9380",
+          "slot": "ta-agent-1",
+          "status": "blocked",
+          "reason": "workspace /var/lib/agent-runner/iso-20261003b/worker-a/data/workspaces/run_03c9d5f3-254c-47fe-9791-7ca9e37a9380 retained as the only copy of a run output"
+        },
+        {
+          "runId": "run_2ad8124b-90de-4f8b-9828-4bf2dd3c4f98",
+          "slot": "ta-agent-2",
+          "status": "released",
+          "reason": null
+        },
+        {
+          "runId": "run_6c4049fe-47f9-4eb3-8ff6-54201d0ae7ea",
+          "slot": "ta-agent-1",
+          "status": "released",
+          "reason": null
+        },
+        {
+          "runId": "run_7e6240d1-5377-4c9e-9667-937ee6aa0a71",
+          "slot": "ta-agent-1",
+          "status": "released",
+          "reason": null
+        },
+        {
+          "runId": "run_fd1da29b-c13f-4e74-88fc-d7a182777362",
+          "slot": "ta-agent-1",
+          "status": "released",
+          "reason": null
+        }
+      ],
+      "freeSlots": null
+    },
+    {
+      "at": "2026-10-03T20:24:49.447Z",
+      "step": "cleanup_after_success",
+      "runId": "run_abf56c7b-c5ee-4794-983c-41a350b03222",
+      "outcome": "succeeded",
+      "cleanup": "completed",
+      "outputRefs": [
+        "art-495333a32b5c3f99ff04f47d"
+      ],
+      "leaseStatus": "released",
+      "workspaceRemoved": true,
+      "isolationPrepared": {
+        "slotId": "ta-agent-2",
+        "username": "ta-agent-2",
+        "uid": 997,
+        "gid": 988,
+        "acl": "posix_0700",
+        "probe": {
+          "checks": 31,
+          "failures": 0
+        }
+      },
+      "eventTypes": [
+        "claimed",
+        "materialized",
+        "isolation_prepared",
+        "log",
+        "started",
+        "log",
+        "log",
+        "exit",
+        "finalizing",
+        "artifact_exported",
+        "export_committed",
+        "succeeded"
+      ]
+    },
+    {
+      "at": "2026-10-03T20:24:49.500Z",
+      "step": "sanitized_transcript_state",
+      "leases": [
+        {
+          "runId": "run_03c9d5f3-254c-47fe-9791-7ca9e37a9380",
+          "slot": "ta-agent-1",
+          "status": "blocked",
+          "reason": "workspace /var/lib/agent-runner/iso-20261003b/worker-a/data/workspaces/run_03c9d5f3-254c-47fe-9791-7ca9e37a9380 retained as the only copy of a run output"
+        },
+        {
+          "runId": "run_2ad8124b-90de-4f8b-9828-4bf2dd3c4f98",
+          "slot": "ta-agent-2",
+          "status": "released",
+          "reason": null
+        },
+        {
+          "runId": "run_6c4049fe-47f9-4eb3-8ff6-54201d0ae7ea",
+          "slot": "ta-agent-1",
+          "status": "released",
+          "reason": null
+        },
+        {
+          "runId": "run_7e6240d1-5377-4c9e-9667-937ee6aa0a71",
+          "slot": "ta-agent-1",
+          "status": "released",
+          "reason": null
+        },
+        {
+          "runId": "run_abf56c7b-c5ee-4794-983c-41a350b03222",
+          "slot": "ta-agent-2",
+          "status": "released",
+          "reason": null
+        },
+        {
+          "runId": "run_fd1da29b-c13f-4e74-88fc-d7a182777362",
+          "slot": "ta-agent-1",
+          "status": "released",
+          "reason": null
+        }
+      ],
+      "freeSlots": null
+    }
+  ],
+  "checks": [
+    {
+      "name": "на хосте есть переключатель идентичности (setpriv/runuser)",
+      "ok": true,
+      "detail": "setpriv,runuser"
+    },
+    {
+      "name": "на хосте есть setfacl для доступа Runner-а в каталоги рана",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "проба запущена от root (нужны слоты и chown)",
+      "ok": true,
+      "detail": "uid=0"
+    },
+    {
+      "name": "слоты созданы и разрешаются в passwd",
+      "ok": true,
+      "detail": "ta-agent-1:999 ta-agent-2:997"
+    },
+    {
+      "name": "capabilities объявляют режим per_run_unix_identity",
+      "ok": true,
+      "detail": "per_run_unix_identity"
+    },
+    {
+      "name": "capabilities объявляют проверенную границу, а не service UID",
+      "ok": true,
+      "detail": "per_run_unix_identity_verified"
+    },
+    {
+      "name": "все слоты свободны до первого рана",
+      "ok": true,
+      "detail": "ta-agent-1,ta-agent-2"
+    },
+    {
+      "name": "лагунчер границы объявлен",
+      "ok": true,
+      "detail": "setpriv"
+    },
+    {
+      "name": "fail-closed объявлен",
+      "ok": true,
+      "detail": "true"
+    },
+    {
+      "name": "mcp.osIsolation совпадает с объявлением границы",
+      "ok": true,
+      "detail": "per_run_unix_identity_verified"
+    },
+    {
+      "name": "два рана приняты API",
+      "ok": true,
+      "detail": "202/202"
+    },
+    {
+      "name": "оба рана живут одновременно",
+      "ok": true,
+      "detail": "run_7e6240d1-5377-4c9e-9667-937ee6aa0a71:140035 run_2ad8124b-90de-4f8b-9828-4bf2dd3c4f98:140036"
+    },
+    {
+      "name": "раны получили РАЗНЫЕ слоты",
+      "ok": true,
+      "detail": "ta-agent-1,ta-agent-2"
+    },
+    {
+      "name": "раны получили разные uid",
+      "ok": true,
+      "detail": "999,997"
+    },
+    {
+      "name": "процесс движка A исполняется под uid слота A",
+      "ok": true,
+      "detail": "engine uid=999 slot uid=999"
+    },
+    {
+      "name": "процесс движка B исполняется под uid слота B",
+      "ok": true,
+      "detail": "engine uid=997 slot uid=997"
+    },
+    {
+      "name": "у процессов движка нет дополнительных групп Runner-а",
+      "ok": true,
+      "detail": "[] []"
+    },
+    {
+      "name": "HOME/TMPDIR движков — run-scoped (проверено по /proc)",
+      "ok": true,
+      "detail": "HOME=/var/lib/agent-runner/iso-20261003b/worker-a/data/cleanrooms/run_7e6240d1-5377-4c9e-9667-937ee6aa0a71/home TMPDIR=/var/lib/agent-runner/iso-20261003b/worker-a/data/cleanrooms/run_2ad8124b-90de-4f8b-9828-4bf2dd3c4f98/tmp"
+    },
+    {
+      "name": "HOME рана A не совпадает с HOME рана B",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "в окружении движков нет имён credential-переменных",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "victim_cwd_denied: denied",
+      "ok": true,
+      "detail": "2: /usr/bin/ls: cannot open directory '/var/lib/agent-runner/iso-20261003b/worker-a/data/workspaces/run_2ad8124b-90de-4f8b-9828-4bf2dd3c4f98': Permission denied (/var/lib/agent-runner/iso-20261003b/worker-a/data/workspaces/run_2ad8124b-90de-4f8b-9828-4bf2dd3c4f98)"
+    },
+    {
+      "name": "victim_home_denied: denied",
+      "ok": true,
+      "detail": "2: /usr/bin/ls: cannot access '/var/lib/agent-runner/iso-20261003b/worker-a/data/cleanrooms/run_2ad8124b-90de-4f8b-9828-4bf2dd3c4f98/home': Permission denied (/var/lib/agent-runner/iso-20261003b/worker-a/data/cleanrooms/run_2ad8124b-90de-4f8b-9828-4bf2dd3c4f98/home)"
+    },
+    {
+      "name": "victim_tmp_denied: denied",
+      "ok": true,
+      "detail": "2: /usr/bin/ls: cannot access '/var/lib/agent-runner/iso-20261003b/worker-a/data/cleanrooms/run_2ad8124b-90de-4f8b-9828-4bf2dd3c4f98/tmp': Permission denied (/var/lib/agent-runner/iso-20261003b/worker-a/data/cleanrooms/run_2ad8124b-90de-4f8b-9828-4bf2dd3c4f98/tmp)"
+    },
+    {
+      "name": "victim_state_denied: denied",
+      "ok": true,
+      "detail": "1: /usr/bin/cat: /var/lib/agent-runner/iso-20261003b/worker-a/data/runs/run_2ad8124b-90de-4f8b-9828-4bf2dd3c4f98/state.json: Permission denied (/var/lib/agent-runner/iso-20261003b/worker-a/data/runs/run_2ad8124b-90de-4f8b-9828-4bf2dd3c4f98/state.json)"
+    },
+    {
+      "name": "runner_root_denied: denied",
+      "ok": true,
+      "detail": "2: /usr/bin/ls: cannot open directory '/var/lib/agent-runner/iso-20261003b/worker-a/data': Permission denied (/var/lib/agent-runner/iso-20261003b/worker-a/data)"
+    },
+    {
+      "name": "runner_credential_denied: denied",
+      "ok": true,
+      "detail": "1: /usr/bin/cat: /var/lib/agent-runner/iso-20261003b/worker-a/config/api-key: Permission denied (/var/lib/agent-runner/iso-20261003b/worker-a/config/api-key)"
+    },
+    {
+      "name": "runner_credential_denied: denied",
+      "ok": true,
+      "detail": "1: /usr/bin/cat: /var/lib/agent-runner/iso-20261003b/worker-a/config/key-registry.json: Permission denied (/var/lib/agent-runner/iso-20261003b/worker-a/config/key-registry.json)"
+    },
+    {
+      "name": "victim_engine_kill_denied: denied",
+      "ok": true,
+      "detail": "1: /usr/bin/kill: (140036): Operation not permitted (pid 140036)"
+    },
+    {
+      "name": "own_cwd_writable: allowed",
+      "ok": true,
+      "detail": "0:  (/var/lib/agent-runner/iso-20261003b/worker-a/data/workspaces/run_7e6240d1-5377-4c9e-9667-937ee6aa0a71)"
+    },
+    {
+      "name": "own_home_writable: allowed",
+      "ok": true,
+      "detail": "0:  (/var/lib/agent-runner/iso-20261003b/worker-a/data/cleanrooms/run_7e6240d1-5377-4c9e-9667-937ee6aa0a71/home)"
+    },
+    {
+      "name": "own_tmp_writable: allowed",
+      "ok": true,
+      "detail": "0:  (/var/lib/agent-runner/iso-20261003b/worker-a/data/cleanrooms/run_7e6240d1-5377-4c9e-9667-937ee6aa0a71/tmp)"
+    },
+    {
+      "name": "shared_tool_executable: allowed",
+      "ok": true,
+      "detail": "0: v20.20.2 (/var/lib/agent-runner/iso-20261003b/iso-probe/tools/node)"
+    },
+    {
+      "name": "shared_tool_write_denied: denied",
+      "ok": true,
+      "detail": "1: /usr/bin/touch: cannot touch '/var/lib/agent-runner/iso-20261003b/iso-probe/tools/.probe-999': Permission denied (/var/lib/agent-runner/iso-20261003b/iso-probe/tools)"
+    },
+    {
+      "name": "victim_cwd_denied: denied",
+      "ok": true,
+      "detail": "2: /usr/bin/ls: cannot open directory '/var/lib/agent-runner/iso-20261003b/worker-a/data/workspaces/run_7e6240d1-5377-4c9e-9667-937ee6aa0a71': Permission denied (/var/lib/agent-runner/iso-20261003b/worker-a/data/workspaces/run_7e6240d1-5377-4c9e-9667-937ee6aa0a71)"
+    },
+    {
+      "name": "victim_home_denied: denied",
+      "ok": true,
+      "detail": "2: /usr/bin/ls: cannot access '/var/lib/agent-runner/iso-20261003b/worker-a/data/cleanrooms/run_7e6240d1-5377-4c9e-9667-937ee6aa0a71/home': Permission denied (/var/lib/agent-runner/iso-20261003b/worker-a/data/cleanrooms/run_7e6240d1-5377-4c9e-9667-937ee6aa0a71/home)"
+    },
+    {
+      "name": "victim_tmp_denied: denied",
+      "ok": true,
+      "detail": "2: /usr/bin/ls: cannot access '/var/lib/agent-runner/iso-20261003b/worker-a/data/cleanrooms/run_7e6240d1-5377-4c9e-9667-937ee6aa0a71/tmp': Permission denied (/var/lib/agent-runner/iso-20261003b/worker-a/data/cleanrooms/run_7e6240d1-5377-4c9e-9667-937ee6aa0a71/tmp)"
+    },
+    {
+      "name": "victim_state_denied: denied",
+      "ok": true,
+      "detail": "1: /usr/bin/cat: /var/lib/agent-runner/iso-20261003b/worker-a/data/runs/run_7e6240d1-5377-4c9e-9667-937ee6aa0a71/state.json: Permission denied (/var/lib/agent-runner/iso-20261003b/worker-a/data/runs/run_7e6240d1-5377-4c9e-9667-937ee6aa0a71/state.json)"
+    },
+    {
+      "name": "runner_root_denied: denied",
+      "ok": true,
+      "detail": "2: /usr/bin/ls: cannot open directory '/var/lib/agent-runner/iso-20261003b/worker-a/data': Permission denied (/var/lib/agent-runner/iso-20261003b/worker-a/data)"
+    },
+    {
+      "name": "runner_credential_denied: denied",
+      "ok": true,
+      "detail": "1: /usr/bin/cat: /var/lib/agent-runner/iso-20261003b/worker-a/config/api-key: Permission denied (/var/lib/agent-runner/iso-20261003b/worker-a/config/api-key)"
+    },
+    {
+      "name": "runner_credential_denied: denied",
+      "ok": true,
+      "detail": "1: /usr/bin/cat: /var/lib/agent-runner/iso-20261003b/worker-a/config/key-registry.json: Permission denied (/var/lib/agent-runner/iso-20261003b/worker-a/config/key-registry.json)"
+    },
+    {
+      "name": "victim_engine_kill_denied: denied",
+      "ok": true,
+      "detail": "1: /usr/bin/kill: (140035): Operation not permitted (pid 140035)"
+    },
+    {
+      "name": "own_cwd_writable: allowed",
+      "ok": true,
+      "detail": "0:  (/var/lib/agent-runner/iso-20261003b/worker-a/data/workspaces/run_2ad8124b-90de-4f8b-9828-4bf2dd3c4f98)"
+    },
+    {
+      "name": "own_home_writable: allowed",
+      "ok": true,
+      "detail": "0:  (/var/lib/agent-runner/iso-20261003b/worker-a/data/cleanrooms/run_2ad8124b-90de-4f8b-9828-4bf2dd3c4f98/home)"
+    },
+    {
+      "name": "own_tmp_writable: allowed",
+      "ok": true,
+      "detail": "0:  (/var/lib/agent-runner/iso-20261003b/worker-a/data/cleanrooms/run_2ad8124b-90de-4f8b-9828-4bf2dd3c4f98/tmp)"
+    },
+    {
+      "name": "shared_tool_executable: allowed",
+      "ok": true,
+      "detail": "0: v20.20.2 (/var/lib/agent-runner/iso-20261003b/iso-probe/tools/node)"
+    },
+    {
+      "name": "shared_tool_write_denied: denied",
+      "ok": true,
+      "detail": "1: /usr/bin/touch: cannot touch '/var/lib/agent-runner/iso-20261003b/iso-probe/tools/.probe-997': Permission denied (/var/lib/agent-runner/iso-20261003b/iso-probe/tools)"
+    },
+    {
+      "name": "второй ран отказан, пока слот занят",
+      "ok": true,
+      "detail": "failed"
+    },
+    {
+      "name": "отказ назван ISOLATION_SLOT_BUSY",
+      "ok": true,
+      "detail": "ISOLATION_SLOT_BUSY"
+    },
+    {
+      "name": "отказ помечен повторяемым",
+      "ok": true,
+      "detail": "true"
+    },
+    {
+      "name": "отказ произошёл ДО спавна движка",
+      "ok": true,
+      "detail": "claimed,materialized,failed"
+    },
+    {
+      "name": "отказанный ран не получил pid движка",
+      "ok": true,
+      "detail": "null"
+    },
+    {
+      "name": "отказанный ран не занял чужой слот",
+      "ok": true,
+      "detail": "null"
+    },
+    {
+      "name": "сломанная настройка объявлена как отказ, а не как verified",
+      "ok": true,
+      "detail": "configured_but_refusing_runs"
+    },
+    {
+      "name": "ран на сломанной границе отказан",
+      "ok": true,
+      "detail": "failed"
+    },
+    {
+      "name": "причина отказа — слот не на хосте",
+      "ok": true,
+      "detail": "ISOLATION_IDENTITY_UNAVAILABLE"
+    },
+    {
+      "name": "отказ произошёл ДО спавна движка",
+      "ok": true,
+      "detail": "claimed,materialized,failed"
+    },
+    {
+      "name": "движок не запускался под service UID",
+      "ok": true,
+      "detail": "null"
+    },
+    {
+      "name": "аренда идентичности не осталась",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "аренда идентичности долговечна (лежит на диске)",
+      "ok": true,
+      "detail": "active"
+    },
+    {
+      "name": "аренда связывает ран и слот",
+      "ok": true,
+      "detail": "ta-agent-1/ta-agent-1"
+    },
+    {
+      "name": "управляемый сбой воркера выполнен",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "переживший воркер движок погашен восстановлением",
+      "ok": true,
+      "detail": "140169"
+    },
+    {
+      "name": "после рестарта слот снова свободен (orphan reconciled)",
+      "ok": true,
+      "detail": "ta-agent-1,ta-agent-2"
+    },
+    {
+      "name": "аренда закрыта после проверенного sweep",
+      "ok": true,
+      "detail": "released: null"
+    },
+    {
+      "name": "каталоги чистых сред убраны",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "повторного запуска движка не было",
+      "ok": true,
+      "detail": "started=1"
+    },
+    {
+      "name": "в логе рана есть причина дочистки",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "ошибка хранилища не стирает единственную копию выхода",
+      "ok": true,
+      "detail": "/var/lib/agent-runner/iso-20261003b/worker-a/data/workspaces/run_03c9d5f3-254c-47fe-9791-7ca9e37a9380"
+    },
+    {
+      "name": "очистка заявлена как pending, а не completed",
+      "ok": true,
+      "detail": "pending"
+    },
+    {
+      "name": "аренда помечена blocked с причиной",
+      "ok": true,
+      "detail": "blocked: workspace /var/lib/agent-runner/iso-20261003b/worker-a/data/workspaces/run_03c9d5f3-254c-47fe-9791-7ca9e37a9380 retained as the only copy of a run output"
+    },
+    {
+      "name": "эфемерные каталоги среды при этом вычищены",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "следующий ран отказан, пока выход не сохранён",
+      "ok": true,
+      "detail": "ISOLATION_SLOT_BUSY"
+    },
+    {
+      "name": "ран завершился успешно",
+      "ok": true,
+      "detail": "succeeded/"
+    },
+    {
+      "name": "выход сохранён в хранилище (outputRefs)",
+      "ok": true,
+      "detail": "[\"art-495333a32b5c3f99ff04f47d\"]"
+    },
+    {
+      "name": "результат читается после очистки",
+      "ok": true,
+      "detail": "run_abf56c7b-c5ee-4794-983c-41a350b03222"
+    },
+    {
+      "name": "workspace рана удалён",
+      "ok": true,
+      "detail": "/var/lib/agent-runner/iso-20261003b/worker-a/data/workspaces/run_abf56c7b-c5ee-4794-983c-41a350b03222"
+    },
+    {
+      "name": "каталоги чистой среды удалены",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "слот освобождён после проверенного sweep",
+      "ok": true,
+      "detail": "released: null"
+    },
+    {
+      "name": "лог рана содержит границу (slotId/uid/gid/acl)",
+      "ok": true,
+      "detail": "{\"slotId\":\"ta-agent-2\",\"username\":\"ta-agent-2\",\"uid\":997,\"gid\":988,\"acl\":\"posix_0700\",\"probe\":{\"checks\":31,\"failures\":0}}"
+    },
+    {
+      "name": "лог рана несёт runId/userTaskId/profileId в каждом событии",
+      "ok": true,
+      "detail": "12 events"
+    },
+    {
+      "name": "слот успешного рана вернулся в пул",
+      "ok": true,
+      "detail": "ta-agent-2"
+    }
+  ],
+  "totals": {
+    "steps": 9,
+    "checks": 81,
+    "failed": 0
+  }
+}
