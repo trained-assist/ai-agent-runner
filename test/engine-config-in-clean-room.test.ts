@@ -9,7 +9,7 @@ import { ENGINE_CONFIG_LAYOUTS, loadEngineConfigTemplates, materializeEngineConf
 import { FakeEngine } from '../src/adapters/engine/fake-engine.js';
 import { CleanRoomError, type CleanRoom } from '../src/isolation/contract.js';
 
-const layout = ENGINE_CONFIG_LAYOUTS['opencode'] as { dir: string; file: string };
+const layout = ENGINE_CONFIG_LAYOUTS['opencode'] as { file: string };
 
 /**
  * Ран с именем движка `opencode`: шаблон кладётся по имени движка, поэтому подменить
@@ -53,18 +53,18 @@ describe('конфиг движка в run-scoped clean room', () => {
 
     const { h, launcher, provider } = opencodeHarness({ templatesDir, scenario: 'timeout' });
 
-    const { receipt } = h.start(opencodeSpec);
+    const { receipt, spec } = h.start(opencodeSpec);
     // Ран «висящий» (scenario=timeout): каталоги среды на месте, пока их не снёс sweep.
     await waitFor(() => logMessages(h.rootDir, receipt.runId).some((line) => line.startsWith('engine_config.seeded')));
 
-    const configDir = join(h.rootDir, 'cleanrooms', receipt.runId, 'config', layout.dir);
-    const configPath = join(configDir, layout.file);
+    // Конфиг рана лежит в корне workspace (проектная директория движка): собственный
+    // HOME рана закрыт слотом, и каталог, созданный Runner'ом внутри него, теряет ACL
+    // Runner'а — уборка такого каталога потом не завершается.
+    const configPath = join(spec.cwd, layout.file);
     expect(existsSync(configPath)).toBe(true);
     expect(JSON.parse(readFileSync(configPath, 'utf8'))).toEqual(template);
     expect(statSync(configPath).mode & 0o777).toBe(0o600);
-    // Каталог конфигурации — тоже часть среды рана: 0700, иначе движок под идентичностью
-    // рана не прочитает свой конфиг и уйдёт на модель по умолчанию (проверено на VM2).
-    expect(statSync(configDir).mode & 0o777).toBe(0o700);
+    expect(existsSync(join(h.rootDir, 'cleanrooms', receipt.runId, 'config', 'opencode'))).toBe(false);
 
     // В лог рана попадает sha256 копии, а не её содержимое.
     const seeded = logMessages(h.rootDir, receipt.runId).find((line) => line.startsWith('engine_config.seeded')) as string;
@@ -135,7 +135,7 @@ describe('конфиг движка в run-scoped clean room', () => {
     const result = await h.runner.waitFor(receipt.runId);
     expect(result.outcome).toBe('succeeded');
     expect(launcher.calls.length).toBeGreaterThan(0);
-    expect(existsSync(join(h.rootDir, 'cleanrooms', receipt.runId, 'config', layout.dir))).toBe(false);
+    expect(existsSync(join(spec.cwd, layout.file))).toBe(false);
     expect(existsSync(spec.cwd)).toBe(false);
   });
 
