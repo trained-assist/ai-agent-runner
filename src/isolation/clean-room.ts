@@ -276,11 +276,47 @@ export class UnixCleanRoomProvider implements CleanRoomProvider {
     const removed: string[] = [];
     for (const target of targets) {
       if (!existsSync(target)) continue;
-      this.removeTree(target);
-      removed.push(target);
+      // Дерево рана удаляет САМА идентичность рана. Файлы и каталоги внутри задаёт движок,
+      // и он же задаёт им режим (opencode создаёт каталоги 0700): такой режим маскирует
+      // унаследованный ACL Runner'а до `---`, и даже сам Runner до них не дотягивается
+      // (`EACCES` на scandir), не говоря об удалении. Владелец файла — идентичность рана,
+      // поэтому и удаляет она сама; проверка «каталогов не осталось» остаётся за Runner'ом.
+      const removedByRun = await this.removeTreeAsIdentity(target, room.identity);
+      if (!removedByRun) this.removeTree(target);
+      if (!existsSync(target)) removed.push(target);
     }
     this.log(`clean_room.swept runId=${room.runId} reason=${reason} removed=${removed.length} keepWorkspace=${options.keepWorkspace === true}`);
     return removed;
+  }
+
+  /**
+   * Удаление_tree идентичностью рана: `rm -rf` под слотом через лаунчер. Инструмент берётся
+   * из общих read-only каталогов хоста — своих бинарей у процесса рана нет. Возвращает
+   * false, если лаунчера нет или инструмент не найден: тогда удаление пробует сделать сам
+   * Runner (одиночная установка под root), и неудача будет видна как `blocked`.
+   */
+  private async removeTreeAsIdentity(target: string, identity: RunIdentity): Promise<boolean> {
+    if (!this.launcher) return false;
+    const rm = this.findTool('rm');
+    if (!rm) return false;
+    const { command, args } = this.launcher.wrap(identity, rm, ['-rf', '--', target]);
+    return new Promise((resolve) => {
+      const child = spawn(command, args, { stdio: ['ignore', 'ignore', 'pipe'] });
+      void exitCode(child).then((code) => resolve(code === 0));
+      child.on('error', () => resolve(false));
+    });
+  }
+
+  private findTool(name: string): string | null {
+    for (const dir of this.policy.toolPaths) {
+      const candidate = join(dir, name);
+      try {
+        if (statSync(candidate).isFile()) return candidate;
+      } catch {
+        /* каталога инструментов нет — пробуем следующий */
+      }
+    }
+    return null;
   }
 
   async release(room: CleanRoom, reason: string, options: SweepOptions = {}): Promise<void> {
