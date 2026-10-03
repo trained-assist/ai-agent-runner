@@ -1125,10 +1125,11 @@ export class Runner {
       log,
       ...(this.opts.capabilities ? { registry: this.opts.capabilities } : {}),
       bridgeToken: newBridgeToken(),
-      // Сокет моста живёт внутри чистой среды рана: к нему подключается и движок, и
+      // Сокет моста живёт внутри чистой среды рана: к нему подключаются и движок, и
       // per-run MCP-серверы — все под идентичностью рана, поэтому каталог обязан быть
-      // их собственным (0700, владелец — слот).
-      bridgeDir: run.room ? run.room.paths.mcp : join(this.opts.rootDir, 'mcp'),
+      // их собственным (0700, владелец — слот). bridgeDir — родитель каталога `mcp/`,
+      // поэтому это корень среды, а не paths.mcp: иначе получилось бы mcp/mcp/.
+      bridgeDir: run.room ? run.room.paths.root : join(this.opts.rootDir, 'mcp'),
       ...(this.opts.mcpBrokerCommand ? { brokerCommand: this.opts.mcpBrokerCommand } : {}),
       ...(this.opts.isolation?.launcher ? { launcher: this.opts.isolation.launcher } : {}),
       ...(run.room ? { identity: run.room.identity, runEnv: run.room.env } : {}),

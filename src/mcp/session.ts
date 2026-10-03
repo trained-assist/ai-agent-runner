@@ -539,6 +539,7 @@ export class McpRunSession {
       runId: deps.spec.runId,
       serverCount: deps.scope.size,
       scopedTools: declared.length,
+      socketPath,
     });
 
     const killGraceMs = deps.killGraceMs ?? DEFAULT_MCP_KILL_GRACE_MS;
