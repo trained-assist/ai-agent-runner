@@ -18,6 +18,7 @@ import { RunExportStore } from '../src/storage/export.js';
 import type { CapabilityRegistry } from '../src/mcp/capabilities.js';
 import type { BindingValueResolver } from '../src/mcp/scope.js';
 import type { CleanRoomProvider } from '../src/isolation/contract.js';
+import type { EngineConfigTemplate } from '../src/isolation/engine-config.js';
 
 let counter = 0;
 
@@ -85,6 +86,8 @@ export interface HarnessOptions {
    * rootDir харнесса — каталоги аренд и чистых сред обязаны лежать рядом с состоянием ранов.
    */
   isolation?: CleanRoomProvider | ((rootDir: string) => CleanRoomProvider);
+  /** Хостовые шаблоны конфигурации движка для run-scoped HOME (issue #51). */
+  engineConfigTemplates?: EngineConfigTemplate | null;
 }
 
 export interface Harness {
@@ -122,6 +125,7 @@ export function createHarness(options: HarnessOptions = {}): Harness {
   if (options.capabilities) base.capabilities = options.capabilities;
   if (options.bindingResolver) base.bindingResolver = options.bindingResolver;
   if (options.isolation) base.isolation = typeof options.isolation === 'function' ? options.isolation(rootDir) : options.isolation;
+  if (options.engineConfigTemplates) base.engineConfigTemplates = options.engineConfigTemplates;
   let exports: RunExportStore | null = null;
   if (options.artifactExport) {
     const blob = options.blob ?? createBlobStore({ backend: 'local-fs', localRoot: join(rootDir, 'blobs') });

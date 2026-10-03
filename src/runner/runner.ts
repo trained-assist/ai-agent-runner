@@ -37,6 +37,7 @@ import {
 } from './agent-manifest.js';
 import { ANSWER_MAX_CHARS, type CheckpointPersistence, type RunCheckpoint } from './checkpoint.js';
 import { CleanRoomError, type CleanRoom, type CleanRoomLease, type CleanRoomProvider, type RunIdentity } from '../isolation/contract.js';
+import { materializeEngineConfig, type EngineConfigTemplate } from '../isolation/engine-config.js';
 import type { CapabilityRegistry } from '../mcp/capabilities.js';
 import { newBridgeToken } from '../mcp/bridge.js';
 import { McpRunSession, McpStartupError, type EngineMcpConfig, type McpLogFields, type McpLogLevel } from '../mcp/session.js';
@@ -106,6 +107,13 @@ export interface RunnerOptions {
    * fallback к service UID запрещён.
    */
   isolation?: CleanRoomProvider;
+  /**
+   * Хостовые шаблоны конфигурации движка (`AGENT_API_ENGINE_CONFIG_DIR`): один файл на
+   * движок, копия кладётся в run-scoped XDG_CONFIG_HOME. Нужно потому, что своя HOME
+   * рана убирает у движка конфиг пользователя сервиса, а без provider/model он уходит
+   * на платный профиль по умолчанию. Секретов в шаблонах нет и быть не может.
+   */
+  engineConfigTemplates?: EngineConfigTemplate | null;
   /**
    * Резолвер значений credential binding'ов (P13). В песочнице — фикстура, в бою —
    * Credential Broker / Secret Manager. Значение binding'а не попадает в spec/state/events.
@@ -1061,6 +1069,28 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
         checks: room.probe?.checks.length ?? 0,
         failures: room.probe?.failures.length ?? 0,
       },
+    });
+    this.seedEngineConfig(run, st);
+  }
+
+  /**
+   * Конфиг движка в run-scoped HOME. Своя HOME рана убрала бы у движка конфиг пользователя
+   * сервиса, и OpenCode без provider/model ушёл бы на платный профиль по умолчанию,
+   * поэтому хостовый шаблон копируется сюда ДО старта движка. Отказ (шаблон объявлен, но
+   * нечитаем/некуда положить) валит старт рана, а не оставляет движок без модели.
+   * В лог идут путь и sha256 копии — содержимое конфига в логи не попадает.
+   */
+  private seedEngineConfig(run: InternalRun, st: PersistedRunState): void {
+    const room = run.room;
+    if (!room) return;
+    const seeded = materializeEngineConfig(this.opts.engineConfigTemplates ?? null, room, st.spec.engine.name);
+    // Шаблона на хосте нет — поведение прежнее (движок читает свой конфиг сам), и это не
+    // событие рана: в лог попадает только фактически положенная копия.
+    if (!seeded) return;
+    this.emit(st, 'log', {
+      stream: 'runner',
+      level: 'info',
+      message: `engine_config.seeded engine=${seeded.engine} path=${seeded.path} bytes=${seeded.bytes} sha256=${seeded.sha256} slot=${room.identity.slotId}`,
     });
   }
 

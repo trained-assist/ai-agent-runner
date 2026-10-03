@@ -22,6 +22,7 @@ import { createAgentApiServer } from './server.js';
 import { AgentApi, type ApiLogger, type PromotionRuntime } from './service.js';
 import type { CleanRoomProvider } from '../isolation/contract.js';
 import { UnixCleanRoomProvider } from '../isolation/clean-room.js';
+import { loadEngineConfigTemplates } from '../isolation/engine-config.js';
 
 export const DEFAULT_API_PORT = 8787;
 export const DEFAULT_API_HOST = '0.0.0.0';
@@ -50,6 +51,12 @@ export interface AgentApiProcessConfig {
    * поднимает per-run Unix-идентичности; отказ границы валит раны, а не расширяет права.
    */
   isolation: { slots: string[]; toolPaths: string[] };
+  /**
+   * Каталог хостовых шаблонов конфигурации движка (#51). Своя HOME рана убирает у движка
+   * конфиг пользователя сервиса, поэтому provider/model кладёт хост: один read-only файл
+   * `<engine>.json` на движок, копия уезжает в run-scoped XDG_CONFIG_HOME вместе со sweep.
+   */
+  engineConfigDir: string;
 }
 
 function envValue(name: string): string | undefined {
@@ -119,6 +126,7 @@ export function loadAgentApiConfig(env: Record<string, string | undefined> = pro
     ownerStorePath: env['AGENT_API_OWNER_STORE']?.trim() ? describePath(env['AGENT_API_OWNER_STORE'].trim()) : '',
     placementPolicyPath: env['AGENT_API_PLACEMENT_POLICY']?.trim() ? describePath(env['AGENT_API_PLACEMENT_POLICY'].trim()) : '',
     isolation: { slots: isolationSlots, toolPaths: isolationToolPaths },
+    engineConfigDir: env['AGENT_API_ENGINE_CONFIG_DIR']?.trim() ?? '',
   };
 }
 
@@ -253,6 +261,17 @@ async function main(): Promise<void> {
     log({ event: 'clean_room_self_test', ok: selfTest.ok, detail: selfTest.detail, slots: config.isolation.slots.length });
     isolation = provider;
   }
+  // Шаблоны конфигурации движка нужны ровно при настроенной границе: без неё движок и так
+  // читает свой конфиг. Нечитаемый каталог/шаблон валит старт, молчаливый отказ — нет.
+  const engineConfigTemplates = isolation ? loadEngineConfigTemplates(config.engineConfigDir) : null;
+  if (engineConfigTemplates) {
+    log({
+      event: 'engine_config_templates',
+      dir: engineConfigTemplates.dir,
+      engines: engineConfigTemplates.engines,
+      secrets: false,
+    });
+  }
 
   const service = new AgentApi({
     rootDir: config.dataDir,
@@ -271,6 +290,7 @@ async function main(): Promise<void> {
     snapshots,
     promotion,
     ...(isolation ? { isolation } : {}),
+    ...(engineConfigTemplates ? { engineConfigTemplates } : {}),
   });
   const recovery = await service.recover();
 

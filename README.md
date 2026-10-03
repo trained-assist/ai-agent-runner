@@ -313,6 +313,7 @@ Env/константы: `RUNNER_DEFAULT_REPO` (дефолтная репа), `RU
 | Проба | `src/isolation/probe/boundary-probe.mjs` | Отрицательные свойства ДО спавна движка: чужой ран, корень Runner'а и его credentials недоступны; свои HOME/tmp и общие read-only бинари доступны |
 | Runner | `src/runner/runner.ts` | Стадия границы между materialize и MCP/спавном, fail-closed отказ до спавна, сверка uid процесса движка по `/proc`, дочистка аренды в `recover()` |
 | Приёмка | `scripts/isolation-probe.mjs`, `.github/workflows/isolation-probe.yml` | Живые одновременные раны, матрица «свой/чужой», управляемые отказы и рестарт воркера → sanitized-транскрипт + sha256 |
+| Конфиг движка | `src/isolation/engine-config.ts` | Хостовой read-only шаблон `<engine>.json` копируется в run-scoped `XDG_CONFIG_HOME` (владелец — слот, `0600`) до старта движка: своя HOME рана убрала бы у движка provider/model, и `opencode` ушёл бы на платный профиль по умолчанию. Объявленный, но нечитаемый шаблон валит ран, а не оставляет движок без модели. В лог идут путь и sha256 копии, не содержимое |
 | Возможности хоста | `src/isolation/host-capabilities.ts` | Только чтение: root, `setpriv`/`runuser`, `setfacl`, слоты в `passwd`. Непривилегированный хост честно SKIP-ает проверку, а не «проходит» её |
 
 Ключевые семантики:
@@ -333,6 +334,10 @@ Env/константы: `RUNNER_DEFAULT_REPO` (дефолтная репа), `RU
   `cleanup: pending`, причина — в логе рана и в аренде.
 - **Возможности объявляются честно**: без настроенной границы `osIsolation =
   not_proven_service_uid_only`, с нерабочей настройкой — `configured_but_refusing_runs`.
+- **Своя HOME рана не оставляет движок без модели.** Конфиг пользователя сервиса ран не
+  видит — это и есть граница, — поэтому провайдера и модель кладёт хост: read-only шаблон в
+  `AGENT_API_ENGINE_CONFIG_DIR`, копия в `XDG_CONFIG_HOME` рана. Ключ сюда не кладётся и не
+  может: credential'ы приходят в окружение рана по `envAllowlist`, который собирает хост.
 
 ### Где живёт доказательство границы
 
@@ -355,9 +360,11 @@ node scripts/isolation-probe.mjs --fleet-root /var/lib/agent-runner \
 ```
 
 Открытая строка приёмки: «два **настоящих** OpenCode Run одновременно». Бинарь `opencode` на
-песочной VM есть, но под run-scoped HOME у движка нет провайдера/модели, а бесплатный движок
-`llm-ladder` сейчас не отвечает (`unknown ladder: free-ladder` — тем же падает красный
-`probe`-job на `main`). Свойства OS-границы от движка не зависят и проверены fake-движком.
+песочной VM есть; отсутствие провайдера/модели под run-scoped HOME закрыто хостовым
+шаблоном конфигурации движка (`AGENT_API_ENGINE_CONFIG_DIR`, см. `src/isolation/engine-config.ts`),
+а бесплатный движок `llm-ladder` сейчас не отвечает (`unknown ladder: free-ladder` — тем же
+падает красный `probe`-job на `main`). Свойства OS-границы от движка не зависят и проверены
+fake-движком.
 
 ### Что покрыто тестами
 
@@ -369,6 +376,7 @@ node scripts/isolation-probe.mjs --fleet-root /var/lib/agent-runner \
 - [x] Переживший воркер движок гасится восстановлением, слот возвращается, повторного запуска нет — `test/clean-room-isolation.test.ts`
 - [x] Единственная копия выхода: `cleanup: pending`, слот заблокирован, после рестарта блокировка держится — `test/clean-room-isolation.test.ts`
 - [x] Настоящая граница на привилегированном хосте (переключение uid) — `test/clean-room-isolation.test.ts`, блок `skipIf` с указанием причины на непривилегированном хосте
+- [x] Конфиг движка в run-scoped HOME: копия 0600 от слота, sha256 в логе без содержимого, хостовый шаблон не меняется, сломанный шаблон валит ран до спавна — `test/engine-config-in-clean-room.test.ts`
 - [x] Проба приёмки на настоящем Linux-хосте: `docs/evidence/p51-clean-room-vm2` (81/81)
 
 ## Разработка
