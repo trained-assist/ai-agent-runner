@@ -12,7 +12,9 @@ import { createAgentApiServer } from '../src/api/server.js';
 import { AgentApi, type AgentApiOptions, type PromotionRuntime, type ServiceRecoveryReport } from '../src/api/service.js';
 import { FaultRegistry } from '../src/faults/registry.js';
 import { isTerminalState } from '../src/runner/state-machine.js';
-import type { ArtifactStore } from '../src/storage/artifact-store.js';
+import { ArtifactStore } from '../src/storage/artifact-store.js';
+import { RunExportStore } from '../src/storage/export.js';
+import { createBlobStore } from '../src/storage/create-blob-store.js';
 import type { CapabilityRegistry } from '../src/mcp/capabilities.js';
 import type { BindingValueResolver } from '../src/mcp/scope.js';
 import { removeDirWithRetry } from './helpers.js';
@@ -66,6 +68,11 @@ export interface HttpHarnessOptions {
   /** Регион воркера (P30): по умолчанию sandbox-eu; для симуляции двух воркеров задаётся явно. */
   hostRegion?: string;
   /**
+   * Стадия сохранения выходов (P07/#54): blob + манифесты экспорта, как в dist/API.
+   * Без неё `outputRefs` в результате всегда пуст — хранилища нет, сохранять некуда.
+   */
+  artifactExport?: boolean;
+  /**
    * Промоушен-контур (P29). Фабрика, а не готовый объект: рестарт сервиса должен заново
    * прочитать файл состояния релиза — иначе откат нельзя было бы проверить перезапуском.
    */
@@ -79,6 +86,9 @@ export interface HttpHarness {
   readonly logs: Record<string, unknown>[];
   readonly service: AgentApi;
   readonly base: string;
+  /** Хранилище выходов рана; создаётся только при `artifactExport: true`. */
+  readonly artifacts: ArtifactStore | null;
+  readonly exports: RunExportStore | null;
   restart(options?: { killProcesses?: boolean }): Promise<ServiceRecoveryReport>;
   close(): Promise<void>;
 }
@@ -105,6 +115,11 @@ export async function startHttpHarness(options: HttpHarnessOptions = {}): Promis
   const logger = (entry: Record<string, unknown>): void => {
     logs.push(entry);
   };
+  // Стадия сохранения выходов подключается ровно как в dist/API (main.ts): без неё
+  // ран завершается, но сохранять выходы некуда и outputRefs всегда пуст.
+  const blob = options.artifactExport ? createBlobStore({ env: {}, localRoot: join(rootDir, 'blobs') }) : null;
+  const artifacts = blob ? new ArtifactStore({ rootDir, blob }) : (options.artifacts ?? null);
+  const exports = blob ? new RunExportStore({ rootDir, artifacts: artifacts as ArtifactStore }) : null;
   const serviceOptions: AgentApiOptions = {
     rootDir,
     adapters: { fake, opencode: new OpenCodeAdapter() },
@@ -115,6 +130,8 @@ export async function startHttpHarness(options: HttpHarnessOptions = {}): Promis
     ...(options.heartbeatIntervalMs !== undefined ? { heartbeatIntervalMs: options.heartbeatIntervalMs } : {}),
     ...(options.capabilities ? { capabilities: options.capabilities } : {}),
     ...(options.bindingResolver ? { bindingResolver: options.bindingResolver } : {}),
+    ...(blob ? { blob } : {}),
+    ...(exports ? { exports } : {}),
   };
   const start = (): AgentApi => {
     const service = new AgentApi(options.promotion ? { ...serviceOptions, promotion: options.promotion() } : serviceOptions);
@@ -129,7 +146,8 @@ export async function startHttpHarness(options: HttpHarnessOptions = {}): Promis
     streamPollMs,
     keepaliveMs,
     maxBodyBytes,
-    ...(options.artifacts ? { artifacts: options.artifacts } : {}),
+    ...(artifacts ? { artifacts } : {}),
+    ...(exports ? { exports } : {}),
     ...(options.capabilities ? { capabilities: options.capabilities } : {}),
     ...(options.bindingResolver ? { bindingResolver: options.bindingResolver } : {}),
   };
@@ -141,6 +159,8 @@ export async function startHttpHarness(options: HttpHarnessOptions = {}): Promis
     fake,
     faults,
     logs,
+    artifacts,
+    exports,
     get service() {
       return service;
     },
