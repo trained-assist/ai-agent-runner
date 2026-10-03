@@ -18,7 +18,7 @@
  * allowlist, который собирает хост.
  */
 import { createHash } from 'node:crypto';
-import { chmodSync, chownSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { chmodSync, chownSync, existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { CleanRoomError, type CleanRoom } from './contract.js';
 import { writeFileAtomic } from '../runner/util.js';
@@ -29,13 +29,22 @@ export const ENGINE_CONFIG_TEMPLATE_MAX_BYTES = 64 * 1024;
 const ENGINE_NAME = /^[a-z0-9][a-z0-9._-]{0,63}$/i;
 
 /**
- * Куда движок читает свой конфиг внутри XDG_CONFIG_HOME. Таблица намеренно мала: раскладку
- * знает только движок, и добавление нового движка — это новая строка здесь плюс шаблон
- * на хосте. Движка в таблице нет — хост объявил о нём шаблон, а Runner не знает, куда его
- * положить: это поломка настройки хоста, и ран падает ДО спавна.
+ * Куда движок читает свой конфиг рана. Таблица намеренно мала: раскладку знает только
+ * движок, и добавление нового движка — это новая строка здесь плюс шаблон на хосте.
+ * Движка в таблице нет — хост объявил о нём шаблон, а Runner не знает, куда его положить:
+ * это поломка настройки хоста, и ран падает ДО спавна.
+ *
+ * Конфиг кладётся в корень workspace рана (проектная директория движка), а не в
+ * run-scoped XDG_CONFIG_HOME, и это не выбор вкуса:
+ *  - `HOME`/`XDG_CONFIG_HOME` рана закрыты (0700) и принадлежат слоту; каталог, созданный
+ *    Runner'ом внутри них, теряет ACL Runner'а (`mkdir` с явным режимом маскирует
+ *    унаследованный default ACL), и дальше Runner не может ни дописать конфиг, ни снести
+ *    его при sweep — уборка не завершается, слот блокируется;
+ *  - в workspace у Runner'а уже есть явный и default ACL (persist/sweep), и opencode
+ *    читает `opencode.json` проекта — проверено живым прогоном под идентичностью рана.
  */
-export const ENGINE_CONFIG_LAYOUTS: Record<string, { dir: string; file: string }> = {
-  opencode: { dir: 'opencode', file: 'opencode.json' },
+export const ENGINE_CONFIG_LAYOUTS: Record<string, { file: string }> = {
+  opencode: { file: 'opencode.json' },
 };
 
 export interface EngineConfigTemplate {
@@ -46,7 +55,7 @@ export interface EngineConfigTemplate {
 }
 
 export interface MaterializedEngineConfig {
-  /** Путь копии внутри run-scoped XDG_CONFIG_HOME. */
+  /** Путь копии в корне workspace рана (проектная директория движка). */
   path: string;
   engine: string;
   bytes: number;
@@ -127,32 +136,20 @@ export function materializeEngineConfig(
     throw new CleanRoomError('ENGINE_CONFIG_INVALID', `engine config template for "${engineName}" must be a JSON object`);
   }
 
-  const dir = join(room.paths.config, layout.dir);
-  const path = join(dir, layout.file);
-  mkdirSync(dir, { recursive: true, mode: 0o700 });
-  // Файл пишется ДО передачи каталога слоту, и только потом отдаётся и каталог, и файл.
-  // Обратный порядок не работает по двум причинам: каталог слота закрыт (0700, чужой uid),
-  // и mkdir с явным режимом маскирует унаследованный от XDG_CONFIG_HOME default ACL, так
-  // что Runner теряет право записи в свой же каталог. Итог тот же, что нужен: движок под
-  // идентичностью рана читает свой конфиг (каталог и файл — слота, 0700/0600).
+  const path = join(room.paths.cwd, layout.file);
   writeFileAtomic(path, text);
-  // Права и владение — независимые шаги: смена владельца требует привилегий, а 0700/0600
-  // обязаны быть и там, где их нет (иначе конфиг рана прочитал бы соседний слот).
-  try {
-    chmodSync(dir, 0o700);
-  } catch {
-    /* каталог создан с 0700 */
-  }
+  // Права и владение — независимые шаги: смена владельца требует привилегий, а 0600
+  // обязано быть и без них, иначе конфиг рана прочитал бы соседний слот. Порядок тоже
+  // важен: chown каталога раньше chown файла закрыл бы путь и ломал уборку.
   try {
     chmodSync(path, 0o600);
   } catch {
     /* файл создан с правами по umask; это увидит проба границы */
   }
   try {
-    chownSync(dir, room.identity.uid, room.identity.gid);
     chownSync(path, room.identity.uid, room.identity.gid);
   } catch {
-    /* chown требует привилегий: каталог и файл остаются 0700/0600 и не читаются соседями */
+    /* chown требует привилегий: файл остаётся 0600 и принадлежит Runner'у */
   }
   return { path, engine: engineName, bytes: Buffer.byteLength(text), sha256: createHash('sha256').update(text).digest('hex') };
 }
