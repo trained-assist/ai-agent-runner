@@ -372,7 +372,14 @@ function nestedPath(rule: string, source: string, target: string): PromotionViol
 /** Описание развёртывания собирается из манифеста релиза (значения секретов не нужны). */
 export function descriptorFromManifest(
   manifest: {
-    host: { workerId: string; environment: string; region: string; roles: { delivery: boolean }; roots: { dataDir: string; configDir: string }; endpoint: { host: string; port: number } };
+    host: {
+      workerId: string;
+      environment: string;
+      region: string;
+      roles: { schedule: boolean; delivery: boolean };
+      roots: { dataDir: string; configDir: string };
+      endpoint: { host: string; port: number };
+    };
   },
   keyHashes: string[],
   options: { ownsDelivery?: boolean; storagePrefix?: string } = {},

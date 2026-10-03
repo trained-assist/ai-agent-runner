@@ -656,19 +656,23 @@ export class AgentApi {
       });
       return decision;
     }
-    this.refuseAdmission(decision);
+    this.refuseAdmission(decision, principal.principalId);
   }
 
-  private refuseAdmission(refusal: { admit: false; code: AdmissionRefusalCode; reason: string; detail: Record<string, unknown> }): never {
+  private refuseAdmission(
+    refusal: { admit: false; code: AdmissionRefusalCode; reason: string; detail: Record<string, unknown> },
+    principalId: string,
+  ): never {
     const promotion = this.opts.promotion;
     promotion?.journal.append({
       kind: 'admission_refused',
       reason: refusal.reason,
       cohortId: promotion?.cohort.cohortId,
-      detail: { code: refusal.code, ...refusal.detail },
+      detail: { code: refusal.code, principalId, ...refusal.detail },
     });
     this.log({
       event: 'admission_refused',
+      principalId,
       code: refusal.code,
       reason: refusal.reason,
       ...refusal.detail,
@@ -695,7 +699,7 @@ export class AgentApi {
       });
       return claim.ownerGeneration;
     }
-    this.refuseAdmission(claim);
+    this.refuseAdmission(claim, principal.principalId);
   }
 
   private requireRun(principal: Principal, runId: string): AdmissionRecord {
