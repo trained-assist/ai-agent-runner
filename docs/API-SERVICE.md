@@ -42,6 +42,8 @@ bash /opt/sb/ai-agent-runner/scripts/deploy-api-service.sh
 | `AGENT_API_REGION`, `AGENT_API_ENVIRONMENT` | host-info в runner |
 | `ARTIFACT_SHARE_SECRET` | HMAC-секрет share-токенов (генерируется при первом деплое) |
 | `ARTIFACT_BASE_URL` | база для ссылок на артефакты: `http://169.58.15.230:8787` |
+| `AGENT_API_ISOLATION_SLOTS`, `AGENT_API_ISOLATION_TOOL_PATHS` | граница Agent clean room (#51): пул Unix-слотов ран'а (`ta-agent-1,ta-agent-2`) и общие read-only каталоги бинарей. Пустой слот — движок под service UID, и capabilities объявляют это честно |
+| `AGENT_API_ENGINE_CONFIG_DIR` | каталог хостовых шаблонов конфигурации движка: один read-only файл `<engine>.json` на движок. Копия кладётся в run-scoped `XDG_CONFIG_HOME` (владелец — слот, `0600`) и уезжает со sweep. Нужен потому, что своя HOME рана убирает у движка конфиг пользователя сервиса: без provider/model `opencode` уходит на платный профиль по умолчанию. Секретов в шаблонах нет — ключи приходят в env рана по `envAllowlist` |
 | `AGENT_API_FAKE_SCENARIO` | опционально: сценарий fake-движка (`success` по умолчанию, `timeout`, `nonzero-exit`, …) — для проверки аварийных путей; правится вручную в env-файле + `systemctl restart` |
 
 Старт падает сразу и явно, если: не задан `AGENT_API_KEY_REGISTRY`, файла ключей нет или в нём 0 ключей,

@@ -39,6 +39,7 @@ import {
 import { ApiError, type ApiErrorCode } from './errors.js';
 import { ApiStore, API_STORE_SCHEMA_VERSION, type AdmissionRecord } from './store.js';
 import type { CleanRoomProvider } from '../isolation/contract.js';
+import type { EngineConfigTemplate } from '../isolation/engine-config.js';
 
 export type ApiLogger = (entry: Record<string, unknown>) => void;
 
@@ -114,6 +115,8 @@ export interface AgentApiOptions {
   bindingResolver?: BindingValueResolver;
   /** Граница Agent clean room (issue #51): per-run Unix-идентичность вместо service UID. */
   isolation?: CleanRoomProvider;
+  /** Хостовые шаблоны конфигурации движка для run-scoped HOME — см. RunnerOptions. */
+  engineConfigTemplates?: EngineConfigTemplate | null;
   /** Промоушен-контур P29: pinned release, когорта, откат, журнал, реестр владельцев. */
   promotion?: PromotionRuntime;
 }
@@ -156,6 +159,7 @@ export class AgentApi {
     if (options.capabilities) runnerOptions.capabilities = options.capabilities;
     if (options.bindingResolver) runnerOptions.bindingResolver = options.bindingResolver;
     if (options.isolation) runnerOptions.isolation = options.isolation;
+    if (options.engineConfigTemplates) runnerOptions.engineConfigTemplates = options.engineConfigTemplates;
     this.runner = new Runner(runnerOptions);
   }
 
