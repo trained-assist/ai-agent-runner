@@ -685,8 +685,13 @@ export class AgentApi {
     if (request.credentialBindings !== undefined) spec.credentialBindings = request.credentialBindings;
     if (request.budget !== undefined) spec.budget = request.budget;
     if (request.result !== undefined) spec.result = request.result;
+    if (request.outputs !== undefined) spec.outputs = request.outputs;
     if (request.traceId !== undefined) spec.traceId = request.traceId;
     if (request.repository !== undefined) spec.repository = request.repository;
+    // Требование границы доходит до рана: без него запрос `per_run_unix_identity` на хосте
+    // без провайдера не отличался бы от обычного и тихо ушёл бы под service UID, а
+    // запрос `none` всё равно получил бы чистую среду.
+    if (request.isolation !== undefined) spec.isolation = request.isolation;
 
     const validated = validateRunSpec(spec);
     if (!validated.ok) {
