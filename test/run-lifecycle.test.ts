@@ -205,6 +205,47 @@ describe('lifecycle рана: persist → проверенная уборка (i
     expect(engine.startCalls).toBe(1);
   });
 
+  it('отказ уборки одного рана не роняет восстановление целиком (дефект с VM2)', async () => {
+    const engine = new SilentEngine();
+    const inner = createHarness({ artifactExport: true });
+    const flaky = new FlakyBlob(inner.exports?.artifacts.blob as unknown as BlobStore, 1);
+    const h = createHarness({ adapters: { fake: engine }, blob: flaky, artifactExport: true });
+    // Терминальный ран, у которого уборка не доведена: выход не сохранён, единственная копия
+    // на диске — ровно то состояние, в котором восстановление обязано повторить sweep.
+    const { receipt, spec } = h.start({ outputs: [{ path: 'ran.txt' }] });
+    const terminal = await h.runner.waitFor(receipt.runId);
+    expect(terminal.persistence).toBe('failed');
+    expect(terminal.cleanup).toBe('pending');
+    flaky.failuresLeft = 0;
+
+    // Восстановление обязано пережить отказ уборки: иначе один застрявший каталог не дал бы
+    // API подняться и обслуживать остальные раны (найдено пробой на песочной VM2).
+    const restarting = h.reopenWithoutDispose();
+    h.faults.inject('cleanup', { kind: 'throw', once: true });
+    const failed = await restarting.recover();
+    expect(failed.cleanupResumesFailed).toBe(1);
+    expect(failed.cleanupsResumed).toBe(0);
+    // Повторный export успел подтвердить байты чтением, поэтому локальная копия уже снята,
+    // а недоведённой осталась только уборка каталогов — и она обязана остаться недоведённой.
+    const midway = restarting.getRun(receipt.runId)?.result;
+    expect(midway?.persistence).toBe('persisted');
+    expect(midway?.cleanup).toBe('pending');
+    expect(existsSync(join(spec.cwd, 'ran.txt'))).toBe(false);
+    expect(existsSync(spec.cwd)).toBe(true);
+    expect(
+      restarting.events(receipt.runId).some((event) => String((event.payload as { message?: string }).message ?? '').startsWith('lifecycle.resume_failed')),
+    ).toBe(true);
+
+    // Следующее восстановление дожимает ту же уборку: намерение на диске пережило отказ.
+    const again = await restarting.recover();
+    expect(again.cleanupsResumed).toBe(1);
+    expect(again.cleanupResumesFailed).toBe(0);
+    expect(restarting.getRun(receipt.runId)?.result?.cleanup).toBe('completed');
+    expect(existsSync(spec.cwd)).toBe(false);
+    expect(engine.startCalls).toBe(1);
+    expect(restarting.getRun(receipt.runId)?.result?.outputRefs).toHaveLength(1);
+  });
+
   it('retainWorkspaces: уборка честно остаётся pending, пока каталог на месте', async () => {
     const engine = new WritingEngine();
     const h = createHarness({ adapters: { fake: engine }, artifactExport: true, retainWorkspaces: true } as HarnessOptions);

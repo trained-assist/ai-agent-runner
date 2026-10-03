@@ -46,6 +46,7 @@ bash /opt/sb/ai-agent-runner/scripts/deploy-api-service.sh
 | `AGENT_API_ENGINE_CONFIG_DIR` | каталог хостовых шаблонов конфигурации движка: один read-only файл `<engine>.json` на движок. Копия кладётся в run-scoped `XDG_CONFIG_HOME` (владелец — слот, `0600`) и уезжает со sweep. Нужен потому, что своя HOME рана убирает у движка конфиг пользователя сервиса: без provider/model `opencode` уходит на платный профиль по умолчанию. Секретов в шаблонах нет — ключи приходят в env рана по `envAllowlist` |
 | `AGENT_API_COHORT_ID`, `AGENT_API_COHORT_MODE`, `AGENT_API_COHORT_PRINCIPALS` | когорта P29: по умолчанию (`off`) **не обслуживает никого** — каждый `POST /v1/runs` получает `COHORT_NOT_ENABLED`. Одиночная установка обязана объявить allowlist с principal'ами, иначе она принимает ноль задач |
 | `AGENT_API_FAKE_SCENARIO` | опционально: сценарий fake-движка (`success` по умолчанию, `timeout`, `nonzero-exit`, …) — для проверки аварийных путей; правится вручную в env-файле + `systemctl restart` |
+| `AGENT_API_FAULTS` | опционально: управляемые точки сбоя для приёмки lifecycle (#52) — `cleanup` (сбой в момент уборки), `export`, `finalization`, … через запятую, `точка:count` задаёт число срабатываний (без `count` — один раз). Неизвестная точка валит старт: молча проигнорированная точка означала бы пробу, которая «прошла», ни разу не упав. В обычном сервисе переменная пуста |
 
 Старт падает сразу и явно, если: не задан `AGENT_API_KEY_REGISTRY`, файла ключей нет или в нём 0 ключей,
 data dir попал во временный каталог или имеет права шире `0700`.

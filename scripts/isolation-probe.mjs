@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-// Приёмка границы Agent clean room (issue #51) на настоящем хосте: per-run Unix-идентичность.
+// Приёмка границы Agent clean room (#51) и полного lifecycle рана (#52) на настоящем хосте:
+// per-run Unix-идентичность, сохранение с подтверждением чтением и уборка среды.
 //
 // Проба поднимает СВОЙ API/Runner (не прод и не чужую VM), создаёт пул непривилегированных
 // Unix-пользователей — слотов — и проверяет отрицательные свойства границы на живых ранах:
@@ -9,6 +10,12 @@
 // отсутствие свободного слота и отказ хранилища обязаны вести себя предсказуемо, а рестарт
 // воркера — дочищать аренду идентичности без повторного запуска движка.
 //
+// Шаги lifecycle (#52): после terminal+persist каталоги рана и его HOME/config/tmp/сокет
+// отсутствуют, а результат, события и байты выхода читаются; сбой В МОМЕНТ УБОРКИ
+// (AGENT_API_FAULTS=cleanup) оставляет намерение на диске, и рестарт воркера доводит уборку
+// ровно один раз, сохранив байты и не перезапустив движок; отказ хранилища оставляет
+// единственную копию, статус с причиной и рестарт, который её не стирает.
+//
 // Требует root (useradd/chown/setpriv), Linux и setfacl. Ключи и share-секреты читаются из
 // файлов namespace и в транскрипт не попадают (проверяется в конце пробы).
 //
@@ -16,7 +23,7 @@
 //   scripts/recreate-sandbox.sh --namespace iso-$(date -u +%Y%m%d) \
 //     --fleet-root /var/lib/agent-runner-iso --workers a --client-engines fake,opencode
 //   sudo node scripts/isolation-probe.mjs --fleet-root /var/lib/agent-runner-iso \
-//     --namespace iso-20261003 --out docs/evidence/p51-clean-room
+//     --namespace iso-20261003 --out docs/evidence/p52-lifecycle-vm2
 //
 // Опции:
 //   --out <dir>        каталог транскрипта (по умолчанию docs/evidence/p51-clean-room)
@@ -514,12 +521,12 @@ function writeSkippedTranscript(capabilities) {
   const payload = `${JSON.stringify(
     {
       schemaVersion: 1,
-      probe: 'Граница Agent clean room: per-run Unix-идентичность (issue #51)',
+      probe: 'Граница Agent clean room (per-run Unix-идентичность, #51) и lifecycle рана: persist → sweep (#52)',
       status: 'skipped',
       generatedAt: new Date().toISOString(),
       host: { platform: process.platform, kernel: kernelRelease(), apiProcessUid: capabilities.uid },
       skippedBecause: capabilities.reasons,
-      note: 'Проба границы не выполнялась: хосту не хватает привилегий для per-run Unix-идентичности. Это не доказательство границы и не провал — доказательство берётся с привилегированной песочной VM (docs/evidence/p51-clean-room-vm2).',
+      note: 'Проба границы и lifecycle не выполнялась: хосту не хватает привилегий для per-run Unix-идентичности. Это не доказательство границы и не провал — доказательство берётся с привилегированной песочной VM (docs/evidence/p51-clean-room-vm2, docs/evidence/p52-lifecycle-vm2).',
     },
     null,
     2,
@@ -788,19 +795,48 @@ async function main() {
       const capabilities = (await worker.get('/v1/capabilities')).body;
       check('ошибка хранилища не стирает единственную копию выхода', existsSync(join(state.spec.cwd, ENGINE_OUTPUT)), state.spec.cwd);
       check('очистка заявлена как pending, а не completed', result.cleanup === 'pending', String(result.cleanup));
+      check('причина невыполненной уборки называет единственную копию', /only copy/.test(String(result.cleanupReason)), String(result.cleanupReason));
+      check('сохранение объявлено failed с причиной, а не persisted', result.persistence === 'failed' && /durable storage/.test(String(result.persistenceReason)), `${String(result.persistence)}: ${String(result.persistenceReason)}`);
+      check('ран при этом завершился успешно (движок отработал)', result.outcome === 'succeeded', `${String(result.outcome)}/${String(result.failure?.code ?? '')}`);
       check('аренда помечена blocked с причиной', lease?.status === 'blocked', `${String(lease?.status)}: ${String(lease?.reason)}`);
       check('эфемерные каталоги среды при этом вычищены', !existsSync(join(spec.dataDir, 'cleanrooms', submitted.body.runId, 'home')), '');
       const nextRun = await startRun(worker, { prompt: 'must be refused while the sole copy is retained' });
       const refused = await waitTerminal(worker, nextRun.body.runId, 30_000);
       check('следующий ран отказан, пока выход не сохранён', refused.failure?.code === 'ISOLATION_SLOT_BUSY', String(refused.failure?.code));
+      const soleCopy = join(state.spec.cwd, ENGINE_OUTPUT);
+      await worker.stop();
+
+      // Рестарт воркера при всё ещё нерабочем хранилище: единственная копия обязана выжить,
+      // а движок — не перезапуститься (recovery повторяет persist, а не работу агента).
+      const restarted = new Worker({ ...spec, port }, clientKey, {
+        AGENT_API_PORT: String(port),
+        ...isolationEnv([slotsFlag[0]], { STORAGE_BACKEND: 'r2' }),
+      }).start();
+      try {
+        await restarted.waitHealthy();
+        const afterRestart = (await restarted.get(`/v1/runs/${submitted.body.runId}/result`)).body;
+        check('рестарт не стёр единственную копию', existsSync(soleCopy), soleCopy);
+        check('рестарт не переписал статус сохранения', afterRestart.persistence === 'failed' && afterRestart.cleanup === 'pending', `${String(afterRestart.persistence)}/${String(afterRestart.cleanup)}`);
+        check('рестарт не перезапустил движок', restarted.events(submitted.body.runId).filter((event) => event.type === 'started').length === 1, '');
+        check('после рестарта слот всё ещё занят единственной копией', (await restarted.get('/v1/capabilities')).body.isolation.freeSlots.length === 0, (await restarted.get('/v1/capabilities')).body.isolation.freeSlots.join(','));
+      } finally {
+        await restarted.stop();
+      }
+
       record('storage_failure_keeps_sole_copy', {
         runId: submitted.body.runId,
+        userTaskId: result.userTaskId,
+        profileId: result.profileId,
         outcome: result.outcome,
+        persistence: result.persistence,
+        persistenceReason: result.persistenceReason,
         cleanup: result.cleanup,
+        cleanupReason: result.cleanupReason,
         lease: { status: lease?.status ?? null, reason: lease?.reason ?? null },
         slotsConfigured: [slotsFlag[0]],
         freeSlots: capabilities.isolation.freeSlots,
         retainedWorkspace: state.spec.cwd,
+        soleCopySurvivedRestart: existsSync(soleCopy),
         refused: { runId: nextRun.body.runId, failureCode: refused.failure?.code ?? null },
       });
     } finally {
@@ -846,11 +882,140 @@ async function main() {
     }
   });
 
+  await runStep('lifecycle_persist_then_sweep', async () => {
+    const port = await freePort(spec.port + 60);
+    const worker = new Worker({ ...spec, port }, clientKey, { AGENT_API_PORT: String(port), ...isolationEnv(slotsFlag) }).start();
+    try {
+      await worker.waitHealthy();
+      const submitted = await startRun(worker, { outputs: [{ path: ENGINE_OUTPUT }] });
+      const result = await waitTerminal(worker, submitted.body.runId, 40_000);
+      const state = worker.state(submitted.body.runId);
+      const room = state.cleanRoom?.paths ?? {};
+      const checkpoint = readJson(join(spec.dataDir, 'runs', submitted.body.runId, 'checkpoint.json'));
+      const listing = await worker.get(`/v1/runs/${submitted.body.runId}/artifacts`);
+      const declared = (listing.body?.artifacts ?? []).find((artifact) => artifact.name === ENGINE_OUTPUT);
+
+      // Сохранение — факт чтения, а не намерение: выход объявлен, ссылка есть, статус объяснён.
+      check('выход сохранён и статус persistence = persisted', result.persistence === 'persisted', `${String(result.persistence)}: ${String(result.persistenceReason)}`);
+      check('причина сохранения ссылается на read-back', /read-back/.test(String(result.persistenceReason)), String(result.persistenceReason));
+      check('ответ агента сохранён отдельным артефактом', (listing.body?.artifacts ?? []).some((artifact) => artifact.name === 'answer.txt'), JSON.stringify((listing.body?.artifacts ?? []).map((a) => a.name)));
+
+      // Уборка — проверенный контракт: ни каталога рана, ни его HOME/config/tmp, ни сокета.
+      check('статус cleanup = completed с причиной', result.cleanup === 'completed' && typeof result.cleanupReason === 'string' && result.cleanupReason !== '', `${String(result.cleanup)}: ${String(result.cleanupReason)}`);
+      check('workspace рана удалён', !existsSync(state.spec.cwd), state.spec.cwd);
+      for (const [name, path] of [['home', room.home], ['tmp', room.tmp], ['mcp', room.mcp], ['root', room.root]]) {
+        check(`run-scoped ${name} удалён`, typeof path === 'string' && !existsSync(path), String(path));
+      }
+      check('checkpoint на диске: phase=complete, cleanup=completed', checkpoint.phase === 'complete' && checkpoint.cleanup?.status === 'completed', `${String(checkpoint.phase)}/${String(checkpoint.cleanup?.status)}`);
+      check('checkpoint несёт ответ агента (source/size)', checkpoint.answer?.present === true && checkpoint.answer.chars > 0, JSON.stringify(checkpoint.answer ?? {}));
+
+      // Результат, события и байты переживают sweep.
+      const after = (await worker.get(`/v1/runs/${submitted.body.runId}/result`)).body;
+      check('результат читается после sweep', after.runId === submitted.body.runId && after.outputRefs.length === 1, JSON.stringify(after.outputRefs ?? []));
+      check('события рана читаются после sweep', worker.events(submitted.body.runId).some((event) => event.type === 'succeeded'), '');
+      const bytes = await fetch(`${worker.base}/v1/artifacts/${declared.artifactId}`, { headers: { authorization: `Bearer ${clientKey}` } });
+      const body = Buffer.from(await bytes.arrayBuffer());
+      check('байты выхода читаются из долговечного хранилища', bytes.status === 200 && body.toString('utf8') === 'ok', `${bytes.status}: ${body.toString('utf8').slice(0, 20)}`);
+
+      record('lifecycle_persist_then_sweep', {
+        runId: submitted.body.runId,
+        userTaskId: after.userTaskId,
+        profileId: after.profileId,
+        outcome: after.outcome,
+        persistence: after.persistence,
+        persistenceReason: after.persistenceReason,
+        cleanup: after.cleanup,
+        cleanupReason: after.cleanupReason,
+        outputRefs: after.outputRefs,
+        checkpoint: { phase: checkpoint.phase, persistence: checkpoint.persistence, cleanup: checkpoint.cleanup?.status, answer: checkpoint.answer ?? null },
+        removedRunPaths: { cwd: state.spec.cwd, home: room.home ?? null, tmp: room.tmp ?? null, mcp: room.mcp ?? null },
+        artifactBytes: body.toString('utf8'),
+      });
+    } finally {
+      await worker.stop();
+    }
+  });
+
+  await runStep('crash_during_sweep_recovers', async () => {
+    const port = await freePort(spec.port + 65);
+    // Управляемый сбой В МОМЕНТ УБОРКИ: намерение уборки уже записано на диск, но каталоги
+    // рана остаются. Дальше воркер падает по-настоящему (SIGKILL) и поднимается заново.
+    const worker = new Worker({ ...spec, port }, clientKey, {
+      AGENT_API_PORT: String(port),
+      ...isolationEnv(slotsFlag, { AGENT_API_FAULTS: 'cleanup' }),
+    }).start();
+    let submitted;
+    let runId;
+    try {
+      await worker.waitHealthy();
+      submitted = await startRun(worker, { outputs: [{ path: ENGINE_OUTPUT }] });
+      runId = submitted.body.runId;
+      const checkpointPath = join(spec.dataDir, 'runs', runId, 'checkpoint.json');
+      await waitFor(() => existsSync(checkpointPath), 40_000, 'checkpoint with cleanup intent');
+      const intent = readJson(checkpointPath);
+      const state = worker.state(runId);
+      const startedBefore = worker.events(runId).filter((event) => event.type === 'started').length;
+      const statusWhileBroken = (await worker.get(`/v1/runs/${runId}/status`)).body?.state;
+
+      check('упавшая уборка оставила намерение на диске', intent.phase === 'cleanup_pending' && intent.cleanup?.intentAt !== null, `${String(intent.phase)}/${String(intent.cleanup?.intentAt)}`);
+      check('каталоги рана на месте после сбоя в sweep', existsSync(state.spec.cwd), state.spec.cwd);
+      check('ран не терминален, пока уборка не доведена', statusWhileBroken !== 'succeeded', String(statusWhileBroken));
+      check('движок до сбоя был запущен ровно один раз', startedBefore === 1, `started=${startedBefore}`);
+      await worker.killHard();
+      await worker.waitExit();
+    } finally {
+      await worker.closeLog();
+    }
+
+    // Рестарт воркера: recover() обязан повторить persist/sweep и завершить уборку один раз.
+    const restarted = new Worker({ ...spec, port }, clientKey, { AGENT_API_PORT: String(port), ...isolationEnv(slotsFlag) }).start();
+    try {
+      await restarted.waitHealthy();
+      const result = await waitTerminal(restarted, runId, 40_000);
+      const state = restarted.state(runId);
+      const lease = restarted.lease(runId);
+      const startedAfter = restarted.events(runId).filter((event) => event.type === 'started').length;
+      const capabilities = (await restarted.get('/v1/capabilities')).body;
+      check('после восстановления уборка доведена до конца', result.cleanup === 'completed', `${String(result.cleanup)}: ${String(result.cleanupReason)}`);
+      check('байты выхода сохранены и после сбоя', result.persistence === 'persisted' && result.outputRefs.length === 1, `${String(result.persistence)}: ${JSON.stringify(result.outputRefs)}`);
+      check('каталоги рана убраны восстановлением', !existsSync(state.spec.cwd) && !existsSync(join(spec.dataDir, 'cleanrooms', runId)), state.spec.cwd);
+      check('аренда идентичности закрыта', lease?.status === 'released', `${String(lease?.status)}: ${String(lease?.reason)}`);
+      check('повторного запуска движка не было', startedAfter <= 1, `started after=${startedAfter}`);
+      check('слот вернулся в пул после восстановления', capabilities.isolation.freeSlots.includes(lease?.identity?.slotId), capabilities.isolation.freeSlots.join(','));
+
+      // Второй recover ничего не делает заново: уборка уже подтверждена.
+      const second = new Worker({ ...spec, port }, clientKey, { AGENT_API_PORT: String(port), ...isolationEnv(slotsFlag) }).start();
+      try {
+        await second.waitHealthy();
+        const again = (await second.get(`/v1/runs/${runId}/result`)).body;
+        check('после повторного рестарта статус уборки не изменился', again.cleanup === 'completed', `${String(again.cleanup)}: ${String(again.cleanupReason)}`);
+        check('повторный recover не перезапускал движок', second.events(runId).filter((event) => event.type === 'started').length <= 1, '');
+      } finally {
+        await second.stop();
+      }
+
+      record('crash_during_sweep_recovers', {
+        runId,
+        userTaskId: result.userTaskId,
+        profileId: result.profileId,
+        persistence: result.persistence,
+        cleanup: result.cleanup,
+        cleanupReason: result.cleanupReason,
+        outputRefs: result.outputRefs,
+        leaseStatus: lease?.status ?? null,
+        freeSlots: capabilities.isolation.freeSlots,
+        recoveryLogLines: logs.filter((line) => line.includes('"api_listening"')).slice(-2),
+      });
+    } finally {
+      await restarted.stop();
+    }
+  });
+
   await runStep('sanitized_transcript', async () => {
     const payload = `${JSON.stringify(
       {
         schemaVersion: 1,
-        probe: 'Граница Agent clean room: per-run Unix-идентичность (issue #51)',
+        probe: 'Граница Agent clean room (per-run Unix-идентичность, #51) и lifecycle рана: persist → sweep (#52)',
         generatedAt: new Date().toISOString(),
         host: { platform: process.platform, kernel: kernelRelease(), apiProcessUid: process.getuid?.() ?? null },
         topology:

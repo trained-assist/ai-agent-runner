@@ -246,6 +246,33 @@ describe('clean room isolation (issue #51)', () => {
     expect(first.h.fake.startCalls).toBe(fakeStartsBefore);
   });
 
+  it('сбой во время sweep с границей: восстановление освобождает идентичность (VM2)', async () => {
+    const launcher = new RecordingLauncher();
+    const rootDir = harnessRootFor('sweep-crash');
+    const first = harnessWith(launcher, { provider: { slots: ['slot-a'] }, harness: { rootDir, artifactExport: true } });
+    // Уборка падает ПОСЛЕ записи намерения на диск: аренда и каталоги рана остаются,
+    // ран не терминален. Ровно этот сбой воспроизводила проба на песочной VM2.
+    first.h.faults.inject('cleanup', { kind: 'throw', once: true });
+    const runId = first.h.start({ outputs: [{ path: 'ran.txt' }] }).receipt.runId;
+    await waitFor(() => !first.h.faults.has('cleanup'), 10_000, 'cleanup fault to be consumed');
+    const interrupted = first.h.runner.getRun(runId);
+    expect(interrupted?.state).toBe('finalizing');
+    expect(first.provider.lease(runId)?.status).not.toBe('released');
+    expect(first.provider.freeSlots()).toEqual([]);
+
+    // Новый воркер поверх того же rootDir: в его процессе run.room уже пуст, а аренда и
+    // каталоги — на диске. Уборка обязана довести их до конца, иначе слот зависнет.
+    const restarted = harnessWith(launcher, { provider: { slots: ['slot-a'] }, harness: { rootDir, artifactExport: true } });
+    await restarted.h.runner.recover();
+    const result = restarted.h.runner.getRun(runId)?.result;
+    expect(result?.cleanup).toBe('completed');
+    expect(result?.outputRefs).toHaveLength(1);
+    expect(restarted.provider.lease(runId)?.status).toBe('released');
+    expect(restarted.provider.freeSlots()).toEqual(['slot-a']);
+    expect(listDir(join(rootDir, 'cleanrooms'))).toEqual([]);
+    expect(restarted.h.fake.startCalls).toBe(0);
+  });
+
   it('переживший воркер движок не держит слот: аренда дочищается без повторного запуска', async () => {
     const launcher = new RecordingLauncher();
     const rootDir = harnessRootFor('orphan');

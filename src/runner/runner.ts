@@ -217,6 +217,12 @@ export interface RecoveryReport {
   checkpointsRebuilt: number;
   /** Уборки, доведённые до конца при восстановлении: persist/sweep без движка (issue #52). */
   cleanupsResumed: number;
+  /**
+   * Уборки, которые восстановление не смогло довести (отказ хранилища, занятый каталог).
+   * Ран остаётся с записанным намерением уборки и будет дожат следующим recover(); сам
+   * факт отказа считается, чтобы «уборка не завершена» не выглядела как «уборки не было».
+   */
+  cleanupResumesFailed: number;
 }
 
 interface InternalRun {
@@ -655,7 +661,7 @@ export class Runner {
   }
 
   async recover(): Promise<RecoveryReport> {
-    const report: RecoveryReport = { scanned: 0, resumedQueued: 0, orphaned: 0, lost: 0, finalizingResumed: 0, terminal: 0, exportRetried: 0, orphanedMcp: 0, cleanRoomsReconciled: 0, checkpointsRebuilt: 0, cleanupsResumed: 0 };
+    const report: RecoveryReport = { scanned: 0, resumedQueued: 0, orphaned: 0, lost: 0, finalizingResumed: 0, terminal: 0, exportRetried: 0, orphanedMcp: 0, cleanRoomsReconciled: 0, checkpointsRebuilt: 0, cleanupsResumed: 0, cleanupResumesFailed: 0 };
     await this.fireFault('recovery');
     for (const run of [...this.runs.values()]) {
       if (this.disposed) break;
@@ -668,7 +674,25 @@ export class Runner {
         if (this.ensureCheckpoint(run)) report.checkpointsRebuilt += 1;
         if (await this.reconcileCleanRoom(run)) report.cleanRoomsReconciled += 1;
         // Движок уже отработал: незавершённые persist/sweep дожимаются здесь, без rerun.
-        if (await this.resumeCleanup(run)) report.cleanupsResumed += 1;
+        //
+        // Отказ одного рана не имеет права уронить восстановление целиком: иначе один
+        // застрявший каталог не дал бы API подняться и обслуживать остальные раны. Ран
+        // остаётся в состоянии «уборка не доведена» и будет дожат следующим recover().
+        try {
+          if (await this.resumeCleanup(run)) report.cleanupsResumed += 1;
+        } catch (error) {
+          report.cleanupResumesFailed += 1;
+          const detail = error instanceof Error ? error.message : String(error);
+          try {
+            this.emit(st, 'log', {
+              stream: 'runner',
+              level: 'error',
+              message: `lifecycle.resume_failed runId=${st.runId} detail=${truncateLine(redactSecrets(detail), 300)}`,
+            });
+            } catch {
+            // даже падение самой записи в журнал не имеет права уронить восстановление
+          }
+        }
         continue;
       }
       switch (st.state) {
@@ -1173,7 +1197,7 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
     const lease = provider.lease(st.runId);
     if (!lease || lease.status === 'released') return false;
     const manifest = this.exportManifest(st.runId);
-    const retained = manifest?.cleanup.decision === 'retained_sole_copy';
+    const retained = this.soleCopiesOnDisk(st, manifest).length > 0;
     try {
       await provider.reconcile(lease, retained ? { keepWorkspace: true } : {});
     } catch (error) {
@@ -1649,6 +1673,11 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
    * С границей уборку делает провайдер (слот освобождается только после проверки), без
    * границы хост убирает рабочий каталог и сокет сам — иначе каталоги ранов копились бы
    * вечно, а ран объявлял бы уборку выполненной по отсутствию процессов.
+   *
+   * Граница, поднятая ПРЕЖДУМ воркером, переживает рестарт: в этом процессе `run.room`
+   * уже пуст, но аренда и каталоги лежат на диске. Уборка обязана довести их до конца и
+   * здесь — иначе слот остался бы занятым навсегда, а `cleanup: completed` — неправдой
+   * (дефект, найденный пробой на песочной VM2).
    */
   private async sweepRunEnvironment(
     run: InternalRun | undefined,
@@ -1665,26 +1694,59 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
     // сбой здесь — честный «сбой во время sweep»: восстановление найдёт намерение и
     // доведёт уборку до конца, не перезапуская движок.
     await this.fireFault('cleanup', st.runId);
-    if (run.room) {
-      await this.releaseCleanRoom(run, reason, { ...(keep ? { keepWorkspace: true } : {}) });
-      const lease = this.opts.isolation?.lease(st.runId) ?? null;
+    const provider = this.opts.isolation ?? null;
+    const room = run.room;
+    const lease = provider?.lease(st.runId) ?? null;
+    if (room || (provider && lease && lease.status !== 'released' && st.cleanRoom)) {
+      if (room) {
+        await this.releaseCleanRoom(run, reason, { ...(keep ? { keepWorkspace: true } : {}) });
+      } else {
+        // Аренда с прошлого воркера: тот же проверенный sweep+release, только по аренде.
+        if (st.cleanRoom) {
+          st.cleanRoom.status = 'sweeping';
+          this.store.saveState(st);
+        }
+        try {
+          await provider?.reconcile(lease as CleanRoomLease, keep ? { keepWorkspace: true } : {});
+        } catch (error) {
+          this.emit(st, 'log', {
+            stream: 'runner',
+            level: 'error',
+            message: `clean_room.reconcile_failed runId=${st.runId} reason=${reason} detail=${truncateLine(redactSecrets(error instanceof Error ? error.message : String(error)), 300)}`,
+          });
+        }
+        const after = provider?.lease(st.runId) ?? null;
+        if (st.cleanRoom) {
+          st.cleanRoom.status = after?.status ?? 'released';
+          this.store.saveState(st);
+        }
+        this.emit(st, 'log', {
+          stream: 'runner',
+          level: 'info',
+          message: `clean_room.reconciled_sweep runId=${st.runId} reason=${reason} lease=${after?.status ?? 'absent'}`,
+        });
+      }
+      const current = provider?.lease(st.runId) ?? null;
       const socket = this.runSocketPath(st.runId, null);
       if (socket && !existsSync(socket)) removed.push(socket);
       const missing = st.cleanRoom === null ? [] : [st.cleanRoom.paths.root, st.cleanRoom.paths.cwd];
       const leftovers = missing.filter((target) => existsSync(target));
-      if (lease?.status === 'released' && leftovers.length === 0) {
+      const released = current === null || current.status === 'released';
+      if (released && leftovers.length === 0) {
         return { status: 'completed', reason: 'clean room lease released and every run directory is gone', removed };
       }
       const blocked = {
         status: 'pending' as const,
-        reason: lease?.reason ?? `cleanup is not verified: ${leftovers.length > 0 ? `left ${leftovers.join(', ')}` : 'lease is not released'}`,
+        reason:
+          current?.reason ??
+          `cleanup is not verified: ${leftovers.length > 0 ? `left ${leftovers.join(', ')}` : 'lease is not released'}`,
         removed,
       };
       // Причина невыполненной уборки видна в логе рана ДО терминального события.
       this.emit(st, 'log', {
         stream: 'runner',
         level: 'warn',
-        message: `clean_room.cleanup_blocked runId=${st.runId} status=${lease?.status ?? 'unknown'} reason=${truncateLine(blocked.reason, 300)}`,
+        message: `clean_room.cleanup_blocked runId=${st.runId} status=${current?.status ?? 'unknown'} reason=${truncateLine(blocked.reason, 300)}`,
       });
       return blocked;
     }
@@ -1967,6 +2029,20 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
     const st = this.runs.get(ctx.runId)?.state;
     const field = `spec.outputs[${index}].path`;
     try {
+      // Повторный экспорт (persist после рестарта) не имеет права переписать уже
+      // подтверждённый артефакт: локальная копия к этому моменту снята как
+      // подтверждённая, и «файла нет» здесь означало бы не сохранённые байты.
+      const carried = exports.read(ctx.runId)?.entries.find((entry) => entry.sourcePath === output.path);
+      if (carried?.status === 'exported' && carried.artifactId !== null) {
+        if (st) {
+          this.emit(st, 'log', {
+            stream: 'runner',
+            level: 'info',
+            message: `export.already_verified runId=${ctx.runId} path=${output.path} artifactId=${carried.artifactId}`,
+          });
+        }
+        return;
+      }
       // граница workspace: абсолютный путь, ".." и symlink наружу отвергаются
       const absolute = resolveExistingInsideRoot(cwd, output.path, field);
       if (!isRegularFile(absolute)) {
@@ -2358,18 +2434,21 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
     const fresh = this.runs.get(st.runId) ?? run;
     const cleanup = await this.sweepRunEnvironment(fresh, 'recovered_cleanup', { keepWorkspace: soleCopies.length > 0 });
     const next = this.updateTerminalResult(st, this.computeResult(st, exportManifest, cleanup));
+    // Фаза выводится из обоих фактов, а не только из уборки: `complete` при
+    // persistence=failed — ложь на диске (и RunStore такой checkpoint не примет).
+    const complete = cleanup.status === 'completed' && next.persistence !== 'failed';
     this.writeCheckpoint(
       st,
       next,
       exportManifest,
       null,
       null,
-      cleanup.status === 'completed' ? 'complete' : 'cleanup_pending',
+      complete ? 'complete' : 'cleanup_pending',
       {
         status: cleanup.status === 'completed' ? 'completed' : 'blocked',
         reason: cleanup.reason,
         intentAt: checkpoint.cleanup.intentAt ?? checkpoint.updatedAt,
-        finishedAt: cleanup.status === 'completed' ? this.nowIso() : null,
+        finishedAt: complete ? this.nowIso() : null,
       },
       { silent: true },
     );

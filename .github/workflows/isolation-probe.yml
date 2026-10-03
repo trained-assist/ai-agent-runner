@@ -10,7 +10,8 @@ name: isolation-probe
 # а решение об OS-границе принимается на привилегированной песочной VM. Обычный CI-раннер
 # не может ни доказать, ни честно опровергнуть границу, поэтому он её не запускает: вместо
 # зелёного шага «изоляция проверена» там был бы шаг с привилегиями, случайно выданными CI.
-# Доказательство границы — транскрипт в docs/evidence/p51-clean-room-vm2.
+# Доказательство границы и lifecycle — транскрипты в docs/evidence/p51-clean-room-vm2
+# и docs/evidence/p52-lifecycle-vm2.
 #
 # Прод и настоящие RU/EU-воркеры не используются: у пробы свой namespace и свои слоты.
 # Если возможностей хоста не хватает, job честно отмечает SKIP, а не PASS.
@@ -64,7 +65,7 @@ jobs:
               echo '```'
               echo "${reasons}"
               echo '```'
-              echo 'Доказательство берётся с привилегированной песочной VM: docs/evidence/p51-clean-room-vm2.'
+              echo 'Доказательство берётся с привилегированной песочной VM: docs/evidence/p51-clean-room-vm2, docs/evidence/p52-lifecycle-vm2.'
             } >> "$GITHUB_STEP_SUMMARY"
             echo "::warning::граница рана не проверялась на этом хосте:${reasons}"
           fi
@@ -104,7 +105,7 @@ jobs:
           if [ -f .iso-probe/out/transcript.sha256 ]; then
             (cd .iso-probe/out && sha256sum -c transcript.sha256)
             {
-              echo '### Проба границы Agent clean room (issue #51)'
+              echo '### Проба границы Agent clean room (#51) и lifecycle рана (#52)'
               echo '```'
               cat .iso-probe/out/transcript.sha256
               echo '```'
@@ -118,7 +119,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: p51-clean-room-transcript
+          name: clean-room-and-lifecycle-transcript
           path: ${{ runner.temp }}/isolation-transcript.tgz
           retention-days: 14
           if-no-files-found: warn
