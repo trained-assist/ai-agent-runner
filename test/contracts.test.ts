@@ -58,6 +58,23 @@ const EVENT_PAYLOADS: Record<RunnerEventType, unknown> = {
     acl: 'posix_0700',
     probe: { checks: 4, failures: 0 },
   },
+  agent_exit_resolved: {
+    manifest: 'ok',
+    declared: 1,
+    fromManifest: 2,
+    answerSource: 'agent_file',
+    answerChars: 128,
+    planned: 4,
+    reason: 'final manifest declares 2 output(s)',
+  },
+  agent_answer_saved: { artifactId: 'art-1', source: 'agent_file', chars: 128, size: 128 },
+  checkpoint_written: {
+    phase: 'cleanup_pending',
+    persistence: 'persisted',
+    cleanup: 'pending',
+    outputRefs: 1,
+    reason: 'cleanup intent recorded before sweep',
+  },
 };
 
 function validEvent(type: RunnerEventType, over: Record<string, unknown> = {}): Record<string, unknown> {

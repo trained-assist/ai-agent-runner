@@ -24,7 +24,9 @@ describe('объявленные выходы через API (#54)', () => {
       return status.state === 'succeeded';
     }, 8000, 'run to succeed');
 
-    // 1. поле дошло до RunSpec: без него план экспорта пуст и сохранять нечего
+    // 1. поле дошло до RunSpec: без него план экспорта пуст и сохранять нечего.
+    // План экспорта — только объявленные клиентом выходы; текст ответа агента уходит
+    // в хранилище отдельным артефактом и в план не входит.
     const snapshot = harness.service.runner.getRun(runId);
     expect(snapshot?.result?.outcome).toBe('succeeded');
     expect(snapshot?.export?.planned).toBe(1);
@@ -45,16 +47,20 @@ describe('объявленные выходы через API (#54)', () => {
       artifacts: Array<{ artifactId: string; name: string; sha256: string }>;
       export: { status: string; exported: number };
     };
-    expect(listing.count).toBe(1);
-    expect(listing.artifacts[0]?.artifactId).toBe(result.outputRefs[0]);
-    expect(listing.artifacts[0]?.name).toBe('ran.txt');
+    expect(listing.count).toBe(2);
+    const declared = listing.artifacts.find((artifact) => artifact.name === 'ran.txt');
+    const answer = listing.artifacts.find((artifact) => artifact.name === 'answer.txt');
+    expect(declared?.artifactId).toBe(result.outputRefs[0]);
+    expect(answer).toBeDefined();
     expect(listing.export.status).toBe('complete');
     expect(listing.export.exported).toBe(1);
 
-    const artifactId = result.outputRefs[0] as string;
-    const bytes = await harness.artifacts?.read(runId, artifactId);
+    const bytes = await harness.artifacts?.read(runId, declared?.artifactId as string);
     expect(bytes?.bytes.toString('utf8')).toBe('ok');
     expect(bytes?.manifest.profileId).toBe(alphaPrincipal.profileId);
+    // Текст ответа сохранён отдельным артефактом и переживает sweep чистой среды.
+    const answerBytes = await harness.artifacts?.read(runId, answer?.artifactId as string);
+    expect(answerBytes?.bytes.toString('utf8').length).toBeGreaterThan(0);
   });
 
   it('ответ без объявленных выходов не притворяется сохранённым: план пуст, ссылок нет', async () => {
@@ -70,8 +76,13 @@ describe('объявленные выходы через API (#54)', () => {
     const result = (await (await fetch(`${harness.base}/v1/runs/${runId}/result`, { headers: authHeader(alphaKey) })).json()) as {
       outputRefs: string[];
     };
-    // Объявления не было — выдумывать ссылку нельзя, но и ран обязан завершиться успешно.
+    // Объявления не было — выдумывать выход нельзя: outputRefs пуст и план экспорта не
+    // открывался. Текст ответа при этом сохраняется всегда, отдельным артефактом.
     expect(result.outputRefs).toEqual([]);
+    const listing = (await (await fetch(`${harness.base}/v1/runs/${runId}/artifacts`, { headers: authHeader(alphaKey) })).json()) as {
+      artifacts: Array<{ name: string }>;
+    };
+    expect(listing.artifacts.map((artifact) => artifact.name)).toEqual(['answer.txt']);
     expect(harness.service.runner.getRun(runId)?.export).toBeNull();
   });
 
@@ -89,7 +100,9 @@ describe('объявленные выходы через API (#54)', () => {
       count: number;
       export: { status: string; planned: number; failed: number };
     };
-    expect(listing.count).toBe(0);
+    // Объявленный файл не записан движком: он объявлен как failed, а ответ агента
+    // сохранён рядом — ран не теряет то, что успел произвести.
+    expect(listing.count).toBe(1);
     expect(listing.export.planned).toBe(1);
     expect(listing.export.failed).toBe(1);
     expect(listing.export.status).toBe('failed');

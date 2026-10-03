@@ -35,6 +35,7 @@ describe('runner lifecycle', () => {
     expect(snap?.result).toEqual(result);
 
     const events = h.runner.events(receipt.runId);
+    // Харнесс без хранилища: ответ агента уходит в checkpoint, а не в артефакты.
     expect(events.map((event) => event.type)).toEqual([
       'claimed',
       'materialized',
@@ -43,8 +44,30 @@ describe('runner lifecycle', () => {
       'log',
       'exit',
       'finalizing',
+      // Выход определён: объявленных выходов нет, манифеста агента нет, ответ пришёл
+      // из stdout движка (issue #52, шаг 2).
+      'agent_exit_resolved',
+      // Намерение уборки записано до самой уборки (issue #52, шаг 4).
+      'checkpoint_written',
       'succeeded',
     ]);
+    const resolved = events.find((event) => event.type === 'agent_exit_resolved');
+    expect(resolved?.payload).toMatchObject({ manifest: 'absent', declared: 0, fromManifest: 0, answerSource: 'engine_stdout', planned: 0 });
+    const checkpoint = events.find((event) => event.type === 'checkpoint_written');
+    expect(checkpoint?.payload).toMatchObject({ phase: 'cleanup_pending', persistence: 'not_required', cleanup: 'pending' });
+    // Текст ответа обязан пережить sweep чистой среды: он в checkpoint, а не в workspace.
+    const durable = JSON.parse(readFileSync(join(h.rootDir, 'runs', receipt.runId, 'checkpoint.json'), 'utf8')) as {
+      answer: { present: boolean; source: string; chars: number; text: string };
+      persistence: string;
+      cleanup: { status: string };
+    };
+    expect(durable.answer.present).toBe(true);
+    expect(durable.answer.source).toBe('engine_stdout');
+    expect(durable.answer.text).toContain('fake-engine: done');
+    expect(durable.persistence).toBe('not_required');
+    // Финальный checkpoint несёт проверенный факт уборки: на хосте без границы
+    // чистой среды намерение закрыто как completed (issue #52, шаг 4).
+    expect(durable.cleanup.status).toBe('completed');
 
     const lines = readLogLines(h.rootDir, receipt.runId);
     expect(lines).toHaveLength(events.length);
