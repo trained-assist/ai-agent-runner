@@ -1,0 +1,1974 @@
+{
+  "schemaVersion": 1,
+  "probe": "P30 — Multi-worker/region contract (карточка #69, этап I10)",
+  "generatedAt": "2026-10-03T08:23:04.272Z",
+  "namespace": "p30-20261003",
+  "fleetRoot": "/opt/sb/ai-agent-runner-p30/.p30-fleet",
+  "sourceCommit": "0533f2c85a33f7ad5657e6f0a649f64d1042d1b6",
+  "releases": {
+    "candidate": "p30-20261003-r2",
+    "previous": "p30-20261003-r1"
+  },
+  "topology": "sandbox-a (sandbox-ru, p30-20261003-r2) на 127.0.0.1:8790 + sandbox-b (sandbox-eu, p30-20261003-r1) на 127.0.0.1:8791, общий реестр владения /opt/sb/ai-agent-runner-p30/.p30-fleet/p30-20261003/fleet/owners.json",
+  "fidelity": "настоящие процессы: API+Runner обоих воркеров, placement-политика, реестр владения, журнал переходов; эмуляция: два региона одной машины (VM2), движок fake (free-only), сетевой partition = молчание в реестре; настоящие RU/EU workers и прод не трогались",
+  "stepsRun": [
+    "sandbox_fresh",
+    "ports_free",
+    "workers_started",
+    "placement_matrix",
+    "placement_http",
+    "drain_before_failover",
+    "failover_no_double_execution",
+    "logs",
+    "no_secrets",
+    "open_decisions"
+  ],
+  "steps": [
+    {
+      "at": "2026-10-03T08:22:53.654Z",
+      "step": "probe_started",
+      "namespace": "p30-20261003",
+      "fleetRoot": "/opt/sb/ai-agent-runner-p30/.p30-fleet",
+      "sourceCommit": "0533f2c85a33f7ad5657e6f0a649f64d1042d1b6",
+      "candidateReleaseId": "p30-20261003-r2",
+      "previousReleaseId": "p30-20261003-r1",
+      "outDir": "/opt/sb/ai-agent-runner-p30/docs/evidence/p30-fleet-vm2",
+      "topology": "client → worker A (sandbox-ru) + worker B (sandbox-eu), общий реестр владения, placement policy на каждый воркер",
+      "fidelity": "настоящие процессы: API+Runner обоих воркеров, placement-политика, реестр владения; эмуляция: движок fake (free-only), два региона ОДНОЙ машины; настоящие RU/EU workers и прод не трогаются",
+      "keysConfigured": 4
+    },
+    {
+      "at": "2026-10-03T08:22:53.658Z",
+      "step": "sandbox_fresh",
+      "runsBefore": [
+        0,
+        0
+      ],
+      "regions": {
+        "a": "sandbox-ru",
+        "b": "sandbox-eu"
+      },
+      "policyId": "p30-sandbox-placement",
+      "dataResidencyDecided": false,
+      "replacedNamespaces": []
+    },
+    {
+      "at": "2026-10-03T08:22:54.046Z",
+      "step": "workers_started",
+      "a": {
+        "workerId": "sandbox-a",
+        "region": "sandbox-ru",
+        "releaseId": "p30-20261003-r2",
+        "port": 8790,
+        "placement": {
+          "policyId": "p30-sandbox-placement",
+          "authority": "sandbox_probe",
+          "decisionRef": "https://github.com/trained-assist/trained-agent-architecture/issues/69 (симуляция P30; это НЕ утверждённая владельцем политика регионов RU/EU)",
+          "engines": {
+            "claude": {
+              "allowedRegions": [
+                "sandbox-eu"
+              ],
+              "explicitProfileRef": null
+            },
+            "codex": {
+              "allowedRegions": [
+                "sandbox-eu"
+              ],
+              "explicitProfileRef": null
+            },
+            "fake": {
+              "allowedRegions": [
+                "sandbox-ru",
+                "sandbox-eu"
+              ],
+              "explicitProfileRef": "sandbox-free-profile (детерминированный движок приёмки, бесплатный)"
+            },
+            "opencode": {
+              "allowedRegions": [
+                "sandbox-ru",
+                "sandbox-eu"
+              ],
+              "explicitProfileRef": "sandbox-free-profile (opencode в песочнице: free-ladder без paid fallback)",
+              "providers": {
+                "free-ladder": {
+                  "allowedRegions": [
+                    "sandbox-ru",
+                    "sandbox-eu"
+                  ]
+                },
+                "zen": {
+                  "allowedRegions": [
+                    "sandbox-eu"
+                  ]
+                }
+              }
+            }
+          },
+          "credentialScopes": {
+            "llm:call": {
+              "regions": [
+                "sandbox-eu"
+              ]
+            },
+            "sandbox:fixture": {
+              "regions": [
+                "sandbox-ru",
+                "sandbox-eu"
+              ]
+            }
+          },
+          "dataResidency": {
+            "decided": false,
+            "decisionRef": null,
+            "regions": []
+          }
+        }
+      },
+      "b": {
+        "workerId": "sandbox-b",
+        "region": "sandbox-eu",
+        "releaseId": "p30-20261003-r1",
+        "port": 8791,
+        "placement": {
+          "policyId": "p30-sandbox-placement",
+          "authority": "sandbox_probe",
+          "decisionRef": "https://github.com/trained-assist/trained-agent-architecture/issues/69 (симуляция P30; это НЕ утверждённая владельцем политика регионов RU/EU)",
+          "engines": {
+            "claude": {
+              "allowedRegions": [
+                "sandbox-eu"
+              ],
+              "explicitProfileRef": null
+            },
+            "codex": {
+              "allowedRegions": [
+                "sandbox-eu"
+              ],
+              "explicitProfileRef": null
+            },
+            "fake": {
+              "allowedRegions": [
+                "sandbox-ru",
+                "sandbox-eu"
+              ],
+              "explicitProfileRef": "sandbox-free-profile (детерминированный движок приёмки, бесплатный)"
+            },
+            "opencode": {
+              "allowedRegions": [
+                "sandbox-ru",
+                "sandbox-eu"
+              ],
+              "explicitProfileRef": "sandbox-free-profile (opencode в песочнице: free-ladder без paid fallback)",
+              "providers": {
+                "free-ladder": {
+                  "allowedRegions": [
+                    "sandbox-ru",
+                    "sandbox-eu"
+                  ]
+                },
+                "zen": {
+                  "allowedRegions": [
+                    "sandbox-eu"
+                  ]
+                }
+              }
+            }
+          },
+          "credentialScopes": {
+            "llm:call": {
+              "regions": [
+                "sandbox-eu"
+              ]
+            },
+            "sandbox:fixture": {
+              "regions": [
+                "sandbox-ru",
+                "sandbox-eu"
+              ]
+            }
+          },
+          "dataResidency": {
+            "decided": false,
+            "decisionRef": null,
+            "regions": []
+          }
+        }
+      },
+      "capabilities": {
+        "placement": {
+          "policyId": "p30-sandbox-placement",
+          "authority": "sandbox_probe",
+          "workerRegion": "sandbox-ru",
+          "allowedEngines": [
+            "fake",
+            "opencode"
+          ],
+          "dataResidencyDecided": false,
+          "dataResidencyDecisionRef": null,
+          "checkedBefore": "paid_profile_and_cohort",
+          "runnerRechecksEngineRegion": true
+        }
+      }
+    },
+    {
+      "at": "2026-10-03T08:22:54.054Z",
+      "step": "placement_matrix",
+      "matrix": [
+        {
+          "engineName": "fake",
+          "expected": {
+            "ru": "place",
+            "eu": "place"
+          },
+          "actual": {
+            "ru": "place",
+            "eu": "place"
+          },
+          "matched": true
+        },
+        {
+          "engineName": "opencode",
+          "model": "free-ladder/grok",
+          "expected": {
+            "ru": "place",
+            "eu": "place"
+          },
+          "actual": {
+            "ru": "place",
+            "eu": "place"
+          },
+          "matched": true
+        },
+        {
+          "engineName": "opencode",
+          "model": "zen/grok",
+          "expected": {
+            "ru": "PROVIDER_REGION_FORBIDDEN",
+            "eu": "place"
+          },
+          "actual": {
+            "ru": "PROVIDER_REGION_FORBIDDEN",
+            "eu": "place"
+          },
+          "matched": true
+        },
+        {
+          "engineName": "claude",
+          "expected": {
+            "ru": "REGION_ENGINE_FORBIDDEN",
+            "eu": "REGION_EXPLICIT_PROFILE_REQUIRED"
+          },
+          "actual": {
+            "ru": "REGION_ENGINE_FORBIDDEN",
+            "eu": "REGION_EXPLICIT_PROFILE_REQUIRED"
+          },
+          "matched": true
+        },
+        {
+          "engineName": "codex",
+          "expected": {
+            "ru": "REGION_ENGINE_FORBIDDEN",
+            "eu": "REGION_EXPLICIT_PROFILE_REQUIRED"
+          },
+          "actual": {
+            "ru": "REGION_ENGINE_FORBIDDEN",
+            "eu": "REGION_EXPLICIT_PROFILE_REQUIRED"
+          },
+          "matched": true
+        },
+        {
+          "engineName": "gemini",
+          "expected": {
+            "ru": "REGION_ENGINE_UNDECLARED",
+            "eu": "REGION_ENGINE_UNDECLARED"
+          },
+          "actual": {
+            "ru": "REGION_ENGINE_UNDECLARED",
+            "eu": "REGION_ENGINE_UNDECLARED"
+          },
+          "matched": true
+        },
+        {
+          "engineName": "fake",
+          "credentialBindings": [
+            {
+              "ref": "sb-llm",
+              "scope": "llm:call"
+            }
+          ],
+          "expected": {
+            "ru": "CREDENTIAL_REGION_FORBIDDEN",
+            "eu": "place"
+          },
+          "actual": {
+            "ru": "CREDENTIAL_REGION_FORBIDDEN",
+            "eu": "place"
+          },
+          "matched": true
+        },
+        {
+          "engineName": "fake",
+          "credentialBindings": [
+            {
+              "ref": "sb-x",
+              "scope": "unknown:scope"
+            }
+          ],
+          "expected": {
+            "ru": "CREDENTIAL_SCOPE_UNDECLARED",
+            "eu": "CREDENTIAL_SCOPE_UNDECLARED"
+          },
+          "actual": {
+            "ru": "CREDENTIAL_SCOPE_UNDECLARED",
+            "eu": "CREDENTIAL_SCOPE_UNDECLARED"
+          },
+          "matched": true
+        },
+        {
+          "engineName": "fake",
+          "regionConstraints": {
+            "dataResidency": "sandbox-ru"
+          },
+          "expected": {
+            "ru": "DATA_RESIDENCY_UNDECIDED",
+            "eu": "DATA_RESIDENCY_UNDECIDED"
+          },
+          "actual": {
+            "ru": "DATA_RESIDENCY_UNDECIDED",
+            "eu": "DATA_RESIDENCY_UNDECIDED"
+          },
+          "matched": true
+        }
+      ],
+      "screen": {
+        "eligible": [],
+        "rejected": [
+          {
+            "workerId": "sandbox-a",
+            "region": "sandbox-ru",
+            "code": "REGION_ENGINE_FORBIDDEN",
+            "reason": "engine \"claude\" is not allowed in region sandbox-ru (allowed: sandbox-eu)"
+          },
+          {
+            "workerId": "sandbox-b",
+            "region": "sandbox-eu",
+            "code": "WORKER_DRAINING",
+            "reason": "worker sandbox-b is draining: it does not accept new tasks, accepted ones stay with it"
+          }
+        ]
+      },
+      "allowedEngines": {
+        "ru": [
+          "fake",
+          "opencode"
+        ],
+        "eu": [
+          "fake",
+          "opencode"
+        ]
+      }
+    },
+    {
+      "at": "2026-10-03T08:22:54.800Z",
+      "step": "placement_http",
+      "refusals": {
+        "claudeRu": {
+          "code": "REGION_ENGINE_FORBIDDEN",
+          "message": "engine \"claude\" is not allowed in region sandbox-ru (allowed: sandbox-eu)",
+          "details": {
+            "engine": "claude",
+            "region": "sandbox-ru",
+            "allowedRegions": [
+              "sandbox-eu"
+            ],
+            "policyId": "p30-sandbox-placement",
+            "workerId": "sandbox-a"
+          }
+        },
+        "claudeEu": {
+          "code": "REGION_EXPLICIT_PROFILE_REQUIRED",
+          "message": "engine \"claude\" runs in region sandbox-eu only under an explicitly approved profile; placement policy p30-sandbox-placement records no such profile",
+          "details": {
+            "engine": "claude",
+            "region": "sandbox-eu",
+            "allowedRegions": [
+              "sandbox-eu"
+            ],
+            "policyId": "p30-sandbox-placement",
+            "explicitProfileRef": null,
+            "requiredBy": "ARCHITECTURE §8, приёмка P30: Claude/Codex вне RU только с явным профилем",
+            "workerId": "sandbox-b"
+          }
+        },
+        "codexRu": {
+          "code": "REGION_ENGINE_FORBIDDEN",
+          "message": "engine \"codex\" is not allowed in region sandbox-ru (allowed: sandbox-eu)",
+          "details": {
+            "engine": "codex",
+            "region": "sandbox-ru",
+            "allowedRegions": [
+              "sandbox-eu"
+            ],
+            "policyId": "p30-sandbox-placement",
+            "workerId": "sandbox-a"
+          }
+        },
+        "zenRu": {
+          "code": "PROVIDER_REGION_FORBIDDEN",
+          "message": "provider \"zen\" is not available in region sandbox-ru (allowed: sandbox-eu)",
+          "details": {
+            "engine": "opencode",
+            "provider": "zen",
+            "region": "sandbox-ru",
+            "allowedRegions": [
+              "sandbox-eu"
+            ],
+            "policyId": "p30-sandbox-placement",
+            "workerId": "sandbox-a"
+          }
+        },
+        "zenEu": {
+          "code": "PAID_PROFILE_DISABLED",
+          "message": "engine \"opencode\" is not declared as free by release p30-20261003-r1; paid profiles are off unless the owner decision is recorded",
+          "details": {
+            "engine": "opencode",
+            "freeEngines": [
+              "fake"
+            ],
+            "paidEngines": [
+              "opencode",
+              "claude",
+              "codex"
+            ],
+            "paidProfilesAllowed": false
+          }
+        },
+        "credRu": {
+          "code": "CREDENTIAL_REGION_FORBIDDEN",
+          "message": "credential scope \"llm:call\" is not provisioned in region sandbox-ru (provisioned: sandbox-eu)",
+          "details": {
+            "bindingRef": "sb-llm",
+            "scope": "llm:call",
+            "region": "sandbox-ru",
+            "provisionedRegions": [
+              "sandbox-eu"
+            ],
+            "policyId": "p30-sandbox-placement",
+            "workerId": "sandbox-a"
+          }
+        },
+        "residency": {
+          "code": "DATA_RESIDENCY_UNDECIDED",
+          "message": "run requires data residency in sandbox-ru, but storage residency is not an approved decision (policy p30-sandbox-placement); placement refuses instead of choosing a storage region",
+          "details": {
+            "requiredRegion": "sandbox-ru",
+            "region": "sandbox-eu",
+            "policyId": "p30-sandbox-placement",
+            "decisionRef": null,
+            "decidedBy": null,
+            "ownerDecisionRequired": true,
+            "workerId": "sandbox-b"
+          }
+        }
+      },
+      "runsBefore": [
+        0,
+        0
+      ],
+      "runsAfterRefusals": [
+        0,
+        0
+      ],
+      "journalPlacementRefusals": [
+        {
+          "seq": 3,
+          "reason": "engine \"claude\" is not allowed in region sandbox-ru (allowed: sandbox-eu)",
+          "code": "REGION_ENGINE_FORBIDDEN"
+        },
+        {
+          "seq": 4,
+          "reason": "engine \"codex\" is not allowed in region sandbox-ru (allowed: sandbox-eu)",
+          "code": "REGION_ENGINE_FORBIDDEN"
+        },
+        {
+          "seq": 5,
+          "reason": "provider \"zen\" is not available in region sandbox-ru (allowed: sandbox-eu)",
+          "code": "PROVIDER_REGION_FORBIDDEN"
+        },
+        {
+          "seq": 6,
+          "reason": "credential scope \"llm:call\" is not provisioned in region sandbox-ru (provisioned: sandbox-eu)",
+          "code": "CREDENTIAL_REGION_FORBIDDEN"
+        }
+      ],
+      "accepted": {
+        "runId": "run_c23f038c-2796-4e95-a92d-6afd5be33c0b",
+        "placement": {
+          "workerId": "sandbox-b",
+          "region": "sandbox-eu",
+          "provider": null,
+          "policyId": "p30-sandbox-placement",
+          "reasons": [
+            "region sandbox-eu is allowed for engine \"fake\"",
+            "explicit profile sandbox-free-profile (детерминированный движок приёмки, бесплатный)",
+            "credential scope sandbox:fixture is provisioned in region sandbox-eu"
+          ]
+        }
+      },
+      "explicitProfileDrill": {
+        "claudeEuAfter": {
+          "status": 403,
+          "code": "PAID_PROFILE_DISABLED"
+        },
+        "restoredPolicyId": "p30-sandbox-placement"
+      }
+    },
+    {
+      "at": "2026-10-03T08:22:55.076Z",
+      "step": "drain_before_failover",
+      "inFlight": {
+        "runId": "run_1610e0f7-9c00-43f9-92ce-37f05a65df6f",
+        "stateAfterDrain": "running"
+      },
+      "refusedNew": {
+        "status": 503,
+        "code": "WORKER_DRAINING"
+      },
+      "euAccepted": 202
+    },
+    {
+      "at": "2026-10-03T08:23:04.266Z",
+      "step": "failover_no_double_execution",
+      "sharedTask": "task-failover",
+      "attempts": [
+        {
+          "workerId": "sandbox-a",
+          "runId": "run_1610e0f7-9c00-43f9-92ce-37f05a65df6f",
+          "outcome": "failed"
+        },
+        {
+          "workerId": "sandbox-b",
+          "runId": "run_dec9eb1d-47fa-4cac-88d3-1d646ebff938",
+          "outcome": "succeeded"
+        }
+      ],
+      "crashedRun": {
+        "runId": "run_1610e0f7-9c00-43f9-92ce-37f05a65df6f",
+        "outcome": "failed",
+        "failure": {
+          "code": "WORKER_CRASH",
+          "failureClass": "runtime",
+          "safeSummary": "worker restarted while the run was active; execution outcome recorded as lost without a hidden rerun",
+          "retryable": true
+        },
+        "eventTypes": [
+          "claimed",
+          "materialized",
+          "started",
+          "log",
+          "exit",
+          "finalizing",
+          "failed"
+        ]
+      },
+      "doubleDispatch": {
+        "status": 409,
+        "code": "TASK_OWNED_BY_OTHER_WORKER",
+        "details": {
+          "ownerWorkerId": "sandbox-a",
+          "ownerGeneration": 1
+        }
+      },
+      "takeoverWithoutSignal": {
+        "outcome": "partition_is_not_failover",
+        "ownerWorkerId": "sandbox-a",
+        "generation": 1
+      },
+      "priorOwnerWritesExcluded": {
+        "ownerWorkerId": "sandbox-a",
+        "runId": "run_1610e0f7-9c00-43f9-92ce-37f05a65df6f",
+        "runOutcome": "failed",
+        "processAlive": true,
+        "euSeesRun": 404
+      },
+      "takeover": {
+        "workerId": "sandbox-b",
+        "runId": "run_dec9eb1d-47fa-4cac-88d3-1d646ebff938",
+        "ownerGeneration": 2,
+        "previousOwnerWorkerId": "sandbox-a"
+      },
+      "lateAttempt": {
+        "status": 409,
+        "code": "TASK_OWNED_BY_OTHER_WORKER"
+      },
+      "registry": {
+        "principalId": "fleet-client",
+        "userTaskId": "task-failover",
+        "ownerWorkerId": "sandbox-b",
+        "ownerGeneration": 2,
+        "runId": "run_dec9eb1d-47fa-4cac-88d3-1d646ebff938",
+        "state": "owned",
+        "previousOwnerWorkerId": "sandbox-a",
+        "updatedAt": "2026-10-03T08:23:04.010Z"
+      },
+      "newOwnerEvents": {
+        "count": 8,
+        "claimed": 1,
+        "sequences": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8
+        ]
+      },
+      "fencedJournal": [
+        {
+          "seq": 13,
+          "reason": "previous owner sandbox-a is fenced at generation 1",
+          "ownerGeneration": 1
+        }
+      ],
+      "limits": [
+        "volume/файловая доступность между воркерами не доказана: корни dataDir у воркеров раздельны по построению; сохранность volume и чтение workspace новым владельцем проверяются отдельно на настоящих RU/EU воркерах и в отдельной карточке",
+        "два региона — это две логические зоны одной машины (VM2); сетевой partition эмулируется отсутствием сигнала в реестре (partition_is_not_failover)"
+      ]
+    },
+    {
+      "at": "2026-10-03T08:23:04.271Z",
+      "step": "logs",
+      "journalKinds": [
+        "release_pinned",
+        "cohort_configured",
+        "placement_refused",
+        "drain",
+        "admission_refused",
+        "failover",
+        "fenced"
+      ],
+      "journalSeqA": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13
+      ],
+      "journalA": [
+        {
+          "seq": 1,
+          "kind": "release_pinned",
+          "reason": "service start with a pinned release manifest",
+          "releaseId": "p30-20261003-r2",
+          "workerId": "sandbox-a",
+          "region": "sandbox-ru"
+        },
+        {
+          "seq": 2,
+          "kind": "cohort_configured",
+          "reason": "cohort p29 is allowlist",
+          "releaseId": "p30-20261003-r2",
+          "workerId": "sandbox-a",
+          "region": "sandbox-ru"
+        },
+        {
+          "seq": 3,
+          "kind": "placement_refused",
+          "reason": "engine \"claude\" is not allowed in region sandbox-ru (allowed: sandbox-eu)",
+          "releaseId": "p30-20261003-r2",
+          "workerId": "sandbox-a",
+          "region": "sandbox-ru"
+        },
+        {
+          "seq": 4,
+          "kind": "placement_refused",
+          "reason": "engine \"codex\" is not allowed in region sandbox-ru (allowed: sandbox-eu)",
+          "releaseId": "p30-20261003-r2",
+          "workerId": "sandbox-a",
+          "region": "sandbox-ru"
+        },
+        {
+          "seq": 5,
+          "kind": "placement_refused",
+          "reason": "provider \"zen\" is not available in region sandbox-ru (allowed: sandbox-eu)",
+          "releaseId": "p30-20261003-r2",
+          "workerId": "sandbox-a",
+          "region": "sandbox-ru"
+        },
+        {
+          "seq": 6,
+          "kind": "placement_refused",
+          "reason": "credential scope \"llm:call\" is not provisioned in region sandbox-ru (provisioned: sandbox-eu)",
+          "releaseId": "p30-20261003-r2",
+          "workerId": "sandbox-a",
+          "region": "sandbox-ru"
+        },
+        {
+          "seq": 7,
+          "kind": "drain",
+          "reason": "p30 probe: RU worker is draining before the regional switch",
+          "releaseId": "p30-20261003-r2",
+          "workerId": "sandbox-a",
+          "region": "sandbox-ru",
+          "ownerGeneration": 0
+        },
+        {
+          "seq": 8,
+          "kind": "drain",
+          "reason": "worker is draining: it does not accept new tasks",
+          "releaseId": "p30-20261003-r2",
+          "workerId": "sandbox-a",
+          "region": "sandbox-ru",
+          "ownerGeneration": 0
+        },
+        {
+          "seq": 9,
+          "kind": "admission_refused",
+          "reason": "worker sandbox-a is draining and does not accept new tasks",
+          "releaseId": "p30-20261003-r2",
+          "workerId": "sandbox-a",
+          "region": "sandbox-ru"
+        },
+        {
+          "seq": 10,
+          "kind": "release_pinned",
+          "reason": "service start with a pinned release manifest",
+          "releaseId": "p30-20261003-r2",
+          "workerId": "sandbox-a",
+          "region": "sandbox-ru"
+        },
+        {
+          "seq": 11,
+          "kind": "cohort_configured",
+          "reason": "cohort p29 is allowlist",
+          "releaseId": "p30-20261003-r2",
+          "workerId": "sandbox-a",
+          "region": "sandbox-ru"
+        },
+        {
+          "seq": 12,
+          "kind": "drain",
+          "reason": "undrain: p30 probe: worker restored after the drill, fencing must still refuse it",
+          "releaseId": "p30-20261003-r2",
+          "workerId": "sandbox-a",
+          "region": "sandbox-ru",
+          "ownerGeneration": 0
+        },
+        {
+          "seq": 13,
+          "kind": "admission_refused",
+          "reason": "task task-failover is owned by worker sandbox-b at generation 2; starting a second copy would double-dispatch it",
+          "releaseId": "p30-20261003-r2",
+          "workerId": "sandbox-a",
+          "region": "sandbox-ru"
+        }
+      ],
+      "serviceLogSample": [
+        {
+          "ts": "2026-10-03T08:22:53.953Z",
+          "event": "recovered",
+          "releaseId": "p30-20261003-r2",
+          "workerId": "sandbox-a",
+          "region": "sandbox-ru"
+        },
+        {
+          "ts": "2026-10-03T08:22:53.961Z",
+          "event": "api_listening",
+          "releaseId": "p30-20261003-r2",
+          "workerId": "sandbox-a",
+          "region": "sandbox-ru"
+        },
+        {
+          "ts": "2026-10-03T08:22:54.079Z",
+          "event": "placement_refused",
+          "releaseId": "p30-20261003-r2",
+          "workerId": "sandbox-a",
+          "region": "sandbox-ru",
+          "code": "REGION_ENGINE_FORBIDDEN",
+          "reason": "engine \"claude\" is not allowed in region sandbox-ru (allowed: sandbox-eu)",
+          "engine": "claude"
+        },
+        {
+          "ts": "2026-10-03T08:22:54.106Z",
+          "event": "placement_refused",
+          "releaseId": "p30-20261003-r2",
+          "workerId": "sandbox-a",
+          "region": "sandbox-ru",
+          "code": "REGION_ENGINE_FORBIDDEN",
+          "reason": "engine \"codex\" is not allowed in region sandbox-ru (allowed: sandbox-eu)",
+          "engine": "codex"
+        },
+        {
+          "ts": "2026-10-03T08:22:54.113Z",
+          "event": "placement_refused",
+          "releaseId": "p30-20261003-r2",
+          "workerId": "sandbox-a",
+          "region": "sandbox-ru",
+          "code": "PROVIDER_REGION_FORBIDDEN",
+          "reason": "provider \"zen\" is not available in region sandbox-ru (allowed: sandbox-eu)",
+          "engine": "opencode"
+        },
+        {
+          "ts": "2026-10-03T08:22:54.124Z",
+          "event": "placement_refused",
+          "releaseId": "p30-20261003-r2",
+          "workerId": "sandbox-a",
+          "region": "sandbox-ru",
+          "code": "CREDENTIAL_REGION_FORBIDDEN",
+          "reason": "credential scope \"llm:call\" is not provisioned in region sandbox-ru (provisioned: sandbox-eu)"
+        },
+        {
+          "ts": "2026-10-03T08:22:54.805Z",
+          "event": "placement_admitted",
+          "releaseId": "p30-20261003-r2",
+          "workerId": "sandbox-a",
+          "region": "sandbox-ru",
+          "engine": "fake"
+        },
+        {
+          "ts": "2026-10-03T08:22:54.808Z",
+          "event": "ownership_claimed",
+          "releaseId": "p30-20261003-r2",
+          "workerId": "sandbox-a",
+          "region": "sandbox-ru",
+          "runId": "run_1610e0f7-9c00-43f9-92ce-37f05a65df6f",
+          "userTaskId": "task-failover",
+          "ownerGeneration": 1
+        },
+        {
+          "ts": "2026-10-03T08:22:54.813Z",
+          "event": "submit",
+          "releaseId": "p30-20261003-r2",
+          "workerId": "sandbox-a",
+          "region": "sandbox-ru",
+          "runId": "run_1610e0f7-9c00-43f9-92ce-37f05a65df6f",
+          "userTaskId": "task-failover",
+          "ownerGeneration": 1,
+          "engine": "fake"
+        },
+        {
+          "ts": "2026-10-03T08:22:54.866Z",
+          "event": "placement_admitted",
+          "releaseId": "p30-20261003-r2",
+          "workerId": "sandbox-a",
+          "region": "sandbox-ru",
+          "engine": "fake"
+        },
+        {
+          "ts": "2026-10-03T08:22:54.866Z",
+          "event": "ownership_drained",
+          "releaseId": "p30-20261003-r2",
+          "workerId": "sandbox-a",
+          "region": "sandbox-ru",
+          "userTaskId": "task-new-after-drain",
+          "ownerGeneration": 0,
+          "reason": "worker is draining: it does not accept new tasks"
+        },
+        {
+          "ts": "2026-10-03T08:23:03.925Z",
+          "event": "recovered",
+          "releaseId": "p30-20261003-r2",
+          "workerId": "sandbox-a",
+          "region": "sandbox-ru"
+        },
+        {
+          "ts": "2026-10-03T08:23:03.932Z",
+          "event": "api_listening",
+          "releaseId": "p30-20261003-r2",
+          "workerId": "sandbox-a",
+          "region": "sandbox-ru"
+        },
+        {
+          "ts": "2026-10-03T08:23:04.257Z",
+          "event": "placement_admitted",
+          "releaseId": "p30-20261003-r2",
+          "workerId": "sandbox-a",
+          "region": "sandbox-ru",
+          "engine": "fake"
+        },
+        {
+          "ts": "2026-10-03T08:22:53.968Z",
+          "event": "recovered",
+          "releaseId": "p30-20261003-r1",
+          "workerId": "sandbox-b",
+          "region": "sandbox-eu"
+        },
+        {
+          "ts": "2026-10-03T08:22:53.980Z",
+          "event": "api_listening",
+          "releaseId": "p30-20261003-r1",
+          "workerId": "sandbox-b",
+          "region": "sandbox-eu"
+        },
+        {
+          "ts": "2026-10-03T08:22:54.094Z",
+          "event": "placement_refused",
+          "releaseId": "p30-20261003-r1",
+          "workerId": "sandbox-b",
+          "region": "sandbox-eu",
+          "code": "REGION_EXPLICIT_PROFILE_REQUIRED",
+          "reason": "engine \"claude\" runs in region sandbox-eu only under an explicitly approved profile; placement policy p30-sandbox-placement records no such profile",
+          "engine": "claude"
+        },
+        {
+          "ts": "2026-10-03T08:22:54.130Z",
+          "event": "placement_refused",
+          "releaseId": "p30-20261003-r1",
+          "workerId": "sandbox-b",
+          "region": "sandbox-eu",
+          "code": "DATA_RESIDENCY_UNDECIDED",
+          "reason": "run requires data residency in sandbox-ru, but storage residency is not an approved decision (policy p30-sandbox-placement); placement refuses instead of choosing a storage region"
+        },
+        {
+          "ts": "2026-10-03T08:22:54.146Z",
+          "event": "placement_admitted",
+          "releaseId": "p30-20261003-r1",
+          "workerId": "sandbox-b",
+          "region": "sandbox-eu",
+          "engine": "fake"
+        },
+        {
+          "ts": "2026-10-03T08:22:54.149Z",
+          "event": "ownership_claimed",
+          "releaseId": "p30-20261003-r1",
+          "workerId": "sandbox-b",
+          "region": "sandbox-eu",
+          "runId": "run_c23f038c-2796-4e95-a92d-6afd5be33c0b",
+          "userTaskId": "task-placement-ok",
+          "ownerGeneration": 1
+        },
+        {
+          "ts": "2026-10-03T08:22:54.153Z",
+          "event": "submit",
+          "releaseId": "p30-20261003-r1",
+          "workerId": "sandbox-b",
+          "region": "sandbox-eu",
+          "runId": "run_c23f038c-2796-4e95-a92d-6afd5be33c0b",
+          "userTaskId": "task-placement-ok",
+          "ownerGeneration": 1,
+          "engine": "fake"
+        },
+        {
+          "ts": "2026-10-03T08:22:54.502Z",
+          "event": "recovered",
+          "releaseId": "p30-20261003-r1",
+          "workerId": "sandbox-b",
+          "region": "sandbox-eu"
+        },
+        {
+          "ts": "2026-10-03T08:22:54.510Z",
+          "event": "api_listening",
+          "releaseId": "p30-20261003-r1",
+          "workerId": "sandbox-b",
+          "region": "sandbox-eu"
+        },
+        {
+          "ts": "2026-10-03T08:22:54.770Z",
+          "event": "recovered",
+          "releaseId": "p30-20261003-r1",
+          "workerId": "sandbox-b",
+          "region": "sandbox-eu"
+        },
+        {
+          "ts": "2026-10-03T08:22:54.779Z",
+          "event": "api_listening",
+          "releaseId": "p30-20261003-r1",
+          "workerId": "sandbox-b",
+          "region": "sandbox-eu"
+        },
+        {
+          "ts": "2026-10-03T08:22:54.897Z",
+          "event": "placement_admitted",
+          "releaseId": "p30-20261003-r1",
+          "workerId": "sandbox-b",
+          "region": "sandbox-eu",
+          "engine": "fake"
+        },
+        {
+          "ts": "2026-10-03T08:22:54.900Z",
+          "event": "ownership_claimed",
+          "releaseId": "p30-20261003-r1",
+          "workerId": "sandbox-b",
+          "region": "sandbox-eu",
+          "runId": "run_c6ad8178-55aa-4589-baa9-d47c331a7223",
+          "userTaskId": "task-new-after-drain",
+          "ownerGeneration": 1
+        },
+        {
+          "ts": "2026-10-03T08:22:54.906Z",
+          "event": "submit",
+          "releaseId": "p30-20261003-r1",
+          "workerId": "sandbox-b",
+          "region": "sandbox-eu",
+          "runId": "run_c6ad8178-55aa-4589-baa9-d47c331a7223",
+          "userTaskId": "task-new-after-drain",
+          "ownerGeneration": 1,
+          "engine": "fake"
+        },
+        {
+          "ts": "2026-10-03T08:22:55.080Z",
+          "event": "placement_admitted",
+          "releaseId": "p30-20261003-r1",
+          "workerId": "sandbox-b",
+          "region": "sandbox-eu",
+          "engine": "fake"
+        },
+        {
+          "ts": "2026-10-03T08:23:04.009Z",
+          "event": "placement_admitted",
+          "releaseId": "p30-20261003-r1",
+          "workerId": "sandbox-b",
+          "region": "sandbox-eu",
+          "engine": "fake"
+        },
+        {
+          "ts": "2026-10-03T08:23:04.010Z",
+          "event": "ownership_claimed",
+          "releaseId": "p30-20261003-r1",
+          "workerId": "sandbox-b",
+          "region": "sandbox-eu",
+          "runId": "run_dec9eb1d-47fa-4cac-88d3-1d646ebff938",
+          "userTaskId": "task-failover",
+          "ownerGeneration": 2
+        },
+        {
+          "ts": "2026-10-03T08:23:04.015Z",
+          "event": "submit",
+          "releaseId": "p30-20261003-r1",
+          "workerId": "sandbox-b",
+          "region": "sandbox-eu",
+          "runId": "run_dec9eb1d-47fa-4cac-88d3-1d646ebff938",
+          "userTaskId": "task-failover",
+          "ownerGeneration": 2,
+          "engine": "fake"
+        }
+      ],
+      "logLineCounts": {
+        "a": 34,
+        "b": 67
+      }
+    },
+    {
+      "at": "2026-10-03T08:23:04.272Z",
+      "step": "no_secrets",
+      "secretsChecked": 4,
+      "shareSecretsChecked": 2
+    },
+    {
+      "at": "2026-10-03T08:23:04.272Z",
+      "step": "open_decisions",
+      "dataResidency": {
+        "status": "не решено",
+        "note": "placement отказывает с DATA_RESIDENCY_UNDECIDED и не выбирает регион хранения; утверждение политики резидентности — отдельное решение владельца с policyId/decisionRef",
+        "policy": {
+          "decided": false,
+          "decisionRef": null,
+          "regions": []
+        }
+      },
+      "existingWorkers": {
+        "status": "не тронуты",
+        "note": "существующие RU/EU workers (прод) не изменялись: их часть карточки P30 — после readiness, с shell-доступом к RU VM (AC-31)"
+      },
+      "shellAccessRuVm": {
+        "status": "нет",
+        "ac": "AC-31",
+        "note": "без shell-доступа к RU VM региональная приёмка на реальной машине недоказуема — блокер на стороне владельца"
+      },
+      "blockers": []
+    }
+  ],
+  "checks": [
+    {
+      "name": "namespace создан заново: ни одного рана до прогона",
+      "ok": true,
+      "detail": "runs до прогона: 0/0"
+    },
+    {
+      "name": "политика размещения одинаково настроена на обоих воркерах",
+      "ok": true,
+      "detail": "policyId p30-sandbox-placement, authority sandbox_probe, dataResidency.decided false"
+    },
+    {
+      "name": "регионы воркеров различны (симуляция двух зон на одной машине)",
+      "ok": true,
+      "detail": "sandbox-ru / sandbox-eu"
+    },
+    {
+      "name": "в provisioning-манифесте нет значений секретов",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "порт 8790 свободен до старта sandbox-a",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "порт 8791 свободен до старта sandbox-b",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "релиз A закреплён",
+      "ok": true,
+      "detail": "p30-20261003-r2@0533f2c8"
+    },
+    {
+      "name": "релиз B закреплён на предыдущем",
+      "ok": true,
+      "detail": "p30-20261003-r1"
+    },
+    {
+      "name": "воркеры в разных регионах и с разными workerId/портами",
+      "ok": true,
+      "detail": "sandbox-a:sandbox-ru:8790 / sandbox-b:sandbox-eu:8791"
+    },
+    {
+      "name": "платные профили выключены у обоих воркеров",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "политика placement опубликована в /v1/release",
+      "ok": true,
+      "detail": "p30-sandbox-placement / p30-sandbox-placement"
+    },
+    {
+      "name": "резидентность данных заявлена как нерешённая",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "capabilities объявляет placement и повторную проверку Runner-ом",
+      "ok": true,
+      "detail": "[\"fake\",\"opencode\"]"
+    },
+    {
+      "name": "матрица размещения совпала с контрактом (все 9 сценариев)",
+      "ok": true,
+      "detail": "все совпали"
+    },
+    {
+      "name": "OpenCode вне RU: провайдер разрешён в обеих зонах, но zen только в EU",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "Claude/Codex не в RU, в EU — только с явным профилем (его нет)",
+      "ok": true,
+      "detail": "claude REGION_ENGINE_FORBIDDEN/REGION_EXPLICIT_PROFILE_REQUIRED, codex REGION_ENGINE_FORBIDDEN/REGION_EXPLICIT_PROFILE_REQUIRED"
+    },
+    {
+      "name": "screenWorkers оставляет только подходящего и называет причину отказа",
+      "ok": true,
+      "detail": "sandbox-a:REGION_ENGINE_FORBIDDEN, sandbox-b:WORKER_DRAINING"
+    },
+    {
+      "name": "Claude в RU отклонён политикой региона",
+      "ok": true,
+      "detail": "HTTP 403 REGION_ENGINE_FORBIDDEN"
+    },
+    {
+      "name": "Claude в EU требует явный профиль",
+      "ok": true,
+      "detail": "HTTP 403 REGION_EXPLICIT_PROFILE_REQUIRED"
+    },
+    {
+      "name": "Codex в RU отклонён политикой региона",
+      "ok": true,
+      "detail": "HTTP 403 REGION_ENGINE_FORBIDDEN"
+    },
+    {
+      "name": "OpenCode/zen в RU отклонён провайдером",
+      "ok": true,
+      "detail": "HTTP 403 PROVIDER_REGION_FORBIDDEN"
+    },
+    {
+      "name": "OpenCode/zen в EU: регион пройден, отказ уже по платному флагу",
+      "ok": true,
+      "detail": "HTTP 403 PAID_PROFILE_DISABLED"
+    },
+    {
+      "name": "credential scope вне региона воркера отклонён",
+      "ok": true,
+      "detail": "HTTP 403 CREDENTIAL_REGION_FORBIDDEN"
+    },
+    {
+      "name": "требование резидентности без решения владельца — отказ, а не молчаливый выбор",
+      "ok": true,
+      "detail": "HTTP 409 DATA_RESIDENCY_UNDECIDED"
+    },
+    {
+      "name": "после отказов размещения ни одного рана создано не было",
+      "ok": true,
+      "detail": "runs: 0/0 → 0/0"
+    },
+    {
+      "name": "отказы размещения записаны в durable-журнал с причиной",
+      "ok": true,
+      "detail": "4 записей"
+    },
+    {
+      "name": "разрешённый в EU ран принят",
+      "ok": true,
+      "detail": "HTTP 202"
+    },
+    {
+      "name": "placement_admitted записан с регионом и причинами",
+      "ok": true,
+      "detail": "1 записей"
+    },
+    {
+      "name": "явный профиль в политике открывает регион EU (далее отказывает paid-флаг)",
+      "ok": true,
+      "detail": "HTTP 403 PAID_PROFILE_DISABLED"
+    },
+    {
+      "name": "политика возвращена к исходной (drill не оставил следов)",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "задача принята RU-воркером до drain",
+      "ok": true,
+      "detail": "HTTP 202"
+    },
+    {
+      "name": "drain отмечен в реестре",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "drain записан в журнал воркера с причиной",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "новая задача в drain не принимается (503 WORKER_DRAINING)",
+      "ok": true,
+      "detail": "HTTP 503 WORKER_DRAINING"
+    },
+    {
+      "name": "принятая до drain задача продолжает исполняться у прежнего владельца",
+      "ok": true,
+      "detail": "state running"
+    },
+    {
+      "name": "второй воркер принимает новые задачи во время drain первого",
+      "ok": true,
+      "detail": "HTTP 202"
+    },
+    {
+      "name": "второй воркер не берёт задачу первого (409, владелец назван)",
+      "ok": true,
+      "detail": "sandbox-a"
+    },
+    {
+      "name": "у второго воркера нет рана по чужой задаче",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "молчание сети не считается failover",
+      "ok": true,
+      "detail": "partition_is_not_failover"
+    },
+    {
+      "name": "процесс RU-воркера убит (SIGKILL, без финализации)",
+      "ok": true,
+      "detail": "signal SIGKILL"
+    },
+    {
+      "name": "после рестарта ран записан потерянным, без скрытого rerun",
+      "ok": true,
+      "detail": "failed / WORKER_CRASH"
+    },
+    {
+      "name": "движок после падения не запускался повторно",
+      "ok": true,
+      "detail": "started 1"
+    },
+    {
+      "name": "recovery-строка в логе RU-воркера содержит потерю рана",
+      "ok": true,
+      "detail": "lost=1, orphaned=0, scanned=1"
+    },
+    {
+      "name": "прежний владелец ещё в реестре, его попытка не активна (drain не отдаёт принятое)",
+      "ok": true,
+      "detail": "{\"principalId\":\"fleet-client\",\"userTaskId\":\"task-failover\",\"ownerWorkerId\":\"sandbox-a\",\"ownerGeneration\":1,\"runId\":\"run_1610e0f7-9c00-43f9-92ce-37f05a65df6f\",\"state\":\"draining\",\"previousOwnerWorkerId\":null,\"updatedAt\":\"2026-10-03T08:22:54.858Z\"}"
+    },
+    {
+      "name": "новый воркер не видит записей прежнего владельца (404)",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "процесс прежнего владельца жив и не пишет по задаче",
+      "ok": true,
+      "detail": "pid alive=true"
+    },
+    {
+      "name": "перехват по явному сигналу разрешён",
+      "ok": true,
+      "detail": "granted gen 2"
+    },
+    {
+      "name": "fencing записан в durable-журнал с причиной и поколением",
+      "ok": true,
+      "detail": "1 записей"
+    },
+    {
+      "name": "новый владелец принял задачу (202)",
+      "ok": true,
+      "detail": "HTTP 202"
+    },
+    {
+      "name": "результат получен у нового владельца",
+      "ok": true,
+      "detail": "succeeded"
+    },
+    {
+      "name": "поздняя попытка прежнего владельца отклонена (fenced, 409)",
+      "ok": true,
+      "detail": "HTTP 409 TASK_OWNED_BY_OTHER_WORKER"
+    },
+    {
+      "name": "у прежнего владельца ровно один ран — тот, что был до сбоя (нет второго исполнения)",
+      "ok": true,
+      "detail": "1 ранов: run_1610e0f7-9c00-43f9-92ce-37f05a65df6f"
+    },
+    {
+      "name": "реестр: новый владелец, поколение +1, прежний указан как предыдущий",
+      "ok": true,
+      "detail": "{\"principalId\":\"fleet-client\",\"userTaskId\":\"task-failover\",\"ownerWorkerId\":\"sandbox-b\",\"ownerGeneration\":2,\"runId\":\"run_dec9eb1d-47fa-4cac-88d3-1d646ebff938\",\"state\":\"owned\",\"previousOwnerWorkerId\":\"sandbox-a\",\"updatedAt\":\"2026-10-03T08:23:04.010Z\"}"
+    },
+    {
+      "name": "реплей нового владельца без дублей и пропусков",
+      "ok": true,
+      "detail": "8 событий, claimed 1"
+    },
+    {
+      "name": "ровно один успешный результат на задачу (нет двойного исполнения)",
+      "ok": true,
+      "detail": "[{\"workerId\":\"sandbox-a\",\"runId\":\"run_1610e0f7-9c00-43f9-92ce-37f05a65df6f\",\"outcome\":\"failed\"},{\"workerId\":\"sandbox-b\",\"runId\":\"run_dec9eb1d-47fa-4cac-88d3-1d646ebff938\",\"outcome\":\"succeeded\"}]"
+    },
+    {
+      "name": "журнал содержит release/config/cohort/placement/drain/failover/fenced",
+      "ok": true,
+      "detail": "release_pinned,cohort_configured,placement_refused,drain,admission_refused,failover,fenced"
+    },
+    {
+      "name": "seq в журнале монотонный и без дыр",
+      "ok": true,
+      "detail": "1,2,3,4,5,6,7,8,9,10,11,12,13"
+    },
+    {
+      "name": "у каждой записи журнала есть причина и workerId",
+      "ok": true,
+      "detail": "26 записей"
+    },
+    {
+      "name": "в логах сервиса есть releaseId/workerId/region у каждой строки (прод и песочница различимы)",
+      "ok": true,
+      "detail": "34/67 строк"
+    },
+    {
+      "name": "строки приёма несут userTaskId/runId/ownerGeneration и регион размещения",
+      "ok": true,
+      "detail": "4 строк приёма"
+    },
+    {
+      "name": "отказы placement в логах сервиса содержат причину и код",
+      "ok": true,
+      "detail": "6 строк"
+    },
+    {
+      "name": "переходы владения (drain/failover/fenced) попали в логи сервиса",
+      "ok": true,
+      "detail": "ownership_claim_granted,ownership_claimed,ownership_drained,ownership_claim_held_by_other,ownership_claim_granted,ownership_claimed,ownership_claim_granted,ownership_claimed,ownership_claim_held_by_other,ownership_claim_granted,ownership_claimed"
+    },
+    {
+      "name": "значения ключей в транскрипте нет",
+      "ok": true,
+      "detail": "4 секретов проверено"
+    },
+    {
+      "name": "share-секреты в транскрипте нет",
+      "ok": true,
+      "detail": "2 шар-секретов проверено"
+    },
+    {
+      "name": "в логах воркеров нет заголовков с ключом",
+      "ok": true,
+      "detail": "101 строк"
+    },
+    {
+      "name": "резидентность данных остаётся открытым решением владельца",
+      "ok": true,
+      "detail": "decided=false"
+    },
+    {
+      "name": "прод-VM и настоящие RU/EU воркеры не использовались (только песочница)",
+      "ok": true,
+      "detail": "/opt/sb/ai-agent-runner-p30/.p30-fleet/p30-20261003"
+    }
+  ],
+  "journal": {
+    "a": [
+      {
+        "schemaVersion": 1,
+        "seq": 1,
+        "at": "2026-10-03T08:22:53.961Z",
+        "kind": "release_pinned",
+        "releaseId": "p30-20261003-r2",
+        "reason": "service start with a pinned release manifest",
+        "servingReleaseId": "p30-20261003-r2",
+        "cohortId": "p29",
+        "workerId": "sandbox-a",
+        "region": "sandbox-ru",
+        "detail": {
+          "sourceCommit": "0533f2c85a33f7ad5657e6f0a649f64d1042d1b6",
+          "configVersion": 2,
+          "environment": "sandbox",
+          "paidProfilesAllowed": false,
+          "rolledBack": false,
+          "retention": {
+            "mainEventsDays": 30,
+            "verboseLogsDays": 7
+          },
+          "ownerStore": "shared_fleet_registry"
+        }
+      },
+      {
+        "schemaVersion": 1,
+        "seq": 2,
+        "at": "2026-10-03T08:22:53.962Z",
+        "kind": "cohort_configured",
+        "releaseId": "p30-20261003-r2",
+        "reason": "cohort p29 is allowlist",
+        "cohortId": "p29",
+        "workerId": "sandbox-a",
+        "region": "sandbox-ru",
+        "detail": {
+          "mode": "allowlist",
+          "rolloutPercent": 0,
+          "principals": 2
+        }
+      },
+      {
+        "schemaVersion": 1,
+        "seq": 3,
+        "at": "2026-10-03T08:22:54.079Z",
+        "kind": "placement_refused",
+        "releaseId": "p30-20261003-r2",
+        "reason": "engine \"claude\" is not allowed in region sandbox-ru (allowed: sandbox-eu)",
+        "cohortId": "p29",
+        "workerId": "sandbox-a",
+        "region": "sandbox-ru",
+        "detail": {
+          "code": "REGION_ENGINE_FORBIDDEN",
+          "principalId": "fleet-client",
+          "engine": "claude",
+          "region": "sandbox-ru",
+          "allowedRegions": [
+            "sandbox-eu"
+          ],
+          "policyId": "p30-sandbox-placement",
+          "workerId": "sandbox-a"
+        }
+      },
+      {
+        "schemaVersion": 1,
+        "seq": 4,
+        "at": "2026-10-03T08:22:54.106Z",
+        "kind": "placement_refused",
+        "releaseId": "p30-20261003-r2",
+        "reason": "engine \"codex\" is not allowed in region sandbox-ru (allowed: sandbox-eu)",
+        "cohortId": "p29",
+        "workerId": "sandbox-a",
+        "region": "sandbox-ru",
+        "detail": {
+          "code": "REGION_ENGINE_FORBIDDEN",
+          "principalId": "fleet-client",
+          "engine": "codex",
+          "region": "sandbox-ru",
+          "allowedRegions": [
+            "sandbox-eu"
+          ],
+          "policyId": "p30-sandbox-placement",
+          "workerId": "sandbox-a"
+        }
+      },
+      {
+        "schemaVersion": 1,
+        "seq": 5,
+        "at": "2026-10-03T08:22:54.113Z",
+        "kind": "placement_refused",
+        "releaseId": "p30-20261003-r2",
+        "reason": "provider \"zen\" is not available in region sandbox-ru (allowed: sandbox-eu)",
+        "cohortId": "p29",
+        "workerId": "sandbox-a",
+        "region": "sandbox-ru",
+        "detail": {
+          "code": "PROVIDER_REGION_FORBIDDEN",
+          "principalId": "fleet-client",
+          "engine": "opencode",
+          "provider": "zen",
+          "region": "sandbox-ru",
+          "allowedRegions": [
+            "sandbox-eu"
+          ],
+          "policyId": "p30-sandbox-placement",
+          "workerId": "sandbox-a"
+        }
+      },
+      {
+        "schemaVersion": 1,
+        "seq": 6,
+        "at": "2026-10-03T08:22:54.124Z",
+        "kind": "placement_refused",
+        "releaseId": "p30-20261003-r2",
+        "reason": "credential scope \"llm:call\" is not provisioned in region sandbox-ru (provisioned: sandbox-eu)",
+        "cohortId": "p29",
+        "workerId": "sandbox-a",
+        "region": "sandbox-ru",
+        "detail": {
+          "code": "CREDENTIAL_REGION_FORBIDDEN",
+          "principalId": "fleet-client",
+          "bindingRef": "sb-llm",
+          "scope": "llm:call",
+          "region": "sandbox-ru",
+          "provisionedRegions": [
+            "sandbox-eu"
+          ],
+          "policyId": "p30-sandbox-placement",
+          "workerId": "sandbox-a"
+        }
+      },
+      {
+        "schemaVersion": 1,
+        "seq": 7,
+        "at": "2026-10-03T08:22:54.859Z",
+        "kind": "drain",
+        "releaseId": "p30-20261003-r2",
+        "reason": "p30 probe: RU worker is draining before the regional switch",
+        "workerId": "sandbox-a",
+        "region": "sandbox-ru",
+        "ownerGeneration": 0,
+        "detail": {
+          "principalId": "",
+          "userTaskId": ""
+        }
+      },
+      {
+        "schemaVersion": 1,
+        "seq": 8,
+        "at": "2026-10-03T08:22:54.867Z",
+        "kind": "drain",
+        "releaseId": "p30-20261003-r2",
+        "reason": "worker is draining: it does not accept new tasks",
+        "workerId": "sandbox-a",
+        "region": "sandbox-ru",
+        "ownerGeneration": 0,
+        "detail": {
+          "principalId": "fleet-client",
+          "userTaskId": "task-new-after-drain"
+        }
+      },
+      {
+        "schemaVersion": 1,
+        "seq": 9,
+        "at": "2026-10-03T08:22:54.867Z",
+        "kind": "admission_refused",
+        "releaseId": "p30-20261003-r2",
+        "reason": "worker sandbox-a is draining and does not accept new tasks",
+        "cohortId": "p29",
+        "workerId": "sandbox-a",
+        "region": "sandbox-ru",
+        "detail": {
+          "code": "WORKER_DRAINING",
+          "principalId": "fleet-client",
+          "workerId": "sandbox-a"
+        }
+      },
+      {
+        "schemaVersion": 1,
+        "seq": 10,
+        "at": "2026-10-03T08:23:03.933Z",
+        "kind": "release_pinned",
+        "releaseId": "p30-20261003-r2",
+        "reason": "service start with a pinned release manifest",
+        "servingReleaseId": "p30-20261003-r2",
+        "cohortId": "p29",
+        "workerId": "sandbox-a",
+        "region": "sandbox-ru",
+        "detail": {
+          "sourceCommit": "0533f2c85a33f7ad5657e6f0a649f64d1042d1b6",
+          "configVersion": 2,
+          "environment": "sandbox",
+          "paidProfilesAllowed": false,
+          "rolledBack": false,
+          "retention": {
+            "mainEventsDays": 30,
+            "verboseLogsDays": 7
+          },
+          "ownerStore": "shared_fleet_registry"
+        }
+      },
+      {
+        "schemaVersion": 1,
+        "seq": 11,
+        "at": "2026-10-03T08:23:03.933Z",
+        "kind": "cohort_configured",
+        "releaseId": "p30-20261003-r2",
+        "reason": "cohort p29 is allowlist",
+        "cohortId": "p29",
+        "workerId": "sandbox-a",
+        "region": "sandbox-ru",
+        "detail": {
+          "mode": "allowlist",
+          "rolloutPercent": 0,
+          "principals": 2
+        }
+      },
+      {
+        "schemaVersion": 1,
+        "seq": 12,
+        "at": "2026-10-03T08:23:04.249Z",
+        "kind": "drain",
+        "releaseId": "p30-20261003-r2",
+        "reason": "undrain: p30 probe: worker restored after the drill, fencing must still refuse it",
+        "workerId": "sandbox-a",
+        "region": "sandbox-ru",
+        "ownerGeneration": 0,
+        "detail": {
+          "principalId": "",
+          "userTaskId": ""
+        }
+      },
+      {
+        "schemaVersion": 1,
+        "seq": 13,
+        "at": "2026-10-03T08:23:04.261Z",
+        "kind": "admission_refused",
+        "releaseId": "p30-20261003-r2",
+        "reason": "task task-failover is owned by worker sandbox-b at generation 2; starting a second copy would double-dispatch it",
+        "cohortId": "p29",
+        "workerId": "sandbox-a",
+        "region": "sandbox-ru",
+        "detail": {
+          "code": "TASK_OWNED_BY_OTHER_WORKER",
+          "principalId": "fleet-client",
+          "ownerWorkerId": "sandbox-b",
+          "ownerGeneration": 2
+        }
+      }
+    ],
+    "b": [
+      {
+        "schemaVersion": 1,
+        "seq": 1,
+        "at": "2026-10-03T08:22:53.981Z",
+        "kind": "release_pinned",
+        "releaseId": "p30-20261003-r1",
+        "reason": "service start with a pinned release manifest",
+        "servingReleaseId": "p30-20261003-r1",
+        "cohortId": "p29",
+        "workerId": "sandbox-b",
+        "region": "sandbox-eu",
+        "detail": {
+          "sourceCommit": "0533f2c85a33f7ad5657e6f0a649f64d1042d1b6",
+          "configVersion": 1,
+          "environment": "sandbox",
+          "paidProfilesAllowed": false,
+          "rolledBack": false,
+          "retention": {
+            "mainEventsDays": 30,
+            "verboseLogsDays": 7
+          },
+          "ownerStore": "shared_fleet_registry"
+        }
+      },
+      {
+        "schemaVersion": 1,
+        "seq": 2,
+        "at": "2026-10-03T08:22:53.981Z",
+        "kind": "cohort_configured",
+        "releaseId": "p30-20261003-r1",
+        "reason": "cohort p29 is allowlist",
+        "cohortId": "p29",
+        "workerId": "sandbox-b",
+        "region": "sandbox-eu",
+        "detail": {
+          "mode": "allowlist",
+          "rolloutPercent": 0,
+          "principals": 2
+        }
+      },
+      {
+        "schemaVersion": 1,
+        "seq": 3,
+        "at": "2026-10-03T08:22:54.094Z",
+        "kind": "placement_refused",
+        "releaseId": "p30-20261003-r1",
+        "reason": "engine \"claude\" runs in region sandbox-eu only under an explicitly approved profile; placement policy p30-sandbox-placement records no such profile",
+        "cohortId": "p29",
+        "workerId": "sandbox-b",
+        "region": "sandbox-eu",
+        "detail": {
+          "code": "REGION_EXPLICIT_PROFILE_REQUIRED",
+          "principalId": "fleet-client",
+          "engine": "claude",
+          "region": "sandbox-eu",
+          "allowedRegions": [
+            "sandbox-eu"
+          ],
+          "policyId": "p30-sandbox-placement",
+          "explicitProfileRef": null,
+          "requiredBy": "ARCHITECTURE §8, приёмка P30: Claude/Codex вне RU только с явным профилем",
+          "workerId": "sandbox-b"
+        }
+      },
+      {
+        "schemaVersion": 1,
+        "seq": 4,
+        "at": "2026-10-03T08:22:54.118Z",
+        "kind": "admission_refused",
+        "releaseId": "p30-20261003-r1",
+        "reason": "engine \"opencode\" is not declared as free by release p30-20261003-r1; paid profiles are off unless the owner decision is recorded",
+        "cohortId": "p29",
+        "workerId": "sandbox-b",
+        "region": "sandbox-eu",
+        "detail": {
+          "code": "PAID_PROFILE_DISABLED",
+          "principalId": "fleet-client",
+          "engine": "opencode",
+          "freeEngines": [
+            "fake"
+          ],
+          "paidEngines": [
+            "opencode",
+            "claude",
+            "codex"
+          ],
+          "paidProfilesAllowed": false
+        }
+      },
+      {
+        "schemaVersion": 1,
+        "seq": 5,
+        "at": "2026-10-03T08:22:54.129Z",
+        "kind": "placement_refused",
+        "releaseId": "p30-20261003-r1",
+        "reason": "run requires data residency in sandbox-ru, but storage residency is not an approved decision (policy p30-sandbox-placement); placement refuses instead of choosing a storage region",
+        "cohortId": "p29",
+        "workerId": "sandbox-b",
+        "region": "sandbox-eu",
+        "detail": {
+          "code": "DATA_RESIDENCY_UNDECIDED",
+          "principalId": "fleet-client",
+          "requiredRegion": "sandbox-ru",
+          "region": "sandbox-eu",
+          "policyId": "p30-sandbox-placement",
+          "decisionRef": null,
+          "decidedBy": null,
+          "ownerDecisionRequired": true,
+          "workerId": "sandbox-b"
+        }
+      },
+      {
+        "schemaVersion": 1,
+        "seq": 6,
+        "at": "2026-10-03T08:22:54.511Z",
+        "kind": "release_pinned",
+        "releaseId": "p30-20261003-r1",
+        "reason": "service start with a pinned release manifest",
+        "servingReleaseId": "p30-20261003-r1",
+        "cohortId": "p29",
+        "workerId": "sandbox-b",
+        "region": "sandbox-eu",
+        "detail": {
+          "sourceCommit": "0533f2c85a33f7ad5657e6f0a649f64d1042d1b6",
+          "configVersion": 1,
+          "environment": "sandbox",
+          "paidProfilesAllowed": false,
+          "rolledBack": false,
+          "retention": {
+            "mainEventsDays": 30,
+            "verboseLogsDays": 7
+          },
+          "ownerStore": "shared_fleet_registry"
+        }
+      },
+      {
+        "schemaVersion": 1,
+        "seq": 7,
+        "at": "2026-10-03T08:22:54.511Z",
+        "kind": "cohort_configured",
+        "releaseId": "p30-20261003-r1",
+        "reason": "cohort p29 is allowlist",
+        "cohortId": "p29",
+        "workerId": "sandbox-b",
+        "region": "sandbox-eu",
+        "detail": {
+          "mode": "allowlist",
+          "rolloutPercent": 0,
+          "principals": 2
+        }
+      },
+      {
+        "schemaVersion": 1,
+        "seq": 8,
+        "at": "2026-10-03T08:22:54.557Z",
+        "kind": "admission_refused",
+        "releaseId": "p30-20261003-r1",
+        "reason": "engine \"claude\" is not declared as free by release p30-20261003-r1; paid profiles are off unless the owner decision is recorded",
+        "cohortId": "p29",
+        "workerId": "sandbox-b",
+        "region": "sandbox-eu",
+        "detail": {
+          "code": "PAID_PROFILE_DISABLED",
+          "principalId": "fleet-client",
+          "engine": "claude",
+          "freeEngines": [
+            "fake"
+          ],
+          "paidEngines": [
+            "opencode",
+            "claude",
+            "codex"
+          ],
+          "paidProfilesAllowed": false
+        }
+      },
+      {
+        "schemaVersion": 1,
+        "seq": 9,
+        "at": "2026-10-03T08:22:54.780Z",
+        "kind": "release_pinned",
+        "releaseId": "p30-20261003-r1",
+        "reason": "service start with a pinned release manifest",
+        "servingReleaseId": "p30-20261003-r1",
+        "cohortId": "p29",
+        "workerId": "sandbox-b",
+        "region": "sandbox-eu",
+        "detail": {
+          "sourceCommit": "0533f2c85a33f7ad5657e6f0a649f64d1042d1b6",
+          "configVersion": 1,
+          "environment": "sandbox",
+          "paidProfilesAllowed": false,
+          "rolledBack": false,
+          "retention": {
+            "mainEventsDays": 30,
+            "verboseLogsDays": 7
+          },
+          "ownerStore": "shared_fleet_registry"
+        }
+      },
+      {
+        "schemaVersion": 1,
+        "seq": 10,
+        "at": "2026-10-03T08:22:54.780Z",
+        "kind": "cohort_configured",
+        "releaseId": "p30-20261003-r1",
+        "reason": "cohort p29 is allowlist",
+        "cohortId": "p29",
+        "workerId": "sandbox-b",
+        "region": "sandbox-eu",
+        "detail": {
+          "mode": "allowlist",
+          "rolloutPercent": 0,
+          "principals": 2
+        }
+      },
+      {
+        "schemaVersion": 1,
+        "seq": 11,
+        "at": "2026-10-03T08:22:55.082Z",
+        "kind": "admission_refused",
+        "releaseId": "p30-20261003-r1",
+        "reason": "task task-failover is owned by worker sandbox-a at generation 1; starting a second copy would double-dispatch it",
+        "cohortId": "p29",
+        "workerId": "sandbox-b",
+        "region": "sandbox-eu",
+        "detail": {
+          "code": "TASK_OWNED_BY_OTHER_WORKER",
+          "principalId": "fleet-client",
+          "ownerWorkerId": "sandbox-a",
+          "ownerGeneration": 1
+        }
+      },
+      {
+        "schemaVersion": 1,
+        "seq": 12,
+        "at": "2026-10-03T08:23:03.995Z",
+        "kind": "failover",
+        "releaseId": "p30-20261003-r1",
+        "reason": "operator: worker sandbox-a killed during the drain drill; owner declared dead",
+        "workerId": "sandbox-b",
+        "region": "sandbox-eu",
+        "ownerGeneration": 2,
+        "detail": {
+          "principalId": "fleet-client",
+          "userTaskId": "task-failover",
+          "previousOwnerWorkerId": "sandbox-a"
+        }
+      },
+      {
+        "schemaVersion": 1,
+        "seq": 13,
+        "at": "2026-10-03T08:23:03.996Z",
+        "kind": "fenced",
+        "releaseId": "p30-20261003-r1",
+        "reason": "previous owner sandbox-a is fenced at generation 1",
+        "workerId": "sandbox-b",
+        "region": "sandbox-eu",
+        "ownerGeneration": 1,
+        "detail": {
+          "principalId": "fleet-client",
+          "userTaskId": "task-failover"
+        }
+      }
+    ]
+  },
+  "serviceLogLines": {
+    "a": 34,
+    "b": 67
+  },
+  "openDecisions": {
+    "at": "2026-10-03T08:23:04.272Z",
+    "step": "open_decisions",
+    "dataResidency": {
+      "status": "не решено",
+      "note": "placement отказывает с DATA_RESIDENCY_UNDECIDED и не выбирает регион хранения; утверждение политики резидентности — отдельное решение владельца с policyId/decisionRef",
+      "policy": {
+        "decided": false,
+        "decisionRef": null,
+        "regions": []
+      }
+    },
+    "existingWorkers": {
+      "status": "не тронуты",
+      "note": "существующие RU/EU workers (прод) не изменялись: их часть карточки P30 — после readiness, с shell-доступом к RU VM (AC-31)"
+    },
+    "shellAccessRuVm": {
+      "status": "нет",
+      "ac": "AC-31",
+      "note": "без shell-доступа к RU VM региональная приёмка на реальной машине недоказуема — блокер на стороне владельца"
+    },
+    "blockers": []
+  }
+}
