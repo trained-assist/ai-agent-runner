@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { spawn } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHarness, waitFor } from './helpers.js';
@@ -318,7 +319,6 @@ describe('clean room isolation (issue #51)', () => {
     const rootDir = longRootFor('mcp-socket');
     const roomSocket = bridgeSocketPath(join(rootDir, 'cleanrooms', 'run-1'), 'run-1', { scoped: true });
     expect(roomSocket).toBeNull();
-    const sharedSocketsBefore = new Set(readdirSync(tmpdir()).filter((name) => name.startsWith('mcp-') && name.endsWith('.sock')));
 
     const { h, provider } = harnessWith(launcher, { harness: { rootDir, scenario: 'mcp-tools' } });
     const remote = await startFakeRemote();
@@ -352,9 +352,12 @@ describe('clean room isolation (issue #51)', () => {
       // Отказ до спавна движка и до поднятия MCP-сервера
       expect(h.fake.startCalls).toBe(0);
       expect(launcher.forCommand('stdio-domain-server.mjs')).toHaveLength(0);
-      // Сокет моста не появился в общем tmpdir хоста: запасного варианта у границы нет
-      const sharedSocketsAfter = readdirSync(tmpdir()).filter((name) => name.startsWith('mcp-') && name.endsWith('.sock'));
-      expect(sharedSocketsAfter.filter((name) => !sharedSocketsBefore.has(name))).toEqual([]);
+      // Сокет моста не появился в общем tmpdir хоста: запасного варианта у границы нет.
+      // Проверяется сокет ИМЕННО этого рана (имя выводится из runId): общий tmpdir
+      // разделяют параллельные файлы тестов, и сокет соседнего теста к границе рана
+      // отношения не имеет — сравнение «до/после» ловило чужой сокет и мигало.
+      const thisRunDigest = createHash('sha256').update(receipt.runId).digest('hex').slice(0, 10);
+      expect(existsSync(join(tmpdir(), `mcp-${thisRunDigest}.sock`))).toBe(false);
       // Аренда снята на отказе: слот свободен для следующего рана
       expect(provider.freeSlots()).toEqual(['slot-a', 'slot-b']);
       runner.dispose();
