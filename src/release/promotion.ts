@@ -73,7 +73,11 @@ export class PromotionJournal {
   }
 
   append(entry: Omit<PromotionEntry, 'schemaVersion' | 'seq' | 'at' | 'releaseId'> & { at?: string }): PromotionEntry {
-    this.seq += 1;
+    // seq берётся из файла, а не из счётчика конструктора: журнал пишут два процесса —
+    // сервис воркера и операторский контроллер отката (тот же файл, другая жизнь). Кэш
+    // конструктора после этого давал бы второй `seq = 7` и дыру в нумерации переходов.
+    // Запись сама атомарна (appendFileSync открывает файл на O_APPEND).
+    this.seq = Math.max(this.seq, countEntries(this.path)) + 1;
     const record: PromotionEntry = {
       schemaVersion: PROMOTION_JOURNAL_SCHEMA_VERSION,
       seq: this.seq,

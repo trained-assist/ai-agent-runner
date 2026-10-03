@@ -259,6 +259,25 @@ describe('журнал промоушена и откат (P29, AC-324)', () => 
     expect(readJournal(path).map((entry) => entry.reason)).toEqual(['first', 'second']);
     expect(existsSync(path)).toBe(true);
   });
+
+  it('два писателя в один журнал не выдают второй одинаковый seq (сервис воркера + операторский откат)', () => {
+    const dir = tempDir('ai-agent-runner-journal-two-writers-');
+    const path = join(dir, 'promotion.jsonl');
+    // Сервис воркера поднят раньше оператора: его счётчик seq уже в памяти, когда оператор
+    // дописывает откат, и сервис продолжает писать в тот же файл.
+    const service = new PromotionJournal({ path, releaseId: 'r2', workerId: 'sb-eu-a' });
+    const operator = new PromotionJournal({ path, releaseId: 'r2', workerId: 'sb-eu-a' });
+
+    service.append({ kind: 'release_pinned', reason: 'worker started' });
+    operator.append({ kind: 'rollback', reason: 'operator rollback', servingReleaseId: 'r1' });
+    service.append({ kind: 'admission_refused', reason: 'promotion paused' });
+    operator.append({ kind: 'rollback_resumed', reason: 'gate green', servingReleaseId: 'r2' });
+
+    const entries = readJournal(path);
+    expect(entries.map((entry) => entry.kind)).toEqual(['release_pinned', 'rollback', 'admission_refused', 'rollback_resumed']);
+    expect(entries.map((entry) => entry.seq)).toEqual([1, 2, 3, 4]);
+    expect(new Set(entries.map((entry) => entry.seq)).size).toBe(entries.length);
+  });
 });
 
 describe('граница промоушена (AC-171, AC-09)', () => {
