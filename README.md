@@ -313,27 +313,63 @@ Env/константы: `RUNNER_DEFAULT_REPO` (дефолтная репа), `RU
 | Проба | `src/isolation/probe/boundary-probe.mjs` | Отрицательные свойства ДО спавна движка: чужой ран, корень Runner'а и его credentials недоступны; свои HOME/tmp и общие read-only бинари доступны |
 | Runner | `src/runner/runner.ts` | Стадия границы между materialize и MCP/спавном, fail-closed отказ до спавна, сверка uid процесса движка по `/proc`, дочистка аренды в `recover()` |
 | Приёмка | `scripts/isolation-probe.mjs`, `.github/workflows/isolation-probe.yml` | Живые одновременные раны, матрица «свой/чужой», управляемые отказы и рестарт воркера → sanitized-транскрипт + sha256 |
+| Возможности хоста | `src/isolation/host-capabilities.ts` | Только чтение: root, `setpriv`/`runuser`, `setfacl`, слоты в `passwd`. Непривилегированный хост честно SKIP-ает проверку, а не «проходит» её |
 
 Ключевые семантики:
 
 - **Fallback к service UID запрещён.** Нет `setpriv`/`runuser`, нет свободного слота, слот не
   на хосте или проба не прошла — ран отказывается ДО спавна движка (`ISOLATION_UNAVAILABLE`,
-  `ISOLATION_SLOT_BUSY`, `ISOLATION_IDENTITY_UNAVAILABLE`, `ISOLATION_PROBE_FAILED`).
+  `ISOLATION_SLOT_BUSY`, `ISOLATION_IDENTITY_UNAVAILABLE`, `ISOLATION_PROBE_FAILED`). То же и
+  для запроса `isolation: per_run_unix_identity` на хосте без провайдера: требование клиента
+  доходит до preflight, а не теряется по дороге.
 - **Аренда переживает рестарт воркера** и снимается только после проверенного удаления
   каталогов рана; если выход остался единственной копией, аренда `blocked` и слот не
   переиспользуется — иначе следующий ран прочитал бы прежние данные.
+- **Аренда ограничена во времени.** Движок запускается detached и переживает аварию воркера;
+  после рестарта его гасит `recover()`, ран финализируется как `failed`/`WORKER_CRASH`
+  (повторного запуска нет) и слот возвращается в пул. Без этого пул из двух слотов терялся бы
+  навсегда после двух аварий.
 - **Единственная копия важнее чистоты**: при отказе хранилища workspace не удаляется,
   `cleanup: pending`, причина — в логе рана и в аренде.
 - **Возможности объявляются честно**: без настроенной границы `osIsolation =
   not_proven_service_uid_only`, с нерабочей настройкой — `configured_but_refusing_runs`.
 
+### Где живёт доказательство границы
+
+Привилегированная проба **не гейт PR**: она требует root (`useradd`/`chown`/`setfacl`), а
+обычный CI-раннер не может ни доказать, ни честно опровергнуть границу. Workflow запускается
+вручную (`workflow_dispatch`), сам скрипт и workflow сначала детектят возможности и на
+непривилегированном хосте пишут транскрипт со `status: skipped` — зелёный шаг «изоляция
+проверена» там был бы доказательством от случайно выданных CI привилегий.
+
+Доказательство берётся на привилегированной песочной VM и лежит в репозитории:
+[`docs/evidence/p51-clean-room-vm2/`](docs/evidence/p51-clean-room-vm2/) — 81/81 проверок,
+sha256 рядом. Воспроизведение (каждый прогон требует **нового** namespace, иначе
+`blocked`-аренда предыдущего прогона занимает слот):
+
+```bash
+scripts/recreate-sandbox.sh --namespace iso-$(date -u +%Y%m%d-%H%M) \
+  --fleet-root /var/lib/agent-runner --workers a --client-engines fake,opencode
+node scripts/isolation-probe.mjs --fleet-root /var/lib/agent-runner \
+  --namespace iso-... --out docs/evidence/p51-clean-room-vm2
+```
+
+Открытая строка приёмки: «два **настоящих** OpenCode Run одновременно». Бинарь `opencode` на
+песочной VM есть, но под run-scoped HOME у движка нет провайдера/модели, а бесплатный движок
+`llm-ladder` сейчас не отвечает (`unknown ladder: free-ladder` — тем же падает красный
+`probe`-job на `main`). Свойства OS-границы от движка не зависят и проверены fake-движком.
+
 ### Что покрыто тестами
 
 - [x] Слот, run-scoped HOME, движок и per-run MCP под идентичностью рана, сокет моста внутри среды — `test/clean-room-isolation.test.ts`
 - [x] Поломанная граница и отсутствие слота отказывают до спавна, без расширения прав — `test/clean-room-isolation.test.ts`
+- [x] Требование границы клиента доходит до рана; объявленные выходы доходят до экспорта — `test/clean-room-isolation.test.ts`
+- [x] Закрытая (`released`) аренда возвращает слот; `active`/`blocked`/`sweeping` — нет — `test/clean-room-isolation.test.ts`
 - [x] Аренда переживает рестарт воркера; блокировка слота дочекается sweep — `test/clean-room-isolation.test.ts`
+- [x] Переживший воркер движок гасится восстановлением, слот возвращается, повторного запуска нет — `test/clean-room-isolation.test.ts`
 - [x] Единственная копия выхода: `cleanup: pending`, слот заблокирован, после рестарта блокировка держится — `test/clean-room-isolation.test.ts`
-- [x] Проба приёмки на настоящем Linux-хосте: `.github/workflows/isolation-probe.yml`
+- [x] Настоящая граница на привилегированном хосте (переключение uid) — `test/clean-room-isolation.test.ts`, блок `skipIf` с указанием причины на непривилегированном хосте
+- [x] Проба приёмки на настоящем Linux-хосте: `docs/evidence/p51-clean-room-vm2` (81/81)
 
 ## Разработка
 
