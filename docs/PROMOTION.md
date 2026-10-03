@@ -97,3 +97,5 @@ fleet-root — `/tmp` проба не трогает.
 - [x] Внешний контракт: auth и область `/v1/release`, отказы 403/503/409 без побочных записей,
   откат прогоном, два воркера на одной VM — `test/promotion-api.test.ts`
 - [x] Проба на песочной VM2: 59/59, транскрипт `docs/evidence/p29-promotion-vm2/`
+      (namespace `p29-20261003-2`, sourceCommit `f416378`,
+      sha256 `cc6e0dfdd97ec183e45f7c513bc107083c1702707042e362d115001022630957`)
