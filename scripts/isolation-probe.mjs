@@ -205,6 +205,7 @@ class Worker {
     this.child = null;
     this.exitInfo = null;
     this.logDir = logDir;
+    this.logStream = null;
   }
 
   start() {
@@ -217,6 +218,7 @@ class Worker {
     // и причины переходов. Значения ключей в него не попадают (проверяется в конце пробы).
     mkdirSync(this.logDir, { recursive: true });
     const logFile = createWriteStream(join(this.logDir, `api-${this.port}.log`), { flags: 'a' });
+    this.logStream = logFile;
     const capture = (chunk) => {
       for (const line of String(chunk).split('\n')) {
         if (line.trim() === '') continue;
@@ -252,11 +254,24 @@ class Worker {
   }
 
   async stop() {
-    if (!this.child || this.child.exitCode !== null) return;
-    this.child.kill('SIGTERM');
-    const deadline = Date.now() + 8000;
-    while (Date.now() < deadline && this.child.exitCode === null) await sleep(50);
-    if (this.child.exitCode === null) this.child.kill('SIGKILL');
+    if (this.child && this.child.exitCode === null) {
+      this.child.kill('SIGTERM');
+      const deadline = Date.now() + 8000;
+      while (Date.now() < deadline && this.child.exitCode === null) await sleep(50);
+      if (this.child.exitCode === null) this.child.kill('SIGKILL');
+    }
+    this.closeLog();
+  }
+
+  /**
+   * Закрытие файла журнала. Незакрытый WriteStream держит event loop, и проба после
+   * завершения шагов висела до таймаута job вместо того, чтобы отдать транскрипт и выйти.
+   */
+  closeLog() {
+    if (!this.logStream) return;
+    const stream = this.logStream;
+    this.logStream = null;
+    stream.end();
   }
 
   /** Управляемый сбой воркера: SIGKILL без финализации, как падение процесса на VM. */
@@ -805,10 +820,13 @@ async function main() {
 
   await cancelAll(pending);
   if (!keep) for (const worker of live) await worker.stop();
+  else for (const worker of live) worker.closeLog();
 
   process.stdout.write(`\nisolation probe: ${checks.length - failures}/${checks.length} checks, ${stepsRun.length} steps\n`);
   process.stdout.write(`transcript: ${join(OUT_DIR, 'transcript.sha256')}\n`);
-  if (failures > 0) process.exitCode = 1;
+  // Выход по коду, а не через опустошение event loop: иначе оставшийся поток или
+  // подвешенный stdio vorkera удерживал бы пробу до таймаута job.
+  process.exit(failures > 0 ? 1 : 0);
 }
 
 /** Гасит незавершённые раны шага: иначе их аренды идентичности держат слоты занятыми. */

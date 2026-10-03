@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHarness, waitFor } from './helpers.js';
@@ -12,8 +13,14 @@ import { OpenCodeAdapter } from '../src/adapters/engine/opencode-adapter.js';
 import { createBlobStore } from '../src/storage/create-blob-store.js';
 import { Runner } from '../src/runner/runner.js';
 import { BRIDGE_SOCKET_PATH_LIMIT, bridgeSocketPath } from '../src/mcp/bridge.js';
-import type { CleanRoomProvider } from '../src/isolation/contract.js';
+import { UnixCleanRoomProvider } from '../src/isolation/clean-room.js';
+import { detectHostIsolationCapabilities, hostCapabilitySkipReason } from '../src/isolation/host-capabilities.js';
+import { RUN_ISOLATION_SCHEMA_VERSION, type CleanRoomLeaseStatus, type CleanRoomProvider } from '../src/isolation/contract.js';
 import type { Harness, HarnessOptions } from './helpers.js';
+
+/** Слоты для настоящей границы: на непривилегированном CI их нет, и блок пропускается. */
+const hostCapabilities = detectHostIsolationCapabilities({ slots: ['ta-agent-1', 'ta-agent-2'] });
+const hostSkipReason = hostCapabilitySkipReason(hostCapabilities);
 
 function events(rootDir: string, runId: string): Array<Record<string, unknown>> {
   const path = join(rootDir, 'runs', runId, 'events.jsonl');
@@ -402,6 +409,100 @@ describe('clean room isolation (issue #51)', () => {
     expect(validateRunSpec({ ...base, isolation: { mode: 'per_run_unix_identity' } }).ok).toBe(true);
     expect(validateRunSpec({ ...base, isolation: { mode: 'none' } }).ok).toBe(true);
     expect(validateRunSpec({ ...base, isolation: { mode: 'container' } }).ok).toBe(false);
+  });
+});
+
+/**
+ * Реестр слотов настоящего провайдера: без привилегий рана не запустить, но правило
+ * «закрытая аренда освобождает слот» проверяется целиком — это чистый ввод/вывод.
+ */
+describe('реестр аренд слотов настоящего провайдера', () => {
+  function providerAt(rootDir: string): UnixCleanRoomProvider {
+    return new UnixCleanRoomProvider({
+      rootDir,
+      policy: { mode: 'per_run_unix_identity', slots: ['slot-a', 'slot-b'], toolPaths: [] },
+      launcher: new RecordingLauncher(),
+    });
+  }
+
+  function writeLease(rootDir: string, runId: string, slotId: string, status: CleanRoomLeaseStatus): void {
+    const dir = join(rootDir, 'identity', 'leases');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, `${runId}.json`),
+      `${JSON.stringify({
+        schemaVersion: RUN_ISOLATION_SCHEMA_VERSION,
+        runId,
+        userTaskId: 'task-1',
+        profileId: 'profile-a',
+        identity: { slotId, username: slotId, uid: 40001, gid: 40001 },
+        paths: { root: join(rootDir, 'cleanrooms', runId), cwd: join(rootDir, 'cleanrooms', runId, 'cwd') },
+        status,
+        reason: null,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        releasedAt: null,
+      })}\n`,
+    );
+  }
+
+  it('аренда в состоянии released освобождает слот для следующего рана', () => {
+    const rootDir = harnessRootFor('registry');
+    const provider = providerAt(rootDir);
+    writeLease(rootDir, 'run-done', 'slot-a', 'released');
+    expect(provider.freeSlots()).toEqual(['slot-a', 'slot-b']);
+    expect(provider.lease('run-done')?.status).toBe('released');
+  });
+
+  it('незакрытая аренда держит слот: active, blocked, sweeping', () => {
+    const rootDir = harnessRootFor('registry');
+    const provider = providerAt(rootDir);
+    writeLease(rootDir, 'run-live', 'slot-a', 'active');
+    writeLease(rootDir, 'run-sole', 'slot-b', 'blocked');
+    expect(provider.freeSlots()).toEqual([]);
+
+    // Повреждённый и незнакомый файлы не должны ни ронять чтение, ни освобождать слот.
+    writeFileSync(join(rootDir, 'identity', 'leases', 'broken.json'), '{not json');
+    expect(provider.leases()).toHaveLength(2);
+    expect(provider.lease('broken')).toBeNull();
+    expect(provider.freeSlots()).toEqual([]);
+  });
+});
+
+/**
+ * Настоящая OS-граница (переключение uid, ACL, отрицательные свойства) требует
+ * привилегированного хоста. В обычном CI их нет, поэтому блок честно пропускается с
+ * указанием причины, а не падает и не притворяется пройденным.
+ */
+describe.skipIf(hostSkipReason !== null)(`настоящая граница на привилегированном хосте${hostSkipReason === null ? '' : ` — ${hostSkipReason}`}`, () => {
+  it('слот переключает идентичность процесса движка, а ресурсы слота возвращаются в пул', async () => {
+    const slots = hostCapabilities.slots;
+    const rootDir = harnessRootFor('real-boundary');
+    const provider = new UnixCleanRoomProvider({
+      rootDir,
+      policy: {
+        mode: 'per_run_unix_identity',
+        slots: slots.map((slot) => slot.slotId),
+        toolPaths: [],
+        ...(process.getuid !== undefined ? { runnerUid: process.getuid() } : {}),
+      },
+      log: () => undefined,
+    });
+    const selfTest = await provider.selfTest();
+    expect(selfTest.ok).toBe(true);
+
+    const launcher = provider.launcher;
+    expect(launcher).not.toBeNull();
+    const identity = { slotId: slots[0]!.slotId, username: slots[0]!.slotId, uid: slots[0]!.uid, gid: slots[0]!.gid };
+    const launch = launcher!.wrap(identity, process.execPath, ['-e', 'process.stdout.write(String(process.getuid()))']);
+    const child = spawn(launch.command, launch.args, { stdio: ['ignore', 'pipe', 'ignore'] });
+    let out = '';
+    child.stdout.on('data', (chunk: Buffer) => {
+      out += chunk.toString();
+    });
+    const code = await new Promise<number | null>((done) => child.once('exit', done));
+    expect(code).toBe(0);
+    expect(Number(out.trim())).toBe(identity.uid);
   });
 });
 

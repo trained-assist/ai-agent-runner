@@ -227,6 +227,38 @@ function readProcUid(pid: number): number | null {
   }
 }
 
+/** Окно, в течение которого процесс движка обязан сменить идентичность на слот. */
+const IDENTITY_SETTLE_TIMEOUT_MS = 3000;
+const IDENTITY_SETTLE_POLL_MS = 25;
+
+type IdentitySettle =
+  | { kind: 'matched'; uid: number; waitedMs: number }
+  | { kind: 'mismatch'; uid: number; waitedMs: number }
+  | { kind: 'gone'; uid: null; waitedMs: number };
+
+/**
+ * Ожидание смены идентичности процесса движка.
+ *
+ * Между `spawn` и `setuid` есть окно, в котором `/proc/<pid>/status` ещё показывает UID
+ * родителя: переключатель (setpriv/runuser) сначала стартует сам, и только потом снимает
+ * права. Одноразовое чтение давало ложный `identity_mismatch` на живом и правильном ране.
+ * Поэтому сверка идёт с ограниченным ожиданием: UID совпал, процесс ушёл (успеет
+ * отработать его собственный обработчик выхода) либо окно истекло — тогда расхождение
+ * настоящее, и ран отказывает.
+ */
+async function settleEngineIdentity(room: CleanRoom, pid: number): Promise<IdentitySettle> {
+  const deadline = Date.now() + IDENTITY_SETTLE_TIMEOUT_MS;
+  let waitedMs = 0;
+  let uid = readProcUid(pid);
+  while (uid !== null && uid !== room.identity.uid && Date.now() < deadline) {
+    await new Promise((done) => setTimeout(done, IDENTITY_SETTLE_POLL_MS));
+    waitedMs += IDENTITY_SETTLE_POLL_MS;
+    uid = readProcUid(pid);
+  }
+  if (uid === null) return { kind: 'gone', uid: null, waitedMs };
+  return { kind: uid === room.identity.uid ? 'matched' : 'mismatch', uid, waitedMs };
+}
+
 function formatMcpFields(fields: McpLogFields): string {
   return Object.entries(fields)
     .map(([key, value]) => `${key}=${value === null ? '-' : String(value)}`)
@@ -824,7 +856,7 @@ export class Runner {
         return;
       }
       if (!handle.pid) throw new Error('engine adapter did not return a live process id');
-      if (run.room) this.assertEngineIdentity(run, st, handle.pid);
+      if (run.room) await this.assertEngineIdentity(run, st, handle.pid);
       st.pid = handle.pid;
       st.pgid = handle.pgid ?? handle.pid;
       st.startedAt = this.nowIso();
@@ -948,7 +980,7 @@ export class Runner {
    * Провайдер без привилегий (`simulated`) переключения не делает: сверка тогда не
    * выполняется, и это видно в логе рана, а не проходит как «проверено».
    */
-  private assertEngineIdentity(run: InternalRun, st: PersistedRunState, pid: number): void {
+  private async assertEngineIdentity(run: InternalRun, st: PersistedRunState, pid: number): Promise<void> {
     const room = run.room;
     if (!room) return;
     if (this.opts.isolation?.identityEnforcement === 'simulated') {
@@ -959,27 +991,27 @@ export class Runner {
       });
       return;
     }
-    const uid = readProcUid(pid);
-    if (uid === null) {
+    const settled = await settleEngineIdentity(room, pid);
+    if (settled.kind === 'gone') {
       this.emit(st, 'log', {
         stream: 'runner',
         level: 'warn',
-        message: `engine.identity_unknown pid=${pid} slot=${room.identity.slotId}`,
+        message: `engine.identity_unknown pid=${pid} slot=${room.identity.slotId} waitedMs=${settled.waitedMs}`,
       });
       return;
     }
-    if (uid !== room.identity.uid) {
+    if (settled.kind === 'mismatch') {
       this.emit(st, 'log', {
         stream: 'runner',
         level: 'error',
-        message: `engine.identity_mismatch pid=${pid} uid=${uid} expected=${room.identity.slotId}:${room.identity.uid}`,
+        message: `engine.identity_mismatch pid=${pid} uid=${settled.uid} expected=${room.identity.slotId}:${room.identity.uid} waitedMs=${settled.waitedMs}`,
       });
-      throw new CleanRoomError('ISOLATION_IDENTITY_MISMATCH', `engine process ${pid} runs as uid ${uid}, expected slot ${room.identity.slotId} (uid ${room.identity.uid})`);
+      throw new CleanRoomError('ISOLATION_IDENTITY_MISMATCH', `engine process ${pid} runs as uid ${settled.uid}, expected slot ${room.identity.slotId} (uid ${room.identity.uid})`);
     }
     this.emit(st, 'log', {
       stream: 'runner',
       level: 'info',
-      message: `engine.identity_verified pid=${pid} uid=${uid} slot=${room.identity.slotId}`,
+      message: `engine.identity_verified pid=${pid} uid=${settled.uid} slot=${room.identity.slotId} waitedMs=${settled.waitedMs}`,
     });
   }
 

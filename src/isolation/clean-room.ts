@@ -107,7 +107,14 @@ export class UnixCleanRoomProvider implements CleanRoomProvider {
   }
 
   freeSlots(): string[] {
-    const busy = new Set(this.leases().map((lease) => lease.identity.slotId));
+    // `released` — единственное состояние, в котором слот можно переиспользовать:
+    // проверенный sweep закрыл аренду. Иначе закрытая аренда навсегда занимала бы слот,
+    // и пул из двух слотов исчерпывался после двух ранов за жизнь хоста.
+    const busy = new Set(
+      this.leases()
+        .filter((lease) => lease.status !== 'released')
+        .map((lease) => lease.identity.slotId),
+    );
     return this.policy.slots.filter((slot) => !busy.has(slot) && !this.reservedSlots.has(slot));
   }
 
