@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHarness, waitFor } from './helpers.js';
 import { RecordingLauncher, StubCleanRoomProvider, eventTypes, listDir, logMessages, type StubProviderOptions } from './isolation-helpers.js';
@@ -10,6 +11,7 @@ import { FakeEngine } from '../src/adapters/engine/fake-engine.js';
 import { OpenCodeAdapter } from '../src/adapters/engine/opencode-adapter.js';
 import { createBlobStore } from '../src/storage/create-blob-store.js';
 import { Runner } from '../src/runner/runner.js';
+import { BRIDGE_SOCKET_PATH_LIMIT, bridgeSocketPath } from '../src/mcp/bridge.js';
 import type { CleanRoomProvider } from '../src/isolation/contract.js';
 import type { Harness, HarnessOptions } from './helpers.js';
 
@@ -246,11 +248,17 @@ describe('clean room isolation (issue #51)', () => {
     expect(existsSync(join(spec.cwd, 'ran.txt'))).toBe(true);
   });
 
-  it('per-run MCP-процессы получают ту же идентичность, сокет — внутри чистой среды', async () => {
+  // Путь unix-сокета ограничен ~104 байтами. На хосте с длинным рабочим каталогом (CI)
+  // сокет чистой среды не помещается: тогда позитивная проверка сокета пропускается, а отказ
+  // при слишком длинном пути проверяется отдельным тестом ниже — запасного варианта нет.
+  const mcpRoot = harnessRootFor('mcp');
+  const mcpSocketFits = bridgeSocketPath(join(mcpRoot, 'cleanrooms', 'run-1'), 'run-1', { scoped: true }) !== null;
+
+  it.skipIf(!mcpSocketFits)('per-run MCP-процессы получают ту же идентичность, сокет — внутри чистой среды', async () => {
     const launcher = new RecordingLauncher();
     // Короткий rootDir внутри репозитория: путь unix-сокета моста должен поместиться в
     // каталог рана (лимит ~104 байта), иначе мост уходит в общий tmpdir хоста.
-    const { h, provider } = harnessWith(launcher, { harness: { rootDir: harnessRootFor('mcp'), scenario: 'mcp-tools' } });
+    const { h, provider } = harnessWith(launcher, { harness: { rootDir: mcpRoot, scenario: 'mcp-tools' } });
     const remote = await startFakeRemote();
     try {
       const registry = demoRegistry(remote.baseUrl);
@@ -292,6 +300,56 @@ describe('clean room isolation (issue #51)', () => {
       expect(listDir(join(h.rootDir, 'mcp'))).toEqual([]);
       expect(listDir(join(h.rootDir, 'cleanrooms'))).toEqual([]);
       expect(existsSync(spec.cwd)).toBe(false);
+      runner.dispose();
+    } finally {
+      await remote.stop();
+    }
+  });
+
+  it('слишком длинный путь для сокета: старт отказывает, сокет не уходит в общий tmpdir', async () => {
+    const launcher = new RecordingLauncher();
+    const rootDir = longRootFor('mcp-socket');
+    const roomSocket = bridgeSocketPath(join(rootDir, 'cleanrooms', 'run-1'), 'run-1', { scoped: true });
+    expect(roomSocket).toBeNull();
+    const sharedSocketsBefore = new Set(readdirSync(tmpdir()).filter((name) => name.startsWith('mcp-') && name.endsWith('.sock')));
+
+    const { h, provider } = harnessWith(launcher, { harness: { rootDir, scenario: 'mcp-tools' } });
+    const remote = await startFakeRemote();
+    try {
+      const registry = demoRegistry(remote.baseUrl);
+      const runner = new Runner({
+        rootDir: h.rootDir,
+        adapters: { fake: h.fake },
+        host: { region: 'sandbox-eu', environment: 'sandbox' },
+        isolation: provider,
+        capabilities: registry,
+        bindingResolver: fixtureBindingResolver({ 'cred:demo-domain-write': remote.token }),
+        cancelGraceMs: 500,
+      });
+      const spec = h.makeSpec({
+        mcp: {
+          servers: [mcpServer({ serverId: 'demo-domain-write', bindingRef: 'cred:demo-domain-write', allowedTools: ['demo.record_note'] })],
+        },
+        credentialBindings: [{ ref: 'cred:demo-domain-write', scope: 'demo:write' }],
+        input: { inlinePrompt: mcpPlan({ calls: [{ tool: 'demo.record_note', arguments: { text: 'note' } }] }) },
+      });
+      const receipt = runner.start(spec);
+      const result = await runner.waitFor(receipt.runId);
+
+      expect(result.outcome).toBe('failed');
+      expect(result.failure?.code).toBe('MCP_STARTUP_FAILED');
+      expect(result.failure?.safeSummary).toContain('unix-socket limit');
+      // Причина отказа видна в логе рана: сокет не помещается в чистую среду
+      const messages = logMessages(h.rootDir, receipt.runId);
+      expect(messages.some((line) => line.includes('mcp.bridge_socket_unavailable') && line.includes('path_too_long'))).toBe(true);
+      // Отказ до спавна движка и до поднятия MCP-сервера
+      expect(h.fake.startCalls).toBe(0);
+      expect(launcher.forCommand('stdio-domain-server.mjs')).toHaveLength(0);
+      // Сокет моста не появился в общем tmpdir хоста: запасного варианта у границы нет
+      const sharedSocketsAfter = readdirSync(tmpdir()).filter((name) => name.startsWith('mcp-') && name.endsWith('.sock'));
+      expect(sharedSocketsAfter.filter((name) => !sharedSocketsBefore.has(name))).toEqual([]);
+      // Аренда снята на отказе: слот свободен для следующего рана
+      expect(provider.freeSlots()).toEqual(['slot-a', 'slot-b']);
       runner.dispose();
     } finally {
       await remote.stop();
@@ -355,4 +413,15 @@ function harnessRootFor(name: string): string {
   const base = join(import.meta.dirname, '..', '_scratch', 'isolation');
   mkdirSync(base, { recursive: true });
   return mkdtempSync(join(base, `${name}-`));
+}
+
+/**
+ * Каталог с заведомо длинным путом: путь unix-сокета чистой среды не должен в него
+ * поместиться, и граница обязана отказать, а не унести сокет в общий tmpdir хоста.
+ */
+function longRootFor(name: string): string {
+  let current = harnessRootFor(name);
+  for (let i = 0; i < 12; i += 1) current = join(current, `segment-${i}-0123456789abcdef`);
+  mkdirSync(current, { recursive: true });
+  return current;
 }

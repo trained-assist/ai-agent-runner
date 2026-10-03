@@ -6,7 +6,7 @@ import type { ProcessLauncher } from '../isolation/launcher.js';
 import type { RunIdentity } from '../isolation/contract.js';
 import type { RunSpec } from '../contracts/run-spec.js';
 import type { CapabilityRegistry } from './capabilities.js';
-import { McpBridgeServer, bridgeSocketPath, type McpBridgeCallRequest, type McpBridgeCaller, type McpBridgeCallResult } from './bridge.js';
+import { BRIDGE_SOCKET_PATH_LIMIT, McpBridgeServer, bridgeSocketPath, type McpBridgeCallRequest, type McpBridgeCaller, type McpBridgeCallResult } from './bridge.js';
 import { RPC_ERROR_CODES, StdioJsonRpcClient, StdioRpcError } from './jsonrpc.js';
 import type { McpDenyReason, McpRunScope, ScopedServer, ScopedToolView } from './scope.js';
 
@@ -48,7 +48,8 @@ export type McpStartupFailure =
   | 'readiness_failed'
   | 'transport_closed'
   | 'capability_unknown'
-  | 'binding_unavailable';
+  | 'binding_unavailable'
+  | 'socket_path_too_long';
 
 export class McpStartupError extends Error {
   readonly code = 'MCP_STARTUP_FAILED' as const;
@@ -508,7 +509,23 @@ export class McpRunSession {
     // Сессии серверов наполняются ниже, но мост должен существовать до их спавна:
     // дочерние процессы подключаются к нему сразу (hello + capability/invoke).
     const servers: McpServerSession[] = [];
-    const socketPath = bridgeSocketPath(deps.bridgeDir ?? deps.spec.cwd, deps.spec.runId);
+    // Сокет моста — внутри чистой среды рана, когда граница объявлена. Слишком длинный путь
+    // для unix-сокета — отказ старта, а не уход сокета в общий tmpdir хоста.
+    const socketPath = bridgeSocketPath(deps.bridgeDir ?? deps.spec.cwd, deps.spec.runId, { scoped: Boolean(deps.identity) });
+    if (!socketPath) {
+      const limit = BRIDGE_SOCKET_PATH_LIMIT;
+      deps.log('error', 'mcp.bridge_socket_unavailable', {
+        runId: deps.spec.runId,
+        reason: 'path_too_long',
+        limit,
+        bridgeDir: deps.bridgeDir ?? deps.spec.cwd,
+      });
+      throw new McpStartupError(
+        deps.scope.servers[0]?.serverId ?? 'bridge',
+        'socket_path_too_long',
+        `the run clean room path is longer than the unix-socket limit (${limit}); the bridge socket cannot live outside the run boundary`,
+      );
+    }
     const bridge = await McpBridgeServer.listen({
       socketPath,
       runToken: deps.bridgeToken,
