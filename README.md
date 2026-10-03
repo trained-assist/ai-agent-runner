@@ -230,6 +230,39 @@ Env/константы: `RUNNER_DEFAULT_REPO` (дефолтная репа), `RU
 - [x] Один capability handler на два транспорта (MCP ран + API control plane), отказ по scope одинаков — `test/capability-facade.test.ts`
 - [x] Проба приёмки на песочной VM: 25/25 проверок, транскрипт `docs/evidence/p13-mcp-lifecycle-vm2/`
 
+## Promotion и fleet acceptance (P29, этап I10)
+
+Соответствует карточке [#68](https://github.com/trained-assist/trained-agent-architecture/issues/68) и этапу [SANDBOX · I10](https://github.com/trained-assist/trained-agent-architecture/blob/main/SANDBOX.md#i10--promotion-совместимость-rueu). Детали — [docs/PROMOTION.md](docs/PROMOTION.md).
+
+| Область | Файл | Что делает |
+|---|---|---|
+| Релиз | `src/release/manifest.ts` | Закреплённый релиз: `sourceCommit`, `configVersion`, host-манифест (workerId/region/environment/roles/roots/endpoint), env-манифест только по именам binding'ов, retention TTL. Без манифеста старт падает |
+| Когорта | `src/release/cohort.ts` | `off` / `allowlist` / `percentage` с детерминированным бакетом: одно решение на любом воркере и после рестарта |
+| Переходы | `src/release/promotion.ts` | Durable-журнал promotion/cohort/rollback/fencing/drain/retention с причиной каждого перехода; контроллер отката и возврата; `checkPromotionBoundary` — песочные артефакты нельзя объявить production |
+| Владение | `src/release/dispatch-owner.ts` | Одна задача — один владелец на VM: общий файл под file-lock, partition ≠ failover, перехват только по явному сигналу, прежний владелец fenced, новая попытка = поколение +1 |
+| Приём | `src/release/admission.ts` | Порядок отказов: откат → платный профиль → когорта → владение. Отказ видно по HTTP: 503 `PROMOTION_PAUSED`, 403 `COHORT_NOT_ENABLED` / `PAID_PROFILE_DISABLED`, 409 `TASK_OWNED_BY_OTHER_WORKER` |
+| Приёмка | `scripts/recreate-sandbox.sh`, `scripts/promotion-probe.mjs` | Чистая песочница (новый namespace, свежие ключи, локальный fixture-репозиторий) и 12 шагов приёмки на двух настоящих процессах → sanitized-транскрипт + sha256 |
+
+Ключевые семантики:
+
+- **Откат — не рестарт задач.** Новые приёмы когорты останавливаются, обслуживает предыдущий
+  релиз, а уже принятые раны доигрывает их прежний владелец; состояние готовится файлом и
+  переживает рестарт процесса.
+- **Платные профили выключены по умолчанию**: `paid.allowed` требует явного `approvedBy`,
+  иначе 403 до запуска. В пробе работает только free-движок `fake`.
+- **Правило 8 проверяется, а не декларируется**: попытка выдать песочный релиз за production
+  отклоняется по workerId/корням/endpoint/ключам, ключи и данные живут только внутри
+  namespace, транскрипт не содержит значений секретов.
+- **Партиция ≠ failover**: перехват задачи требует явного сигнала прежнего владельца; сам
+  молчающий воркер её не перехватывает.
+
+### Что покрыто тестами
+
+- [x] Контракты релиза, когорты, отката и реестра владельцев — `test/promotion-release.test.ts`
+- [x] Внешний контракт поверх HTTP, включая два воркера на одной VM и откат прогоном — `test/promotion-api.test.ts`
+- [x] Проба приёмки на песочной VM2: 59/59 проверок, транскрипт `docs/evidence/p29-promotion-vm2/`
+- [x] Проба в CI на каждом PR: `.github/workflows/promotion-probe.yml`
+
 ## Разработка
 
 ```bash

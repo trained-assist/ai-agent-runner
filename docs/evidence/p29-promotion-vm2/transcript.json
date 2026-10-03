@@ -1,0 +1,1544 @@
+{
+  "schemaVersion": 1,
+  "probe": "P29 — Promotion и fleet acceptance (карточка #68, этап I10)",
+  "generatedAt": "2026-10-03T07:01:41.852Z",
+  "namespace": "p29-20261003-2",
+  "fleetRoot": "/opt/sb/p29/fleet",
+  "sourceCommit": "f4163786bb2a5540f0e1f0ef83e8b0db235da1eb",
+  "releases": {
+    "candidate": "p29-20261003-2-r2",
+    "previous": "p29-20261003-2-r1"
+  },
+  "topology": "sandbox-a (p29-20261003-2-r2, config 2) на 127.0.0.1:8790 + sandbox-b (p29-20261003-2-r1, config 1) на 127.0.0.1:8791, общий реестр владения /opt/sb/p29/fleet/p29-20261003-2/fleet/owners.json",
+  "fidelity": "настоящие процессы: API+Runner обоих воркеров, promotion-контур, реестр владения; эмуляция: каналы Web/Telegram (ingress/egress adapter) и движок fake (free-only); живой бот, Web-UI и платные модели не проверялись",
+  "stepsRun": [
+    "sandbox_fresh",
+    "ports_free",
+    "workers_started",
+    "api_smoke",
+    "channel_smoke",
+    "admission_controls",
+    "fleet_ownership",
+    "rollback_drill",
+    "retention_and_config",
+    "clean_promotion",
+    "logs",
+    "no_secrets"
+  ],
+  "steps": [
+    {
+      "at": "2026-10-03T07:01:38.337Z",
+      "step": "probe_started",
+      "namespace": "p29-20261003-2",
+      "fleetRoot": "/opt/sb/p29/fleet",
+      "sourceCommit": "f4163786bb2a5540f0e1f0ef83e8b0db235da1eb",
+      "candidateReleaseId": "p29-20261003-2-r2",
+      "previousReleaseId": "p29-20261003-2-r1",
+      "outDir": "/opt/sb/p29/out",
+      "topology": "client → (web | telegram adapter) → worker A/B (node dist/api/main.js) → shared owner registry",
+      "fidelity": "API, Runner, реестр владения и promotion-контур — настоящие процессы; каналы Web/TG — эмуляция ingress/egress; движок fake (free-only), платные профили выключены",
+      "keysConfigured": 4
+    },
+    {
+      "at": "2026-10-03T07:01:38.341Z",
+      "step": "sandbox_fresh",
+      "runsBefore": [
+        0,
+        0
+      ],
+      "distinctOwnKeyHashes": 2,
+      "replacedNamespaces": []
+    },
+    {
+      "at": "2026-10-03T07:01:38.678Z",
+      "step": "workers_started",
+      "a": {
+        "workerId": "sandbox-a",
+        "releaseId": "p29-20261003-2-r2",
+        "configVersion": 2,
+        "port": 8790,
+        "cohort": {
+          "cohortId": "p29",
+          "mode": "allowlist",
+          "rolloutPercent": 0,
+          "principals": 2
+        }
+      },
+      "b": {
+        "workerId": "sandbox-b",
+        "releaseId": "p29-20261003-2-r1",
+        "configVersion": 1,
+        "port": 8791,
+        "cohort": {
+          "cohortId": "p29",
+          "mode": "allowlist",
+          "rolloutPercent": 0,
+          "principals": 2
+        }
+      },
+      "retentionPolicy": {
+        "mainEventsDays": 30,
+        "verboseLogsDays": 7
+      },
+      "health": {
+        "a": {
+          "status": "ok",
+          "ready": true,
+          "droppedLogCount": 0,
+          "activeRuns": 0,
+          "runs": 0
+        },
+        "b": {
+          "status": "ok",
+          "ready": true,
+          "droppedLogCount": 0,
+          "activeRuns": 0,
+          "runs": 0
+        }
+      }
+    },
+    {
+      "at": "2026-10-03T07:01:38.816Z",
+      "step": "api_smoke",
+      "receipt": {
+        "requestId": "req_b81229c3-e04e-497d-956a-cf310760bc74",
+        "userTaskId": "task-api-smoke",
+        "runId": "run_eac0b4f3-a876-49e2-b780-62263f422d42",
+        "deduplicated": false
+      },
+      "status": {
+        "requestId": "req_b81229c3-e04e-497d-956a-cf310760bc74",
+        "userTaskId": "task-api-smoke",
+        "conversationId": "conv-api-smoke",
+        "runId": "run_eac0b4f3-a876-49e2-b780-62263f422d42",
+        "ownerGeneration": 1,
+        "state": "succeeded",
+        "cancelRequested": false,
+        "connectionLost": false,
+        "observedAt": "2026-10-03T07:01:38.784Z",
+        "sequence": 8,
+        "fencing": {
+          "rejected": 0
+        }
+      },
+      "eventTypes": [
+        "claimed",
+        "materialized",
+        "started",
+        "log",
+        "log",
+        "exit",
+        "finalizing",
+        "succeeded"
+      ],
+      "sequence": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8
+      ],
+      "duplicateRunId": "run_eac0b4f3-a876-49e2-b780-62263f422d42"
+    },
+    {
+      "at": "2026-10-03T07:01:39.269Z",
+      "step": "channel_smoke",
+      "correlation": {
+        "web": {
+          "externalRef": "web:conv-7/41",
+          "userTaskId": "web-conv-7-41",
+          "requestId": "req_929dcfdb-91c1-47f1-a340-01f148f34aa1",
+          "runId": "run_52ebab02-a6f7-43b4-836f-1e4471b70140",
+          "conversationId": "web-conv-7",
+          "outcome": "succeeded"
+        },
+        "telegram": {
+          "externalRef": "tg:chat-555/9001",
+          "userTaskId": "tg-chat-555-9001",
+          "requestId": "req_68da2d67-df53-465c-9429-92efd13784f5",
+          "runId": "run_cf1ab58a-5e58-45e2-8c5f-84decc674395",
+          "conversationId": "tg-chat-555",
+          "outcome": "succeeded"
+        }
+      },
+      "eventCount": {
+        "web": 8,
+        "telegram": 8
+      }
+    },
+    {
+      "at": "2026-10-03T07:01:39.279Z",
+      "step": "admission_controls",
+      "outsideCohort": {
+        "status": 403,
+        "code": "COHORT_NOT_ENABLED",
+        "details": {
+          "cohortId": "p29",
+          "mode": "allowlist",
+          "bucket": 5407,
+          "reason": "outside_allowlist"
+        }
+      },
+      "paid": {
+        "status": 403,
+        "code": "PAID_PROFILE_DISABLED",
+        "details": {
+          "engine": "opencode",
+          "freeEngines": [
+            "fake"
+          ],
+          "paidEngines": [
+            "opencode",
+            "claude",
+            "codex"
+          ],
+          "paidProfilesAllowed": false
+        }
+      },
+      "journalRefusals": [
+        {
+          "seq": 3,
+          "reason": "principal \"p29-outsider\" is not in cohort p29 (outside_allowlist)",
+          "detail": {
+            "code": "COHORT_NOT_ENABLED",
+            "principalId": "p29-outsider",
+            "cohortId": "p29",
+            "mode": "allowlist",
+            "bucket": 5407,
+            "reason": "outside_allowlist"
+          }
+        },
+        {
+          "seq": 4,
+          "reason": "engine \"opencode\" is not declared as free by release p29-20261003-2-r2; paid profiles are off unless the owner decision is recorded",
+          "detail": {
+            "code": "PAID_PROFILE_DISABLED",
+            "principalId": "p29-outsider",
+            "engine": "opencode",
+            "freeEngines": [
+              "fake"
+            ],
+            "paidEngines": [
+              "opencode",
+              "claude",
+              "codex"
+            ],
+            "paidProfilesAllowed": false
+          }
+        }
+      ]
+    },
+    {
+      "at": "2026-10-03T07:01:39.638Z",
+      "step": "fleet_ownership",
+      "task": "task-fleet-shared",
+      "firstAttempt": {
+        "workerId": "sandbox-a",
+        "runId": "run_58b4fd66-1e59-4388-b137-26e2dc003e23"
+      },
+      "doubleDispatch": {
+        "status": 409,
+        "code": "TASK_OWNED_BY_OTHER_WORKER",
+        "details": {
+          "ownerWorkerId": "sandbox-a",
+          "ownerGeneration": 1
+        }
+      },
+      "takeoverWithoutSignal": {
+        "outcome": "partition_is_not_failover",
+        "ownerWorkerId": "sandbox-a",
+        "generation": 1
+      },
+      "takeover": {
+        "workerId": "sandbox-b",
+        "runId": "run_b34a30dc-02ab-453e-8d7d-bde81e23f435",
+        "ownerGeneration": 2
+      },
+      "fenced": {
+        "status": 409,
+        "code": "TASK_OWNED_BY_OTHER_WORKER"
+      },
+      "registry": {
+        "principalId": "p29-client",
+        "userTaskId": "task-fleet-shared",
+        "ownerWorkerId": "sandbox-b",
+        "ownerGeneration": 2,
+        "runId": "run_b34a30dc-02ab-453e-8d7d-bde81e23f435",
+        "state": "owned",
+        "previousOwnerWorkerId": "sandbox-a",
+        "updatedAt": "2026-10-03T07:01:39.451Z"
+      },
+      "replaySequences": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8
+      ]
+    },
+    {
+      "at": "2026-10-03T07:01:41.819Z",
+      "step": "rollback_drill",
+      "state": {
+        "afterRollback": {
+          "releaseId": "p29-20261003-2-r2",
+          "servingReleaseId": "p29-20261003-2-r1",
+          "previousReleaseId": "p29-20261003-2-r2",
+          "rolledBack": true,
+          "reason": "promotion probe: candidate release rolled back",
+          "updatedAt": "2026-10-03T07:01:40.342Z",
+          "transitions": 1
+        },
+        "afterResume": {
+          "releaseId": "p29-20261003-2-r2",
+          "servingReleaseId": "p29-20261003-2-r2",
+          "previousReleaseId": "p29-20261003-2-r1",
+          "rolledBack": false,
+          "reason": null,
+          "updatedAt": "2026-10-03T07:01:40.778Z",
+          "transitions": 2
+        }
+      },
+      "refusedAfterRollback": {
+        "status": 503,
+        "code": "PROMOTION_PAUSED",
+        "details": {
+          "releaseId": "p29-20261003-2-r2",
+          "servingReleaseId": "p29-20261003-2-r1",
+          "previousReleaseId": "p29-20261003-2-r2",
+          "newAdmissions": "refused",
+          "acceptedRuns": "stay_with_current_owner"
+        }
+      },
+      "acceptedBeforeRollback": {
+        "workerId": "sandbox-b",
+        "releaseId": "p29-20261003-2-r1",
+        "runId": "run_393f5c78-0502-4d61-b7c8-7b334f641b6c",
+        "stateDuringRollback": "running",
+        "finalState": "cancelled"
+      },
+      "replayAfterRollback": {
+        "runId": "run_eac0b4f3-a876-49e2-b780-62263f422d42",
+        "events": 8
+      },
+      "journalRollbacks": [
+        {
+          "seq": 6,
+          "at": "2026-10-03T07:01:40.343Z",
+          "reason": "promotion probe: candidate release rolled back",
+          "servingReleaseId": "p29-20261003-2-r1",
+          "previousReleaseId": "p29-20261003-2-r2"
+        }
+      ],
+      "resumeJournal": []
+    },
+    {
+      "at": "2026-10-03T07:01:41.832Z",
+      "step": "retention_and_config",
+      "retention": {
+        "policy": {
+          "mainEventsDays": 30,
+          "verboseLogsDays": 7
+        },
+        "evaluatedAt": "2026-10-03T07:01:41.823Z",
+        "total": 5,
+        "active": 0,
+        "terminal": 5,
+        "expiredRuns": [],
+        "verboseExpiredRuns": [],
+        "protectedActiveRuns": [],
+        "removalPerformed": false,
+        "verdict": "ok"
+      },
+      "cohort": {
+        "cohortId": "p29",
+        "mode": "allowlist",
+        "rolloutPercent": 0,
+        "principals": 2
+      },
+      "fleet": {
+        "workerId": "sandbox-a",
+        "draining": false,
+        "owned": 4,
+        "drainingTasks": 0,
+        "owners": [
+          {
+            "workerId": "sandbox-a",
+            "tasks": 4
+          },
+          {
+            "workerId": "sandbox-b",
+            "tasks": 2
+          }
+        ]
+      },
+      "journal": {
+        "entries": 12,
+        "lastSeq": 12,
+        "lastKind": "cohort_configured"
+      },
+      "capabilitiesPromotion": {
+        "pinnedRelease": {
+          "releaseId": "p29-20261003-2-r2",
+          "sourceCommit": "f4163786bb2a5540f0e1f0ef83e8b0db235da1eb",
+          "configVersion": 2
+        },
+        "cohortEnabled": true,
+        "cohortId": "p29",
+        "rollbackAvailable": true,
+        "rolledBack": false,
+        "servingReleaseId": "p29-20261003-2-r2",
+        "paidProfilesAllowed": false,
+        "sharedOwnerRegistry": true,
+        "takeoverRequiresExplicitSignal": true,
+        "partitionIsNotFailover": true,
+        "retentionPolicy": {
+          "mainEventsDays": 30,
+          "verboseLogsDays": 7
+        },
+        "releaseEndpoint": "/v1/release"
+      }
+    },
+    {
+      "at": "2026-10-03T07:01:41.843Z",
+      "step": "clean_promotion",
+      "sandboxDescriptor": {
+        "environment": "sandbox",
+        "workerId": "sandbox-a",
+        "dataRoot": "/opt/sb/p29/fleet/p29-20261003-2/worker-a/data",
+        "configDir": "/opt/sb/p29/fleet/p29-20261003-2/worker-a/config",
+        "endpoint": {
+          "host": "127.0.0.1",
+          "port": 8790
+        },
+        "keyHashes": [
+          "cf5fb86cf14d69b8111945dfadea53210d911ee2067ea9e1dceb667e0904a77f",
+          "96e18fb600cf5cccc32204f4d92a8d40c49fe432d19d6fbc77b037df28dbea01",
+          "fba76576def167f96760ef6f331c625753773f98ac9a60d24ee88d9c46065d53"
+        ],
+        "ownsDelivery": false
+      },
+      "promotionAttempt": {
+        "ok": false,
+        "violations": [
+          {
+            "rule": "workerId",
+            "detail": "worker id \"sandbox-a\" is used by both deployments"
+          },
+          {
+            "rule": "dataRoot",
+            "detail": "dataRoot \"/opt/sb/p29/fleet/p29-20261003-2/worker-a/data\" is shared by both deployments"
+          },
+          {
+            "rule": "configDir",
+            "detail": "configDir \"/opt/sb/p29/fleet/p29-20261003-2/worker-a/config\" is shared by both deployments"
+          },
+          {
+            "rule": "endpoint",
+            "detail": "both deployments listen on 127.0.0.1:8790"
+          },
+          {
+            "rule": "keys",
+            "detail": "3 key hash(es) are present in both key registries: rotating one would rotate the other"
+          }
+        ]
+      },
+      "productionBaseline": "на песочной VM прод-сторона недоступна: проверяется отказ объявить песочницу продом и изоляция ключей/корней; сравнение с живым продом — за пределами этой пробы",
+      "namespacesSeen": [
+        "p29-20261003",
+        "p29-20261003-2"
+      ],
+      "fleetView": {
+        "workerId": "sandbox-a",
+        "draining": false,
+        "owned": 4,
+        "drainingTasks": 0,
+        "owners": [
+          {
+            "workerId": "sandbox-a",
+            "tasks": 4
+          },
+          {
+            "workerId": "sandbox-b",
+            "tasks": 2
+          }
+        ]
+      }
+    },
+    {
+      "at": "2026-10-03T07:01:41.848Z",
+      "step": "logs",
+      "journalKinds": [
+        "release_pinned",
+        "cohort_configured",
+        "admission_refused",
+        "rollback",
+        "rollback_resumed"
+      ],
+      "journalSeqA": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12
+      ],
+      "journalA": [
+        {
+          "seq": 1,
+          "at": "2026-10-03T07:01:38.580Z",
+          "kind": "release_pinned",
+          "reason": "service start with a pinned release manifest",
+          "releaseId": "p29-20261003-2-r2",
+          "workerId": "sandbox-a",
+          "region": "sandbox-eu",
+          "cohortId": "p29",
+          "servingReleaseId": "p29-20261003-2-r2"
+        },
+        {
+          "seq": 2,
+          "at": "2026-10-03T07:01:38.581Z",
+          "kind": "cohort_configured",
+          "reason": "cohort p29 is allowlist",
+          "releaseId": "p29-20261003-2-r2",
+          "workerId": "sandbox-a",
+          "region": "sandbox-eu",
+          "cohortId": "p29"
+        },
+        {
+          "seq": 3,
+          "at": "2026-10-03T07:01:39.273Z",
+          "kind": "admission_refused",
+          "reason": "principal \"p29-outsider\" is not in cohort p29 (outside_allowlist)",
+          "releaseId": "p29-20261003-2-r2",
+          "workerId": "sandbox-a",
+          "region": "sandbox-eu",
+          "cohortId": "p29"
+        },
+        {
+          "seq": 4,
+          "at": "2026-10-03T07:01:39.277Z",
+          "kind": "admission_refused",
+          "reason": "engine \"opencode\" is not declared as free by release p29-20261003-2-r2; paid profiles are off unless the owner decision is recorded",
+          "releaseId": "p29-20261003-2-r2",
+          "workerId": "sandbox-a",
+          "region": "sandbox-eu",
+          "cohortId": "p29"
+        },
+        {
+          "seq": 5,
+          "at": "2026-10-03T07:01:39.636Z",
+          "kind": "admission_refused",
+          "reason": "task task-fleet-shared is owned by worker sandbox-b at generation 2; starting a second copy would double-dispatch it",
+          "releaseId": "p29-20261003-2-r2",
+          "workerId": "sandbox-a",
+          "region": "sandbox-eu",
+          "cohortId": "p29"
+        },
+        {
+          "seq": 6,
+          "at": "2026-10-03T07:01:40.343Z",
+          "kind": "rollback",
+          "reason": "promotion probe: candidate release rolled back",
+          "releaseId": "p29-20261003-2-r2",
+          "workerId": "sandbox-a",
+          "region": "sandbox-eu",
+          "cohortId": "p29",
+          "servingReleaseId": "p29-20261003-2-r1",
+          "previousReleaseId": "p29-20261003-2-r2"
+        },
+        {
+          "seq": 7,
+          "at": "2026-10-03T07:01:40.573Z",
+          "kind": "release_pinned",
+          "reason": "service start with a pinned release manifest",
+          "releaseId": "p29-20261003-2-r2",
+          "workerId": "sandbox-a",
+          "region": "sandbox-eu",
+          "cohortId": "p29",
+          "servingReleaseId": "p29-20261003-2-r1"
+        },
+        {
+          "seq": 8,
+          "at": "2026-10-03T07:01:40.573Z",
+          "kind": "cohort_configured",
+          "reason": "cohort p29 is allowlist",
+          "releaseId": "p29-20261003-2-r2",
+          "workerId": "sandbox-a",
+          "region": "sandbox-eu",
+          "cohortId": "p29"
+        },
+        {
+          "seq": 9,
+          "at": "2026-10-03T07:01:40.593Z",
+          "kind": "admission_refused",
+          "reason": "release p29-20261003-2-r2 is rolled back: promotion probe: candidate release rolled back",
+          "releaseId": "p29-20261003-2-r2",
+          "workerId": "sandbox-a",
+          "region": "sandbox-eu",
+          "cohortId": "p29"
+        },
+        {
+          "seq": 10,
+          "at": "2026-10-03T07:01:40.779Z",
+          "kind": "rollback_resumed",
+          "reason": "promotion probe: gate green, serving candidate again",
+          "releaseId": "p29-20261003-2-r2",
+          "workerId": "sandbox-a",
+          "region": "sandbox-eu",
+          "cohortId": "p29",
+          "servingReleaseId": "p29-20261003-2-r2",
+          "previousReleaseId": "p29-20261003-2-r1"
+        },
+        {
+          "seq": 11,
+          "at": "2026-10-03T07:01:41.148Z",
+          "kind": "release_pinned",
+          "reason": "service start with a pinned release manifest",
+          "releaseId": "p29-20261003-2-r2",
+          "workerId": "sandbox-a",
+          "region": "sandbox-eu",
+          "cohortId": "p29",
+          "servingReleaseId": "p29-20261003-2-r2"
+        },
+        {
+          "seq": 12,
+          "at": "2026-10-03T07:01:41.149Z",
+          "kind": "cohort_configured",
+          "reason": "cohort p29 is allowlist",
+          "releaseId": "p29-20261003-2-r2",
+          "workerId": "sandbox-a",
+          "region": "sandbox-eu",
+          "cohortId": "p29"
+        }
+      ],
+      "serviceLogSample": [
+        {
+          "ts": "2026-10-03T07:01:38.573Z",
+          "event": "recovered",
+          "releaseId": "p29-20261003-2-r2",
+          "workerId": "sandbox-a",
+          "region": "sandbox-eu"
+        },
+        {
+          "ts": "2026-10-03T07:01:38.580Z",
+          "event": "api_listening",
+          "releaseId": "p29-20261003-2-r2",
+          "workerId": "sandbox-a",
+          "region": "sandbox-eu"
+        },
+        {
+          "ts": "2026-10-03T07:01:38.687Z",
+          "event": "admission_accepted",
+          "releaseId": "p29-20261003-2-r2",
+          "workerId": "sandbox-a",
+          "region": "sandbox-eu",
+          "cohortId": "p29"
+        },
+        {
+          "ts": "2026-10-03T07:01:38.688Z",
+          "event": "ownership_claimed",
+          "releaseId": "p29-20261003-2-r2",
+          "workerId": "sandbox-a",
+          "region": "sandbox-eu",
+          "runId": "run_eac0b4f3-a876-49e2-b780-62263f422d42",
+          "userTaskId": "task-api-smoke",
+          "ownerGeneration": 1
+        },
+        {
+          "ts": "2026-10-03T07:01:38.691Z",
+          "event": "submit",
+          "releaseId": "p29-20261003-2-r2",
+          "workerId": "sandbox-a",
+          "region": "sandbox-eu",
+          "runId": "run_eac0b4f3-a876-49e2-b780-62263f422d42",
+          "userTaskId": "task-api-smoke",
+          "ownerGeneration": 1,
+          "cohortId": "p29",
+          "outcome": "accepted"
+        },
+        {
+          "ts": "2026-10-03T07:01:38.812Z",
+          "event": "submit",
+          "releaseId": "p29-20261003-2-r2",
+          "workerId": "sandbox-a",
+          "region": "sandbox-eu",
+          "runId": "run_eac0b4f3-a876-49e2-b780-62263f422d42",
+          "userTaskId": "task-api-smoke",
+          "ownerGeneration": 1,
+          "outcome": "duplicate"
+        },
+        {
+          "ts": "2026-10-03T07:01:38.821Z",
+          "event": "admission_accepted",
+          "releaseId": "p29-20261003-2-r2",
+          "workerId": "sandbox-a",
+          "region": "sandbox-eu",
+          "cohortId": "p29"
+        },
+        {
+          "ts": "2026-10-03T07:01:38.823Z",
+          "event": "ownership_claimed",
+          "releaseId": "p29-20261003-2-r2",
+          "workerId": "sandbox-a",
+          "region": "sandbox-eu",
+          "runId": "run_52ebab02-a6f7-43b4-836f-1e4471b70140",
+          "userTaskId": "web-conv-7-41",
+          "ownerGeneration": 1
+        },
+        {
+          "ts": "2026-10-03T07:01:38.825Z",
+          "event": "submit",
+          "releaseId": "p29-20261003-2-r2",
+          "workerId": "sandbox-a",
+          "region": "sandbox-eu",
+          "runId": "run_52ebab02-a6f7-43b4-836f-1e4471b70140",
+          "userTaskId": "web-conv-7-41",
+          "ownerGeneration": 1,
+          "cohortId": "p29",
+          "outcome": "accepted"
+        },
+        {
+          "ts": "2026-10-03T07:01:38.836Z",
+          "event": "admission_accepted",
+          "releaseId": "p29-20261003-2-r2",
+          "workerId": "sandbox-a",
+          "region": "sandbox-eu",
+          "cohortId": "p29"
+        },
+        {
+          "ts": "2026-10-03T07:01:38.837Z",
+          "event": "ownership_claimed",
+          "releaseId": "p29-20261003-2-r2",
+          "workerId": "sandbox-a",
+          "region": "sandbox-eu",
+          "runId": "run_cf1ab58a-5e58-45e2-8c5f-84decc674395",
+          "userTaskId": "tg-chat-555-9001",
+          "ownerGeneration": 1
+        },
+        {
+          "ts": "2026-10-03T07:01:38.839Z",
+          "event": "submit",
+          "releaseId": "p29-20261003-2-r2",
+          "workerId": "sandbox-a",
+          "region": "sandbox-eu",
+          "runId": "run_cf1ab58a-5e58-45e2-8c5f-84decc674395",
+          "userTaskId": "tg-chat-555-9001",
+          "ownerGeneration": 1,
+          "cohortId": "p29",
+          "outcome": "accepted"
+        },
+        {
+          "ts": "2026-10-03T07:01:39.273Z",
+          "event": "admission_refused",
+          "releaseId": "p29-20261003-2-r2",
+          "workerId": "sandbox-a",
+          "region": "sandbox-eu",
+          "code": "COHORT_NOT_ENABLED",
+          "cohortId": "p29"
+        },
+        {
+          "ts": "2026-10-03T07:01:39.277Z",
+          "event": "admission_refused",
+          "releaseId": "p29-20261003-2-r2",
+          "workerId": "sandbox-a",
+          "region": "sandbox-eu",
+          "code": "PAID_PROFILE_DISABLED"
+        },
+        {
+          "ts": "2026-10-03T07:01:39.281Z",
+          "event": "admission_accepted",
+          "releaseId": "p29-20261003-2-r2",
+          "workerId": "sandbox-a",
+          "region": "sandbox-eu",
+          "cohortId": "p29"
+        },
+        {
+          "ts": "2026-10-03T07:01:39.282Z",
+          "event": "ownership_claimed",
+          "releaseId": "p29-20261003-2-r2",
+          "workerId": "sandbox-a",
+          "region": "sandbox-eu",
+          "runId": "run_58b4fd66-1e59-4388-b137-26e2dc003e23",
+          "userTaskId": "task-fleet-shared",
+          "ownerGeneration": 1
+        },
+        {
+          "ts": "2026-10-03T07:01:39.283Z",
+          "event": "submit",
+          "releaseId": "p29-20261003-2-r2",
+          "workerId": "sandbox-a",
+          "region": "sandbox-eu",
+          "runId": "run_58b4fd66-1e59-4388-b137-26e2dc003e23",
+          "userTaskId": "task-fleet-shared",
+          "ownerGeneration": 1,
+          "cohortId": "p29",
+          "outcome": "accepted"
+        },
+        {
+          "ts": "2026-10-03T07:01:39.634Z",
+          "event": "admission_accepted",
+          "releaseId": "p29-20261003-2-r2",
+          "workerId": "sandbox-a",
+          "region": "sandbox-eu",
+          "cohortId": "p29"
+        },
+        {
+          "ts": "2026-10-03T07:01:39.636Z",
+          "event": "admission_refused",
+          "releaseId": "p29-20261003-2-r2",
+          "workerId": "sandbox-a",
+          "region": "sandbox-eu",
+          "ownerGeneration": 2,
+          "code": "TASK_OWNED_BY_OTHER_WORKER"
+        },
+        {
+          "ts": "2026-10-03T07:01:40.563Z",
+          "event": "recovered",
+          "releaseId": "p29-20261003-2-r2",
+          "workerId": "sandbox-a",
+          "region": "sandbox-eu"
+        },
+        {
+          "ts": "2026-10-03T07:01:40.572Z",
+          "event": "api_listening",
+          "releaseId": "p29-20261003-2-r2",
+          "workerId": "sandbox-a",
+          "region": "sandbox-eu"
+        },
+        {
+          "ts": "2026-10-03T07:01:40.593Z",
+          "event": "admission_refused",
+          "releaseId": "p29-20261003-2-r2",
+          "workerId": "sandbox-a",
+          "region": "sandbox-eu",
+          "code": "PROMOTION_PAUSED"
+        },
+        {
+          "ts": "2026-10-03T07:01:40.768Z",
+          "event": "submit",
+          "releaseId": "p29-20261003-2-r2",
+          "workerId": "sandbox-a",
+          "region": "sandbox-eu",
+          "runId": "run_eac0b4f3-a876-49e2-b780-62263f422d42",
+          "userTaskId": "task-api-smoke",
+          "ownerGeneration": 1,
+          "outcome": "duplicate"
+        },
+        {
+          "ts": "2026-10-03T07:01:41.138Z",
+          "event": "recovered",
+          "releaseId": "p29-20261003-2-r2",
+          "workerId": "sandbox-a",
+          "region": "sandbox-eu"
+        },
+        {
+          "ts": "2026-10-03T07:01:41.146Z",
+          "event": "api_listening",
+          "releaseId": "p29-20261003-2-r2",
+          "workerId": "sandbox-a",
+          "region": "sandbox-eu"
+        }
+      ]
+    },
+    {
+      "at": "2026-10-03T07:01:41.852Z",
+      "step": "no_secrets",
+      "secretsChecked": 8,
+      "shareSecretsChecked": 2
+    }
+  ],
+  "checks": [
+    {
+      "name": "namespace создан заново: ни одного рана до прогона",
+      "ok": true,
+      "detail": "runs до прогона: 0/0"
+    },
+    {
+      "name": "собственные ключи воркеров различны",
+      "ok": true,
+      "detail": "2 ключей"
+    },
+    {
+      "name": "клиентский ключ известен обоим воркерам, ключ вне когорты — тоже",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "в provisioning-манифесте нет значений секретов",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "порт 8790 свободен до старта sandbox-a",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "порт 8791 свободен до старта sandbox-b",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "healthz воркера A отвечает без ключа и без секретов",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "релиз A закреплён",
+      "ok": true,
+      "detail": "p29-20261003-2-r2@f4163786"
+    },
+    {
+      "name": "релиз B закреплён на предыдущем",
+      "ok": true,
+      "detail": "p29-20261003-2-r1"
+    },
+    {
+      "name": "у воркеров разные workerId и порты",
+      "ok": true,
+      "detail": "sandbox-a:8790 / sandbox-b:8791"
+    },
+    {
+      "name": "платные профили выключены у обоих воркеров",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "режим роли новой машины: расписание и доставка выключены",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "API принял задачу (202 + receipt)",
+      "ok": true,
+      "detail": "runId run_eac0b4f3…"
+    },
+    {
+      "name": "результат терминальный и успешный",
+      "ok": true,
+      "detail": "succeeded"
+    },
+    {
+      "name": "цепочка событий полная и без пропусков",
+      "ok": true,
+      "detail": "claimed→materialized→started→log→log→exit→finalizing→succeeded"
+    },
+    {
+      "name": "повтор с тем же Idempotency-Key = тот же receipt, второй ран не создан",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "Web-канал принял сообщение",
+      "ok": true,
+      "detail": "userTaskId web-conv-7-41"
+    },
+    {
+      "name": "TG-канал принял апдейт",
+      "ok": true,
+      "detail": "userTaskId tg-chat-555-9001"
+    },
+    {
+      "name": "Web-результат доставлен с runId рана",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "TG-результат доставлен с runId рана",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "корреляция внешних ID сохранена по всей цепочке",
+      "ok": true,
+      "detail": "web-conv-7-41 / tg-chat-555-9001"
+    },
+    {
+      "name": "ID в каналах различаются (нет склейки задач)",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "принципал вне когорты отклонён",
+      "ok": true,
+      "detail": "HTTP 403 COHORT_NOT_ENABLED"
+    },
+    {
+      "name": "платный профиль отклонён по умолчанию",
+      "ok": true,
+      "detail": "HTTP 403 PAID_PROFILE_DISABLED"
+    },
+    {
+      "name": "отказы записаны в durable-журнал с причиной",
+      "ok": true,
+      "detail": "2 записей"
+    },
+    {
+      "name": "воркер A принял задачу первой",
+      "ok": true,
+      "detail": "runId run_58b4fd66…"
+    },
+    {
+      "name": "второй воркер не взял задачу первого (409, владелец назван)",
+      "ok": true,
+      "detail": "sandbox-a"
+    },
+    {
+      "name": "у второго воркера нет рана по чужой задаче",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "молчание сети не считается failover",
+      "ok": true,
+      "detail": "partition_is_not_failover"
+    },
+    {
+      "name": "после явного сигнала новый владелец принял новую попытку",
+      "ok": true,
+      "detail": "HTTP 202"
+    },
+    {
+      "name": "прежний владелец fenced: поздняя попытка отклонена",
+      "ok": true,
+      "detail": "HTTP 409"
+    },
+    {
+      "name": "владение и поколение в реестре совпадают с раном",
+      "ok": true,
+      "detail": "{\"principalId\":\"p29-client\",\"userTaskId\":\"task-fleet-shared\",\"ownerWorkerId\":\"sandbox-b\",\"ownerGeneration\":2,\"runId\":\"run_b34a30dc-02ab-453e-8d7d-bde81e23f435\",\"state\":\"owned\",\"previousOwnerWorkerId\":\"sandbox-a\",\"updatedAt\":\"2026-10-03T07:01:39.451Z\"}"
+    },
+    {
+      "name": "новая попытка = новый runId, тот же userTaskId, поколение +1",
+      "ok": true,
+      "detail": "run_b34a30dc-02ab-453e-8d7d-bde81e23f435 gen 2"
+    },
+    {
+      "name": "реплей новой попытки без дублей и пропусков",
+      "ok": true,
+      "detail": "8 событий, claimed 1"
+    },
+    {
+      "name": "задача принята до отката",
+      "ok": true,
+      "detail": "HTTP 202"
+    },
+    {
+      "name": "после рестарта релиз откатан и обслуживает предыдущий",
+      "ok": true,
+      "detail": "serving p29-20261003-2-r1"
+    },
+    {
+      "name": "новые задачи когорты не принимаются (503 PROMOTION_PAUSED)",
+      "ok": true,
+      "detail": "HTTP 503 PROMOTION_PAUSED"
+    },
+    {
+      "name": "принятое до отката живо у прежнего владельца во время отката",
+      "ok": true,
+      "detail": "state running"
+    },
+    {
+      "name": "отменённое прежним владельцем дошло до терминала у него же",
+      "ok": true,
+      "detail": "200 cancelled"
+    },
+    {
+      "name": "данные ранее принятого рана читаются и при откате",
+      "ok": true,
+      "detail": "HTTP 200"
+    },
+    {
+      "name": "реплей ранее принятого рана цел",
+      "ok": true,
+      "detail": "8 событий"
+    },
+    {
+      "name": "откат записан в журнал с причиной и переходами",
+      "ok": true,
+      "detail": "p29-20261003-2-r1: promotion probe: candidate release rolled back"
+    },
+    {
+      "name": "после resume обслуживает кандидат",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "после resume приём работает",
+      "ok": true,
+      "detail": "HTTP 202"
+    },
+    {
+      "name": "retention-здоровье отдаётся с политикой и планом",
+      "ok": true,
+      "detail": "total 5, terminal 5"
+    },
+    {
+      "name": "живые раны защищены от очистки",
+      "ok": true,
+      "detail": "protected 0"
+    },
+    {
+      "name": "журнал промоушена читается и содержит переходы",
+      "ok": true,
+      "detail": "12 записей, последняя cohort_configured"
+    },
+    {
+      "name": "capabilities объявляет promotion-контур",
+      "ok": true,
+      "detail": "{\"releaseId\":\"p29-20261003-2-r2\",\"sourceCommit\":\"f4163786bb2a5540f0e1f0ef83e8b0db235da1eb\",\"configVersion\":2}"
+    },
+    {
+      "name": "в ответе /v1/release нет значения ключа",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "экспериментальные данные/ключи нельзя объявить production",
+      "ok": true,
+      "detail": "workerId,dataRoot,configDir,endpoint,keys"
+    },
+    {
+      "name": "namespace изолирован: другие эксперименты не тронуты",
+      "ok": true,
+      "detail": "соседние namespace: p29-20261003"
+    },
+    {
+      "name": "артефакты прогона не вышли за пределы namespace",
+      "ok": true,
+      "detail": "нет выходов за границу"
+    },
+    {
+      "name": "журнал содержит release/cohort/rollback",
+      "ok": true,
+      "detail": "release_pinned,cohort_configured,admission_refused,rollback,rollback_resumed"
+    },
+    {
+      "name": "seq в журнале монотонный и без дыр",
+      "ok": true,
+      "detail": "1,2,3,4,5,6,7,8,9,10,11,12"
+    },
+    {
+      "name": "в логах сервиса есть releaseId/workerId/region у каждой строки",
+      "ok": true,
+      "detail": "95 строк разобрано"
+    },
+    {
+      "name": "стартовая строка содержит закреплённый релиз, когорту и retention",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "значения ключей в транскрипте нет",
+      "ok": true,
+      "detail": "8 секретов проверено"
+    },
+    {
+      "name": "share-секреты в транскрипте нет",
+      "ok": true,
+      "detail": "2 шар-секретов проверено"
+    },
+    {
+      "name": "в логах воркеров нет заголовков с ключом",
+      "ok": true,
+      "detail": "95 строк"
+    }
+  ],
+  "journal": {
+    "a": [
+      {
+        "schemaVersion": 1,
+        "seq": 1,
+        "at": "2026-10-03T07:01:38.580Z",
+        "kind": "release_pinned",
+        "releaseId": "p29-20261003-2-r2",
+        "reason": "service start with a pinned release manifest",
+        "servingReleaseId": "p29-20261003-2-r2",
+        "cohortId": "p29",
+        "workerId": "sandbox-a",
+        "region": "sandbox-eu",
+        "detail": {
+          "sourceCommit": "f4163786bb2a5540f0e1f0ef83e8b0db235da1eb",
+          "configVersion": 2,
+          "environment": "sandbox",
+          "paidProfilesAllowed": false,
+          "rolledBack": false,
+          "retention": {
+            "mainEventsDays": 30,
+            "verboseLogsDays": 7
+          },
+          "ownerStore": "shared_fleet_registry"
+        }
+      },
+      {
+        "schemaVersion": 1,
+        "seq": 2,
+        "at": "2026-10-03T07:01:38.581Z",
+        "kind": "cohort_configured",
+        "releaseId": "p29-20261003-2-r2",
+        "reason": "cohort p29 is allowlist",
+        "cohortId": "p29",
+        "workerId": "sandbox-a",
+        "region": "sandbox-eu",
+        "detail": {
+          "mode": "allowlist",
+          "rolloutPercent": 0,
+          "principals": 2
+        }
+      },
+      {
+        "schemaVersion": 1,
+        "seq": 3,
+        "at": "2026-10-03T07:01:39.273Z",
+        "kind": "admission_refused",
+        "releaseId": "p29-20261003-2-r2",
+        "reason": "principal \"p29-outsider\" is not in cohort p29 (outside_allowlist)",
+        "cohortId": "p29",
+        "workerId": "sandbox-a",
+        "region": "sandbox-eu",
+        "detail": {
+          "code": "COHORT_NOT_ENABLED",
+          "principalId": "p29-outsider",
+          "cohortId": "p29",
+          "mode": "allowlist",
+          "bucket": 5407,
+          "reason": "outside_allowlist"
+        }
+      },
+      {
+        "schemaVersion": 1,
+        "seq": 4,
+        "at": "2026-10-03T07:01:39.277Z",
+        "kind": "admission_refused",
+        "releaseId": "p29-20261003-2-r2",
+        "reason": "engine \"opencode\" is not declared as free by release p29-20261003-2-r2; paid profiles are off unless the owner decision is recorded",
+        "cohortId": "p29",
+        "workerId": "sandbox-a",
+        "region": "sandbox-eu",
+        "detail": {
+          "code": "PAID_PROFILE_DISABLED",
+          "principalId": "p29-outsider",
+          "engine": "opencode",
+          "freeEngines": [
+            "fake"
+          ],
+          "paidEngines": [
+            "opencode",
+            "claude",
+            "codex"
+          ],
+          "paidProfilesAllowed": false
+        }
+      },
+      {
+        "schemaVersion": 1,
+        "seq": 5,
+        "at": "2026-10-03T07:01:39.636Z",
+        "kind": "admission_refused",
+        "releaseId": "p29-20261003-2-r2",
+        "reason": "task task-fleet-shared is owned by worker sandbox-b at generation 2; starting a second copy would double-dispatch it",
+        "cohortId": "p29",
+        "workerId": "sandbox-a",
+        "region": "sandbox-eu",
+        "detail": {
+          "code": "TASK_OWNED_BY_OTHER_WORKER",
+          "principalId": "p29-client",
+          "ownerWorkerId": "sandbox-b",
+          "ownerGeneration": 2
+        }
+      },
+      {
+        "schemaVersion": 1,
+        "seq": 6,
+        "at": "2026-10-03T07:01:40.343Z",
+        "kind": "rollback",
+        "releaseId": "p29-20261003-2-r2",
+        "reason": "promotion probe: candidate release rolled back",
+        "servingReleaseId": "p29-20261003-2-r1",
+        "previousReleaseId": "p29-20261003-2-r2",
+        "cohortId": "p29",
+        "workerId": "sandbox-a",
+        "region": "sandbox-eu",
+        "detail": {
+          "actor": "probe-operator",
+          "declaredReleaseId": "p29-20261003-2-r2",
+          "newAdmissions": "refused_promotion_paused",
+          "acceptedRuns": "stay_with_current_owner"
+        }
+      },
+      {
+        "schemaVersion": 1,
+        "seq": 7,
+        "at": "2026-10-03T07:01:40.573Z",
+        "kind": "release_pinned",
+        "releaseId": "p29-20261003-2-r2",
+        "reason": "service start with a pinned release manifest",
+        "servingReleaseId": "p29-20261003-2-r1",
+        "cohortId": "p29",
+        "workerId": "sandbox-a",
+        "region": "sandbox-eu",
+        "detail": {
+          "sourceCommit": "f4163786bb2a5540f0e1f0ef83e8b0db235da1eb",
+          "configVersion": 2,
+          "environment": "sandbox",
+          "paidProfilesAllowed": false,
+          "rolledBack": true,
+          "retention": {
+            "mainEventsDays": 30,
+            "verboseLogsDays": 7
+          },
+          "ownerStore": "shared_fleet_registry"
+        }
+      },
+      {
+        "schemaVersion": 1,
+        "seq": 8,
+        "at": "2026-10-03T07:01:40.573Z",
+        "kind": "cohort_configured",
+        "releaseId": "p29-20261003-2-r2",
+        "reason": "cohort p29 is allowlist",
+        "cohortId": "p29",
+        "workerId": "sandbox-a",
+        "region": "sandbox-eu",
+        "detail": {
+          "mode": "allowlist",
+          "rolloutPercent": 0,
+          "principals": 2
+        }
+      },
+      {
+        "schemaVersion": 1,
+        "seq": 9,
+        "at": "2026-10-03T07:01:40.593Z",
+        "kind": "admission_refused",
+        "releaseId": "p29-20261003-2-r2",
+        "reason": "release p29-20261003-2-r2 is rolled back: promotion probe: candidate release rolled back",
+        "cohortId": "p29",
+        "workerId": "sandbox-a",
+        "region": "sandbox-eu",
+        "detail": {
+          "code": "PROMOTION_PAUSED",
+          "principalId": "p29-client",
+          "releaseId": "p29-20261003-2-r2",
+          "servingReleaseId": "p29-20261003-2-r1",
+          "previousReleaseId": "p29-20261003-2-r2",
+          "newAdmissions": "refused",
+          "acceptedRuns": "stay_with_current_owner"
+        }
+      },
+      {
+        "schemaVersion": 1,
+        "seq": 10,
+        "at": "2026-10-03T07:01:40.779Z",
+        "kind": "rollback_resumed",
+        "releaseId": "p29-20261003-2-r2",
+        "reason": "promotion probe: gate green, serving candidate again",
+        "servingReleaseId": "p29-20261003-2-r2",
+        "previousReleaseId": "p29-20261003-2-r1",
+        "cohortId": "p29",
+        "workerId": "sandbox-a",
+        "region": "sandbox-eu",
+        "detail": {
+          "actor": "probe-operator",
+          "newAdmissions": "accepted"
+        }
+      },
+      {
+        "schemaVersion": 1,
+        "seq": 11,
+        "at": "2026-10-03T07:01:41.148Z",
+        "kind": "release_pinned",
+        "releaseId": "p29-20261003-2-r2",
+        "reason": "service start with a pinned release manifest",
+        "servingReleaseId": "p29-20261003-2-r2",
+        "cohortId": "p29",
+        "workerId": "sandbox-a",
+        "region": "sandbox-eu",
+        "detail": {
+          "sourceCommit": "f4163786bb2a5540f0e1f0ef83e8b0db235da1eb",
+          "configVersion": 2,
+          "environment": "sandbox",
+          "paidProfilesAllowed": false,
+          "rolledBack": false,
+          "retention": {
+            "mainEventsDays": 30,
+            "verboseLogsDays": 7
+          },
+          "ownerStore": "shared_fleet_registry"
+        }
+      },
+      {
+        "schemaVersion": 1,
+        "seq": 12,
+        "at": "2026-10-03T07:01:41.149Z",
+        "kind": "cohort_configured",
+        "releaseId": "p29-20261003-2-r2",
+        "reason": "cohort p29 is allowlist",
+        "cohortId": "p29",
+        "workerId": "sandbox-a",
+        "region": "sandbox-eu",
+        "detail": {
+          "mode": "allowlist",
+          "rolloutPercent": 0,
+          "principals": 2
+        }
+      }
+    ],
+    "b": [
+      {
+        "schemaVersion": 1,
+        "seq": 1,
+        "at": "2026-10-03T07:01:38.571Z",
+        "kind": "release_pinned",
+        "releaseId": "p29-20261003-2-r1",
+        "reason": "service start with a pinned release manifest",
+        "servingReleaseId": "p29-20261003-2-r1",
+        "cohortId": "p29",
+        "workerId": "sandbox-b",
+        "region": "sandbox-eu",
+        "detail": {
+          "sourceCommit": "f4163786bb2a5540f0e1f0ef83e8b0db235da1eb",
+          "configVersion": 1,
+          "environment": "sandbox",
+          "paidProfilesAllowed": false,
+          "rolledBack": false,
+          "retention": {
+            "mainEventsDays": 30,
+            "verboseLogsDays": 7
+          },
+          "ownerStore": "shared_fleet_registry"
+        }
+      },
+      {
+        "schemaVersion": 1,
+        "seq": 2,
+        "at": "2026-10-03T07:01:38.572Z",
+        "kind": "cohort_configured",
+        "releaseId": "p29-20261003-2-r1",
+        "reason": "cohort p29 is allowlist",
+        "cohortId": "p29",
+        "workerId": "sandbox-b",
+        "region": "sandbox-eu",
+        "detail": {
+          "mode": "allowlist",
+          "rolloutPercent": 0,
+          "principals": 2
+        }
+      },
+      {
+        "schemaVersion": 1,
+        "seq": 3,
+        "at": "2026-10-03T07:01:39.413Z",
+        "kind": "admission_refused",
+        "releaseId": "p29-20261003-2-r1",
+        "reason": "task task-fleet-shared is owned by worker sandbox-a at generation 1; starting a second copy would double-dispatch it",
+        "cohortId": "p29",
+        "workerId": "sandbox-b",
+        "region": "sandbox-eu",
+        "detail": {
+          "code": "TASK_OWNED_BY_OTHER_WORKER",
+          "principalId": "p29-client",
+          "ownerWorkerId": "sandbox-a",
+          "ownerGeneration": 1
+        }
+      },
+      {
+        "schemaVersion": 1,
+        "seq": 4,
+        "at": "2026-10-03T07:01:39.914Z",
+        "kind": "release_pinned",
+        "releaseId": "p29-20261003-2-r1",
+        "reason": "service start with a pinned release manifest",
+        "servingReleaseId": "p29-20261003-2-r1",
+        "cohortId": "p29",
+        "workerId": "sandbox-b",
+        "region": "sandbox-eu",
+        "detail": {
+          "sourceCommit": "f4163786bb2a5540f0e1f0ef83e8b0db235da1eb",
+          "configVersion": 1,
+          "environment": "sandbox",
+          "paidProfilesAllowed": false,
+          "rolledBack": false,
+          "retention": {
+            "mainEventsDays": 30,
+            "verboseLogsDays": 7
+          },
+          "ownerStore": "shared_fleet_registry"
+        }
+      },
+      {
+        "schemaVersion": 1,
+        "seq": 5,
+        "at": "2026-10-03T07:01:39.916Z",
+        "kind": "cohort_configured",
+        "releaseId": "p29-20261003-2-r1",
+        "reason": "cohort p29 is allowlist",
+        "cohortId": "p29",
+        "workerId": "sandbox-b",
+        "region": "sandbox-eu",
+        "detail": {
+          "mode": "allowlist",
+          "rolloutPercent": 0,
+          "principals": 2
+        }
+      },
+      {
+        "schemaVersion": 1,
+        "seq": 6,
+        "at": "2026-10-03T07:01:41.577Z",
+        "kind": "release_pinned",
+        "releaseId": "p29-20261003-2-r1",
+        "reason": "service start with a pinned release manifest",
+        "servingReleaseId": "p29-20261003-2-r1",
+        "cohortId": "p29",
+        "workerId": "sandbox-b",
+        "region": "sandbox-eu",
+        "detail": {
+          "sourceCommit": "f4163786bb2a5540f0e1f0ef83e8b0db235da1eb",
+          "configVersion": 1,
+          "environment": "sandbox",
+          "paidProfilesAllowed": false,
+          "rolledBack": false,
+          "retention": {
+            "mainEventsDays": 30,
+            "verboseLogsDays": 7
+          },
+          "ownerStore": "shared_fleet_registry"
+        }
+      },
+      {
+        "schemaVersion": 1,
+        "seq": 7,
+        "at": "2026-10-03T07:01:41.577Z",
+        "kind": "cohort_configured",
+        "releaseId": "p29-20261003-2-r1",
+        "reason": "cohort p29 is allowlist",
+        "cohortId": "p29",
+        "workerId": "sandbox-b",
+        "region": "sandbox-eu",
+        "detail": {
+          "mode": "allowlist",
+          "rolloutPercent": 0,
+          "principals": 2
+        }
+      }
+    ]
+  },
+  "serviceLogLines": {
+    "a": 95,
+    "b": 54
+  }
+}

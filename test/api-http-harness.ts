@@ -9,7 +9,7 @@ import { sleep, waitForProcessDeath } from '../src/adapters/engine/process-tree.
 import { OpenCodeAdapter } from '../src/adapters/engine/opencode-adapter.js';
 import { generateApiKey, KeyRegistry, keyRecordFor, type Principal } from '../src/api/auth.js';
 import { createAgentApiServer } from '../src/api/server.js';
-import { AgentApi, type AgentApiOptions, type ServiceRecoveryReport } from '../src/api/service.js';
+import { AgentApi, type AgentApiOptions, type PromotionRuntime, type ServiceRecoveryReport } from '../src/api/service.js';
 import { FaultRegistry } from '../src/faults/registry.js';
 import { isTerminalState } from '../src/runner/state-machine.js';
 import type { ArtifactStore } from '../src/storage/artifact-store.js';
@@ -63,6 +63,11 @@ export interface HttpHarnessOptions {
   capabilities?: CapabilityRegistry;
   /** Резолвер значений credential binding'ов (P13). */
   bindingResolver?: BindingValueResolver;
+  /**
+   * Промоушен-контур (P29). Фабрика, а не готовый объект: рестарт сервиса должен заново
+   * прочитать файл состояния релиза — иначе откат нельзя было бы проверить перезапуском.
+   */
+  promotion?: () => PromotionRuntime;
 }
 
 export interface HttpHarness {
@@ -109,8 +114,12 @@ export async function startHttpHarness(options: HttpHarnessOptions = {}): Promis
     ...(options.capabilities ? { capabilities: options.capabilities } : {}),
     ...(options.bindingResolver ? { bindingResolver: options.bindingResolver } : {}),
   };
+  const start = (): AgentApi => {
+    const service = new AgentApi(options.promotion ? { ...serviceOptions, promotion: options.promotion() } : serviceOptions);
+    return service;
+  };
 
-  let service = new AgentApi(serviceOptions);
+  let service = start();
   await service.recover();
   const serverOptions = {
     keys,
@@ -148,7 +157,7 @@ export async function startHttpHarness(options: HttpHarnessOptions = {}): Promis
       await shutdown(server);
       service.dispose({ killProcesses });
       for (const victim of victims) await waitForProcessDeath(victim.pgid, victim.pid, 3000);
-      service = new AgentApi(serviceOptions);
+      service = start();
       const report = await service.recover();
       server = createAgentApiServer(service, serverOptions);
       port = await listen(server);
