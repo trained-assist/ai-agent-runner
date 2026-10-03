@@ -12,16 +12,21 @@ import { AgentApi } from '../src/api/service.js';
 import { FakeEngine } from '../src/adapters/engine/fake-engine.js';
 import { OpenCodeAdapter } from '../src/adapters/engine/opencode-adapter.js';
 import { createBlobStore } from '../src/storage/create-blob-store.js';
+import { ArtifactStore } from '../src/storage/artifact-store.js';
+import { RunExportStore } from '../src/storage/export.js';
 import { Runner } from '../src/runner/runner.js';
 import { BRIDGE_SOCKET_PATH_LIMIT, bridgeSocketPath } from '../src/mcp/bridge.js';
 import { UnixCleanRoomProvider } from '../src/isolation/clean-room.js';
 import { detectHostIsolationCapabilities, hostCapabilitySkipReason } from '../src/isolation/host-capabilities.js';
 import { RUN_ISOLATION_SCHEMA_VERSION, type CleanRoomLeaseStatus, type CleanRoomProvider } from '../src/isolation/contract.js';
+import type { Principal } from '../src/api/auth.js';
 import type { Harness, HarnessOptions } from './helpers.js';
 
 /** Слоты для настоящей границы: на непривилегированном CI их нет, и блок пропускается. */
 const hostCapabilities = detectHostIsolationCapabilities({ slots: ['ta-agent-1', 'ta-agent-2'] });
 const hostSkipReason = hostCapabilitySkipReason(hostCapabilities);
+
+const principal: Principal = { principalId: 'p-iso', profileId: 'profile-a', scopes: ['runs:read', 'runs:write'], engines: ['fake'] };
 
 function events(rootDir: string, runId: string): Array<Record<string, unknown>> {
   const path = join(rootDir, 'runs', runId, 'events.jsonl');
@@ -50,11 +55,16 @@ function harnessWith(
   return { h, provider };
 }
 
-function apiFor(options: { rootDir: string; isolation?: CleanRoomProvider }): AgentApi {
+function apiFor(options: { rootDir: string; isolation?: CleanRoomProvider; artifactExport?: boolean }): AgentApi {
+  const blob = createBlobStore({ backend: 'local-fs', localRoot: join(options.rootDir, 'blobs') });
   return new AgentApi({
     rootDir: options.rootDir,
     adapters: { fake: new FakeEngine('success'), opencode: new OpenCodeAdapter() },
     host: { region: 'sandbox-eu', environment: 'sandbox' },
+    blob,
+    ...(options.artifactExport
+      ? { exports: new RunExportStore({ rootDir: options.rootDir, artifacts: new ArtifactStore({ rootDir: options.rootDir, blob }) }) }
+      : {}),
     ...(options.isolation ? { isolation: options.isolation } : {}),
   });
 }
@@ -412,6 +422,40 @@ describe('clean room isolation (issue #51)', () => {
     expect(validateRunSpec({ ...base, isolation: { mode: 'per_run_unix_identity' } }).ok).toBe(true);
     expect(validateRunSpec({ ...base, isolation: { mode: 'none' } }).ok).toBe(true);
     expect(validateRunSpec({ ...base, isolation: { mode: 'container' } }).ok).toBe(false);
+  });
+
+  it('требование границы клиента доходит до рана: без провайдера такой ран отказывается', async () => {
+    const apiRoot = harnessRootFor('request-wiring');
+    // Хост БЕЗ провайдера границы: клиент запросил per_run_unix_identity.
+    const api = apiFor({ rootDir: apiRoot });
+    const receipt = api.submit(principal, 'idem-iso-required', {
+      userTaskId: 'task-iso',
+      engine: { name: 'fake', adapterVersion: '1' },
+      envAllowlist: [],
+      limits: { timeoutMs: 10_000 },
+      isolation: { mode: 'per_run_unix_identity' },
+    });
+    await waitFor(() => api.status(principal, receipt.runId).state === 'failed', 8000, 'run to be refused');
+    // Отказ до спавна движка: запуск под service UID был бы расширением прав.
+    expect(api.result(principal, receipt.runId).failure?.code).toBe('ISOLATION_UNAVAILABLE');
+  });
+
+  it('объявленные выходы клиента доходят до рана и сохраняются', async () => {
+    const launcher = new RecordingLauncher();
+    const rootDir = harnessRootFor('outputs-wiring');
+    const provider = new StubCleanRoomProvider({ rootDir }, launcher);
+    const api = apiFor({ rootDir, isolation: provider, artifactExport: true });
+    const receipt = api.submit(principal, 'idem-outputs', {
+      userTaskId: 'task-outputs',
+      engine: { name: 'fake', adapterVersion: '1' },
+      envAllowlist: [],
+      limits: { timeoutMs: 10_000 },
+      outputs: [{ path: 'ran.txt' }],
+    });
+    await waitFor(() => api.status(principal, receipt.runId).state === 'succeeded', 8000, 'run to succeed');
+    // spec.outputs переносится в RunSpec, иначе экспортировать нечего: манифест пуст.
+    expect(api.runner.getRun(receipt.runId)?.export?.exported).toBe(1);
+    expect(api.result(principal, receipt.runId).outputRefs).toHaveLength(1);
   });
 });
 
