@@ -91,14 +91,21 @@ describe('совместимость с control plane (C01/C02/C03, P06, AC-69)'
     };
     const sequences = [...page1.events, ...page2.events].map((event) => event.sequence);
     expect(new Set(sequences).size).toBe(sequences.length); // без дублей на стыке курсоров
-    const full = (await (await fetch(`${h.base}/v1/runs/${receipt.runId}/events?cursor=0&limit=1000`, { headers: authHeader(alphaKey) })).json()) as { events: Array<{ type: string }> };
+    // Ждём последнюю строку движка, прежде чем мерять «status не создаёт событий»:
+    // иначе в замер попадает ещё не долетевший stdout движка (известный CI-флейк).
+    const eventsPage = () => fetch(`${h.base}/v1/runs/${receipt.runId}/events?cursor=0&limit=1000`, { headers: authHeader(alphaKey) }).then((res) => res.json()) as Promise<{ events: Array<{ type: string; payload?: { message?: string } }> }>;
+    await waitFor(async () => {
+      const page = await eventsPage();
+      return page.events.some((event) => event.type === 'log');
+    }, 8000, 'engine log line');
+    const full = await eventsPage();
     expect(full.events.filter((event) => event.type === 'claimed')).toHaveLength(1); // никакого rerun
 
     // ---- status только чтение: не создаёт событий и не запускает попыток
     const before = full.events.length;
     await getStatus(h.base, alphaKey, receipt.runId);
     await getStatus(h.base, alphaKey, receipt.runId);
-    const after = (await (await fetch(`${h.base}/v1/runs/${receipt.runId}/events?cursor=0&limit=1000`, { headers: authHeader(alphaKey) })).json()) as { events: Array<{ type: string }> };
+    const after = await eventsPage();
     expect(after.events.length).toBe(before);
 
     // ---- C03: cancel requested ≠ stopped
