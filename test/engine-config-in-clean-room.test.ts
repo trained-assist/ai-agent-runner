@@ -57,10 +57,14 @@ describe('конфиг движка в run-scoped clean room', () => {
     // Ран «висящий» (scenario=timeout): каталоги среды на месте, пока их не снёс sweep.
     await waitFor(() => logMessages(h.rootDir, receipt.runId).some((line) => line.startsWith('engine_config.seeded')));
 
-    const configPath = join(h.rootDir, 'cleanrooms', receipt.runId, 'config', layout.dir, layout.file);
+    const configDir = join(h.rootDir, 'cleanrooms', receipt.runId, 'config', layout.dir);
+    const configPath = join(configDir, layout.file);
     expect(existsSync(configPath)).toBe(true);
     expect(JSON.parse(readFileSync(configPath, 'utf8'))).toEqual(template);
     expect(statSync(configPath).mode & 0o777).toBe(0o600);
+    // Каталог конфигурации — тоже часть среды рана: 0700, иначе движок под идентичностью
+    // рана не прочитает свой конфиг и уйдёт на модель по умолчанию (проверено на VM2).
+    expect(statSync(configDir).mode & 0o777).toBe(0o700);
 
     // В лог рана попадает sha256 копии, а не её содержимое.
     const seeded = logMessages(h.rootDir, receipt.runId).find((line) => line.startsWith('engine_config.seeded')) as string;
