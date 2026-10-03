@@ -54,7 +54,7 @@ jobs:
       - name: Install opencode (глобально)
         run: npm install -g opencode-ai >/dev/null 2>&1 && opencode --version
 
-      - name: "Opencode free-ladder: 4 параллельных + 1 длинный"
+      - name: "Opencode free: 4 параллельных + 1 длинный"
         env:
           LLM_LADDER_TOKEN: ${{ secrets.LLM_LADDER_TOKEN }}
         run: |
@@ -65,7 +65,7 @@ jobs:
               "ladder": {
                 "name": "llm-ladder",
                 "options": { "baseURL": "https://llm-ladder.trainedassist.store/v1", "apiKey": "{env:LLM_LADDER_TOKEN}" },
-                "models": { "free-ladder": { "name": "free-ladder" } }
+                "models": { "free": { "name": "free" } }
               }
             }
           }
@@ -75,7 +75,7 @@ jobs:
             local label="$1" prompt="$2" tmo="$3"
             local s e code out
             s=$(date +%s%3N)
-            out=$(timeout "$tmo" opencode run --auto -m ladder/free-ladder "$prompt" 2>&1)
+            out=$(timeout "$tmo" opencode run --auto -m ladder/free "$prompt" 2>&1)
             code=$?
             e=$(date +%s%3N)
             printf '%s\t%s\t%s\t%s\n' "$label" "$code" "$((e - s))" "$(echo "$out" | tail -1 | tr '\t' ' ' | cut -c1-140)" >> oc.tsv
@@ -94,7 +94,7 @@ jobs:
             console.log(JSON.stringify(summary, null, 2));
           '
           {
-            echo "### opencode free-ladder под нагрузкой"
+            echo "### opencode free под нагрузкой"
             echo '```'
             column -t -s$'\t' oc.tsv | head -10
             echo '```'
