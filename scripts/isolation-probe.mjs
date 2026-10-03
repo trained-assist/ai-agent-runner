@@ -479,6 +479,58 @@ function isolationEnv(slots, extra = {}) {
   return { AGENT_API_ISOLATION_SLOTS: slots.join(','), AGENT_API_ISOLATION_TOOL_PATHS: TOOL_DIR, ...extra };
 }
 
+// ------------------------------------------------- детект возможностей хоста (skip)
+
+/**
+ * Что этому хосту доступно для настоящей границы. Граница привилегированная: без root
+ * нельзя создать слот и раздать ACL, без setfacl каталог рана под сервисным dataDir
+ * недостижим для слота, без переключателя идентичности нечего проверять.
+ */
+function detectHostCapabilities() {
+  const uid = typeof process.getuid === 'function' ? process.getuid() : null;
+  const launcher = ['setpriv', 'runuser'].filter(hasCommand);
+  const setfacl = hasCommand('setfacl');
+  const reasons = [];
+  if (process.platform !== 'linux') reasons.push(`platform ${process.platform}, нужна linux`);
+  if (uid !== 0) reasons.push(`uid=${String(uid)}, нужны root (useradd/chown/setfacl/setpriv)`);
+  if (launcher.length === 0) reasons.push('нет переключателя идентичности (setpriv/runuser)');
+  if (!setfacl) reasons.push('нет setfacl: каталог рана под dataDir недостижим для слота');
+  const slots = [];
+  const missing = [];
+  for (const slot of slotsFlag) {
+    if (runAs('/usr/bin/getent', ['passwd', slot]).code === 0) slots.push(slot);
+    else missing.push(slot);
+  }
+  if (missing.length > 0) reasons.push(`слотов нет на хосте: ${missing.join(',')}`);
+  return { uid, launcher, setfacl, slots, missing, reasons, enforced: reasons.length === 0 };
+}
+
+/**
+ * Пропуск пробы на хосте без привилегий. Это НЕ успех: граница здесь не проверялась, и
+ * транскрипт говорит об этом прямо (`status: skipped`), чтобы «зелёный» CI-шаг нельзя
+ * было прочитать как доказанную изоляцию.
+ */
+function writeSkippedTranscript(capabilities) {
+  const payload = `${JSON.stringify(
+    {
+      schemaVersion: 1,
+      probe: 'Граница Agent clean room: per-run Unix-идентичность (issue #51)',
+      status: 'skipped',
+      generatedAt: new Date().toISOString(),
+      host: { platform: process.platform, kernel: kernelRelease(), apiProcessUid: capabilities.uid },
+      skippedBecause: capabilities.reasons,
+      note: 'Проба границы не выполнялась: хосту не хватает привилегий для per-run Unix-идентичности. Это не доказательство границы и не провал — доказательство берётся с привилегированной песочной VM (docs/evidence/p51-clean-room-vm2).',
+    },
+    null,
+    2,
+  )}\n`;
+  writeFileSync(join(OUT_DIR, 'transcript.json'), payload);
+  const sha = createHash('sha256').update(readFileSync(join(OUT_DIR, 'transcript.json'))).digest('hex');
+  writeFileSync(join(OUT_DIR, 'transcript.sha256'), `${sha}  transcript.json\n`);
+  process.stdout.write(`SKIP  проба границы пропущена (не провалена): ${capabilities.reasons.join('; ')}\n`);
+  process.stdout.write(`transcript: ${join(OUT_DIR, 'transcript.sha256')}\n`);
+}
+
 // ---------------------------------------------------------------------------- main
 
 async function main() {
@@ -491,6 +543,12 @@ async function main() {
   const spec = readJson(PROVISIONING).workers[0];
   if (!spec) throw new Error(`namespace ${NAMESPACE} has no worker to probe`);
   mkdirSync(OUT_DIR, { recursive: true });
+
+  const host = detectHostCapabilities();
+  if (!host.enforced) {
+    writeSkippedTranscript(host);
+    process.exit(0);
+  }
 
   const stepsRun = [];
   const runStep = async (id, fn) => {
