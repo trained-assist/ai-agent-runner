@@ -62,6 +62,8 @@ export interface StubProviderOptions {
  */
 export class StubCleanRoomProvider implements CleanRoomProvider {
   readonly policy: IsolationPolicy;
+  /** uid не переключается: провайдер без привилегий, реальная граница проверяется пробой на хосте. */
+  readonly identityEnforcement = 'simulated' as const;
   readonly launcher: ProcessLauncher | null;
   private readonly rootDir: string;
   private readonly options: StubProviderOptions;

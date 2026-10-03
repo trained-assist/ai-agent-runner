@@ -11,7 +11,9 @@
  * Выход: один JSON-объект в stdout. Ноль — все проверки сошлись; 3 — граница нарушена;
  * 4 — проба не смогла выполниться (ошибка пробы, а не нарушение).
  */
-import { accessSync, constants, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+// realpathSync берём из node:fs: в ESM-импорте node:path этот именованный экспорт
+// недоступен, и проба падала бы на разборе модуля вместо вердикта.
+import { accessSync, constants, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { readFileSync as readProcStatus } from 'node:fs';
 
 const checks = [];
@@ -31,6 +33,12 @@ function tryDenied(label, expect, target, fn) {
     record(label, expect, target, 'allowed', 'operation succeeded');
   } catch (error) {
     const code = error && typeof error.code === 'string' ? error.code : 'ERR';
+    // Отсутствующая цель — не утечка: чужой ран мог уже закончиться и быть вычищен.
+    // Такую проверку пропускаем, иначе уборка соседа выглядела бы нарушением границы.
+    if (code === 'ENOENT') {
+      record(label, expect, target, 'skipped', 'target is already gone');
+      return;
+    }
     record(label, expect, target, deniedBy(error) ? 'denied' : 'error', code);
   }
 }
@@ -41,7 +49,7 @@ function tryAllowed(label, expect, target, fn) {
     record(label, expect, target, 'allowed', 'operation succeeded');
   } catch (error) {
     const code = error && typeof error.code === 'string' ? error.code : 'ERR';
-    record(label, expect, target, 'error', code);
+    record(label, expect, target, code === 'ENOENT' ? 'skipped' : 'error', code);
   }
 }
 
@@ -97,7 +105,6 @@ function main() {
 
   let cwdOk = false;
   try {
-    const { realpathSync } = await import('node:path');
     const real = realpathSync(process.cwd());
     const base = realpathSync(roomCwd);
     cwdOk = real === base;
@@ -194,7 +201,9 @@ function main() {
     gid: self.gid,
     groups: self.groups,
     checks,
-    failures: failures.map((check) => `${check.name}:${check.outcome}`),
+    // причина провала — в сообщении: по логу рана должно быть видно, КАКАЯ именно
+    // отрицательная проверка не сработала, а не только «граница нарушена».
+    failures: failures.map((check) => `${check.name}:${check.outcome}:${check.detail}`),
   };
   process.stdout.write(`${JSON.stringify(result)}\n`);
   process.exitCode = failures.length === 0 ? 0 : 3;

@@ -944,10 +944,21 @@ export class Runner {
    * Сверка, что процесс движка реально исполняется под идентичностью рана. Хост читает
    * /proc/<pid>/status: если UID не совпал со слотом, процесс убивается, а ран отказывает —
    * запускать движок с более широкими правами, чем у рана, нельзя.
+   *
+   * Провайдер без привилегий (`simulated`) переключения не делает: сверка тогда не
+   * выполняется, и это видно в логе рана, а не проходит как «проверено».
    */
   private assertEngineIdentity(run: InternalRun, st: PersistedRunState, pid: number): void {
     const room = run.room;
     if (!room) return;
+    if (this.opts.isolation?.identityEnforcement === 'simulated') {
+      this.emit(st, 'log', {
+        stream: 'runner',
+        level: 'warn',
+        message: `engine.identity_not_enforced pid=${pid} slot=${room.identity.slotId} reason=provider_simulated`,
+      });
+      return;
+    }
     const uid = readProcUid(pid);
     if (uid === null) {
       this.emit(st, 'log', {

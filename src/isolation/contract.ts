@@ -131,6 +131,13 @@ export interface SweepOptions {
 
 export interface CleanRoomProvider {
   readonly policy: IsolationPolicy;
+  /**
+   * Обещание провайдера по идентичности. `enforced` — переключение на хосте реально
+   * происходит, и Runner сверяет uid процесса движка по /proc и отказывает при расхождении.
+   * `simulated` — провайдер без привилегий (тесты/пробы в CI): переключения нет, сверка не
+   * выполняется, и это объявляется в логе рана, а не проходит молча.
+   */
+  readonly identityEnforcement: 'enforced' | 'simulated';
   /** Лаунчер переключения идентичности для движка и per-run MCP-процессов. */
   readonly launcher: ProcessLauncher | null;
   /** Честная декларация хоста для `GET /v1/capabilities`. */

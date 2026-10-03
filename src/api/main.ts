@@ -158,6 +158,10 @@ function writeJson(res: ServerResponse, status: number, data: unknown): void {
 }
 
 async function main(): Promise<void> {
+  // API держит ключи и состояние ранов: umask по умолчанию оставлял бы файлы 0644, а слоту
+  // выдаётся проходимость к dataDir. Слот не должен получить на чтение то, что Runner
+  // создаёт рядом со своим каталогом, поэтому процесс стартует с закрытым umask.
+  process.umask(0o077);
   const config = loadAgentApiConfig();
   const manifest: ReleaseManifest = releaseManifestFromEnv(process.env);
   const identity = releaseIdentity(manifest);

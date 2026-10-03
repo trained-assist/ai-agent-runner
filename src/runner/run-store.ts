@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { validateRunnerEvent, type RunnerEvent } from '../contracts/events.js';
 import type { RunResult } from '../contracts/result.js';
@@ -82,6 +82,14 @@ export class RunStore {
 
   init(): void {
     mkdirSync(this.runsDir, { recursive: true });
+    // 0700: каталог состояния ранов лежит под тем же dataDir, куда слоту выдаётся
+    // проходимость ACL. Если каталог останется 0755, слот прочитает state.json чужого
+    // рана — состояние рана это его credentials-эквивалент.
+    try {
+      chmodSync(this.runsDir, 0o700);
+    } catch {
+      // платформа без posix-прав: тогда граница не настроена и раны не идут через слот
+    }
     if (existsSync(this.operationsPath)) {
       try {
         const parsed = JSON.parse(readFileSync(this.operationsPath, 'utf8')) as Record<string, OperationEntry>;

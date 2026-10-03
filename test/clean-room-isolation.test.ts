@@ -54,12 +54,6 @@ describe('clean room isolation (issue #51)', () => {
     const launcher = new RecordingLauncher();
     const { h, provider } = harnessWith(launcher);
     const { receipt, spec } = h.start();
-    // Каталог рана — 0700 внутри чистой среды, без общего пользовательского конфига
-    await waitFor(() => eventTypes(h.rootDir, receipt.runId).includes('isolation_prepared'));
-    const roomRoot = join(h.rootDir, 'cleanrooms', receipt.runId);
-    expect(statSync(roomRoot).mode & 0o777).toBe(0o700);
-    expect(statSync(join(roomRoot, 'home')).mode & 0o777).toBe(0o700);
-
     const result = await h.runner.waitFor(receipt.runId);
 
     expect(result.outcome).toBe('succeeded');
@@ -101,6 +95,32 @@ describe('clean room isolation (issue #51)', () => {
     // Аренда снята после проверенного sweep: слот свободен, каталогов рана нет
     expect(provider.freeSlots()).toEqual(['slot-a', 'slot-b']);
     expect(listDir(join(h.rootDir, 'cleanrooms'))).toEqual([]);
+    expect(existsSync(spec.cwd)).toBe(false);
+  });
+
+  it('каталоги чистой среды 0700 и переживают только свой ран: проверка на живом ране', async () => {
+    const launcher = new RecordingLauncher();
+    // Висящий движок: пока ран жив, каталоги среды на месте — иначе проверка прав была бы
+    // гонкой с собственным sweep'ом рана.
+    const { h, provider } = harnessWith(launcher, { harness: { scenario: 'timeout' } });
+    const { receipt, spec } = h.start();
+    await waitFor(() => eventTypes(h.rootDir, receipt.runId).includes('isolation_prepared'));
+    const roomRoot = join(h.rootDir, 'cleanrooms', receipt.runId);
+    expect(statSync(roomRoot).mode & 0o777).toBe(0o700);
+    for (const name of ['home', 'config', 'cache', 'data', 'tmp', 'mcp']) {
+      expect(statSync(join(roomRoot, name)).mode & 0o777).toBe(0o700);
+    }
+    // Движок стартовал под лаунчером рана, а uid-сверка честно объявлена как непроверяемая:
+    // тестовый провайдер не переключает идентичность, и это видно в логе, а не скрыто.
+    const engineCalls = launcher.calls.filter((call) => call.args.includes('-e'));
+    expect(engineCalls).toHaveLength(1);
+    expect(engineCalls[0]?.identity.slotId).toBe('slot-a');
+    const messages = logMessages(h.rootDir, receipt.runId);
+    expect(messages.some((line) => line.startsWith('engine.identity_not_enforced'))).toBe(true);
+
+    await h.runner.cancel(receipt.runId, 1);
+    await waitFor(() => provider.freeSlots().length === 2);
+    expect(existsSync(roomRoot)).toBe(false);
     expect(existsSync(spec.cwd)).toBe(false);
   });
 

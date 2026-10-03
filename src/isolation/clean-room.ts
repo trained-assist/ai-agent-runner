@@ -1,6 +1,6 @@
-import { spawn } from 'node:child_process';
-import { chownSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
-import { join } from 'node:path';
+import { spawn, spawnSync } from 'node:child_process';
+import { chmodSync, chownSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { dirname, join, sep } from 'node:path';
 import {
   CleanRoomError,
   type BoundaryProbeResult,
@@ -56,6 +56,7 @@ function exitCode(child: ExitOnce): Promise<number> {
  */
 export class UnixCleanRoomProvider implements CleanRoomProvider {
   readonly policy: IsolationPolicy;
+  readonly identityEnforcement = 'enforced' as const;
   readonly launcher: ProcessLauncher | null;
   private readonly rootDir: string;
   private readonly probeScript: string;
@@ -63,6 +64,12 @@ export class UnixCleanRoomProvider implements CleanRoomProvider {
   private readonly log: (message: string) => void;
   /** Последнее подтверждение границы на этом хосте: selfTest при старте или проба рана. */
   private verification: { ok: boolean; detail: string; at: number } | null = null;
+  /**
+   * Слоты, занятые в этом процессе между выбором и записью аренды. Без этого резервирования
+   * два одновременных acquire'а выбирали бы один слот: между freeSlots() и writeLease()
+   * есть await, и второй ран успевал прочитать пустой реестр.
+   */
+  private readonly reservedSlots = new Set<string>();
 
   constructor(options: UnixCleanRoomOptions) {
     this.rootDir = options.rootDir;
@@ -101,7 +108,7 @@ export class UnixCleanRoomProvider implements CleanRoomProvider {
 
   freeSlots(): string[] {
     const busy = new Set(this.leases().map((lease) => lease.identity.slotId));
-    return this.policy.slots.filter((slot) => !busy.has(slot));
+    return this.policy.slots.filter((slot) => !busy.has(slot) && !this.reservedSlots.has(slot));
   }
 
   leases(): CleanRoomLease[] {
@@ -140,83 +147,112 @@ export class UnixCleanRoomProvider implements CleanRoomProvider {
     }
     const free = this.freeSlots();
     if (free.length === 0) {
+      const busy = this.leases()
+        .filter((lease) => lease.status !== 'released')
+        .map((lease) => `${lease.identity.slotId}:${lease.runId}:${lease.status}`)
+        .join(' ');
       throw new CleanRoomError(
         'ISOLATION_SLOT_BUSY',
-        `all ${this.policy.slots.length} identity slots are leased; no fallback to the service UID`,
+        `all ${this.policy.slots.length} identity slots are leased (slots: ${this.policy.slots.join(',') || 'none'}, free: ${free.join(',') || 'none'}, leases: ${busy || 'none'}, reserved: ${[...this.reservedSlots].join(',') || 'none'}); no fallback to the service UID`,
         true,
       );
     }
     const slotId = free[0] as string;
-    let identity: RunIdentity;
+    // Резервируем слот до первого await: иначе второй одновременный ран выберет тот же.
+    // Снимается в finally — после записи долговечной аренды, поэтому слот не может
+    // «зависнуть» в резерве при любом отказе подъёма границы.
+    this.reservedSlots.add(slotId);
     try {
-      identity = await this.resolveSlot(slotId);
+      const identity = await this.resolveSlot(slotId);
+      const paths = this.pathsFor(runId, cwd);
+      const at = this.now().toISOString();
+
+      this.prepareDirectory(paths.root, identity, 0o700);
+      for (const dir of [paths.home, paths.config, paths.cache, paths.data, paths.tmp, paths.mcp]) {
+        this.prepareDirectory(dir, identity, 0o700);
+      }
+      this.adoptTree(paths.cwd, identity);
+
+      // Каталоги рана у слота, но путь к ним лежит под сервисным dataDir: без явного
+      // traverse-доступа процесс рана не дойдёт до собственного HOME. Доступ выдаётся
+      // ТОЛЬКО слоту через ACL и только на путь (x, без r); без setfacl ран отказывает —
+      // мировой o+x раскрыл бы список каталогов флота. Слабого запасного варианта нет.
+      const traverse = this.ensureTraverse(paths, identity);
+      if (!traverse) {
+        this.removeTree(paths.root);
+        this.removeTree(paths.cwd);
+        this.record({ ok: false, detail: 'the run identity cannot traverse into its own room (no ACL support on this host)' });
+        throw new CleanRoomError(
+          'ISOLATION_ACL_UNAVAILABLE',
+          `slot "${slotId}" cannot traverse to its clean room: setfacl is required to grant per-slot path access without world-traversable directories`,
+        );
+      }
+
+      let acl: CleanRoomAcl = 'posix_0700';
+      const runnerUid = this.policy.runnerUid ?? safeUid();
+      if (runnerUid && runnerUid !== identity.uid) {
+        acl = (await this.applyAcl(paths, runnerUid)) ? 'posix_0700_acl' : 'posix_0700';
+      }
+
+      const probe = await this.runProbe(runId, identity, paths);
+      if (!probe) {
+        // Проба не смогла выполниться — граница не доказана, ран не запускаем.
+        this.removeTree(paths.root);
+        this.removeTree(paths.cwd);
+        this.record({ ok: false, detail: `boundary probe produced no verdict for slot "${slotId}"` });
+        throw new CleanRoomError('ISOLATION_PROBE_UNAVAILABLE', `boundary probe could not run for slot "${slotId}"`);
+      }
+      if (!probe.ok) {
+        this.removeTree(paths.root);
+        this.removeTree(paths.cwd);
+        this.record({ ok: false, detail: `boundary probe failed for slot "${slotId}": ${probe.failures.join('; ')}` });
+        this.log(`clean_room.probe_failed runId=${runId} slot=${slotId} failures=${probe.failures.join('; ')} checks=${JSON.stringify(probe.checks)}`);
+        throw new CleanRoomError('ISOLATION_PROBE_FAILED', `boundary probe failed for slot "${slotId}": ${probe.failures.join('; ')}`);
+      }
+      this.record({ ok: true, detail: `boundary probe passed for slot "${slotId}" (${probe.checks.length} checks)` });
+      this.log(`clean_room.probe_passed runId=${runId} slot=${slotId} checks=${probe.checks.length}`);
+
+      const lease: CleanRoomLease = {
+        schemaVersion: RUN_ISOLATION_SCHEMA_VERSION,
+        runId,
+        userTaskId,
+        profileId,
+        identity,
+        paths,
+        status: 'active',
+        reason: null,
+        createdAt: at,
+        updatedAt: at,
+        releasedAt: null,
+      };
+      this.writeLease(lease);
+      this.log(`clean_room.acquired runId=${runId} slot=${slotId} uid=${identity.uid} gid=${identity.gid} acl=${acl} probeChecks=${probe.checks.length}`);
+      return {
+        runId,
+        identity,
+        paths,
+        env: {
+          HOME: paths.home,
+          XDG_CONFIG_HOME: paths.config,
+          XDG_CACHE_HOME: paths.cache,
+          XDG_DATA_HOME: paths.data,
+          TMPDIR: paths.tmp,
+        },
+        probe,
+        acl,
+      };
     } catch (error) {
       // Слота нет на хосте — это поломка настройки границы, а не отсутствие ёмкости:
       // capabilities перестают объявлять проверенную границу.
-      this.record({ ok: false, detail: error instanceof Error ? error.message : String(error) });
+      if (error instanceof CleanRoomError && error.code === 'ISOLATION_IDENTITY_UNAVAILABLE') {
+        this.record({ ok: false, detail: error instanceof Error ? error.message : String(error) });
+      }
       throw error;
+    } finally {
+      this.reservedSlots.delete(slotId);
     }
-    const paths = this.pathsFor(runId, cwd);
-    const at = this.now().toISOString();
-
-    this.prepareDirectory(paths.root, identity, 0o700);
-    for (const dir of [paths.home, paths.config, paths.cache, paths.data, paths.tmp, paths.mcp]) {
-      this.prepareDirectory(dir, identity, 0o700);
-    }
-    this.adoptTree(paths.cwd, identity);
-
-    let acl: CleanRoomAcl = 'posix_0700';
-    const runnerUid = this.policy.runnerUid ?? safeUid();
-    if (runnerUid && runnerUid !== identity.uid) {
-      acl = (await this.applyAcl(paths, runnerUid)) ? 'posix_0700_acl' : 'posix_0700';
-    }
-
-    const probe = await this.runProbe(runId, identity, paths);
-    if (!probe) {
-      // Проба не смогла выполниться — граница не доказана, ран не запускаем.
-      this.removeTree(paths.root);
-      this.removeTree(paths.cwd);
-      this.record({ ok: false, detail: `boundary probe produced no verdict for slot "${slotId}"` });
-      throw new CleanRoomError('ISOLATION_PROBE_UNAVAILABLE', `boundary probe could not run for slot "${slotId}"`);
-    }
-    if (!probe.ok) {
-      this.removeTree(paths.root);
-      this.removeTree(paths.cwd);
-      this.record({ ok: false, detail: `boundary probe failed for slot "${slotId}": ${probe.failures.join('; ')}` });
-      throw new CleanRoomError('ISOLATION_PROBE_FAILED', `boundary probe failed for slot "${slotId}": ${probe.failures.join('; ')}`);
-    }
-    this.record({ ok: true, detail: `boundary probe passed for slot "${slotId}" (${probe.checks.length} checks)` });
-
-    const lease: CleanRoomLease = {
-      schemaVersion: RUN_ISOLATION_SCHEMA_VERSION,
-      runId,
-      userTaskId,
-      profileId,
-      identity,
-      paths,
-      status: 'active',
-      reason: null,
-      createdAt: at,
-      updatedAt: at,
-      releasedAt: null,
-    };
-    this.writeLease(lease);
-    this.log(`clean_room.acquired runId=${runId} slot=${slotId} uid=${identity.uid} gid=${identity.gid} acl=${acl} probeChecks=${probe.checks.length}`);
-    return {
-      runId,
-      identity,
-      paths,
-      env: {
-        HOME: paths.home,
-        XDG_CONFIG_HOME: paths.config,
-        XDG_CACHE_HOME: paths.cache,
-        XDG_DATA_HOME: paths.data,
-        TMPDIR: paths.tmp,
-      },
-      probe,
-      acl,
-    };
   }
+
 
   async sweep(room: CleanRoom, reason: string, options: SweepOptions = {}): Promise<string[]> {
     const targets = options.keepWorkspace ? [room.paths.root] : [room.paths.root, room.paths.cwd];
@@ -346,12 +382,75 @@ export class UnixCleanRoomProvider implements CleanRoomProvider {
     chownSync(path, identity.uid, identity.gid);
   }
 
+  /**
+   * Проходимость пути до каталога рана и до общих бинарей инструментов.
+   *
+   * Каталоги рана принадлежат слоту, но путь к ним лежит под сервисными каталогами
+   * (fleet root, namespace, worker, dataDir), которые закрыты для остальных. Без явного
+   * traverse-доступа процесс рана не дойдёт даже до собственного HOME — граница была бы
+   * декларацией. Доступ выдаётся ТОЛЬКО слоту через ACL и только на путь (x, без r):
+   * список каталогов слот при этом не видит. Мировой o+x не выдаём — он открыл бы обзор
+   * соседних ранов. Без setfacl ран отказывает: слабого запасного варианта нет.
+   */
+  private ensureTraverse(paths: CleanRoomPaths, identity: RunIdentity): boolean {
+    const setfacl = findSetfacl();
+    if (!setfacl) return false;
+    const segments = new Set<string>();
+    for (const target of [paths.root, paths.cwd, ...this.policy.toolPaths]) {
+      for (const dir of this.chainToRoot(target)) segments.add(dir);
+    }
+    // Порядок важен: сначала закрываем свои корни, потом выдаём проходимость. Иначе
+    // снятие o+x отняло бы у слота доступ, который он успел получить по старой правке.
+    for (const dir of [join(this.rootDir, 'cleanrooms'), join(this.rootDir, 'workspaces')]) {
+      let stat;
+      try {
+        stat = statSync(dir);
+      } catch {
+        continue;
+      }
+      if (stat.uid !== identity.uid && stat.mode & 0o077) chmodSync(dir, 0o700);
+    }
+    for (const dir of segments) {
+      let stat;
+      try {
+        stat = statSync(dir);
+      } catch {
+        continue;
+      }
+      if (stat.uid === identity.uid) continue;
+      if (stat.mode & 0o001) continue;
+      const result = spawnSync(setfacl, ['-m', `u:${identity.uid}:x`, dir], { stdio: ['ignore', 'ignore', 'pipe'] });
+      if (result.status !== 0) return false;
+    }
+    return true;
+  }
+
+  /** Все сегменты пути от корня файловой системы до каталога (включая оба). */
+  private chainToRoot(target: string): string[] {
+    const chain: string[] = [];
+    let current = target;
+    for (;;) {
+      chain.push(current);
+      const parent = dirname(current);
+      if (parent === current) break;
+      current = parent;
+    }
+    return chain.reverse();
+  }
+
   private adoptTree(path: string, identity: RunIdentity): void {
     if (!existsSync(path)) {
       this.prepareDirectory(path, identity, 0o700);
       return;
     }
     chownSync(path, identity.uid, identity.gid);
+    // Workspace развернут materialize'ом под сервисным uid и с правами по umask (0755):
+    // оставленный таким, он читался бы соседним слотом. Для чистой среды каталог закрыт.
+    try {
+      if (statSync(path).mode & 0o077) chmodSync(path, 0o700);
+    } catch {
+      // если снять права не удалось — это поймает проба границы ниже
+    }
     let entries: string[] = [];
     try {
       entries = readdirSync(path);

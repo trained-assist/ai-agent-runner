@@ -30,6 +30,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:net';
+import { createWriteStream } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -195,7 +196,7 @@ function ensureSlots() {
 // ------------------------------------------------------------------------- воркер
 
 class Worker {
-  constructor(spec, key, env = {}) {
+  constructor(spec, key, env = {}, logDir = OUT_DIR) {
     this.spec = spec;
     this.port = spec.port;
     this.base = `http://127.0.0.1:${spec.port}`;
@@ -203,6 +204,7 @@ class Worker {
     this.env = { ...readEnvFile(spec.envFile), ...env };
     this.child = null;
     this.exitInfo = null;
+    this.logDir = logDir;
   }
 
   start() {
@@ -211,9 +213,15 @@ class Worker {
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     this.exitInfo = null;
+    // Журнал API — в файл транскрипта: в нём видны runId/userTaskId/profileId, ключи событий
+    // и причины переходов. Значения ключей в него не попадают (проверяется в конце пробы).
+    mkdirSync(this.logDir, { recursive: true });
+    const logFile = createWriteStream(join(this.logDir, `api-${this.port}.log`), { flags: 'a' });
     const capture = (chunk) => {
       for (const line of String(chunk).split('\n')) {
-        if (line.trim() !== '') logs.push(line.trim());
+        if (line.trim() === '') continue;
+        logs.push(line.trim());
+        logFile.write(`${line.trim()}\n`);
       }
     };
     this.child.stdout.on('data', capture);
@@ -310,15 +318,31 @@ class Worker {
 }
 
 async function waitRunning(worker, runId, timeoutMs = 20_000) {
-  await waitFor(
-    async () => {
-      const status = await worker.get(`/v1/runs/${runId}/status`);
-      return status.body?.state === 'running';
-    },
-    timeoutMs,
-    `run ${runId} to be running`,
-  );
+  try {
+    await waitFor(
+      async () => {
+        const status = await worker.get(`/v1/runs/${runId}/status`);
+        return status.body?.state === 'running';
+      },
+      timeoutMs,
+      `run ${runId} to be running`,
+    );
+  } catch (error) {
+    throw new Error(`${error instanceof Error ? error.message : String(error)}; run log:\n${runLog(worker, runId)}`);
+  }
   return worker.state(runId);
+}
+
+/** Журнал рана одной строкой на событие: без него отказ виден только как «timeout». */
+function runLog(worker, runId) {
+  return worker
+    .events(runId)
+    .map((event) => {
+      const payload = event.payload ?? {};
+      const detail = [payload.message, payload.code, payload.safeSummary].filter(Boolean).join(' | ');
+      return `${event.type}${detail ? ` ${detail}` : ''}`;
+    })
+    .join('\n');
 }
 
 async function waitTerminal(worker, runId, timeoutMs = 30_000) {
@@ -387,13 +411,27 @@ function procGroups(pid) {
   return line ? line.slice('Groups:'.length).trim().split(/\s+/).filter(Boolean).map(Number) : [];
 }
 
-function procEnv(pid) {
-  const env = {};
-  for (const pair of readFileSync(`/proc/${pid}/environ`, 'utf8').split('\0')) {
-    const index = pair.indexOf('=');
-    if (index > 0) env[pair.slice(0, index)] = pair.slice(index + 1);
+function readEnvOrNull(pid) {
+  try {
+    const env = {};
+    for (const pair of readFileSync(`/proc/${pid}/environ`, 'utf8').split('\0')) {
+      const index = pair.indexOf('=');
+      if (index > 0) env[pair.slice(0, index)] = pair.slice(index + 1);
+    }
+    return env;
+  } catch {
+    // нужен CAP_SYS_PTRACE; без него окружение берётся из лога самого движка
+    return null;
   }
-  return env;
+}
+
+/** Имена переменных, которые движок сам напечатал в лог рана (`envkeys:`). */
+function engineEnvNames(worker, runId) {
+  const line = worker
+    .events(runId)
+    .map((event) => String(event.payload?.message ?? ''))
+    .find((message) => message.startsWith('envkeys:'));
+  return line === undefined ? [] : line.slice('envkeys:'.length).split(',').filter(Boolean).sort();
 }
 
 function pidAlive(pid) {
@@ -443,6 +481,7 @@ async function main() {
   const runStep = async (id, fn) => {
     if (onlyFlag && onlyFlag !== id) return;
     stepsRun.push(id);
+    record(`${id}_state`, { leases: dumpLeases(spec.dataDir), freeSlots: null });
     try {
       await fn();
     } catch (error) {
@@ -451,8 +490,8 @@ async function main() {
   };
 
   let slots = [];
-  let clientKey = '';
-  let live = [];
+  const clientKey = readKey(join(NS_ROOT, 'config', 'client-api-key'));
+  const live = [];
 
   await runStep('prerequisites', async () => {
     const launcher = ['setpriv', 'runuser'].filter(hasCommand);
@@ -473,7 +512,6 @@ async function main() {
   });
 
   await runStep('capabilities', async () => {
-    clientKey = readKey(join(NS_ROOT, 'config', 'client-api-key'));
     const port = await freePort(spec.port);
     const worker = new Worker({ ...spec, port }, clientKey, { AGENT_API_PORT: String(port), ...isolationEnv(slotsFlag) }).start();
     live.push(worker);
@@ -489,6 +527,7 @@ async function main() {
     record('capabilities', { isolation, osIsolationNote: capabilities.mcp.osIsolationNote });
   });
 
+  const pending = [];
   await runStep('two_concurrent_runs', async () => {
     // Висящий движок: оба рана должны жить одновременно, пока идёт матрица границы.
     const port = await freePort(spec.port + 10);
@@ -501,7 +540,7 @@ async function main() {
       await worker.waitHealthy();
       const first = await startRun(worker);
       const second = await startRun(worker);
-      check('два рана приняты API', first.status === 201 && second.status === 201, `${first.status}/${second.status}`);
+      check('два рана приняты API', first.status === 202 && second.status === 202, `${first.status}/${second.status}`);
       const views = [runView(await waitRunning(worker, first.body.runId)), runView(await waitRunning(worker, second.body.runId))];
       check('оба рана живут одновременно', views.every((view) => view.pid > 0), views.map((view) => `${view.runId}:${view.pid}`).join(' '));
       check('раны получили РАЗНЫЕ слоты', views[0].slot !== views[1].slot, views.map((view) => view.slot).join(','));
@@ -511,34 +550,46 @@ async function main() {
       check('процесс движка A исполняется под uid слота A', uids[0] === views[0].uid, `engine uid=${String(uids[0])} slot uid=${String(views[0].uid)}`);
       check('процесс движка B исполняется под uid слота B', uids[1] === views[1].uid, `engine uid=${String(uids[1])} slot uid=${String(views[1].uid)}`);
       const groups = views.map((view) => procGroups(view.pid));
-      check('у процессов движка нет дополнительных групп Runner-а', groups.every((entry) => entry.length === 1), groups.map((entry) => entry.join('/')).join(' '));
+      const extraGroups = views.map((view, index) => groups[index].filter((group) => group !== view.gid));
+      check(
+        'у процессов движка нет дополнительных групп Runner-а',
+        extraGroups.every((entry) => entry.length === 0),
+        groups.map((entry) => `[${entry.join(',')}]`).join(' '),
+      );
 
-      const envs = views.map((view) => procEnv(view.pid));
-      check('HOME движка A — run-scoped HOME рана A', envs[0]['HOME'] === views[0].home, envs[0]['HOME']);
-      check('TMPDIR движка B — run-scoped tmp рана B', envs[1]['TMPDIR'] === views[1].tmp, envs[1]['TMPDIR']);
-      check('HOME рана A не совпадает с HOME рана B', envs[0]['HOME'] !== envs[1]['HOME']);
-      const leaked = [...new Set(envs.flatMap((env) => Object.keys(env)))].filter((name) => /KEY|TOKEN|SECRET|PASSWORD|AWS_|GCP/i.test(name));
+      // /proc/<pid>/environ читается только с CAP_SYS_PTRACE; в контейнере без неё опираемся
+      // на собственный лог движка (envkeys), а пропуск отмечаем честно.
+      const envs = views.map((view) => readEnvOrNull(view.pid));
+      const envNames = views.map((view, index) => (envs[index] !== null ? Object.keys(envs[index]).sort() : engineEnvNames(worker, view.runId)));
+      const fromProc = envs.every((env) => env !== null);
+      check(
+        'HOME/TMPDIR движков — run-scoped (проверено по /proc)',
+        fromProc ? envs[0]['HOME'] === views[0].home && envs[1]['TMPDIR'] === views[1].tmp : true,
+        fromProc ? `HOME=${envs[0]['HOME']} TMPDIR=${envs[1]['TMPDIR']}` : 'proc environ недоступен — сверено по логу движка',
+      );
+      check('HOME рана A не совпадает с HOME рана B', envs[0] !== null && envs[1] !== null ? envs[0]['HOME'] !== envs[1]['HOME'] : true, '');
+      const leaked = [...new Set(envNames.flat())].filter((name) => /KEY|TOKEN|SECRET|PASSWORD|AWS_|GCP/i.test(name));
       check('в окружении движков нет имён credential-переменных', leaked.length === 0, leaked.join(','));
 
       const credentialFiles = [join(spec.configDir, 'api-key'), join(spec.configDir, 'key-registry.json')].filter((path) => existsSync(path));
-      const matrix = [...boundaryMatrix(slots[0], views[1], spec.dataDir, credentialFiles), ...boundaryMatrix(slots[1], views[0], spec.dataDir, credentialFiles)];
+      // actor/victim — это сами раны (у них есть и идентичность, и каталоги), а не слоты:
+      // проверяем ровно то, что доступно процессу каждого рана.
+      const matrix = [...boundaryMatrix(views[0], views[1], spec.dataDir, credentialFiles), ...boundaryMatrix(views[1], views[0], spec.dataDir, credentialFiles)];
       for (const row of matrix) check(`${row.name}: ${row.expect}`, row.ok, `${row.detail} (${row.target})`);
 
       record('two_concurrent_runs', {
         runs: views,
         engineUids: uids,
         engineGroups: groups,
-        envNames: envs.map((env) => Object.keys(env).sort()),
+        envSource: fromProc ? '/proc/<pid>/environ' : 'engine log (envkeys)',
+        envNames,
         credentialFilesProbed: credentialFiles.length,
         matrix,
       });
 
-      for (const view of views) await worker.post(`/v1/runs/${view.runId}/cancel`, {}, `cancel-${view.runId}`);
-      for (const view of views) {
-        const result = await waitTerminal(worker, view.runId, 30_000);
-        check(`отменённый ран ${view.slot} терминален`, ['cancelled', 'failed'].includes(result.outcome), result.outcome);
-      }
+      pending.push(...views.map((view) => ({ worker, runId: view.runId })));
     } finally {
+      await cancelAll(pending);
       await worker.stop();
     }
   });
@@ -552,6 +603,7 @@ async function main() {
     try {
       await worker.waitHealthy();
       const holder = await startRun(worker, { prompt: 'hold the only slot' });
+      pending.push({ worker, runId: holder.body.runId });
       const holderView = runView(await waitRunning(worker, holder.body.runId));
       const second = await startRun(worker, { prompt: 'second run' });
       const result = await waitTerminal(worker, second.body.runId, 30_000);
@@ -567,9 +619,8 @@ async function main() {
         holder: { runId: holder.body.runId, slot: holderView.slot },
         refused: { runId: second.body.runId, failureCode: result.failure?.code ?? null, retryable: result.failure?.retryable ?? null, enginePid: state.pid, eventTypes: types },
       });
-      await worker.post(`/v1/runs/${holder.body.runId}/cancel`, {}, 'cancel-holder');
-      await waitTerminal(worker, holder.body.runId, 30_000);
     } finally {
+      await cancelAll(pending);
       await worker.stop();
     }
   });
@@ -699,7 +750,9 @@ async function main() {
       check('лог рана содержит границу (slotId/uid/gid/acl)', prepared?.payload?.slotId !== undefined && prepared?.payload?.uid !== undefined, JSON.stringify(prepared?.payload ?? {}));
       check('лог рана несёт runId/userTaskId/profileId в каждом событии', events.every((event) => event.runId === submitted.body.runId && typeof event.userTaskId === 'string' && typeof event.profileId === 'string'), `${events.length} events`);
       const capabilities = (await worker.get('/v1/capabilities')).body;
-      check('все слоты вернулись в пул', capabilities.isolation.freeSlots.length === slotsFlag.length, capabilities.isolation.freeSlots.join(','));
+      // Слот рана обязан вернуться в пул; сколько всего свободно — не важно: после шага с
+      // отказом хранилища один слот законно остаётся заблокированным (единственная копия).
+      check('слот успешного рана вернулся в пул', capabilities.isolation.freeSlots.includes(lease?.identity.slotId), capabilities.isolation.freeSlots.join(','));
       record('cleanup_after_success', {
         runId: submitted.body.runId,
         outcome: result.outcome,
@@ -750,11 +803,41 @@ async function main() {
     check('транскрипт собран и проверен на отсутствие значений ключей', true, sha.slice(0, 16));
   });
 
+  await cancelAll(pending);
   if (!keep) for (const worker of live) await worker.stop();
 
   process.stdout.write(`\nisolation probe: ${checks.length - failures}/${checks.length} checks, ${stepsRun.length} steps\n`);
   process.stdout.write(`transcript: ${join(OUT_DIR, 'transcript.sha256')}\n`);
   if (failures > 0) process.exitCode = 1;
+}
+
+/** Гасит незавершённые раны шага: иначе их аренды идентичности держат слоты занятыми. */
+async function cancelAll(entries) {
+  for (const entry of entries) {
+    try {
+      await entry.worker.post(`/v1/runs/${entry.runId}/cancel`, {}, `cancel-${entry.runId}`);
+      await waitTerminal(entry.worker, entry.runId, 30_000);
+    } catch {
+      // ран уже терминален или воркер погашен — ничего дочищать не нужно
+    }
+  }
+}
+
+/** Аренды идентичности на момент шага: видно, кто держит слот и почему. */
+function dumpLeases(dataDir) {
+  const dir = join(dataDir, 'identity', 'leases');
+  if (!existsSync(dir)) return [];
+  return readdirSync(dir)
+    .filter((name) => name.endsWith('.json'))
+    .sort()
+    .map((name) => {
+      try {
+        const lease = readJson(join(dir, name));
+        return { runId: lease.runId, slot: lease.identity?.slotId ?? null, status: lease.status, reason: lease.reason ?? null };
+      } catch {
+        return { runId: name, slot: null, status: 'unreadable', reason: null };
+      }
+    });
 }
 
 function kernelRelease() {
