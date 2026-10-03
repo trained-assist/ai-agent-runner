@@ -24,6 +24,19 @@ import { tmpdir } from 'node:os';
  * хосте без `getent` (macOS) проверяется сама модель DAC — с зубами: прежний порядок она
  * ловит, новый — нет.
  */
+/** Все родители пути: проходимость по каждому из них нужна и mkdir, и chown. */
+function ancestors(path: string): string[] {
+  const chain: string[] = [];
+  let current = dirname(path);
+  for (;;) {
+    chain.push(current);
+    const parent = dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  return chain;
+}
+
 const trace: { owners: Map<string, number>; violations: string[]; slotUid: number } = {
   owners: new Map<string, number>(),
   violations: [],
@@ -36,6 +49,11 @@ vi.mock('node:fs', async (importOriginal) => {
     ...actual,
     default: actual,
     chownSync: (path: string, uid: number, gid: number) => {
+      // chown тоже требует проходимости по всем родителям: если хоть один из них уже
+      // отдан слоту (0700, чужой uid), путь недостижим — EACCES.
+      for (const ancestor of ancestors(String(path))) {
+        if (trace.owners.get(ancestor) === trace.slotUid) trace.violations.push(`chown ${path}`);
+      }
       trace.owners.set(String(path), uid);
       try {
         actual.chownSync(path, uid, gid);
@@ -45,7 +63,7 @@ vi.mock('node:fs', async (importOriginal) => {
     },
     mkdirSync: (path: string, options?: unknown) => {
       const parent = dirname(String(path));
-      if (trace.owners.get(parent) === trace.slotUid) trace.violations.push(String(path));
+      if (trace.owners.get(parent) === trace.slotUid) trace.violations.push(`mkdir ${path}`);
       return actual.mkdirSync(path, options as never);
     },
   };
@@ -120,12 +138,14 @@ describe('модель правила DAC для каталогов рана', (
     const rootDir = mkdtempSync(join(tmpdir(), 'clean-room-order-old-'));
     const root = join(rootDir, 'root');
     const home = join(root, 'home');
-    // Прежний порядок: корень отдан слоту, потом Runner создаёт в нём home.
+    // Прежний порядок: корень отдан слоту, потом Runner создаёт в нём home и передаёт
+    // ему владение — обе операции требуют проходимости по корню, который уже не наш.
     mkdirSync(root, { recursive: true, mode: 0o700 });
     chownSync(root, trace.slotUid, trace.slotUid);
     mkdirSync(home, { recursive: true, mode: 0o700 });
+    chownSync(home, trace.slotUid, trace.slotUid);
 
-    expect(trace.violations).toEqual([home]);
+    expect(trace.violations).toEqual([`mkdir ${home}`, `chown ${home}`]);
   });
 
   it('создание всех каталогов до отдачи — нарушений нет', async () => {
@@ -138,7 +158,8 @@ describe('модель правила DAC для каталогов рана', (
     const root = join(rootDir, 'root');
     const dirs = [root, join(root, 'home'), join(root, 'config'), join(root, 'tmp')];
     for (const dir of dirs) mkdirSync(dir, { recursive: true, mode: 0o700 });
-    for (const dir of dirs) chownSync(dir, trace.slotUid, trace.slotUid);
+    // Владение снизу вверх: корень среды последним.
+    for (const dir of [...dirs].reverse()) chownSync(dir, trace.slotUid, trace.slotUid);
 
     expect(trace.violations).toEqual([]);
   });
