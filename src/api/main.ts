@@ -10,11 +10,15 @@ import { RunExportStore } from '../storage/export.js';
 import { ShareTokenIssuer } from '../storage/share.js';
 import { UploadSessionStore } from '../storage/upload-session.js';
 import { WorkspaceSnapshotStore } from '../storage/workspace-snapshot.js';
+import { cohortFromEnv, type CohortPolicy } from '../release/cohort.js';
+import { DispatchOwnerStore } from '../release/dispatch-owner.js';
+import { releaseIdentity, releaseManifestFromEnv, type ReleaseManifest } from '../release/manifest.js';
+import { PromotionJournal, ReleaseStateController } from '../release/promotion.js';
 import { KeyRegistry } from './auth.js';
 import { handleArtifactRequest, type ArtifactRouteDeps } from './artifact-route.js';
 import { ApiError } from './errors.js';
 import { createAgentApiServer } from './server.js';
-import { AgentApi, type ApiLogger } from './service.js';
+import { AgentApi, type ApiLogger, type PromotionRuntime } from './service.js';
 
 export const DEFAULT_API_PORT = 8787;
 export const DEFAULT_API_HOST = '0.0.0.0';
@@ -29,6 +33,12 @@ export interface AgentApiProcessConfig {
   region: string;
   environment: string;
   fakeScenario: FakeScenario;
+  releaseManifestPath: string;
+  cohort: CohortPolicy;
+  /** Файл состояния релиза: вход отката, читается при старте (AC-324). */
+  releaseStatePath: string;
+  /** Общий реестр владения задачами флота; без него установка одиночная. */
+  ownerStorePath: string;
 }
 
 function envValue(name: string): string | undefined {
@@ -66,6 +76,11 @@ export function loadAgentApiConfig(env: Record<string, string | undefined> = pro
     throw new Error('AGENT_API_KEY_REGISTRY is required: path to a mode-0600 key registry JSON file with a principals array');
   }
 
+  const releaseManifestPath = env['AGENT_API_RELEASE_MANIFEST']?.trim();
+  if (!releaseManifestPath) {
+    throw new Error('AGENT_API_RELEASE_MANIFEST is required: pinned release/config manifest (P29, AC-170)');
+  }
+
   const fakeScenarioRaw = env['AGENT_API_FAKE_SCENARIO']?.trim() || 'success';
   const fakeScenario = fakeScenarioResult(fakeScenarioRaw);
   if (!fakeScenario.ok) throw new Error(`AGENT_API_FAKE_SCENARIO: ${fakeScenario.errors.join('; ')}`);
@@ -82,6 +97,10 @@ export function loadAgentApiConfig(env: Record<string, string | undefined> = pro
     region: env['AGENT_API_REGION']?.trim() || 'sandbox',
     environment: env['AGENT_API_ENVIRONMENT']?.trim() || 'sandbox',
     fakeScenario: fakeScenario.value,
+    releaseManifestPath: describePath(releaseManifestPath),
+    cohort: cohortFromEnv(env),
+    releaseStatePath: describePath(env['AGENT_API_RELEASE_STATE']?.trim() || join(dataDir, 'release-state.json')),
+    ownerStorePath: env['AGENT_API_OWNER_STORE']?.trim() ? describePath(env['AGENT_API_OWNER_STORE'].trim()) : '',
   };
 }
 
@@ -114,9 +133,35 @@ function writeJson(res: ServerResponse, status: number, data: unknown): void {
 
 async function main(): Promise<void> {
   const config = loadAgentApiConfig();
+  const manifest: ReleaseManifest = releaseManifestFromEnv(process.env);
+  const identity = releaseIdentity(manifest);
   const log: ApiLogger = (entry) => {
-    process.stdout.write(`${JSON.stringify({ ts: new Date().toISOString(), ...entry })}\n`);
+    // Каждая строка журнала несёт закреплённый релиз и машину: прод и песочница различимы
+    // в логах без догадок (SANDBOX · I10).
+    process.stdout.write(`${JSON.stringify({ ts: new Date().toISOString(), ...identity, ...entry })}\n`);
   };
+  const journal = new PromotionJournal({
+    path: join(config.dataDir, 'promotion.jsonl'),
+    releaseId: manifest.releaseId,
+    workerId: manifest.host.workerId,
+    region: manifest.host.region,
+  });
+  const releaseState = new ReleaseStateController({
+    path: config.releaseStatePath,
+    releaseId: manifest.releaseId,
+    previousReleaseId: envPreviousReleaseId(),
+    journal,
+    cohortId: config.cohort.cohortId,
+  });
+  const owners = config.ownerStorePath
+    ? new DispatchOwnerStore({
+        path: config.ownerStorePath,
+        workerId: manifest.host.workerId,
+        onEvent: (event) => log({ ...event, event: `ownership_${event.event}` }),
+      })
+    : undefined;
+  const promotion: PromotionRuntime = { manifest, cohort: config.cohort, state: releaseState, journal };
+  if (owners) promotion.owners = owners;
 
   mkdirSync(config.dataDir, { recursive: true, mode: 0o700 });
   chmodSync(config.dataDir, 0o700);
@@ -141,12 +186,13 @@ async function main(): Promise<void> {
   const service = new AgentApi({
     rootDir: config.dataDir,
     adapters: { fake: new FakeEngine(config.fakeScenario), opencode: new OpenCodeAdapter() },
-    host: { region: config.region, environment: config.environment },
+    host: { region: config.region, environment: config.environment, release: manifest.releaseId, workerId: manifest.host.workerId },
     logger: log,
     blob,
     exports,
     uploads,
     snapshots,
+    promotion,
   });
   const recovery = await service.recover();
 
@@ -218,6 +264,18 @@ async function main(): Promise<void> {
       engines: ['fake', 'opencode'],
       fakeScenario: config.fakeScenario,
       health: '/healthz',
+      release: {
+        ...identity,
+        builtAt: manifest.builtAt,
+        engines: [...manifest.engines],
+        paidEngines: [...manifest.paid.engines],
+        bindings: manifest.bindings.length,
+        retention: manifest.retention,
+        cohort: { cohortId: config.cohort.cohortId, mode: config.cohort.mode, rolloutPercent: config.cohort.rolloutPercent, principals: config.cohort.principals.length },
+        servingReleaseId: releaseState.snapshot().servingReleaseId,
+        rolledBack: releaseState.paused,
+        ownerStore: config.ownerStorePath === '' ? 'single_worker' : 'shared_fleet_registry',
+      },
       recovery: {
         scanned: recovery.scanned,
         resumedQueued: recovery.resumedQueued,
@@ -229,7 +287,35 @@ async function main(): Promise<void> {
       artifactExport: { enabled: true, versions: 'runs/<runId>/export/v<N>.json' },
       startedAt: new Date().toISOString(),
     });
+    // Первая запись журнала промоушена: что закреплено и в каком состоянии обслуживание.
+    journal.append({
+      kind: 'release_pinned',
+      reason: 'service start with a pinned release manifest',
+      servingReleaseId: releaseState.snapshot().servingReleaseId,
+      cohortId: config.cohort.cohortId,
+      detail: {
+        sourceCommit: manifest.sourceCommit,
+        configVersion: manifest.configVersion,
+        environment: manifest.host.environment,
+        paidProfilesAllowed: manifest.paid.allowed,
+        rolledBack: releaseState.paused,
+        retention: manifest.retention,
+        ownerStore: config.ownerStorePath === '' ? 'single_worker' : 'shared_fleet_registry',
+      },
+    });
+    journal.append({
+      kind: 'cohort_configured',
+      reason: `cohort ${config.cohort.cohortId} is ${config.cohort.mode}`,
+      cohortId: config.cohort.cohortId,
+      detail: { mode: config.cohort.mode, rolloutPercent: config.cohort.rolloutPercent, principals: config.cohort.principals.length },
+    });
   });
+}
+
+/** Предыдущий релиз для отката: без него rollback некуда возвращать. */
+function envPreviousReleaseId(): string | null {
+  const previous = process.env['AGENT_API_PREVIOUS_RELEASE']?.trim();
+  return previous === undefined || previous === '' ? null : previous;
 }
 
 main().catch((err: unknown) => {

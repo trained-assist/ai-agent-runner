@@ -103,6 +103,17 @@ export function createAgentApiServer(service: AgentApi, options: AgentApiServerO
       return 200;
     }
 
+    // Закреплённый релиз/конфиг, когорта, откат и retention-здоровье (P29). Приёмник читает
+    // это вместо догадок о том, какой релиз обслуживает задачи и что будет при откате.
+    if (segments[0] === 'v1' && segments[1] === 'release' && segments.length === 2) {
+      if (req.method !== 'GET') throw new ApiError('METHOD_NOT_ALLOWED', 'release supports GET only');
+      requireScope(principal, 'runs:read');
+      const view = service.release();
+      if (!view) throw new ApiError('ROUTE_NOT_FOUND', 'release manifest is not enabled in this deployment');
+      sendJson(res, 200, view);
+      return 200;
+    }
+
     // Второй транспортный фасад над теми же capability handler'ами, что и MCP-вызовы рана (P13):
     // «Один domain handler имеет contract и разные transport facades».
     if (segments[0] === 'v1' && segments[1] === 'capabilities' && segments[2] === 'invoke' && segments.length === 3) {

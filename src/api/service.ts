@@ -10,6 +10,12 @@ import { stripRepositoryToken, validateRunSpec, type InputSpec, type RunSpec } f
 import type { FaultRegistry } from '../faults/registry.js';
 import type { CapabilityRegistry } from '../mcp/capabilities.js';
 import type { BindingValueResolver } from '../mcp/scope.js';
+import { claimOwnership, decideAdmission, type AdmissionRefusalCode } from '../release/admission.js';
+import type { CohortPolicy } from '../release/cohort.js';
+import type { DispatchOwnerStore } from '../release/dispatch-owner.js';
+import type { ReleaseManifest } from '../release/manifest.js';
+import type { PromotionJournal, ReleaseStateController } from '../release/promotion.js';
+import { retentionHealth, type RetentionHealth } from '../release/retention.js';
 import { Runner, type CancelReceipt, type RecoveryReport, type RunnerHostInfo, type RunSnapshot } from '../runner/runner.js';
 import type { LogSink } from '../runner/scoped-log.js';
 import { isTerminalState } from '../runner/state-machine.js';
@@ -29,10 +35,54 @@ import {
   type SubmitRequest,
   type SubmitResponse,
 } from './contracts.js';
-import { ApiError } from './errors.js';
+import { ApiError, type ApiErrorCode } from './errors.js';
 import { ApiStore, API_STORE_SCHEMA_VERSION, type AdmissionRecord } from './store.js';
 
 export type ApiLogger = (entry: Record<string, unknown>) => void;
+
+/**
+ * Промоушен-контур P29: закреплённый релиз/конфиг, флаг когорты, состояние отката,
+ * durable-журнал переходов и (в fleet-развёртывании) общий реестр владельцев задач.
+ * Отсутствие этого блока означает одиночную установку без когортного флага — как раньше.
+ */
+export interface PromotionRuntime {
+  manifest: ReleaseManifest;
+  cohort: CohortPolicy;
+  state: ReleaseStateController;
+  journal: PromotionJournal;
+  owners?: DispatchOwnerStore;
+}
+
+export interface ReleaseView {
+  schemaVersion: 1;
+  release: {
+    releaseId: string;
+    sourceCommit: string;
+    configVersion: number;
+    builtAt: string;
+    workerId: string;
+    region: string;
+    environment: string;
+    roles: { schedule: boolean; delivery: boolean };
+    engines: string[];
+    paidEngines: string[];
+    paidProfilesAllowed: boolean;
+  };
+  bindings: Array<{ name: string; required: boolean; source: string; owner: string; rotatedAt?: string }>;
+  cohort: { cohortId: string; mode: string; rolloutPercent: number; principals: number };
+  rollback: {
+    releaseId: string;
+    servingReleaseId: string;
+    previousReleaseId: string | null;
+    rolledBack: boolean;
+    reason: string | null;
+    updatedAt: string;
+    transitions: number;
+  };
+  retention: RetentionHealth;
+  fleet: ReturnType<DispatchOwnerStore['view']> | null;
+  journal: { entries: number; lastSeq: number; lastKind: string | null };
+}
 
 export interface AgentApiOptions {
   rootDir: string;
@@ -56,6 +106,8 @@ export interface AgentApiOptions {
   capabilities?: CapabilityRegistry;
   /** Резолвер значений credential binding'ов (P13). */
   bindingResolver?: BindingValueResolver;
+  /** Промоушен-контур P29: pinned release, когорта, откат, журнал, реестр владельцев. */
+  promotion?: PromotionRuntime;
 }
 
 export interface ServiceRecoveryReport extends RecoveryReport {
@@ -167,6 +219,10 @@ export class AgentApi {
       );
     }
 
+    // Откат релиза и флаг когорты проверяются ДО любой записи: отказ не должен оставить
+    // ни admission-записи, ни рана (иначе «откат» означал бы half-принятые задачи).
+    const admission = this.decideAdmission(principal, request);
+
     let requestId: string;
     let userTaskId: string;
     let jobId: string;
@@ -203,6 +259,17 @@ export class AgentApi {
     }
 
     const spec = this.buildSpec(request, { principal, requestId, userTaskId, jobId, ownerGeneration });
+    // Реестр владельцев (fleet): решение о владении принимается один раз на задачу и
+    // определяет ownerGeneration. Отказ = «не запускай вторую копию», а не «попробуй ещё раз».
+    const ownership = this.claimOwnership(principal, userTaskId, spec.runId);
+    if (ownership) ownerGeneration = ownership;
+    if (ownership !== undefined) {
+      spec.ownerGeneration = ownership;
+      const revalidated = validateRunSpec(spec);
+      if (!revalidated.ok) {
+        throw new ApiError('INVALID_REQUEST', `assembled spec is invalid: ${revalidated.errors.join('; ')}`, { errors: revalidated.errors });
+      }
+    }
     const record: AdmissionRecord = {
       schemaVersion: API_STORE_SCHEMA_VERSION,
       requestId,
@@ -230,8 +297,79 @@ export class AgentApi {
       runId: spec.runId,
       ownerGeneration,
       engine: spec.engine.name,
+      ...(admission.admit
+        ? {
+            cohortId: admission.cohortId,
+            cohortReason: admission.cohortReason,
+            cohortBucket: admission.bucket,
+            servingReleaseId: admission.servingReleaseId,
+          }
+        : {}),
     });
     return { requestId, userTaskId, runId: spec.runId, deduplicated: false };
+  }
+
+  /**
+   * Декларация развёрнутого релиза для control plane (P29): что закреплено, кто владелец,
+   * когорта, откат, retention. Значений секретов здесь нет — только имена binding'ов.
+   */
+  release(): ReleaseView | null {
+    const promotion = this.opts.promotion;
+    if (!promotion) return null;
+    const manifest = promotion.manifest;
+    const state = promotion.state.snapshot();
+    const journal = promotion.journal.list();
+    const runs = this.runner
+      .listRunIds()
+      .map((runId) => this.runner.getRun(runId))
+      .filter((snapshot): snapshot is RunSnapshot => snapshot !== null)
+      .map((snapshot) => ({ runId: snapshot.runId, state: snapshot.state, updatedAt: snapshot.updatedAt }));
+    const retention = retentionHealth({ policy: manifest.retention, runs, now: this.clock() });
+    return {
+      schemaVersion: 1,
+      release: {
+        releaseId: manifest.releaseId,
+        sourceCommit: manifest.sourceCommit,
+        configVersion: manifest.configVersion,
+        builtAt: manifest.builtAt,
+        workerId: manifest.host.workerId,
+        region: manifest.host.region,
+        environment: manifest.host.environment,
+        roles: manifest.host.roles,
+        engines: [...manifest.engines],
+        paidEngines: [...manifest.paid.engines],
+        paidProfilesAllowed: manifest.paid.allowed,
+      },
+      bindings: manifest.bindings.map((binding) => ({
+        name: binding.name,
+        required: binding.required,
+        source: binding.source,
+        owner: binding.owner,
+        ...(binding.rotatedAt !== undefined ? { rotatedAt: binding.rotatedAt } : {}),
+      })),
+      cohort: {
+        cohortId: promotion.cohort.cohortId,
+        mode: promotion.cohort.mode,
+        rolloutPercent: promotion.cohort.rolloutPercent,
+        principals: promotion.cohort.principals.length,
+      },
+      rollback: {
+        releaseId: state.releaseId,
+        servingReleaseId: state.servingReleaseId,
+        previousReleaseId: state.previousReleaseId,
+        rolledBack: state.rolledBack,
+        reason: state.reason,
+        updatedAt: state.updatedAt,
+        transitions: state.transitions,
+      },
+      retention,
+      fleet: promotion.owners ? promotion.owners.view() : null,
+      journal: {
+        entries: journal.length,
+        lastSeq: journal.length > 0 ? journal[journal.length - 1]!.seq : 0,
+        lastKind: journal.length > 0 ? journal[journal.length - 1]!.kind : null,
+      },
+    };
   }
 
   status(principal: Principal, runId: string): RunStatusView {
@@ -335,6 +473,43 @@ export class AgentApi {
           'per-run MCP processes are spawned by this worker under the same service UID; a service UID is not a proven OS isolation boundary (ARCHITECTURE §9, карточка P13)',
       },
       cancel: { requestedReceipt: true, terminalConfirmation: true },
+      /**
+       * Промоушен (P29). Объявляется честно: без promotion-контура когорты и отката нет,
+       * платные профили считаются выключенными только когда это объявлено манифестом.
+       */
+      promotion: this.opts.promotion
+        ? {
+            pinnedRelease: {
+              releaseId: this.opts.promotion.manifest.releaseId,
+              sourceCommit: this.opts.promotion.manifest.sourceCommit,
+              configVersion: this.opts.promotion.manifest.configVersion,
+            },
+            cohortEnabled: this.opts.promotion.cohort.mode !== 'off',
+            cohortId: this.opts.promotion.cohort.cohortId,
+            rollbackAvailable: true,
+            rolledBack: this.opts.promotion.state.paused,
+            servingReleaseId: this.opts.promotion.state.snapshot().servingReleaseId,
+            paidProfilesAllowed: this.opts.promotion.manifest.paid.allowed,
+            sharedOwnerRegistry: this.opts.promotion.owners !== undefined,
+            takeoverRequiresExplicitSignal: true,
+            partitionIsNotFailover: true,
+            retentionPolicy: this.opts.promotion.manifest.retention,
+            releaseEndpoint: '/v1/release',
+          }
+        : {
+            pinnedRelease: null,
+            cohortEnabled: false,
+            cohortId: 'none',
+            rollbackAvailable: false,
+            rolledBack: false,
+            servingReleaseId: null,
+            paidProfilesAllowed: null,
+            sharedOwnerRegistry: false,
+            takeoverRequiresExplicitSignal: true,
+            partitionIsNotFailover: true,
+            retentionPolicy: null,
+            releaseEndpoint: 'absent',
+          },
       engines: Object.keys(this.opts.adapters).sort(),
     };
   }
@@ -454,6 +629,73 @@ export class AgentApi {
       throw new ApiError('INVALID_REQUEST', `assembled spec is invalid: ${validated.errors.join('; ')}`, { errors: validated.errors });
     }
     return validated.value;
+  }
+
+  /**
+ * Приёмная политика промоушена. Без promotion-контура поведение прежнее: одиночная
+ * установка принимает всё, что разрешено движком и scope. С контуром — отказ пишется и в
+ * лог, и в durable-журнал: «почему задача не принята» должно читаться без request'а.
+ */
+  private decideAdmission(principal: Principal, request: SubmitRequest) {
+    const promotion = this.opts.promotion;
+    if (!promotion) return { admit: true as const, cohortId: 'none', cohortReason: 'cohort_off' as const, bucket: 0, releaseId: '', servingReleaseId: '' };
+    const decision = decideAdmission(
+      { manifest: promotion.manifest, cohort: promotion.cohort, state: promotion.state.snapshot() },
+      { principalId: principal.principalId, engineName: request.engine.name },
+    );
+    if (decision.admit) {
+      this.log({
+        event: 'admission_accepted',
+        principalId: principal.principalId,
+        engine: request.engine.name,
+        cohortId: decision.cohortId,
+        cohortReason: decision.cohortReason,
+        cohortBucket: decision.bucket,
+        releaseId: decision.releaseId,
+        servingReleaseId: decision.servingReleaseId,
+      });
+      return decision;
+    }
+    this.refuseAdmission(decision);
+  }
+
+  private refuseAdmission(refusal: { admit: false; code: AdmissionRefusalCode; reason: string; detail: Record<string, unknown> }): never {
+    const promotion = this.opts.promotion;
+    promotion?.journal.append({
+      kind: 'admission_refused',
+      reason: refusal.reason,
+      cohortId: promotion?.cohort.cohortId,
+      detail: { code: refusal.code, ...refusal.detail },
+    });
+    this.log({
+      event: 'admission_refused',
+      code: refusal.code,
+      reason: refusal.reason,
+      ...refusal.detail,
+    });
+    throw new ApiError(refusal.code, refusal.reason, refusal.detail);
+  }
+
+  /**
+   * Claim владения в общем реестре флота. Возвращает поколение, если владение выдано,
+   * `undefined` — если реестр не настроен (одиночная установка).
+   */
+  private claimOwnership(principal: Principal, userTaskId: string, runId: string): number | undefined {
+    const owners = this.opts.promotion?.owners;
+    if (!owners) return undefined;
+    const claim = claimOwnership(owners, principal.principalId, userTaskId, runId);
+    if (claim.admit) {
+      this.log({
+        event: 'ownership_claimed',
+        principalId: principal.principalId,
+        userTaskId,
+        runId,
+        ownerWorkerId: owners.workerId,
+        ownerGeneration: claim.ownerGeneration,
+      });
+      return claim.ownerGeneration;
+    }
+    this.refuseAdmission(claim);
   }
 
   private requireRun(principal: Principal, runId: string): AdmissionRecord {

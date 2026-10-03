@@ -156,6 +156,26 @@ export interface ApiCapabilities {
     osIsolation: 'not_proven_service_uid_only';
     osIsolationNote: string;
   };
+  /**
+   * Промоушен (P29, этап I10): закреплённый релиз, флаг когорты, возможность отката,
+   * политика платных профилей и общий реестр владения. Значения объявлены честно: без
+   * promotion-контура приёмник видит `cohortEnabled: false`, а не догадку о когорте.
+   */
+  promotion: {
+    pinnedRelease: { releaseId: string; sourceCommit: string; configVersion: number } | null;
+    cohortEnabled: boolean;
+    cohortId: string;
+    rollbackAvailable: boolean;
+    rolledBack: boolean;
+    servingReleaseId: string | null;
+    /** null = манифест не подключён, политика платных профилей не объявлена. */
+    paidProfilesAllowed: boolean | null;
+    sharedOwnerRegistry: boolean;
+    takeoverRequiresExplicitSignal: true;
+    partitionIsNotFailover: true;
+    retentionPolicy: { mainEventsDays: number; verboseLogsDays: number } | null;
+    releaseEndpoint: string;
+  };
   engines: string[];
 }
 
