@@ -174,10 +174,13 @@ export class UnixCleanRoomProvider implements CleanRoomProvider {
       const paths = this.pathsFor(runId, cwd);
       const at = this.now().toISOString();
 
-      this.prepareDirectory(paths.root, identity, 0o700);
-      for (const dir of [paths.home, paths.config, paths.cache, paths.data, paths.tmp, paths.mcp]) {
-        this.prepareDirectory(dir, identity, 0o700);
-      }
+      // Каталоги среды создаются под служебным uid, и только потом отдаются слоту. Создать
+      // каталог ВНУТРИ уже отданного слота каталога может только root или DAC_OVERRIDE, а
+      // Runner намеренно без них работает (User=sandbox + CAP_SETUID/SETGID/CHOWN/FOWNER):
+      // порядок «создать всё → затем отдать» позволяет поднять границу без расширенных прав.
+      const runDirs = [paths.root, paths.home, paths.config, paths.cache, paths.data, paths.tmp, paths.mcp];
+      for (const dir of runDirs) mkdirSync(dir, { recursive: true, mode: 0o700 });
+      for (const dir of runDirs) chownSync(dir, identity.uid, identity.gid);
       this.adoptTree(paths.cwd, identity);
 
       // Каталоги рана у слота, но путь к ним лежит под сервисным dataDir: без явного
@@ -198,7 +201,11 @@ export class UnixCleanRoomProvider implements CleanRoomProvider {
       let acl: CleanRoomAcl = 'posix_0700';
       const runnerUid = this.policy.runnerUid ?? safeUid();
       if (runnerUid && runnerUid !== identity.uid) {
-        acl = (await this.applyAcl(paths, runnerUid)) ? 'posix_0700_acl' : 'posix_0700';
+        // Доступ Runner'а нужен на ВСЕ каталоги рана, а не только на корень: persist
+        // читает выходы из cwd и пишет конфиг движка в HOME/config, sweep удаляет всё
+        // дерево. Раньше ACL выдавался на {root, cwd}, и persist/sweep падали с EPERM,
+        // как только ран шёл не под service UID.
+        acl = (await this.applyAcl([...runDirs, paths.cwd], runnerUid)) ? 'posix_0700_acl' : 'posix_0700';
       }
 
       const probe = await this.runProbe(runId, identity, paths);
@@ -477,11 +484,11 @@ export class UnixCleanRoomProvider implements CleanRoomProvider {
     }
   }
 
-  private async applyAcl(paths: CleanRoomPaths, runnerUid: number): Promise<boolean> {
+  private async applyAcl(targets: string[], runnerUid: number): Promise<boolean> {
     const setfacl = findSetfacl();
     if (!setfacl) return false;
     let applied = true;
-    for (const target of [paths.root, paths.cwd]) {
+    for (const target of targets) {
       if (!existsSync(target)) continue;
       for (const args of [
         ['-m', `u:${runnerUid}:rwx`, target],

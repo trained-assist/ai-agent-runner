@@ -44,10 +44,21 @@ bash /opt/sb/ai-agent-runner/scripts/deploy-api-service.sh
 | `ARTIFACT_BASE_URL` | база для ссылок на артефакты: `http://169.58.15.230:8787` |
 | `AGENT_API_ISOLATION_SLOTS`, `AGENT_API_ISOLATION_TOOL_PATHS` | граница Agent clean room (#51): пул Unix-слотов ран'а (`ta-agent-1,ta-agent-2`) и общие read-only каталоги бинарей. Пустой слот — движок под service UID, и capabilities объявляют это честно |
 | `AGENT_API_ENGINE_CONFIG_DIR` | каталог хостовых шаблонов конфигурации движка: один read-only файл `<engine>.json` на движок. Копия кладётся в run-scoped `XDG_CONFIG_HOME` (владелец — слот, `0600`) и уезжает со sweep. Нужен потому, что своя HOME рана убирает у движка конфиг пользователя сервиса: без provider/model `opencode` уходит на платный профиль по умолчанию. Секретов в шаблонах нет — ключи приходят в env рана по `envAllowlist` |
+| `AGENT_API_COHORT_ID`, `AGENT_API_COHORT_MODE`, `AGENT_API_COHORT_PRINCIPALS` | когорта P29: по умолчанию (`off`) **не обслуживает никого** — каждый `POST /v1/runs` получает `COHORT_NOT_ENABLED`. Одиночная установка обязана объявить allowlist с principal'ами, иначе она принимает ноль задач |
 | `AGENT_API_FAKE_SCENARIO` | опционально: сценарий fake-движка (`success` по умолчанию, `timeout`, `nonzero-exit`, …) — для проверки аварийных путей; правится вручную в env-файле + `systemctl restart` |
 
 Старт падает сразу и явно, если: не задан `AGENT_API_KEY_REGISTRY`, файла ключей нет или в нём 0 ключей,
 data dir попал во временный каталог или имеет права шире `0700`.
+
+### Capability юнита и граница clean room
+
+Юнит даёт процессу ровно четыре capability: `CAP_SETUID`, `CAP_SETGID` (переключение
+идентичности рана лаунчером) и `CAP_CHOWN`, `CAP_FOWNER` (каталоги среды создаются под
+служебным uid и затем отдаются слоту). `CAP_DAC_OVERRIDE` в наборе нет намеренно: без него
+создание каталога внутри уже отданного слота каталога было бы единственным способом
+поднять границу, то есть цей границы стал бы обходом прав доступа. Если capability не
+выданы, `capabilities.osIsolation` сообщает `configured_but_refusing_runs` → ран
+отказывается, а не идёт под service UID.
 
 ## Безопасность
 
