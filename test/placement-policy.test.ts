@@ -94,7 +94,9 @@ describe('decidePlacement: регион × провайдер × credentials × 
   it('необъявленный движок и необъявленный провайдер не проходят «по умолчанию»', () => {
     expect(refusalOf(decidePlacement(POLICY, RU, { engineName: 'gemini' })).code).toBe('REGION_ENGINE_UNDECLARED');
     expect(refusalOf(decidePlacement(POLICY, RU, { engineName: 'opencode', model: 'mystery/model' })).code).toBe('PROVIDER_UNDECLARED');
-    expect(refusalOf(decidePlacement(POLICY, RU, { engineName: 'opencode' })).code).toBe('PROVIDER_UNDECLARED');
+    // Без модели нечего сопоставлять с картой провайдеров: запрос уходит дальше (paid/движок),
+    // а не блокируется региональной политикой.
+    expect(decidePlacement(POLICY, RU, { engineName: 'opencode' }).place).toBe(true);
   });
 
   it('credential scope проверяется по региону воркера', () => {

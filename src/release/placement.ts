@@ -310,7 +310,7 @@ export function providerOf(model: string | undefined): string | null {
  * 1) движок объявлен в политике (fail-closed: неизвестный движок не «разрешён по умолчанию»);
  * 2) движок разрешён в регионе воркера;
  * 3) explicit profile, если регион его требует;
- * 4) провайдер/модель;
+ * 4) провайдер/модель (только если модель объявлена — без неё нечего сопоставлять);
  * 5) credential bindings по регионам;
  * 6) резидентность данных (не решена → отказ, а не догадка);
  * 7) regionConstraints самого рана.
@@ -353,15 +353,10 @@ export function decidePlacement(policy: PlacementPolicy, worker: PlacementWorker
   reasons.push(`explicit profile ${rule.explicitProfileRef}`);
 
   const provider = providerOf(subject.model);
-  if (rule.providers !== undefined) {
-    if (provider === null) {
-      return refuse('PROVIDER_UNDECLARED', `engine "${subject.engineName}" declares provider constraints in policy ${policy.policyId}, but the run has no model`, {
-        engine: subject.engineName,
-        region,
-        declaredProviders: Object.keys(rule.providers).sort(),
-        policyId: policy.policyId,
-      });
-    }
+  // Провайдер проверяется только когда модель объявлена: без модели нечего сопоставлять с
+  // картой провайдеров, и отказ здесь заблокировал бы все запросы без modelSettings.model
+  // (их дальше разбирают paid-флаг и движок).
+  if (rule.providers !== undefined && provider !== null) {
     const providerRule = rule.providers[provider];
     if (!providerRule) {
       return refuse('PROVIDER_UNDECLARED', `provider "${provider}" is not declared for engine "${subject.engineName}" in placement policy ${policy.policyId}`, {

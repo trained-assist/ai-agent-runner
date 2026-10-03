@@ -263,6 +263,38 @@ Env/константы: `RUNNER_DEFAULT_REPO` (дефолтная репа), `RU
 - [x] Проба приёмки на песочной VM2: 59/59 проверок, транскрипт `docs/evidence/p29-promotion-vm2/`
 - [x] Проба в CI на каждом PR: `.github/workflows/promotion-probe.yml`
 
+## Multi-worker/region contract (P30, этап I10)
+
+Соответствует карточке [#69](https://github.com/trained-assist/trained-agent-architecture/issues/69) и этапу [SANDBOX · I10](https://github.com/trained-assist/trained-agent-architecture/blob/main/SANDBOX.md#i10--promotion-совместимость-rueu). Детали — [docs/MULTI-WORKER-REGION.md](docs/MULTI-WORKER-REGION.md).
+
+| Область | Файл | Что делает |
+|---|---|---|
+| Размещение | `src/release/placement.ts` | Политика размещения fail-closed: движок × регион → explicit profile → провайдер модели → credential scopes → резидентность → `regionConstraints` рана. `screenWorkers` отбирает воркеров флота, `allowedEnginesForRegion` — список для повторной проверки Runner'ом |
+| Приём | `src/release/admission.ts` | Порядок отказов: откат → **placement** → платный профиль → когорта → владение. Placement идёт перед paid-флагом: отказ «платно» маскировал бы нарушение региональной политики |
+| Runner | `src/runner/runner.ts` | Повторная проверка региона движка по `host.allowedEngines` в preflight: `REGION_FORBIDDEN`, движок не запускается |
+| Владение | `src/release/dispatch-owner.ts` | Перехват по явному сигналу оставляет запись без попытки; первый claim нового владельца принимает это поколение, а не увеличивает его |
+| Приёмка | `scripts/recreate-sandbox.sh --regions … --placement …`, `scripts/p30-fleet-probe.mjs` | Два воркера одной VM в разных регионах, матрица размещения, drain, управляемый сбой и failover без двойного исполнения → sanitized-транскрипт + sha256 |
+
+Ключевые семантики:
+
+- **Claude/Codex не в RU; в EU — только с явным профилем.** Политика без `explicitProfileRef`
+  отказывает с `REGION_EXPLICIT_PROFILE_REQUIRED`; профиль включается решением владельца, а не
+  кодом (проба переключает его в конфиге и видит, как меняется отказ).
+- **OpenCode — по провайдеру**: `free-ladder` разрешён в обеих зонах, `zen` только в EU
+  (`PROVIDER_REGION_FORBIDDEN` в RU).
+- **Резидентность данных не решается молча**: `dataResidency.decided: false` даёт 409
+  `DATA_RESIDENCY_UNDECIDED`; симуляция песочницы не может объявить резидентность решённой
+  (`authority: owner_decision` + ссылка на решение).
+- **Нет двойного исполнения после failover**: partition ≠ failover, перехват только по явному
+  сигналу, прежний владелец fenced, успешный результат ровно один на задачу.
+
+### Что покрыто тестами
+
+- [x] Политика размещения: валидация fail-closed, матрица регион × провайдер × credentials × резидентность — `test/placement-policy.test.ts`
+- [x] Внешний контракт поверх HTTP на двух воркерах в разных регионах + failover без двойного исполнения — `test/placement-api.test.ts`
+- [x] Проба приёмки на песочной VM2: 67/67 проверок, транскрипт `docs/evidence/p30-fleet-vm2/`
+- [x] Проба в CI на каждом PR: `.github/workflows/p30-fleet-probe.yml`
+
 ## Разработка
 
 ```bash

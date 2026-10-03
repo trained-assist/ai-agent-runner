@@ -234,6 +234,15 @@ export class DispatchOwnerStore {
     });
   }
 
+  /** Отмена drain: воркер снова принимает новые задачи (уже принятые остаются его). */
+  undrain(reason: string): void {
+    this.withLock((file) => {
+      const index = file.drains.indexOf(this.workerId);
+      if (index >= 0) file.drains.splice(index, 1);
+      this.emit('drained', '', '', 0, `undrain: ${reason}`);
+    });
+  }
+
   isDraining(): boolean {
     return this.withLock((file) => file.drains.includes(this.workerId), { write: false });
   }

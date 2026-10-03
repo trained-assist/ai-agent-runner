@@ -159,6 +159,13 @@ Connection_lost не даёт самостоятельного retry. Для н�
 
 Факт существования LLM Ledger сообщён владельцем. Конкретный полный путь accounting нужно подтвердить: изученный llm-ladder не доказывает покрытие всех engine calls и streaming usage. Разные engine traces также пока не имеют единого подтверждённого retention/export контракта.
 
+Реализовано в P30 (песочница, этап I10): `src/release/placement.ts` — политика размещения
+(движок × регион → explicit profile → провайдер → credential scopes → резидентность),
+fail-closed валидация, `screenWorkers` для выбора воркера, повторная проверка региона в
+Runner preflight. Порядок приёма: откат → placement → платный профиль → когорта → владение.
+Резидентность данных не решается молча: без решения владельца — отказ
+`DATA_RESIDENCY_UNDECIDED`. Детали и границы доказанного — `docs/MULTI-WORKER-REGION.md`.
+
 ## 9. Выделение из core
 
 1. Согласовать RunSpec, события и ownership; подготовить fake adapter.
