@@ -185,13 +185,28 @@ describe('stateless AgentApi: финализация', () => {
     expect(api.result(alpha, receipt.runId).outcome).toBe('succeeded');
   });
 
-  it('ответ воркера вне контракта не превращается в «успешный» ран', async () => {
+  it('квитанция вне контракта не валит ран вслепую: он reconcile-ится, а не теряется', async () => {
+    // Воркер принял ран, но ответ не разобрался. Ран мог реально идти, поэтому валить его
+    // сразу нельзя — клиент повторил бы submit и завёл второй. Контракт (#73 §4) требует
+    // сначала `unknown` и reconcile: спросить воркер, знает ли он этот ран.
     const api = await makeApi({ malformed: true });
     const receipt = api.submit(alpha, 'idem-malformed', body());
+    // Воркер ран знает → reconcile находит его и доводит до конца, второго запуска нет.
+    await waitForState(api, alpha, receipt.runId, 'succeeded');
+    expect(api.result(alpha, receipt.runId).outcome).toBe('succeeded');
+  });
+
+  it('воркер не знает ран после обрыва launch — только тогда ран считается несостоявшимся', async () => {
+    // 5xx = запуск не принят (мок не регистрирует ран). Reconcile спрашивает статус,
+    // получает «не вижу» и только тогда закрывает ран отказом.
+    const api = await makeApi({ httpStatus: 503 });
+    const receipt = api.submit(alpha, 'idem-lost-launch', body());
     await waitForState(api, alpha, receipt.runId, 'failed');
     const result = api.result(alpha, receipt.runId);
     expect(result.outcome).toBe('failed');
-    expect(result.exitReason).toBe('worker_crash');
+    expect(result.failure?.code).toBe('WORKER_HTTP_ERROR');
+    // Повтор безопасен: ран нигде не остался.
+    expect(result.failure?.retryable).toBe(true);
   });
 
   it('отмена живого рана доходит до воркера и даёт outcome cancelled', async () => {

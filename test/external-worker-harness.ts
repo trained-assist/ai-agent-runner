@@ -94,6 +94,14 @@ export async function startMockWorker(options: MockWorkerOptions = {}): Promise<
         const body = JSON.parse(await readBody(req)) as Record<string, unknown>;
         launches.push(body);
         const runId = String(body['runId'] ?? '');
+        // HTTP-ошибка = запуск НЕ принят: ран не регистрируем. Иначе «воркер отказал» было
+        // бы неотличимо от «воркер принял, но ответ потерялся», и reconcile (#73 §4) не
+        // проверить: он бы всегда находил ран у отказавшего воркера.
+        if (settings.httpStatus !== undefined) {
+          res.writeHead(settings.httpStatus, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'worker is unhappy' }));
+          return;
+        }
         // Регистрируем ран сразу, до задержки: отмена может прийти, пока launch ещё «думает».
         let record = [...live].find((entry) => entry.runId === runId);
         if (!record) {
@@ -104,11 +112,6 @@ export async function startMockWorker(options: MockWorkerOptions = {}): Promise<
           };
           if (settings.registerAfterMs && settings.registerAfterMs > 0) setTimeout(register, settings.registerAfterMs);
           else register();
-        }
-        if (settings.httpStatus !== undefined) {
-          res.writeHead(settings.httpStatus, { 'content-type': 'application/json' });
-          res.end(JSON.stringify({ error: 'worker is unhappy' }));
-          return;
         }
         if (settings.delayMs) await new Promise((resolve) => setTimeout(resolve, settings.delayMs));
         // Асинхронный контракт: воркер принял ран и ушёл работать. Квитанция несёт адреса,
