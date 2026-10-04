@@ -882,7 +882,9 @@ export class ExternalWorkerAdapter implements ExternalWorker {
       this.log({ event: 'worker_launch_http_error', runId: spec.runId, status: response.status, detail });
       throw new PreflightError('WORKER_HTTP_ERROR', `the external worker answered ${response.status} on launch`, {
         failureClass: 'runtime',
-        retryable: true,
+        // 4xx — про запрос: тот же запрос получит тот же отказ (битый токен, не тот payload),
+        // и повтор станет штормом. 5xx — про состояние воркера, повтор оправдан.
+        retryable: response.status >= 500,
       });
     }
     const validated = validateLaunchReceipt(await readJson(response), spec.runId);
@@ -891,7 +893,9 @@ export class ExternalWorkerAdapter implements ExternalWorker {
       throw new PreflightError(
         'WORKER_PROTOCOL_INVALID',
         `the external worker answered launch outside the contract: ${validated.errors.join('; ')}`,
-        { failureClass: 'runtime', retryable: true },
+        // Расхождение контракта детерминировано: тот же запрос получит тот же ответ.
+        // Повтор его не исправит и превращается в шторм — это отказ, а не «попробуй ещё».
+        { failureClass: 'runtime', retryable: false },
       );
     }
     this.log({ event: 'worker_launch_accepted', runId: spec.runId, engine: spec.engine.name, statusUrl: validated.value.statusUrl });
@@ -918,7 +922,7 @@ export class ExternalWorkerAdapter implements ExternalWorker {
       throw new PreflightError(
         'WORKER_PROTOCOL_INVALID',
         `the external worker answered status outside the contract: ${validated.errors.join('; ')}`,
-        { failureClass: 'runtime', retryable: true },
+        { failureClass: 'runtime', retryable: false },
       );
     }
     return validated.value;
@@ -948,7 +952,7 @@ export class ExternalWorkerAdapter implements ExternalWorker {
       throw new PreflightError(
         'WORKER_PROTOCOL_INVALID',
         `the external worker answered result outside the contract: ${validated.errors.join('; ')}`,
-        { failureClass: 'runtime', retryable: true },
+        { failureClass: 'runtime', retryable: false },
       );
     }
     return validated.value;
