@@ -16,7 +16,7 @@ import {
   validateIdempotencyKey,
   validateSubmitRequest,
 } from '../src/api/contracts.js';
-import { StatelessStore, isTerminalApiState, type AdmissionRecord } from '../src/api/stateless-store.js';
+import { StatelessStore, STATELESS_STORE_SCHEMA_VERSION, isTerminalApiState, type AdmissionRecord } from '../src/api/stateless-store.js';
 import { ApiError } from '../src/api/errors.js';
 import { makeRunSpec } from './helpers.js';
 
@@ -138,7 +138,7 @@ describe('stateless store: приёмные записи только в пам�
   function record(over: Partial<AdmissionRecord> = {}): AdmissionRecord {
     const spec = makeRunSpec();
     return {
-      schemaVersion: 1,
+      schemaVersion: STATELESS_STORE_SCHEMA_VERSION,
       requestId: 'req_1',
       userTaskId: 'task-1',
       conversationId: spec.conversationId,
