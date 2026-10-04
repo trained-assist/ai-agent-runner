@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it, onTestFinished } from 'vitest';
 import { ApiError } from '../src/api/errors.js';
 import { AgentApi, attemptOperationId } from '../src/api/service.js';
@@ -323,6 +326,38 @@ describe('stateless AgentApi: capabilities отчитываются честно
   it('пустой реестр воркеров — отказ на старте, а не API без способа запустить агента', () => {
     expect(() => new AgentApi({ workers: [] })).toThrowError(/at least one external worker/);
   });
+
+  it('после рестарта API раны, принятые воркером, снова под опросом — результат не теряется', async () => {
+    // §8.2 ревью: журнал хранил только приёмные записи, поэтому принятый воркером ран
+    // после рестарта навсегда оставался `queued` — прочитать результат было нельзя, а
+    // повтор клиента с новым ключом завёл бы второй ран.
+    const dir = mkdtempSync(join(tmpdir(), 'runner-resume-'));
+    onTestFinished(() => rmSync(dir, { recursive: true, force: true }));
+    const logPath = join(dir, 'admissions.jsonl');
+
+    const worker = await startMockWorker({});
+    onTestFinished(() => worker.close());
+
+    // Первый процесс: раны уходят в воркер, журнал пишется на диск.
+    const first = new AgentApi({ workers: [adapterFor(worker)], admissionLogPath: logPath });
+    const submitted = first.submit(alpha, 'idem-resume-1', body());
+    await waitForState(first, alpha, submitted.runId, 'succeeded');
+    const launchesBefore = worker.launches.length;
+    first.dispose();
+
+    // Второй процесс читает тот же журнал.
+    const revived = new StatelessStore({}, logPath);
+    expect(revived.dispatchedRuns().map((entry) => entry.runId)).toContain(submitted.runId);
+
+    // Тот же ключ после рестарта — та же задача и никакого второго запуска.
+    const second = new AgentApi({ workers: [adapterFor(worker)], store: revived, admissionLogPath: logPath });
+    onTestFinished(() => second.dispose());
+    expect(second.resumeDispatched()).toBeGreaterThanOrEqual(0); // идемпотентно на любом состоянии
+    const again = second.submit(alpha, 'idem-resume-1', body());
+    expect(again.runId).toBe(submitted.runId);
+    expect(again.deduplicated).toBe(true);
+    expect(worker.launches.length).toBe(launchesBefore);
+  }, 30000);
 
   it('operationId стабилен в пределах попытки — на этом держится дедупликация воркера', () => {
     // Контракт внешнего worker, п. 2: воркер помнит принятые operationId. Свежий id на

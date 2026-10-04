@@ -17,7 +17,17 @@ import type { ApiRunState } from './contracts.js';
  * а не источник истины для несохранённого выхода.
  */
 
-export const STATELESS_STORE_SCHEMA_VERSION = 1 as const;
+export const STATELESS_STORE_SCHEMA_VERSION = 2 as const;
+
+/**
+ * Строка журнала. Приёмная запись нужна для дедупликации; отметка `dispatched` —
+ * чтобы после рестарта API перезапустить поллеры ранов, которые воркер уже принял.
+ * Без неё принятый ран навсегда остаётся `queued`: результат не прочитать, а повтор
+ * с новым ключом завёл бы второй ран.
+ */
+export type JournalLine =
+  | { kind: 'admission'; record: AdmissionRecord }
+  | { kind: 'dispatched'; runId: string; engine: string; at: string };
 
 export interface AdmissionRecord {
   schemaVersion: typeof STATELESS_STORE_SCHEMA_VERSION;
@@ -87,6 +97,8 @@ export class StatelessStore {
   private readonly limits: StatelessStoreLimits;
   /** Куда дублируются приёмные записи; null = дедупликация только в памяти процесса. */
   private readonly persistPath: string | null;
+  /** Раны, отправленные воркеру: нужны, чтобы поллеры пережили рестарт API. */
+  private readonly dispatched = new Map<string, { runId: string; engine: string; at: string }>();
 
   constructor(limits: Partial<StatelessStoreLimits> = {}, persistPath: string | null = null) {
     this.limits = { ...DEFAULT_STATELESS_LIMITS, ...limits };
@@ -99,13 +111,29 @@ export class StatelessStore {
    * запись переживает падение процесса целиком (строка либо есть, либо нет).
    */
   appendAdmission(record: AdmissionRecord): void {
+    this.write({ kind: 'admission', record });
+  }
+
+  /** Ран принят воркером: помечаем, чтобы поллер пережил рестарт API. */
+  appendDispatched(runId: string, engine: string, at: string): void {
+    this.write({ kind: 'dispatched', runId, engine, at });
+    this.dispatched.set(runId, { runId, engine, at });
+  }
+
+  /** Раны, отправленные воркеру. */
+  dispatchedRuns(): Array<{ runId: string; engine: string; at: string }> {
+    return [...this.dispatched.values()];
+  }
+
+  private write(line: JournalLine): void {
     if (!this.persistPath) return;
     try {
-      appendFileSync(this.persistPath, `${JSON.stringify(record)}\n`, 'utf8');
+      appendFileSync(this.persistPath, `${JSON.stringify(line)}\n`, 'utf8');
     } catch (err) {
       // Журнал не должен ронять приём задачи: при недоступном журнале дедупликация
       // сохраняется в памяти процесса, а факт отказа виден в логе.
-      console.warn(`[stateless-store] persist failed for ${record.requestId}: ${err instanceof Error ? err.message : String(err)}`);
+      const what = line.kind === 'admission' ? line.record.requestId : line.runId;
+      console.warn(`[stateless-store] persist failed for ${what}: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
@@ -118,12 +146,22 @@ export class StatelessStore {
       return; // журнала ещё нет — это первый запуск
     }
     let restored = 0;
+    let resumed = 0;
     for (const line of raw.split('\n')) {
       const trimmed = line.trim();
       if (!trimmed) continue;
       try {
-        const record = JSON.parse(trimmed) as AdmissionRecord;
-        if (record.schemaVersion !== STATELESS_STORE_SCHEMA_VERSION) continue;
+        const entry = JSON.parse(trimmed) as JournalLine;
+        if (entry.kind === 'dispatched') {
+          if (typeof entry.runId === 'string' && entry.runId.length > 0) {
+            this.dispatched.set(entry.runId, { runId: entry.runId, engine: String(entry.engine ?? ''), at: String(entry.at ?? '') });
+            resumed += 1;
+          }
+          continue;
+        }
+        if (entry.kind !== 'admission') continue;
+        const record = entry.record;
+        if (record?.schemaVersion !== STATELESS_STORE_SCHEMA_VERSION) continue;
         if (typeof record.runId !== 'string' || record.runId.length === 0) continue;
         this.index(record);
         restored += 1;
@@ -132,6 +170,7 @@ export class StatelessStore {
       }
     }
     if (restored > 0) console.warn(`[stateless-store] restored ${restored} admission records from ${path}`);
+    if (resumed > 0) console.warn(`[stateless-store] ${resumed} dispatched runs will resume polling`);
   }
 
   /** Перестроить индексы из записи без проверки лимита (восстановление при старте). */

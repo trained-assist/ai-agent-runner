@@ -15,7 +15,7 @@ import {
 } from '../adapters/external-worker-adapter.js';
 import type { RunResult } from '../contracts/result.js';
 import { validateRunSpec, type InputSpec, type RunSpec } from '../contracts/run-spec.js';
-import { DEFAULT_STATELESS_LIMITS, isTerminalApiState, StatelessStore, type AdmissionRecord } from './stateless-store.js';
+import { DEFAULT_STATELESS_LIMITS, isTerminalApiState, STATELESS_STORE_SCHEMA_VERSION, StatelessStore, type AdmissionRecord } from './stateless-store.js';
 import {
   API_CAPABILITIES_SCHEMA_VERSION,
   API_CONTRACT_VERSION,
@@ -240,7 +240,7 @@ export class AgentApi {
 
     const spec = this.buildSpec(request, { principal, requestId, userTaskId, jobId, ownerGeneration });
     const record: AdmissionRecord = {
-      schemaVersion: 1,
+      schemaVersion: STATELESS_STORE_SCHEMA_VERSION,
       requestId,
       userTaskId,
       conversationId: spec.conversationId,
@@ -565,6 +565,31 @@ export class AgentApi {
    * Поллер живёт в фоне и переживает запросы клиента: клиент опрашивает `status`/`events`
    * так же, как раньше, и видит прогресс без изменений со своей стороны.
    */
+  /**
+   * Перезапустить поллеры ранов, принятых воркером до рестарта API (§8.2 ревью).
+   *
+   * Без этого восстановленная из журнала приёмная запись навсегда оставалась `queued`:
+   * результат не прочитать, а повтор клиента с новым ключом создавал бы второй ран —
+   * ровно то окно, которое контракт (п. 2) обязан исключать. Это опрос существующего
+   * запуска, а не повторный submit: новых запусков воркер не получает.
+   */
+  resumeDispatched(): number {
+    let resumed = 0;
+    for (const entry of this.store.dispatchedRuns()) {
+      const record = this.store.getByRun(entry.runId);
+      if (!record) continue;
+      const progress = this.store.progressOf(entry.runId);
+      if (progress && isTerminalApiState(progress.state)) continue;
+      const worker = this.workerFor(record.spec.engine.name);
+      if (!worker) continue;
+      this.store.open(record.runId, record.createdAt);
+      this.log({ event: 'poll_resumed', runId: record.runId, engine: record.spec.engine.name, operationId: record.spec.operationId });
+      void this.pollUntilTerminal(record, worker, this.nowIso());
+      resumed += 1;
+    }
+    return resumed;
+  }
+
   private async execute(record: AdmissionRecord): Promise<void> {
     const run = this.store.open(record.runId, record.createdAt);
     const startedAt = this.nowIso();
@@ -589,6 +614,10 @@ export class AgentApi {
         operationId: receipt.operationId,
         statusUrl: receipt.statusUrl,
       });
+      // Ран принят воркером. Помечаем ДО старта поллера: если процесс упадёт между
+      // здесь и терминальным состоянием, новый процесс должен поллер перезапустить —
+      // иначе результат потерян, а повтор клиента с новым ключом завёл бы второй ран.
+      this.store.appendDispatched(record.runId, record.spec.engine.name, this.nowIso());
       void this.pollUntilTerminal(record, worker, startedAt);
     } catch (err) {
       if (this.disposed) return;

@@ -56,6 +56,11 @@ async function main(): Promise<void> {
     ...(config.defaultRepository ? { defaultRepository: config.defaultRepository } : {}),
     ...(admissionLogPath ? { admissionLogPath } : {}),
   });
+  // Раны, принятые воркером до рестарта API, снова под опросом: без этого результат
+  // потерян, а повтор клиента с новым ключом завёл бы второй ран.
+  const resumed = service.resumeDispatched();
+  if (resumed > 0) log({ event: 'dispatched_runs_resumed', count: resumed });
+
   const server = createAgentApiServer(service, { keys, logger: log });
   // Терминальные раны не переживают себя: без этого процесса память только растёт, а у
   // stateless-сервиса нет ни файла, ни внешнего сборщика мусора.
