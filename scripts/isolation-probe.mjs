@@ -1090,9 +1090,13 @@ async function main() {
       const foreign = other ? execAsSlot(other, '/usr/bin/cat', [materialized]) : null;
       check('вход читает идентичность рана B', own.code === 0, `${own.code}: ${firstLine(`${own.stderr}${own.stdout}`)}`);
       check('вход НЕ читает чужой слот', foreign === null || foreign.code !== 0, foreign ? `${foreign.code}: ${firstLine(`${foreign.stderr}${foreign.stdout}`)}` : 'один слот');
-      pending.push({ worker: workerB, runId: runB.body.runId });
+      const viewBState = runView(workerB.state(runB.body.runId));
     } finally {
-      await workerB.closeLog();
+      // Ран B гасится ЗДЕСЬ, а не в общей копилке шагов: все воркеры пробы делят один
+      // dataDir, и живой ран на поднятии следующего воркера означал бы recover(), который
+      // глушит чужой движок и правит его состояние (это отдельный сценарий, не этот шаг).
+      await cancelAll([{ worker: workerB, runId: runB.body.runId }]);
+      await workerB.stop();
     }
 
     // Чужой principal (второй принципал того же воркера, в когорте) с тем же снимком.
@@ -1104,6 +1108,11 @@ async function main() {
     let runC;
     try {
       await workerC.waitHealthy();
+      // Новый воркер поднялся на ТОМ ЖЕ dataDir, где лежит состояние только что погашенного
+      // рана: две записи state.json из разных процессов — тот случай, на котором фиксированное
+      // имя временного файла роняло старт воркера (ENOENT на rename).
+      const stateB = join(spec.dataDir, 'runs', runB.body.runId, 'state.json');
+      check('состояние прошлого рана пережило старт нового воркера', existsSync(stateB) && readJson(stateB).runId === runB.body.runId, stateB);
       runC = await startRun(workerC, { prompt: 'must be refused', refs: [{ ref: 'theirs', snapshotId }] });
       const resultC = await waitTerminal(workerC, runC.body.runId, 30_000);
       const stateC = workerC.state(runC.body.runId);
@@ -1157,7 +1166,7 @@ async function main() {
       runA: { runId: runA.body.runId, outcome: resultA.outcome, outputRefs: resultA.outputRefs },
       snapshotId,
       artifact: { artifactId: artifact.artifactId, name: artifact.name, size: artifact.size, sha256: artifact.sha256 },
-      runB: { runId: runB.body.runId, slot: runView(workerB.state(runB.body.runId)).slot, materializedPath: join(runView(workerB.state(runB.body.runId)).cwd, '.inputs', snapshotId, ENGINE_OUTPUT), bytes: 'ok' },
+      runB: { runId: runB.body.runId, slot: viewBState.slot, materializedPath: join(viewBState.cwd, '.inputs', snapshotId, ENGINE_OUTPUT), bytes: 'ok', cancelledAfterChecks: true },
       foreignPrincipal: { runId: runC.body.runId, failureCode: resultC.failure?.code ?? null, retryable: resultC.failure?.retryable ?? null, engineStarted: typesC.includes('started') },
       tamperedBytes: { runId: runD.body.runId, failureCode: resultD.failure?.code ?? null, retryable: resultD.failure?.retryable ?? null },
       noRefRun: { runId: runE.body.runId, outcome: resultE.outcome, inputsDirPresent: existsSync(join(workerE.state(runE.body.runId).spec.cwd, '.inputs')) },
