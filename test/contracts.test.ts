@@ -24,6 +24,15 @@ function validSpec(over: Record<string, unknown> = {}): Record<string, unknown> 
 const EVENT_PAYLOADS: Record<RunnerEventType, unknown> = {
   claimed: { operationId: 'op-1' },
   materialized: { inputs: 2 },
+  inputs_materialized: {
+    status: 'materialized',
+    declared: 2,
+    requested: 1,
+    files: 1,
+    bytes: 14,
+    entries: [{ ref: 'prior', snapshotId: 'snap-1', status: 'materialized', code: null, files: 1, bytes: 14, reason: null }],
+    reason: null,
+  },
   started: { pid: 4242 },
   log: { stream: 'stdout', level: 'info', message: 'hello' },
   exit: { code: 0, signal: null },

@@ -10,6 +10,7 @@ import { RunExportStore } from '../storage/export.js';
 import { ShareTokenIssuer } from '../storage/share.js';
 import { UploadSessionStore } from '../storage/upload-session.js';
 import { WorkspaceSnapshotStore } from '../storage/workspace-snapshot.js';
+import { InputMaterializer } from '../storage/input-materializer.js';
 import { cohortFromEnv, type CohortPolicy } from '../release/cohort.js';
 import { DispatchOwnerStore } from '../release/dispatch-owner.js';
 import { releaseIdentity, releaseManifestFromEnv, type ReleaseManifest } from '../release/manifest.js';
@@ -255,6 +256,9 @@ async function main(): Promise<void> {
   const exports = new RunExportStore({ rootDir: config.dataDir, artifacts });
   const uploads = new UploadSessionStore({ rootDir: config.dataDir });
   const snapshots = new WorkspaceSnapshotStore({ rootDir: config.dataDir });
+  // Материализация входов из снимков (issue #52, шаг 1): байты лежат в том же хранилище,
+  // что и экспорт, поэтому указатель снимка проверяется тем же ArtifactStore.
+  const inputs = new InputMaterializer({ snapshots, artifacts });
   const tokens = new ShareTokenIssuer(shareSecret !== undefined ? { secret: shareSecret } : {});
   const baseUrl = process.env['ARTIFACT_BASE_URL']?.trim();
 
@@ -305,6 +309,7 @@ async function main(): Promise<void> {
     exports,
     uploads,
     snapshots,
+    inputs,
     promotion,
     ...(faults ? { faults } : {}),
     ...(isolation ? { isolation } : {}),

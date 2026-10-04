@@ -379,7 +379,38 @@ async function waitTerminal(worker, runId, timeoutMs = 30_000) {
   return (await worker.get(`/v1/runs/${runId}/result`)).body;
 }
 
+/** События рана одной строкой: видно тип события и его поля без чтения журнала целиком. */
+function eventLine(event) {
+  const payload = event.payload ?? {};
+  const detail = [payload.status, payload.code, payload.reason, payload.files, payload.bytes].filter((value) => value !== undefined && value !== null).join(' ');
+  return `${event.type}${detail ? ` ${detail}` : ''}`;
+}
+
+/** Снимок workspace по маршрутам API: создать → привязать артефакт → закоммитить. */
+async function commitSnapshot(worker, runId, artifact) {
+  const created = await worker.post(`/v1/runs/${runId}/snapshot`, { action: 'create' });
+  if (created.status !== 201) throw new Error(`snapshot create failed: ${created.status} ${JSON.stringify(created.body)}`);
+  const snapshotId = created.body.snapshotId;
+  const linked = await worker.post(`/v1/runs/${runId}/snapshot-file/${snapshotId}`, {
+    action: 'link',
+    path: artifact.name,
+    artifactId: artifact.artifactId,
+  });
+  if (linked.status !== 200) throw new Error(`snapshot link failed: ${linked.status} ${JSON.stringify(linked.body)}`);
+  const committed = await worker.post(`/v1/runs/${runId}/snapshot`, { action: 'commit', snapshotId });
+  if (committed.status !== 200) throw new Error(`snapshot commit failed: ${committed.status} ${JSON.stringify(committed.body)}`);
+  return snapshotId;
+}
+
+/** Артефакты рана по маршруту: имя → указатель на байты в долговечном хранилище. */
+async function runArtifacts(worker, runId) {
+  const response = await worker.get(`/v1/runs/${runId}/artifacts`);
+  return response.body?.artifacts ?? [];
+}
+
 function startRun(worker, over = {}) {
+  const input = { inlinePrompt: over.prompt ?? `write ${ENGINE_OUTPUT}` };
+  if (over.refs !== undefined) input.refs = over.refs;
   return worker.post(
     '/v1/runs',
     {
@@ -387,7 +418,7 @@ function startRun(worker, over = {}) {
       envAllowlist: [],
       limits: { timeoutMs: over.timeoutMs ?? 120_000 },
       isolation: { mode: 'per_run_unix_identity' },
-      input: { inlinePrompt: over.prompt ?? `write ${ENGINE_OUTPUT}` },
+      input,
       ...(over.outputs !== undefined ? { outputs: over.outputs } : {}),
     },
     over.idempotencyKey ?? `iso-${Math.random().toString(36).slice(2, 10)}`,
@@ -1011,11 +1042,149 @@ async function main() {
     }
   });
 
+  await runStep('materialize_inputs', async () => {
+    // Шаг 1 lifecycle (#52): байты между ранами лежат в долговечном хранилище, а снимок
+    // workspace — указатель на них. Ран B получает файл рана A в свой workspace с
+    // проверкой владельца и дайджеста; чужой principal и подменённые байты отказывают,
+    // не оставляя ни одного байта в workspace рана.
+    const port = await freePort(spec.port + 70);
+    const worker = new Worker({ ...spec, port }, clientKey, { AGENT_API_PORT: String(port), ...isolationEnv(slotsFlag) }).start();
+    let runA;
+    let snapshotId;
+    let artifact;
+    let resultA;
+    try {
+      await worker.waitHealthy();
+      runA = await startRun(worker, { outputs: [{ path: ENGINE_OUTPUT }] });
+      resultA = await waitTerminal(worker, runA.body.runId, 40_000);
+      check('ран A отработал и сохранил выход', resultA.outcome === 'succeeded' && (resultA.outputRefs ?? []).length === 1, `${String(resultA.outcome)}/${JSON.stringify(resultA.outputRefs ?? [])}`);
+      const listing = await runArtifacts(worker, runA.body.runId);
+      artifact = listing.find((entry) => entry.name === ENGINE_OUTPUT);
+      check('выход рана A — артефакт в хранилище', artifact !== undefined, JSON.stringify(listing.map((entry) => entry.name)));
+      snapshotId = await commitSnapshot(worker, runA.body.runId, artifact);
+      check('снимок рана A закоммичен как указатель на байты', typeof snapshotId === 'string', snapshotId);
+    } finally {
+      await worker.stop();
+    }
+
+    // Ран B живёт (движок висит), чтобы проверить байты ВХОДА на диске под идентичностью рана.
+    const portB = await freePort(spec.port + 71);
+    const workerB = new Worker({ ...spec, port: portB }, clientKey, {
+      AGENT_API_PORT: String(portB),
+      ...isolationEnv(slotsFlag, { AGENT_API_FAKE_SCENARIO: 'timeout' }),
+    }).start();
+    let runB;
+    let viewBState;
+    try {
+      await workerB.waitHealthy();
+      runB = await startRun(workerB, { prompt: 'hold the run', refs: [{ ref: 'prior', snapshotId }] });
+      const viewB = runView(await waitRunning(workerB, runB.body.runId));
+      const materialized = join(viewB.cwd, '.inputs', snapshotId, ENGINE_OUTPUT);
+      check('ран B получил снимок прошлого в свой workspace', existsSync(materialized), materialized);
+      check('байты входа совпадают с выходом рана A', readFileSync(materialized, 'utf8') === 'ok', readFileSync(materialized, 'utf8'));
+      const eventsB = workerB.events(runB.body.runId);
+      const materializedEvent = eventsB.find((event) => event.type === 'inputs_materialized');
+      check('событие входов говорит materialized с файлом и размером', materializedEvent?.payload?.status === 'materialized' && materializedEvent?.payload?.files === 1, JSON.stringify(materializedEvent?.payload ?? {}));
+      check('журнал рана B несёт счётчики материализации', eventsB.some((event) => event.type === 'log' && String(event.payload?.message ?? '').includes('inputs.materialized')), eventsB.map(eventLine).join(' | '));
+      // Вход лежит внутри границы рана: читает свой слот, чужой слот — нет.
+      const own = execAsSlot(viewB, '/usr/bin/cat', [materialized]);
+      const other = slots.find((slot) => slot.slot !== viewB.slot);
+      const foreign = other ? execAsSlot(other, '/usr/bin/cat', [materialized]) : null;
+      check('вход читает идентичность рана B', own.code === 0, `${own.code}: ${firstLine(`${own.stderr}${own.stdout}`)}`);
+      check('вход НЕ читает чужой слот', foreign === null || foreign.code !== 0, foreign ? `${foreign.code}: ${firstLine(`${foreign.stderr}${foreign.stdout}`)}` : 'один слот');
+      viewBState = runView(workerB.state(runB.body.runId));
+    } finally {
+      // Ран B гасится ЗДЕСЬ, а не в общей копилке шагов: все воркеры пробы делят один
+      // dataDir, и живой ран на поднятии следующего воркера означал бы recover(), который
+      // глушит чужой движок и правит его состояние (это отдельный сценарий, не этот шаг).
+      await cancelAll([{ worker: workerB, runId: runB.body.runId }]);
+      await workerB.stop();
+    }
+
+    // Чужой principal (второй принципал того же воркера, в когорте) с тем же снимком.
+    const portC = await freePort(spec.port + 72);
+    const workerC = new Worker({ ...spec, port: portC }, readKey(join(spec.configDir, 'api-key')), {
+      AGENT_API_PORT: String(portC),
+      ...isolationEnv(slotsFlag, { AGENT_API_FAKE_SCENARIO: 'timeout' }),
+    }).start();
+    let runC;
+    let resultC;
+    let typesC;
+    try {
+      await workerC.waitHealthy();
+      // Новый воркер поднялся на ТОМ ЖЕ dataDir, где лежит состояние только что погашенного
+      // рана: две записи state.json из разных процессов — тот случай, на котором фиксированное
+      // имя временного файла роняло старт воркера (ENOENT на rename).
+      const stateB = join(spec.dataDir, 'runs', runB.body.runId, 'state.json');
+      check('состояние прошлого рана пережило старт нового воркера', existsSync(stateB) && readJson(stateB).runId === runB.body.runId, stateB);
+      runC = await startRun(workerC, { prompt: 'must be refused', refs: [{ ref: 'theirs', snapshotId }] });
+      resultC = await waitTerminal(workerC, runC.body.runId, 30_000);
+      const stateC = workerC.state(runC.body.runId);
+      typesC = workerC.events(runC.body.runId).map((event) => event.type);
+      check('чужой principal отказан по владельцу снимка', resultC.failure?.code === 'MATERIALIZE_REF_FOREIGN', String(resultC.failure?.code));
+      check('отказ помечен неповторяемым', resultC.failure?.retryable === false, String(resultC.failure?.retryable));
+      check('отказ произошёл ДО спавна движка', !typesC.includes('started'), typesC.join(','));
+      check('в workspace чужого рана нет ни одного байта входа', !existsSync(join(stateC.spec.cwd, '.inputs')), stateC.spec.cwd);
+      check('причина отказа видна в журнале рана', workerC.events(runC.body.runId).some((event) => event.type === 'log' && String(event.payload?.message ?? '').includes('MATERIALIZE_REF_FOREIGN')), workerC.events(runC.body.runId).map(eventLine).join(' | '));
+    } finally {
+      await workerC.stop();
+    }
+
+    // Управляемый сбой: байты в хранилище подменены на другие той же длины. Указатель
+    // снимка и манифест артефакта продолжают объявлять исходный дайджест.
+    const blobPath = join(spec.dataDir, 'blobs', 'runs', runA.body.runId, 'artifacts', artifact.artifactId);
+    const original = readFileSync(blobPath);
+    writeFileSync(blobPath, Buffer.from('tampered'));
+    const portD = await freePort(spec.port + 73);
+    const workerD = new Worker({ ...spec, port: portD }, clientKey, { AGENT_API_PORT: String(portD), ...isolationEnv(slotsFlag) }).start();
+    let runD;
+    let resultD;
+    try {
+      await workerD.waitHealthy();
+      runD = await startRun(workerD, { prompt: 'must be refused', refs: [{ ref: 'prior', snapshotId }] });
+      resultD = await waitTerminal(workerD, runD.body.runId, 30_000);
+      const stateD = workerD.state(runD.body.runId);
+      check('подменённые байты → отказ по дайджесту', resultD.failure?.code === 'MATERIALIZE_BYTES_MISMATCH', String(resultD.failure?.code));
+      check('отказ по дайджесту неповторяем', resultD.failure?.retryable === false, String(resultD.failure?.retryable));
+      check('ни файла, ни каталога входов не появилось', !existsSync(join(stateD.spec.cwd, '.inputs')), stateD.spec.cwd);
+      check('движок не запускался', !workerD.events(runD.body.runId).some((event) => event.type === 'started'), '');
+    } finally {
+      writeFileSync(blobPath, original);
+      await workerD.stop();
+    }
+
+    // Ран без ref'а не видит данные прошлых ранов: входы не достаются «по умолчанию».
+    const portE = await freePort(spec.port + 74);
+    const workerE = new Worker({ ...spec, port: portE }, clientKey, { AGENT_API_PORT: String(portE), ...isolationEnv(slotsFlag) }).start();
+    let runE;
+    let resultE;
+    try {
+      await workerE.waitHealthy();
+      runE = await startRun(workerE, { prompt: 'no inputs' });
+      resultE = await waitTerminal(workerE, runE.body.runId, 40_000);
+      const stateE = workerE.state(runE.body.runId);
+      check('ран без ref отработал', resultE.outcome === 'succeeded', String(resultE.outcome));
+      check('ран без ref не видит входы прошлых ранов', !existsSync(join(stateE.spec.cwd, '.inputs')), stateE.spec.cwd);
+    } finally {
+      await workerE.stop();
+    }
+
+    record('materialize_inputs', {
+      runA: { runId: runA.body.runId, outcome: resultA.outcome, outputRefs: resultA.outputRefs },
+      snapshotId,
+      artifact: { artifactId: artifact.artifactId, name: artifact.name, size: artifact.size, sha256: artifact.sha256 },
+      runB: { runId: runB.body.runId, slot: viewBState.slot, materializedPath: join(viewBState.cwd, '.inputs', snapshotId, ENGINE_OUTPUT), bytes: 'ok', cancelledAfterChecks: true },
+      foreignPrincipal: { runId: runC.body.runId, failureCode: resultC.failure?.code ?? null, retryable: resultC.failure?.retryable ?? null, engineStarted: typesC.includes('started') },
+      tamperedBytes: { runId: runD.body.runId, failureCode: resultD.failure?.code ?? null, retryable: resultD.failure?.retryable ?? null },
+      noRefRun: { runId: runE.body.runId, outcome: resultE.outcome, inputsDirPresent: existsSync(join(workerE.state(runE.body.runId).spec.cwd, '.inputs')) },
+    });
+  });
+
   await runStep('sanitized_transcript', async () => {
     const payload = `${JSON.stringify(
       {
         schemaVersion: 1,
-        probe: 'Граница Agent clean room (per-run Unix-идентичность, #51) и lifecycle рана: persist → sweep (#52)',
+probe: 'Граница Agent clean room (per-run Unix-идентичность, #51) и lifecycle рана: materialize входов → persist → sweep (#52)',
         generatedAt: new Date().toISOString(),
         host: { platform: process.platform, kernel: kernelRelease(), apiProcessUid: process.getuid?.() ?? null },
         topology:

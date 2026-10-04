@@ -5,6 +5,7 @@ import type { BlobStore } from '../storage/blob-store.js';
 import type { RunExportStore } from '../storage/export.js';
 import type { UploadSessionStore } from '../storage/upload-session.js';
 import type { WorkspaceSnapshotStore } from '../storage/workspace-snapshot.js';
+import { DEFAULT_INPUT_LIMITS, type InputMaterializer } from '../storage/input-materializer.js';
 import type { RunResult } from '../contracts/result.js';
 import { stripRepositoryToken, validateRunSpec, type InputSpec, type RunSpec } from '../contracts/run-spec.js';
 import type { FaultRegistry } from '../faults/registry.js';
@@ -109,6 +110,8 @@ export interface AgentApiOptions {
   uploads?: UploadSessionStore;
   /** Снимки workspace — см. RunnerOptions.snapshots (P09). */
   snapshots?: WorkspaceSnapshotStore;
+  /** Материализация входов из снимков — см. RunnerOptions.inputs (issue #52, шаг 1). */
+  inputs?: InputMaterializer;
   /** Реестр capability handler'ов (P13) — общий для MCP-вызовов рана и этого API. */
   capabilities?: CapabilityRegistry;
   /** Резолвер значений credential binding'ов (P13). */
@@ -157,6 +160,7 @@ export class AgentApi {
     if (options.exports) runnerOptions.exports = options.exports;
     if (options.uploads) runnerOptions.uploads = options.uploads;
     if (options.snapshots) runnerOptions.snapshots = options.snapshots;
+    if (options.inputs) runnerOptions.inputs = options.inputs;
     if (options.clock) runnerOptions.clock = options.clock;
     if (options.faults) runnerOptions.faults = options.faults;
     if (options.logSink) runnerOptions.logSink = options.logSink;
@@ -491,6 +495,15 @@ export class AgentApi {
           conflictDetection: true,
           conflictPolicies: ['reject', 'overwrite', 'merge'] as const,
           cleanRoomOnNewAttempt: true,
+          materialize: {
+            enabled: this.opts.inputs !== undefined,
+            bytesInDurableStorage: true,
+            verifyDigestOnWrite: true,
+            ownerScoped: true,
+            allOrNothing: true,
+            refusalRetryableWhenStorageUnavailable: true,
+            limits: this.opts.inputs?.limits ?? DEFAULT_INPUT_LIMITS,
+          },
         },
       },
       mcp: {

@@ -14,6 +14,8 @@ import { FaultRegistry } from '../src/faults/registry.js';
 import { isTerminalState } from '../src/runner/state-machine.js';
 import { ArtifactStore } from '../src/storage/artifact-store.js';
 import { RunExportStore } from '../src/storage/export.js';
+import { InputMaterializer } from '../src/storage/input-materializer.js';
+import { WorkspaceSnapshotStore } from '../src/storage/workspace-snapshot.js';
 import { createBlobStore } from '../src/storage/create-blob-store.js';
 import type { CapabilityRegistry } from '../src/mcp/capabilities.js';
 import type { BindingValueResolver } from '../src/mcp/scope.js';
@@ -73,6 +75,14 @@ export interface HttpHarnessOptions {
    */
   artifactExport?: boolean;
   /**
+   * Снимки workspace и материализация входов (issue #52, шаг 1). Подключаются ровно как в
+   * dist/api/main.ts и требуют `artifactExport`: указатель снимка проверяется тем же
+   * хранилищем артефактов.
+   */
+  snapshotInputs?: boolean;
+  /** Оставить рабочие каталоги ранов: нужно, чтобы проверить байты ВХОДА на диске. */
+  retainWorkspaces?: boolean;
+  /**
    * Промоушен-контур (P29). Фабрика, а не готовый объект: рестарт сервиса должен заново
    * прочитать файл состояния релиза — иначе откат нельзя было бы проверить перезапуском.
    */
@@ -89,6 +99,8 @@ export interface HttpHarness {
   /** Хранилище выходов рана; создаётся только при `artifactExport: true`. */
   readonly artifacts: ArtifactStore | null;
   readonly exports: RunExportStore | null;
+  /** Снимки workspace; создаётся только при `snapshotInputs: true`. */
+  readonly snapshots: WorkspaceSnapshotStore | null;
   restart(options?: { killProcesses?: boolean }): Promise<ServiceRecoveryReport>;
   close(): Promise<void>;
 }
@@ -120,6 +132,8 @@ export async function startHttpHarness(options: HttpHarnessOptions = {}): Promis
   const blob = options.artifactExport ? createBlobStore({ env: {}, localRoot: join(rootDir, 'blobs') }) : null;
   const artifacts = blob ? new ArtifactStore({ rootDir, blob }) : (options.artifacts ?? null);
   const exports = blob ? new RunExportStore({ rootDir, artifacts: artifacts as ArtifactStore }) : null;
+  const snapshots = options.snapshotInputs && artifacts ? new WorkspaceSnapshotStore({ rootDir }) : null;
+  const inputs = snapshots ? new InputMaterializer({ snapshots, artifacts: artifacts as ArtifactStore }) : null;
   const serviceOptions: AgentApiOptions = {
     rootDir,
     adapters: { fake, opencode: new OpenCodeAdapter() },
@@ -132,6 +146,9 @@ export async function startHttpHarness(options: HttpHarnessOptions = {}): Promis
     ...(options.bindingResolver ? { bindingResolver: options.bindingResolver } : {}),
     ...(blob ? { blob } : {}),
     ...(exports ? { exports } : {}),
+    ...(snapshots ? { snapshots } : {}),
+    ...(inputs ? { inputs } : {}),
+    ...(options.retainWorkspaces !== undefined ? { retainWorkspaces: options.retainWorkspaces } : {}),
   };
   const start = (): AgentApi => {
     const service = new AgentApi(options.promotion ? { ...serviceOptions, promotion: options.promotion() } : serviceOptions);
@@ -148,6 +165,7 @@ export async function startHttpHarness(options: HttpHarnessOptions = {}): Promis
     maxBodyBytes,
     ...(artifacts ? { artifacts } : {}),
     ...(exports ? { exports } : {}),
+    ...(snapshots ? { snapshots } : {}),
     ...(options.capabilities ? { capabilities: options.capabilities } : {}),
     ...(options.bindingResolver ? { bindingResolver: options.bindingResolver } : {}),
   };
@@ -161,6 +179,7 @@ export async function startHttpHarness(options: HttpHarnessOptions = {}): Promis
     logs,
     artifacts,
     exports,
+    snapshots,
     get service() {
       return service;
     },
