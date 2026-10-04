@@ -113,9 +113,13 @@ const service = new WorkspaceService({
   journal,
 });
 
-const PROFILE_ID = `live-probe-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}`;
+// Идентификатор прогона уникален: повторный запуск не должен упираться в репозиторий
+// прошлого прогона (ensure честно вернул бы created=false, и проверка «создан» упала бы
+// не по вине модуля).
+const PROFILE_ID = `live-probe-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}-${randomBytes(4).toString('hex')}`;
 const TENANT = 'live-probe';
 const results = [];
+const values = {};
 const failures = [];
 
 function step(name, fn) {
@@ -124,6 +128,7 @@ function step(name, fn) {
     try {
       const value = await fn();
       results.push({ name, ok: true, ms: Date.now() - started, value });
+      values[name] = value;
       process.stdout.write(`  ok   ${name} (${Date.now() - started}ms)\n`);
       return value;
     } catch (err) {
@@ -173,7 +178,7 @@ const checks = {
   }),
 
   'ensure идемпотентен': step('ensure идемпотентен', async () => {
-    const first = results[0]?.value;
+    const first = values['ensure → приватный репозиторий'];
     const again = await service.ensureProfileRepository({
       operationId: `live:ensure-again:${PROFILE_ID}`,
       tenantId: TENANT,
@@ -232,7 +237,7 @@ const checks = {
       'persona/system.md': 'persona профиля\n',
       'media/blob.bin': heavy,
     });
-    const base = results[2]?.value.revision;
+    const base = values['publish → состояние в git'].revision;
     const publication = await service.publishRunChanges({
       operationId: `live:pub-heavy:${PROFILE_ID}`,
       tenantId: TENANT,
@@ -257,7 +262,7 @@ const checks = {
   }),
 
   'два рана → автоматический merge': step('два рана → автоматический merge', async () => {
-    const base = results[2]?.value.revision;
+    const base = values['publish → состояние в git'].revision;
     const runA = writeFiles(mkdtempSync(join(tmpdir(), 'live-run-c-')), {
       'notes/first.md': 'первая версия заметки\n',
       'persona/system.md': 'persona профиля\n',
@@ -302,7 +307,7 @@ const checks = {
   }),
 
   'same-file → conflict без потери данных': step('same-file → conflict с обеими сторонами', async () => {
-    const base = results[2]?.value.revision;
+    const base = values['publish → состояние в git'].revision;
     const runA = writeFiles(mkdtempSync(join(tmpdir(), 'live-run-e-')), {
       'notes/first.md': 'первая версия заметки\n',
       'persona/system.md': 'persona профиля\n',
@@ -335,7 +340,7 @@ const checks = {
     const conflict = journal.getConflict(pubB.conflictId ?? '');
     if (!conflict) throw new Error('conflictId не записан в журнал');
     if (conflict.entries[0]?.path !== 'notes/shared.md') throw new Error(`путь конфликта: ${conflict.entries[0]?.path}`);
-    if (!conflict.runSha256 || !conflict.entries[0]?.currentSha256) throw new Error('у конфликта нет хэшей сторон');
+    if (!conflict.entries[0]?.runSha256 || !conflict.entries[0]?.currentSha256) throw new Error('у конфликта нет хэшей сторон');
     // Кандидат рана читается и содержит его версию.
     const candidateBytes = await service.readProfileBlob({
       tenantId: TENANT,
@@ -351,7 +356,7 @@ const checks = {
   }),
 
   'stale candidate не публикуется': step('stale candidate → новый конфликт', async () => {
-    const conflictId = results[6]?.value.conflictId;
+    const conflictId = values['same-file → conflict с обеими сторонами'].conflictId;
     const conflict = journal.getConflict(conflictId);
     const resolution = await service.resolveWorkspaceConflict({
       operationId: `live:res:${PROFILE_ID}`,
@@ -390,7 +395,7 @@ const checks = {
   }),
 
   'get читает durable-статус': step('get → durable статус после «рестарта»', async () => {
-    const publicationId = results[2]?.value.publicationId;
+    const publicationId = values['publish → состояние в git'].publicationId;
     // Новый экземпляр сервиса поверх того же журнала — имитация рестарта процесса.
     const restarted = new WorkspaceService({
       git: service.git,
@@ -445,11 +450,22 @@ if (failed) {
 } else {
   process.stdout.write(`OK: ${order.length} шагов, ${results.length} записей\n`);
   process.stdout.write(`journal: ${JSON.stringify(journal.stats())}\n`);
+  const repository = values['ensure → приватный репозиторий']?.repository;
   if (!options.keep) {
     rmSync(stateDir, { recursive: true, force: true });
     process.stdout.write(`state удалён: ${stateDir}\n`);
+    // Репозиторий одноразовый: удаляем его тем же токеном, которым создавали. Иначе каждый
+    // прогон оставляет в org мусор, который потом придётся чистить руками.
+    if (repository) {
+      const [owner, name] = repository.split('/');
+      const response = await fetch(`https://api.github.com/repos/${owner}/${name}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${TOKEN}`, Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28' },
+      });
+      process.stdout.write(response.status === 204 ? `репозиторий удалён: ${repository}\n` : `репозиторий НЕ удалён (${response.status}): ${repository}\n`);
+    }
   } else {
     process.stdout.write(`state оставлен: ${stateDir}\n`);
   }
-  process.stdout.write(`репозиторий: ${results[0]?.value?.repository ?? '(см. журнал)'}\n`);
+  if (repository) process.stdout.write(`репозиторий: ${repository}\n`);
 }

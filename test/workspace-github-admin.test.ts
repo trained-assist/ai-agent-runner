@@ -1,4 +1,7 @@
 import { describe, expect, it } from 'vitest';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { createGitHubRepositoryAdmin } from '../src/workspace/git/github-admin.js';
 import { WorkspaceError } from '../src/workspace/contract.js';
 
@@ -148,5 +151,64 @@ describe('GitHub admin port', () => {
     });
     const unavailable = adminWith(() => ({ status: 502, body: { message: 'bad gateway' } }));
     await expect(unavailable.admin.ensurePrivateRepository({ owner: 'o', name: 'n', private: true, description: 'd' })).rejects.toBeInstanceOf(WorkspaceError);
+  });
+});
+
+describe('transient git failures are retried with backoff', () => {
+  it('classifies network blips as transient and auth/not-found as final', async () => {
+    const { isTransientGitFailure } = await import('../src/workspace/git/local-git.js');
+    const transient = [
+      "fatal: unable to access 'https://github.com/o/p.git/': Recv failure: Connection reset by peer",
+      "fatal: unable to access 'https://github.com/o/p.git/': Failed to connect to github.com port 443: Connection timed out",
+      'error: RPC failed; curl 56 Recv failure: Connection reset by peer',
+      'fatal: the remote end hung up unexpectedly',
+      "fatal: unable to access 'https://github.com/o/p.git/': Could not resolve host: github.com",
+      "fatal: unable to access 'https://github.com/o/p.git/': 502 Bad Gateway",
+      "fatal: unable to access 'https://github.com/o/p.git/': 503 Service Unavailable",
+      "fatal: unable to access 'https://github.com/o/p.git/': 504 Gateway Timeout",
+      'fatal: unexpected disconnect while reading sideband packet',
+    ];
+    for (const message of transient) {
+      expect(isTransientGitFailure(message, false), message).toBe(true);
+    }
+    expect(isTransientGitFailure('fatal: unable to access', true)).toBe(true);
+
+    const final = [
+      "fatal: Authentication failed for 'https://github.com/o/p.git/'",
+      'remote: Repository not found.',
+      "fatal: repository 'https://github.com/o/p.git/' not found",
+      'remote: Permission to o/p.git denied to user.',
+      "fatal: unable to access 'https://github.com/o/p.git/': The requested URL returned error: 403",
+      'fatal: does not appear to be a git repository',
+    ];
+    for (const message of final) {
+      expect(isTransientGitFailure(message, false), message).toBe(false);
+    }
+  });
+
+  it('fails fast on a non-transient error instead of burning the backoff budget', async () => {
+    const { createLocalGitPort } = await import('../src/workspace/git/local-git.js');
+    const root = mkdtempSync(join(tmpdir(), 'workspace-retry-'));
+    const port = createLocalGitPort({ rootDir: root, resolveCredential: async () => 't', timeoutMs: 5000 });
+    const binding = {
+      schemaVersion: 1 as const,
+      bindingId: 'b1',
+      tenantId: 't',
+      profileId: 'p',
+      owner: 'o',
+      repository: 'o/p',
+      url: 'file:///nonexistent-source.git',
+      private: true,
+      branch: 'main',
+      headRevision: null,
+      importedAt: null,
+      importManifestHash: null,
+      createdAt: '2026-10-04T10:00:00.000Z',
+      updatedAt: '2026-10-04T10:00:00.000Z',
+    };
+    const started = Date.now();
+    await expect(port.ensureMirror(binding, { tokenRef: 'r' })).rejects.toMatchObject({ code: 'WORKSPACE_GIT_FAILED' });
+    // Не транзиентная ошибка: ни одного backoff-повтора.
+    expect(Date.now() - started).toBeLessThan(2000);
   });
 });
