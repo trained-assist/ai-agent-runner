@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { randomUUID, timingSafeEqual } from 'node:crypto';
 import { RUNNER_EVENT_SCHEMA_VERSION, type RunnerEvent } from '../contracts/events.js';
 import { RUN_RESULT_SCHEMA_VERSION, type ExitReason, type FailureClass, type RunFailure, type RunOutcome, type RunResult } from '../contracts/result.js';
 import { validateRunResult } from '../contracts/result.js';
@@ -45,9 +45,6 @@ export const CANCEL_DELIVERY_BACKOFF_MS = 40;
  * принял задачу, но результат не вернул. По умолчанию минута — на выгрузку лога и пуш.
  */
 export const RESULT_WATCHDOG_GRACE_MS = 60_000;
-
-/** Статус рана у воркера. `unknown` — исход установить нельзя, это не `failed`. */
-export type WorkerRunStatus = 'accepted' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'unknown';
 
 
 /** Префикс веток ранов. Ветка рана — это его результат, а не мусор в ветке по умолчанию. */
@@ -180,7 +177,10 @@ export interface WorkerCancelResult {
 export interface ExternalWorker {
   readonly name: string;
   readonly baseUrl: string | null;
-  launch(spec: RunSpec): Promise<LaunchResult>;
+  /** Квитанция запуска, а не финальный результат (асинхронный контракт, #73). */
+  launch(spec: RunSpec): Promise<LaunchReceipt>;
+  status(runId: string): Promise<WorkerStatusView>;
+  result(runId: string): Promise<LaunchResult>;
   cancel(runId: string): Promise<WorkerCancelResult>;
 }
 
@@ -206,6 +206,8 @@ function checkText(value: unknown, path: string, collector: ErrorCollector, maxL
 
 export interface ExternalWorkerOptions {
   baseUrl: string;
+  /** Публичный адрес нашего API: воркер шлёт результат на callback resultUrl. */
+  baseUrlForResult?: string;
   /**
    * Имя движка, которым этот воркер отвечает. По умолчанию — `dynamic-ip-azure-agent-run`
    * (Azure VM). Второй воркер (например, получатель раннеров на GitHub Actions) объявляет

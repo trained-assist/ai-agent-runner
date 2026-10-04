@@ -8,6 +8,9 @@ import {
   workerTransportFailure,
   type ExternalWorker,
   type LaunchMapping,
+  type LaunchReceipt,
+  type WorkerRunStatus,
+  ResultNotReadyError,
 } from '../adapters/external-worker-adapter.js';
 import type { RunResult } from '../contracts/result.js';
 import { validateRunSpec, type InputSpec, type RunSpec } from '../contracts/run-spec.js';
@@ -80,6 +83,8 @@ export interface AgentApiOptions {
   workers: ExternalWorker[];
   logger?: ApiLogger;
   clock?: () => Date;
+  /** Запас сверх лимита рана на persist у воркера. По умолчанию минута. */
+  resultGraceMs?: number;
   /** Значения окружения, которые API готов передать воркеру (пересекаются с envAllowlist). */
   env?: Record<string, string>;
   /** Сколько незавершённых ранов API держит до отказа в приёме новых. */
@@ -97,6 +102,12 @@ export interface AgentApiOptions {
   admissionLogPath?: string;
 }
 
+/** Пауза между опросами статуса: растёт от базовой до потолка (экспоненциально). */
+const POLL_BASE_DELAY_MS = 500;
+const POLL_MAX_DELAY_MS = 10_000;
+/** Запас сверх лимита рана на выгрузку лога и пуш ветки до уничтожения среды. */
+const DEFAULT_RESULT_GRACE_MS = 60_000;
+
 const defaultLogger: ApiLogger = (entry) => {
   process.stdout.write(`${JSON.stringify(entry)}\n`);
 };
@@ -107,6 +118,8 @@ export class AgentApi {
   private readonly opts: AgentApiOptions;
   private readonly logger: ApiLogger;
   private readonly clock: () => Date;
+  /** Запас сверх лимита рана: воркер успел выгрузить лог и запушить ветку. */
+  private readonly resultGraceMs: number;
   private disposed = false;
   private readonly maxActiveRuns: number;
   private readonly inFlight = new Set<string>();
@@ -121,6 +134,7 @@ export class AgentApi {
     this.maxActiveRuns = options.maxActiveRuns ?? DEFAULT_STATELESS_LIMITS.maxActiveRuns;
     this.logger = options.logger ?? defaultLogger;
     this.clock = options.clock ?? (() => new Date());
+    this.resultGraceMs = options.resultGraceMs ?? DEFAULT_RESULT_GRACE_MS;
   }
 
   /**

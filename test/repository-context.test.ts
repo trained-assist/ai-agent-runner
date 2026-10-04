@@ -212,7 +212,18 @@ describe('repository context: clone перед спавном движка', () 
 describe('repository context: stateless API (#74)', () => {
   // Ран не запускается: для проверки формы запроса воркер не нужен, нужен его порт.
   const idleWorker = (): ExternalWorkerAdapter =>
-    adapterFor({ baseUrl: '', launches: [], cancels: [], options: {}, lastAuthorization: () => undefined, close: async () => undefined });
+    adapterFor({
+      baseUrl: '',
+      launches: [],
+      cancels: [],
+      results: [],
+      autoDeliver: false,
+      resultSink: null,
+      deliverResult: async () => ({}) as Response,
+      options: {},
+      lastAuthorization: () => undefined,
+      close: async () => undefined,
+    });
 
   const alpha: Principal = {
     principalId: 'p-alpha',

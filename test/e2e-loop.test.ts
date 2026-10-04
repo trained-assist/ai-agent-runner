@@ -163,8 +163,16 @@ describe('e2e: serverless API поверх внешнего воркера (#74)
       /\b(?:writeFileSync|appendFileSync|mkdirSync|rmSync|renameSync|unlinkSync|copyFileSync|chmodSync|createWriteStream)\s*\(/,
       /\b(?:spawn|spawnSync|execFile|execSync|fork)\s*\(/,
     ];
+    // Журнал приёмных записей — единственное исключение, и оно требуется контрактом
+    // внешнего worker (docs/EXTERNAL-WORKER-CONTRACT.md, п. 2): дедупликация по
+    // `Idempotency-Key` обязана переживать рестарт API, а память процесса для этого не
+    // годится. Он включается флагом `AGENT_API_ADMISSION_LOG` и без флага не пишет
+    // ничего, поэтому обслуживающий путь остаётся бездисковым по умолчанию.
+    const journalWriters = new Set(['stateless-store.ts', 'main.ts']);
     const offenders: string[] = [];
     for (const file of files) {
+      const base = file.slice(file.lastIndexOf('/') + 1);
+      if (journalWriters.has(base)) continue;
       const text = readFileSync(file, 'utf8');
       for (const pattern of forbidden) {
         if (pattern.test(text)) offenders.push(`${file} → ${pattern}`);
@@ -172,14 +180,26 @@ describe('e2e: serverless API поверх внешнего воркера (#74)
     }
     expect(offenders).toEqual([]);
 
+    // Журнал включается только явным флагом: без него путь записи не используется.
+    const store = readFileSync(resolve(repoRoot, 'src/api/stateless-store.ts'), 'utf8');
+    expect(store).toMatch(/if \(!this\.persistPath\) return;/);
+    expect(store).not.toMatch(/appendFileSync\([^)]*['"]\/tmp['"]/);
+
     // Файловая система вообще не нужна пакету, кроме чтения реестра ключей при старте:
-    // это конфигурация, а не состояние рана. Больше ни один модуль её не трогает.
+    // это конфигурация, а не состояние рана, и opt-in журнала приёмных записей.
     const touchingFs = files
       .filter((file) => /from 'node:fs'/.test(readFileSync(file, 'utf8')))
       .map((file) => file.replace(repoRoot + '/', ''))
       .sort();
-        // Все три читают один и тот же файл конфигурации — реестр ключей. Это не состояние рана.
-    expect(touchingFs).toEqual(['src/api/auth.ts', 'src/api/config.ts', 'src/api/main.ts']);
+        // auth/config читают реестр ключей; main создаёт каталог журнала; stateless-store
+        // пишет в него только при заданном AGENT_API_ADMISSION_LOG. Состояние рана на диске
+        // не живёт — оно в памяти процесса.
+    expect(touchingFs).toEqual([
+      'src/api/auth.ts',
+      'src/api/config.ts',
+      'src/api/main.ts',
+      'src/api/stateless-store.ts',
+    ]);
   });
 
   it('рестарт процесса забывает ран: клиент повторяет submit с новым ключом (эпик, шаг 6)', async () => {

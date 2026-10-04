@@ -98,7 +98,7 @@ export class StatelessStore {
    * Дописать приёмную запись в долговечный журнал. Одна строка = одна запись, поэтому
    * запись переживает падение процесса целиком (строка либо есть, либо нет).
    */
-  private append(record: AdmissionRecord): void {
+  appendAdmission(record: AdmissionRecord): void {
     if (!this.persistPath) return;
     try {
       appendFileSync(this.persistPath, `${JSON.stringify(record)}\n`, 'utf8');
@@ -147,7 +147,7 @@ export class StatelessStore {
 
   put(record: AdmissionRecord): void {
     this.index(record);
-    this.append(record);
+    this.appendAdmission(record);
     this.evictIfNeeded();
   }
 

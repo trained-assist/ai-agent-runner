@@ -55,7 +55,10 @@ describe('launch request: RunSpec → LaunchRequest (issue #73)', () => {
       isolation: { mode: 'per_run_unix_identity' },
       outputs: [{ path: 'report.md', name: 'report.md', mime: 'text/markdown' }],
     });
-    const request = launchRequestFromSpec(spec, { env: { PATH: '/usr/bin', HOME: '/home/runner', SECRET: 'nope' } });
+    const request = launchRequestFromSpec(spec, {
+      env: { PATH: '/usr/bin', HOME: '/home/runner', SECRET: 'nope' },
+      resultUrl: 'http://api.local/v1/worker/launches/run_x/result',
+    });
 
     expect(request.engine).toEqual({ name: EXTERNAL_WORKER_ENGINE, adapterVersion: '1', modelSettings: { model: 'free' } });
     expect(request.input.inlinePrompt).toBe('сделай отчёт');

@@ -1,6 +1,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { ExternalWorkerAdapter } from '../src/adapters/external-worker-adapter.js';
+import {
+  type LaunchResult, ExternalWorkerAdapter } from '../src/adapters/external-worker-adapter.js';
 
 /**
  * Мок внешнего воркера (epic #74, шаг 8). Поднимает настоящий HTTP-сервер и отвечает по
@@ -25,14 +26,32 @@ export interface MockWorkerOptions {
   registerAfterMs?: number;
   /** Отдать тело, не проходящее контракт. */
   malformed?: boolean;
+  /** Отдать тело результата, не проходящее контракт. */
+  malformedResult?: boolean;
+  /** Терминальный статус рана у воркера (асинхронный контракт, #73). */
+  terminalStatus?: 'succeeded' | 'failed' | 'cancelled' | 'running';
+  /** Задержка доставки результата через callback (мс). */
+  resultDelayMs?: number;
+  /** Не доставлять результат самому: тест забирает его опросом. */
+  autoDeliver?: boolean;
+  /** Промежуточный статус, который воркер отдаёт до терминального. */
+  runningStatus?: 'running';
 }
 
 export interface MockWorker {
   readonly baseUrl: string;
   readonly launches: Array<Record<string, unknown>>;
   readonly cancels: string[];
+  /** Доставленные через callback результаты. */
+  readonly results: Array<Record<string, unknown>>;
+  /** Автоматически доставлять результат через resultUrl (по умолчанию да). */
+  autoDeliver: boolean;
+  /** Приёмник результата вместо HTTP-callback (для локальных тестов). */
+  resultSink: ((runId: string, payload: unknown, bearer: string | undefined) => unknown) | null;
   /** Заголовок Authorization последнего launch-запроса. */
   lastAuthorization(): string | undefined;
+  /** Дослать результат рана (тесты вручную, минуя autoDeliver). */
+  deliverResult(runId: string, over?: Partial<LaunchResult>, token?: string): Promise<Response>;
   options: MockWorkerOptions;
   close(): Promise<void>;
 }
@@ -182,7 +201,7 @@ export async function startMockWorker(options: MockWorkerOptions = {}): Promise<
     resultSink: null,
     options,
     lastAuthorization: () => lastAuthorization,
-    async deliverResult(runId: string, over: Partial<LaunchResult> = {}, token?: string) {
+    async deliverResult(runId: string, over: Partial<LaunchResult> = {}, token?: string): Promise<Response> {
       const launch = launches.find((entry) => entry['runId'] === runId);
       const resultUrl = launch ? requestedResultUrl(launch) : '';
       if (!resultUrl) throw new Error(`run ${runId} was never launched; no resultUrl to post to`);
