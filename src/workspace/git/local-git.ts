@@ -20,6 +20,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { redactSecrets } from '../../runner/util.js';
 import { WorkspaceError, type ProfileRepositoryBinding } from '../contract.js';
+import { isTransientFailure, sleep, RETRY_DELAYS_MS } from './transient.js';
 import {
   GIT_MODE_FILE,
   type CredentialResolver,
@@ -35,30 +36,6 @@ import {
 export const DEFAULT_GIT_TIMEOUT_MS = 60_000;
 export const DEFAULT_BRANCH = 'main';
 export const CANDIDATE_REF_PREFIX = 'refs/workspace/publications/';
-
-/**
- * Транзиентные сбои сети/провайдера: их повторяют с backoff, как и вызовы storage
- * (legacy §3.7). Авторизация, «не найдено» и отказ прав — не транзиентны: повтор не
- * поможет, а только задержит честную ошибку.
- */
-const TRANSIENT_GIT =
-  /connection reset|early EOF|timed out|timeout|could not resolve|unable to access|remote end hung up|RPC failed|unexpected disconnect|network is unreachable|SSL_ERROR|50[234] |502 Bad Gateway|503 Service|504 Gateway/i;
-
-/**
- * Финальные отказы: повтор не поможет, он только задержит честную ошибку. Проверяются
- * ДО транзиентных паттернов: сообщение про 403 содержит «unable to access», и без этого
- * порядка любой отказ прав выглядел бы как сбой сети.
- */
-const FINAL_GIT =
-  /authentication failed|401|403|permission .* denied|repository not found|not found|does not appear to be a git repository|could not read from remote repository|terminal prompts disabled/i;
-
-export function isTransientGitFailure(stderr: string, timedOut: boolean): boolean {
-  if (timedOut) return true;
-  if (FINAL_GIT.test(stderr)) return false;
-  return TRANSIENT_GIT.test(stderr);
-}
-
-const FETCH_RETRY_DELAYS_MS = [250, 750, 2000];
 
 /**
  * Статический askpass-помошник: значение подставляется из окружения процесса, в файл
@@ -336,20 +313,20 @@ export function createLocalGitPort(options: LocalGitPortOptions): GitRepositoryP
     // Транзиентный сбой сети повторяется с backoff: зеркало обязано дойти до remote,
     // иначе следующий publish увидит устаревшую голову и сделает лишний merge-проход.
     let last: RunResult | null = null;
-    for (let attempt = 0; attempt <= FETCH_RETRY_DELAYS_MS.length; attempt += 1) {
+    for (let attempt = 0; attempt <= RETRY_DELAYS_MS.length; attempt += 1) {
       const result = await runAuthenticated(args, credentials);
       last = result;
       if (result.code === 0) return;
-      if (!isTransientGitFailure(result.stderr, result.timedOut)) {
+      if (!isTransientFailure(result.stderr, result.timedOut)) {
         throw new WorkspaceError('WORKSPACE_GIT_FAILED', `git fetch failed: ${summarize(result.stderr)}`, { retryable: true });
       }
-      if (attempt < FETCH_RETRY_DELAYS_MS.length) {
-        await sleep(FETCH_RETRY_DELAYS_MS[attempt] as number);
+      if (attempt < RETRY_DELAYS_MS.length) {
+        await sleep(RETRY_DELAYS_MS[attempt] as number);
       }
     }
     throw new WorkspaceError(
       'WORKSPACE_GIT_FAILED',
-      `git fetch failed after ${FETCH_RETRY_DELAYS_MS.length + 1} attempts: ${last ? summarize(last.stderr) : 'no output'}`,
+      `git fetch failed after ${RETRY_DELAYS_MS.length + 1} attempts: ${last ? summarize(last.stderr) : 'no output'}`,
       { retryable: true },
     );
   };
@@ -365,18 +342,18 @@ export function createLocalGitPort(options: LocalGitPortOptions): GitRepositoryP
         // который несовместим с явными refspec'ами — а нам нужны и ветка профиля, и
         // неканонические ref'ы кандидатов (`refs/workspace/*`).
         let cloned: RunResult | null = null;
-        for (let attempt = 0; attempt <= FETCH_RETRY_DELAYS_MS.length; attempt += 1) {
+        for (let attempt = 0; attempt <= RETRY_DELAYS_MS.length; attempt += 1) {
           cloned = await runAuthenticated(['clone', '--bare', url, dir], credentials);
           if (cloned.code === 0) break;
-          if (!isTransientGitFailure(cloned.stderr, cloned.timedOut)) {
+          if (!isTransientFailure(cloned.stderr, cloned.timedOut)) {
             throw new WorkspaceError('WORKSPACE_GIT_FAILED', `clone of ${binding.repository} failed: ${summarize(cloned.stderr)}`, { retryable: true });
           }
-          if (attempt < FETCH_RETRY_DELAYS_MS.length) await sleep(FETCH_RETRY_DELAYS_MS[attempt] as number);
+          if (attempt < RETRY_DELAYS_MS.length) await sleep(RETRY_DELAYS_MS[attempt] as number);
         }
         if (!cloned || cloned.code !== 0) {
           throw new WorkspaceError(
             'WORKSPACE_GIT_FAILED',
-            `clone of ${binding.repository} failed after ${FETCH_RETRY_DELAYS_MS.length + 1} attempts: ${cloned ? summarize(cloned.stderr) : 'no output'}`,
+            `clone of ${binding.repository} failed after ${RETRY_DELAYS_MS.length + 1} attempts: ${cloned ? summarize(cloned.stderr) : 'no output'}`,
             { retryable: true },
           );
         }
@@ -459,10 +436,6 @@ export function createLocalGitPort(options: LocalGitPortOptions): GitRepositoryP
       return /^[0-9a-f]{40,64}$/.test(sha) ? sha : null;
     },
   };
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function resolveToken(resolver: CredentialResolver | undefined, credentials: GitCredentials | undefined): Promise<string | undefined> {

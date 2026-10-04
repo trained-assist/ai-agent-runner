@@ -181,6 +181,26 @@ describe('provision_existing_profile_repositories', () => {
     expect(existsSync(join(copy, 'auth.json'))).toBe(true);
   });
 
+  it('verifies a heavy artifact by its ref instead of looking for it in the git tree', async () => {
+    const h = harness({ policyTextMaxBytes: 1024 });
+    const copy = writeFiles(tempDir('ws-copy-heavy-'), { 'media/blob.bin': Buffer.alloc(4096, 5) });
+    const result = await h.service.provisionExistingProfileRepositories({
+      operationId: 'batch-heavy',
+      tenantId: 'tenant-a',
+      owner: OWNER,
+      inventory: [{ profileId: 'heavy', sourcePath: copy }],
+      dryRun: false,
+    });
+    // Тяжёлый файл в дереве git отсутствует по построению: проверка обязана идти по ref,
+    // а не требовать файл в дереве (иначе любой импорт тяжёлого файла читался бы как сбой).
+    expect(result.results[0]?.status).toBe('imported');
+    const binding = await h.bindings.findByProfile('tenant-a', 'heavy');
+    const prepared = await h.service.prepareProfileWorkspace({ operationId: 'prep-heavy', tenantId: 'tenant-a', profileId: 'heavy' });
+    expect(prepared.manifest).toHaveLength(1);
+    expect(prepared.manifest[0]?.artifact?.size).toBe(4096);
+    expect(binding?.importedAt).not.toBeNull();
+  });
+
   it('resumes after a failure instead of starting over, and is idempotent on the second pass', async () => {
     const h = harness();
     const first = writeFiles(tempDir('ws-copy-a-'), { 'notes/a.md': 'a' });

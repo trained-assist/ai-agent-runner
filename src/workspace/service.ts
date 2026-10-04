@@ -515,8 +515,7 @@ export class WorkspaceService {
     const entries = toTreeMap(await this.git.listTree(mirror, publication.committedRevision));
     const artifacts = await this.readArtifactIndex(mirror, publication.committedRevision);
     for (const file of files) {
-      const entry = entries.get(file.path);
-      if (!entry) return { ok: false, reason: `imported tree has no "${file.path}"` };
+      // Тяжёлый объект в дереве git отсутствует по построению: проверяется его ref.
       if (file.action === 'heavy') {
         const declared = artifacts.get(file.path);
         if (!declared || !(await this.verifyArtifact(declared))) {
@@ -524,6 +523,8 @@ export class WorkspaceService {
         }
         continue;
       }
+      const entry = entries.get(file.path);
+      if (!entry) return { ok: false, reason: `imported tree has no "${file.path}"` };
       const digest = sha256Hex(await this.git.readBlob(mirror, entry.oid));
       if (digest !== file.sha256) return { ok: false, reason: `imported "${file.path}" has digest ${digest.slice(0, 12)}…, expected ${file.sha256.slice(0, 12)}…` };
     }

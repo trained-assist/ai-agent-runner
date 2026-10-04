@@ -15,8 +15,8 @@
  */
 
 import { createHash } from 'node:crypto';
-import { lstatSync, readFileSync, readdirSync, realpathSync } from 'node:fs';
-import { join, relative, resolve, sep } from 'node:path';
+import { existsSync, lstatSync, readFileSync, readdirSync, realpathSync } from 'node:fs';
+import { dirname, join, relative, resolve, sep } from 'node:path';
 import { isSafeRelativePath } from '../storage/local-paths.js';
 import { sha256Hex } from '../storage/blob-store.js';
 import { WorkspaceError } from './contract.js';
@@ -26,11 +26,20 @@ export const MAX_PATTERN_LENGTH = 200;
 
 export type ExportRuleAction = 'exclude' | 'publish' | 'heavy';
 
+/**
+ * Предусловие правила из legacy clean list. Сейчас поддержан только `git-repo`:
+ * правило действует, пока файл находится внутри рабочей копии (каталог, на любой
+ * глубине которого есть `.git`). Именно так в legacy помечено правило `**` → ARCHIVE:
+ * оно не должно применяться к профилю целиком, только к содержимому git-рабочей копии.
+ */
+export type ExportRuleWhen = 'git-repo';
+
 export interface ExportRule {
   /** Без `/` — имя файла на любой глубине; с `/` — от корня профиля. `*` и `**` допустимы. */
   pattern: string;
   action: ExportRuleAction;
   reason: string;
+  when?: ExportRuleWhen;
 }
 
 export interface ExportPolicy {
@@ -124,7 +133,13 @@ export const DEFAULT_EXPORT_POLICY: ExportPolicy = {
 export interface CompiledPolicy {
   policy: ExportPolicy;
   /** pattern → RegExp; порядок сохранён, первое совпадение выигрывает. */
-  matchers: { action: ExportRuleAction; reason: string; matcher: RegExp }[];
+  matchers: { action: ExportRuleAction; reason: string; matcher: RegExp; when?: ExportRuleWhen }[];
+}
+
+/** Контекст сопоставления: где находится файл, который классифицируют. */
+export interface MatchContext {
+  /** Файл внутри рабочей копии git (каталог-предок содержит `.git`). */
+  insideGitRepo?: boolean;
 }
 
 /**
@@ -140,7 +155,10 @@ export function compilePolicy(policy: ExportPolicy): CompiledPolicy {
     if (rule.pattern.startsWith('/')) {
       throw new WorkspaceError('WORKSPACE_INVALID', `export policy: pattern "${rule.pattern}" must be relative to the profile root (no leading "/")`);
     }
-    return { action: rule.action, reason: rule.reason, matcher: patternToRegExp(rule.pattern) };
+    if (rule.when !== undefined && rule.when !== 'git-repo') {
+      throw new WorkspaceError('WORKSPACE_INVALID', `export policy: unsupported "when" precondition "${String(rule.when)}" for pattern "${rule.pattern}"`);
+    }
+    return { action: rule.action, reason: rule.reason, matcher: patternToRegExp(rule.pattern), when: rule.when };
   });
   return { policy, matchers };
 }
@@ -177,13 +195,16 @@ export function patternToRegExp(pattern: string): RegExp {
 }
 
 /** Первое совпадение или `defaultAction`, если ни одно правило не совпало. */
-export function matchRule(compiled: CompiledPolicy, path: string): { action: ExportRuleAction; reason: string } {
+export function matchRule(compiled: CompiledPolicy, path: string, context: MatchContext = {}): { action: ExportRuleAction; reason: string } {
   const segments = path.split('/');
   // Проверяются и сам путь, и все его предки: правило для каталога закрывает поддерево.
   const candidates: string[] = [];
   for (let i = 1; i < segments.length; i += 1) candidates.push(segments.slice(0, i).join('/'));
   candidates.push(path);
   for (const entry of compiled.matchers) {
+    // Предусловие `git-repo` срабатывает только внутри рабочей копии. Без него правило
+    // `**` → ARCHIVE исключило бы весь профиль целиком, а не содержимое рабочей копии.
+    if (entry.when === 'git-repo' && !context.insideGitRepo) continue;
     for (const candidate of candidates) {
       if (entry.matcher.test(candidate)) return { action: entry.action, reason: entry.reason };
     }
@@ -244,6 +265,7 @@ export interface ScanOptions {
  */
 export function scanWorkspace(compiled: CompiledPolicy, rootDir: string, options: ScanOptions = {}): ScanResult {
   const root = resolve(rootDir);
+  const context: MatchContext = { insideGitRepo: isInsideGitRepo(root) };
   const allow = options.paths && options.paths.length > 0 ? new Set(options.paths.map((p) => p.replace(/\/+$/, ''))) : null;
   const files: ScannedFile[] = [];
   const excluded: ExcludedFile[] = [];
@@ -262,7 +284,7 @@ export function scanWorkspace(compiled: CompiledPolicy, rootDir: string, options
       // Каталог пропускается, только если сам не разрешён и внутри него нет разрешённых
       // путей: иначе сужённая публикация молча теряла бы половину явно перечисленного.
       if (allow && !allow.has(relativePath) && !coversAllowedPath(allow, relativePath)) continue;
-      const matched = matchRule(compiled, relativePath);
+      const matched = matchRule(compiled, relativePath, context);
       if (matched.action === 'exclude') {
         excluded.push({ path: relativePath, reason: matched.reason });
         if (entry.isDirectory()) continue;
@@ -316,6 +338,18 @@ export function scanWorkspace(compiled: CompiledPolicy, rootDir: string, options
 }
 
 /** Разрешён ли путь сам, его предок, или он является предком разрешённого пути. */
+/** Находится ли каталог внутри рабочей копии git: есть ли `.git` у него или у предка. */
+export function isInsideGitRepo(rootDir: string): boolean {
+  let current = resolve(rootDir);
+  for (let level = 0; level < 16; level += 1) {
+    if (existsSync(join(current, '.git'))) return true;
+    const parent = dirname(current);
+    if (parent === current) return false;
+    current = parent;
+  }
+  return false;
+}
+
 function coversAllowedPath(allow: Set<string>, relativePath: string): boolean {
   const segments = relativePath.split('/');
   for (let i = 1; i < segments.length; i += 1) {
@@ -400,12 +434,17 @@ export function repositoryNameFor(profileId: string): string {
  * → exclude с явной причиной («не в постоянном образе профиля»). UNKNOWN-файлы по-прежнему
  * публикуются: политика по умолчанию deny-list, чтобы пользовательские данные не терялись.
  */
-export function compileCleanListRules(rules: readonly { pattern: string; action: string; reason?: string }[]): ExportRule[] {
+export function compileCleanListRules(rules: readonly { pattern: string; action: string; reason?: string; when?: string }[]): ExportRule[] {
   const actionOf: Record<string, ExportRuleAction> = { KEEP: 'publish', EXCLUDE: 'exclude' };
   return rules.map((rule) => {
     const action = actionOf[rule.action.toUpperCase()];
     const reason = rule.reason && rule.reason.length > 0 ? rule.reason : `clean list action ${rule.action}`;
-    if (action === undefined) return { pattern: rule.pattern, action: 'exclude' as const, reason: `${reason} (not part of the persistent profile image)` };
-    return { pattern: rule.pattern, action, reason };
+    // Предусловие обязано пережить компиляцию: без него правило `**` → ARCHIVE
+    // (`when: git-repo`) исключало бы весь профиль целиком, а не содержимое рабочей копии.
+    const when = rule.when === 'git-repo' ? ('git-repo' as const) : undefined;
+    if (action === undefined) {
+      return { pattern: rule.pattern, action: 'exclude' as const, reason: `${reason} (not part of the persistent profile image)`, ...(when ? { when } : {}) };
+    }
+    return { pattern: rule.pattern, action, reason, ...(when ? { when } : {}) };
   });
 }

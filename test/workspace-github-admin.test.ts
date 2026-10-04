@@ -156,7 +156,7 @@ describe('GitHub admin port', () => {
 
 describe('transient git failures are retried with backoff', () => {
   it('classifies network blips as transient and auth/not-found as final', async () => {
-    const { isTransientGitFailure } = await import('../src/workspace/git/local-git.js');
+    const { isTransientFailure } = await import('../src/workspace/git/transient.js');
     const transient = [
       "fatal: unable to access 'https://github.com/o/p.git/': Recv failure: Connection reset by peer",
       "fatal: unable to access 'https://github.com/o/p.git/': Failed to connect to github.com port 443: Connection timed out",
@@ -169,9 +169,9 @@ describe('transient git failures are retried with backoff', () => {
       'fatal: unexpected disconnect while reading sideband packet',
     ];
     for (const message of transient) {
-      expect(isTransientGitFailure(message, false), message).toBe(true);
+      expect(isTransientFailure(message, false), message).toBe(true);
     }
-    expect(isTransientGitFailure('fatal: unable to access', true)).toBe(true);
+    expect(isTransientFailure('fatal: unable to access', true)).toBe(true);
 
     const final = [
       "fatal: Authentication failed for 'https://github.com/o/p.git/'",
@@ -182,7 +182,7 @@ describe('transient git failures are retried with backoff', () => {
       'fatal: does not appear to be a git repository',
     ];
     for (const message of final) {
-      expect(isTransientGitFailure(message, false), message).toBe(false);
+      expect(isTransientFailure(message, false), message).toBe(false);
     }
   });
 
