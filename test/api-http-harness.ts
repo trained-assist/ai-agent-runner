@@ -82,7 +82,7 @@ export async function startHttpHarness(options: HttpHarnessOptions = {}): Promis
     logs.push(entry);
   };
   const service = new AgentApi({
-    worker: adapter,
+    workers: [adapter],
     logger,
     env: options.env ?? {},
     ...(options.store ? { store: options.store } : {}),

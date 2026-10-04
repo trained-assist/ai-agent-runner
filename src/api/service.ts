@@ -75,8 +75,11 @@ export interface RunArtifactsView {
 }
 
 export interface AgentApiOptions {
-  /** Внешний воркер: единственный способ запустить агента. */
-  worker: ExternalWorker;
+  /**
+   * Внешние воркеры: единственный способ запустить агента. Запрос уходит воркеру, чьё имя
+   * совпало с `engine.name`; неизвестный движок отклоняется до записи в память.
+   */
+  workers: ExternalWorker[];
   logger?: ApiLogger;
   clock?: () => Date;
   /** Значения окружения, которые API готов передать воркеру (пересекаются с envAllowlist). */
@@ -96,7 +99,7 @@ const defaultLogger: ApiLogger = (entry) => {
 };
 
 export class AgentApi {
-  readonly worker: ExternalWorker;
+  readonly workers: readonly ExternalWorker[];
   readonly store: StatelessStore;
   private readonly opts: AgentApiOptions;
   private readonly logger: ApiLogger;
@@ -107,7 +110,10 @@ export class AgentApi {
 
   constructor(options: AgentApiOptions) {
     this.opts = options;
-    this.worker = options.worker;
+    if (options.workers.length === 0) {
+      throw new Error('AgentApi requires at least one external worker: without it there is no way to launch an agent');
+    }
+    this.workers = options.workers;
     this.store = options.store ?? new StatelessStore();
     this.maxActiveRuns = options.maxActiveRuns ?? DEFAULT_STATELESS_LIMITS.maxActiveRuns;
     this.logger = options.logger ?? defaultLogger;
@@ -157,11 +163,11 @@ export class AgentApi {
       return { requestId: existing.requestId, userTaskId: existing.userTaskId, runId: existing.runId, deduplicated: true };
     }
 
-    if (request.engine.name !== this.worker.name) {
+    if (!this.workerFor(request.engine.name)) {
       throw new ApiError(
         'ENGINE_NOT_ALLOWED',
-        `this API runs engine "${this.worker.name}" only; request asked for "${request.engine.name}"`,
-        { engines: [this.worker.name] },
+        `this API does not run engine "${request.engine.name}"`,
+        { engines: this.engineNames() },
       );
     }
     if (principal.engines && !principal.engines.includes(request.engine.name)) {
@@ -240,7 +246,7 @@ export class AgentApi {
       runId: spec.runId,
       ownerGeneration,
       engine: spec.engine.name,
-      worker: this.worker.baseUrl,
+      worker: this.workerFor(spec.engine.name)?.baseUrl ?? null,
     });
     return { requestId, userTaskId, runId: spec.runId, deduplicated: false };
   }
@@ -373,10 +379,14 @@ export class AgentApi {
     if (isTerminalApiState(run.state)) {
       return { runId, status: 'already_terminal', state: run.state };
     }
+    const worker = this.workerFor(record.spec.engine.name);
+    if (!worker) {
+      throw new ApiError('INTERNAL', `run ${runId} names engine "${record.spec.engine.name}", which is not configured on this API`);
+    }
     this.store.markCancelRequested(runId, 'cancel');
     let receipt: WorkerCancelResult;
     try {
-      receipt = await this.cancelWithLaunchRace(runId);
+      receipt = await this.cancelWithLaunchRace(runId, worker);
     } catch (err) {
       this.log({ event: 'cancel_failed', runId, message: err instanceof Error ? err.message : String(err) });
       return { runId, status: 'rejected', reason: 'cancel request did not reach the worker' };
@@ -496,16 +506,21 @@ export class AgentApi {
         releaseEndpoint: 'absent',
         placement: null,
       },
-      engines: [this.worker.name],
+      engines: this.engineNames(),
     };
   }
 
-  health(): { status: 'ok'; worker: string | null; engine: string; runs: number; admissions: number; events: number } {
+  health(): {
+    status: 'ok';
+    workers: Array<{ engine: string; baseUrl: string | null }>;
+    runs: number;
+    admissions: number;
+    events: number;
+  } {
     const counts = this.store.counts();
     return {
       status: 'ok',
-      worker: this.worker.baseUrl,
-      engine: this.worker.name,
+      workers: this.workers.map((worker) => ({ engine: worker.name, baseUrl: worker.baseUrl })),
       ...counts,
     };
   }
@@ -521,13 +536,13 @@ export class AgentApi {
    * «ещё не вижу», поэтому запрос повторяется; если ран так и не появился — отказ, а не
    * «остановлено».
    */
-  private async cancelWithLaunchRace(runId: string): Promise<WorkerCancelResult> {
-    let receipt = await this.worker.cancel(runId);
+  private async cancelWithLaunchRace(runId: string, worker: ExternalWorker): Promise<WorkerCancelResult> {
+    let receipt = await worker.cancel(runId);
     for (let attempt = 0; attempt < CANCEL_UNKNOWN_RUN_RETRIES; attempt += 1) {
       if (receipt.status !== 'unknown_run' || !this.inFlight.has(runId)) break;
       await new Promise((resolve) => setTimeout(resolve, CANCEL_UNKNOWN_RUN_BACKOFF_MS));
       if (!this.inFlight.has(runId)) break;
-      receipt = await this.worker.cancel(runId);
+      receipt = await worker.cancel(runId);
     }
     return receipt;
   }
@@ -541,9 +556,9 @@ export class AgentApi {
     this.store.append(record.runId, admissionEvents(record.spec, startedAt));
     this.inFlight.add(record.runId);
     try {
-      const launch = await this.worker.launch(record.spec);
+      const launch = await this.workerFor(record.spec.engine.name)!.launch(record.spec);
       if (this.disposed) return;
-      const mapping = mapLaunchResult(record.spec, launch, { startedAt, finishedAt: this.nowIso() }, { workerBaseUrl: this.worker.baseUrl });
+      const mapping = mapLaunchResult(record.spec, launch, { startedAt, finishedAt: this.nowIso() }, { workerBaseUrl: this.workerFor(record.spec.engine.name)?.baseUrl ?? null });
       this.finalize(record, mapping);
       this.log({
         event: 'run_finished',
@@ -562,10 +577,19 @@ export class AgentApi {
         runId: record.runId,
         message: err instanceof Error ? err.message : String(err),
       });
-      this.finalize(record, workerTransportFailure(record.spec, err, { startedAt, finishedAt: this.nowIso() }, { workerBaseUrl: this.worker.baseUrl }));
+      this.finalize(record, workerTransportFailure(record.spec, err, { startedAt, finishedAt: this.nowIso() }, { workerBaseUrl: this.workerFor(record.spec.engine.name)?.baseUrl ?? null }));
     } finally {
       this.inFlight.delete(record.runId);
     }
+  }
+
+  /** Воркер по имени движка. Имя движка — это адрес воркера, а не его внутренняя деталь. */
+  private workerFor(engineName: string): ExternalWorker | undefined {
+    return this.workers.find((worker) => worker.name === engineName);
+  }
+
+  private engineNames(): string[] {
+    return [...this.workers.map((worker) => worker.name)].sort();
   }
 
   /** Единственное место, где ран становится терминальным. */

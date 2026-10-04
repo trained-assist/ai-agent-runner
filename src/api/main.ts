@@ -3,123 +3,13 @@ import { createServer } from 'node:http';
 import {
   DEFAULT_CANCEL_DEADLINE_MS,
   DEFAULT_LAUNCH_DEADLINE_MS,
+  EXTERNAL_WORKER_ENGINE,
   ExternalWorkerAdapter,
 } from '../adapters/external-worker-adapter.js';
 import { KeyRegistry } from './auth.js';
 import { createAgentApiServer } from './server.js';
 import { AgentApi, type ApiLogger } from './service.js';
-
-export const DEFAULT_API_PORT = 8787;
-export const DEFAULT_API_HOST = '0.0.0.0';
-
-/**
- * Конфигурация процесса (epic #74). Ни `dataDir`, ни release manifest, ни ключей к состоянию
- * на диске: у сервеless-оркестратора их просто нет. Единственный секрет — общий токен воркера,
- * он приходит из окружения.
- */
-export interface AgentApiProcessConfig {
-  host: string;
-  port: number;
-  keyRegistryPath: string;
-  worker: {
-    baseUrl: string;
-    token: string;
-    launchDeadlineMs: number;
-    cancelDeadlineMs: number;
-  };
-  /** Пулы значений окружения, которые можно передать воркеру (по envAllowlist рана). */
-  env: Record<string, string>;
-  /** Репозиторий по умолчанию, когда клиент не объявил `repository` (воркер клонирует его сам). */
-  defaultRepository: string | null;
-}
-
-function envValue(name: string): string | undefined {
-  const raw = process.env[name];
-  if (raw === undefined) return undefined;
-  const trimmed = raw.trim();
-  return trimmed === '' ? undefined : trimmed;
-}
-
-function intEnv(name: string, fallback: number): number {
-  const raw = envValue(name);
-  if (raw === undefined) return fallback;
-  const value = Number(raw);
-  if (!Number.isInteger(value) || value < 1) {
-    throw new Error(`${name}: expected a positive integer, got "${raw}"`);
-  }
-  return value;
-}
-
-/** `AGENT_API_ENV='{"PATH":"/usr/bin","LANG":"C.UTF-8"}'` — значения, отдаваемые воркеру. */
-function parseEnvPool(raw: string | undefined): Record<string, string> {
-  if (raw === undefined) return {};
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    throw new Error('AGENT_API_ENV: expected a JSON object of environment name → value');
-  }
-  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-    throw new Error('AGENT_API_ENV: expected a JSON object of environment name → value');
-  }
-  const pool: Record<string, string> = {};
-  for (const [name, value] of Object.entries(parsed as Record<string, unknown>)) {
-    if (typeof value !== 'string') throw new Error(`AGENT_API_ENV.${name}: expected a string value`);
-    pool[name] = value;
-  }
-  return pool;
-}
-
-export function loadAgentApiConfig(env: Record<string, string | undefined> = process.env): AgentApiProcessConfig {
-  const portRaw = env['AGENT_API_PORT']?.trim() || String(DEFAULT_API_PORT);
-  const port = Number(portRaw);
-  if (!Number.isInteger(port) || port < 1 || port > 65535) {
-    throw new Error(`AGENT_API_PORT: expected an integer in [1, 65535], got "${portRaw}"`);
-  }
-
-  const keyRegistryPath = env['AGENT_API_KEY_REGISTRY']?.trim();
-  if (!keyRegistryPath) {
-    throw new Error('AGENT_API_KEY_REGISTRY is required: path to a mode-0600 key registry JSON file with a principals array');
-  }
-
-  // ТЗ внешнего воркера (docs/TZ-EXTERNAL-OPENCODE-WORKER.md §10.2) называет переменные
-  // DYNAMIC_IP_AZURE_*, epic #74 — EXTERNAL_WORKER_*. Принимаем оба имени, второе приоритетнее.
-  const baseUrl = env['EXTERNAL_WORKER_URL']?.trim() || env['DYNAMIC_IP_AZURE_URL']?.trim();
-  if (!baseUrl) {
-    throw new Error('EXTERNAL_WORKER_URL is required: base URL of the external worker that launches the agent');
-  }
-  if (!/^https?:\/\//.test(baseUrl)) {
-    throw new Error(`EXTERNAL_WORKER_URL: expected an http(s) URL, got "${baseUrl}"`);
-  }
-  const token = env['EXTERNAL_WORKER_TOKEN']?.trim() || env['DYNAMIC_IP_AZURE_TOKEN']?.trim() || '';
-
-  return {
-    host: env['AGENT_API_HOST']?.trim() || DEFAULT_API_HOST,
-    port,
-    keyRegistryPath,
-    worker: {
-      baseUrl,
-      token,
-      launchDeadlineMs: intEnv('EXTERNAL_WORKER_LAUNCH_DEADLINE_MS', DEFAULT_LAUNCH_DEADLINE_MS),
-      cancelDeadlineMs: intEnv('EXTERNAL_WORKER_CANCEL_DEADLINE_MS', DEFAULT_CANCEL_DEADLINE_MS),
-    },
-    env: parseEnvPool(env['AGENT_API_ENV']),
-    defaultRepository: env['RUNNER_DEFAULT_REPO']?.trim() || null,
-  };
-}
-
-function requireKeyRegistry(path: string): KeyRegistry {
-  try {
-    statSync(path);
-  } catch {
-    throw new Error(`key registry not found: ${path}`);
-  }
-  const registry = KeyRegistry.loadFile(path);
-  if (registry.size() === 0) {
-    throw new Error(`key registry ${path} holds no keys; refusing to start an API that cannot authenticate anyone`);
-  }
-  return registry;
-}
+import { loadAgentApiConfig, requireKeyRegistry } from './config.js';
 
 async function main(): Promise<void> {
   const config = loadAgentApiConfig();
@@ -127,15 +17,19 @@ async function main(): Promise<void> {
     process.stdout.write(`${JSON.stringify({ ts: new Date().toISOString(), ...entry })}\n`);
   };
   const keys = requireKeyRegistry(config.keyRegistryPath);
-  const worker = new ExternalWorkerAdapter({
-    baseUrl: config.worker.baseUrl,
-    ...(config.worker.token ? { token: config.worker.token } : {}),
-    deadlineMs: config.worker.launchDeadlineMs,
-    cancelDeadlineMs: config.worker.cancelDeadlineMs,
-    log,
-  });
+  const workers = config.workers.map(
+    (worker) =>
+      new ExternalWorkerAdapter({
+        engineName: worker.engine,
+        baseUrl: worker.baseUrl,
+        ...(worker.token ? { token: worker.token } : {}),
+        deadlineMs: worker.launchDeadlineMs,
+        cancelDeadlineMs: worker.cancelDeadlineMs,
+        log,
+      }),
+  );
   const service = new AgentApi({
-    worker,
+    workers,
     logger: log,
     env: config.env,
     ...(config.defaultRepository ? { defaultRepository: config.defaultRepository } : {}),
@@ -190,9 +84,8 @@ async function main(): Promise<void> {
       port: config.port,
       keyRegistry: config.keyRegistryPath,
       keys: keys.size(),
-      engine: worker.name,
-      worker: worker.baseUrl,
-      workerAuth: config.worker.token === '' ? 'none' : 'bearer',
+      engines: workers.map((entry) => entry.name),
+      workers: workers.map((entry) => ({ engine: entry.name, baseUrl: entry.baseUrl })),
       storage: 'stateless: receipts and run progress live in process memory',
       artifacts: 'github links returned by the worker; the API keeps no bytes',
       logs: 'google storage links returned by the worker',

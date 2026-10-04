@@ -148,6 +148,12 @@ function checkText(value: unknown, path: string, collector: ErrorCollector, maxL
 
 export interface ExternalWorkerOptions {
   baseUrl: string;
+  /**
+   * Имя движка, которым этот воркер отвечает. По умолчанию — `dynamic-ip-azure-agent-run`
+   * (Azure VM). Второй воркер (например, получатель раннеров на GitHub Actions) объявляет
+   * своё: имя движка — это адрес воркера, а не его внутренняя деталь.
+   */
+  engineName?: string;
   token?: string;
   /**
    * Хостовый пул значений окружения. В `LaunchRequest.env` уходит только пересечение с
@@ -677,7 +683,7 @@ export function workerTransportFailure(
 }
 
 export class ExternalWorkerAdapter implements ExternalWorker {
-  readonly name = EXTERNAL_WORKER_ENGINE;
+  readonly name: string;
   readonly baseUrl: string | null;
   private readonly token: string | undefined;
   private readonly env: Record<string, string>;
@@ -688,6 +694,7 @@ export class ExternalWorkerAdapter implements ExternalWorker {
   private readonly log: (entry: Record<string, unknown>) => void;
 
   constructor(options: ExternalWorkerOptions) {
+    this.name = options.engineName ?? EXTERNAL_WORKER_ENGINE;
     this.baseUrl = options.baseUrl;
     this.token = options.token;
     this.env = options.env ?? {};

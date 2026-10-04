@@ -4,6 +4,7 @@ import { AgentApi } from '../src/api/service.js';
 import { StatelessStore } from '../src/api/stateless-store.js';
 import type { Principal } from '../src/api/auth.js';
 import { adapterFor, startMockWorker, type MockWorkerOptions } from './external-worker-harness.js';
+import { ExternalWorkerAdapter } from '../src/adapters/external-worker-adapter.js';
 
 /**
  * Правила приёма stateless-ядра (epic #74): идемпотентность в памяти, границы движка,
@@ -31,7 +32,7 @@ function body(over: Record<string, unknown> = {}): Record<string, unknown> {
 async function makeApi(options: MockWorkerOptions = {}, store = new StatelessStore()): Promise<AgentApi> {
   const worker = await startMockWorker(options);
   onTestFinished(() => worker.close());
-  const api = new AgentApi({ worker: adapterFor(worker), store });
+  const api = new AgentApi({ workers: [adapterFor(worker)], store });
   onTestFinished(() => api.dispose());
   return api;
 }
@@ -103,7 +104,7 @@ describe('stateless AgentApi: приём запроса', () => {
     const worker = await startMockWorker();
     onTestFinished(() => worker.close());
     const loose: Principal = { principalId: 'p-loose', profileId: 'profile-a', scopes: ['runs:read', 'runs:write'] };
-    const api = new AgentApi({ worker: adapterFor(worker) });
+    const api = new AgentApi({ workers: [adapterFor(worker)] });
     onTestFinished(() => api.dispose());
     try {
       api.submit(loose, 'idem-loose-engine', body({ engine: { name: 'opencode', adapterVersion: '1' } }));
@@ -131,7 +132,7 @@ describe('stateless AgentApi: приём запроса', () => {
   it('память процесса: переполнение незавершённых ранов отказывает, а не вытесняет живой ран', async () => {
     const worker = await startMockWorker({ delayMs: 500 });
     onTestFinished(() => worker.close());
-    const api = new AgentApi({ worker: adapterFor(worker), maxActiveRuns: 2 });
+    const api = new AgentApi({ workers: [adapterFor(worker)], maxActiveRuns: 2 });
     onTestFinished(() => api.dispose());
     const runs = [1, 2].map((n) => api.submit(alpha, `idem-cap-${n}`, body()).runId);
     expect(() => api.submit(alpha, 'idem-cap-3', body())).toThrowError(
@@ -263,6 +264,55 @@ describe('stateless AgentApi: capabilities отчитываются честно
     expect(progress.events[progress.events.length - 1]!.type).toBe('succeeded');
     expect(progress.sequence).toBeGreaterThanOrEqual(progress.events[0]!.sequence);
     expect(store.progressOf(receipt.runId)!.droppedEvents).toBeGreaterThan(0);
+  });
+
+  it('реестр движков: запрос уходит воркеру по имени движка, capabilities перечисляет все', async () => {
+    const azure = await startMockWorker();
+    const actions = await startMockWorker();
+    onTestFinished(() => azure.close());
+    onTestFinished(() => actions.close());
+    const service = new AgentApi({
+      workers: [
+        adapterFor(azure),
+        new ExternalWorkerAdapter({ baseUrl: actions.baseUrl, engineName: 'github-actions-agent-run', deadlineMs: 2000 }),
+      ],
+    });
+    onTestFinished(() => service.dispose());
+    // Принципал без allowlist движков: проверяем сам реестр, а не ограничение принципала.
+    const fleet: Principal = { principalId: 'p-fleet', profileId: 'profile-a', scopes: ['runs:read', 'runs:write'] };
+
+    expect(service.capabilities().engines).toEqual(['dynamic-ip-azure-agent-run', 'github-actions-agent-run']);
+    expect(service.health().workers.map((entry) => entry.engine)).toEqual(['dynamic-ip-azure-agent-run', 'github-actions-agent-run']);
+
+    // Каждый движок обслуживает свой воркер: launch ушёл туда, куда просили.
+    const first = service.submit(fleet, 'idem-fleet-azure', body());
+    await waitForState(service, fleet, first.runId, 'succeeded');
+    expect(azure.launches).toHaveLength(1);
+    expect(actions.launches).toHaveLength(0);
+
+    const second = service.submit(fleet, 'idem-fleet-actions', body({ engine: { name: 'github-actions-agent-run', adapterVersion: '1' } }));
+    await waitForState(service, fleet, second.runId, 'succeeded');
+    expect(actions.launches).toHaveLength(1);
+    expect(azure.launches).toHaveLength(1);
+
+    // Отмена уходит в воркер своего движка, а не в первый попавшийся.
+    const third = service.submit(fleet, 'idem-fleet-cancel', body({ engine: { name: 'github-actions-agent-run', adapterVersion: '1' } }));
+    await service.cancel(fleet, third.runId);
+    expect(actions.cancels).toContain(third.runId);
+    expect(azure.cancels).not.toContain(third.runId);
+
+    // Движок, которого в реестре нет, отклоняется до записи — и перечисляет доступные.
+    try {
+      service.submit(fleet, 'idem-fleet-unknown', body({ engine: { name: 'opencode', adapterVersion: '1' } }));
+      expect.unreachable('an unregistered engine must be refused');
+    } catch (err) {
+      expect((err as ApiError).code).toBe('ENGINE_NOT_ALLOWED');
+      expect((err as ApiError).details).toMatchObject({ engines: ['dynamic-ip-azure-agent-run', 'github-actions-agent-run'] });
+    }
+  }, 30000);
+
+  it('пустой реестр воркеров — отказ на старте, а не API без способа запустить агента', () => {
+    expect(() => new AgentApi({ workers: [] })).toThrowError(/at least one external worker/);
   });
 
   it('у ядра нет recovery: состояние живёт в памяти и вычищается по TTL', async () => {

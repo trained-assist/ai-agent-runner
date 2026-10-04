@@ -171,6 +171,26 @@ describe('e2e: serverless API поверх внешнего воркера (#74)
       }
     }
     expect(offenders).toEqual([]);
+
+    // Файловая система вообще не нужна пакету, кроме чтения реестра ключей при старте:
+    // это конфигурация, а не состояние рана. Больше ни один модуль её не трогает.
+    const touchingFs = files
+      .filter((file) => /from 'node:fs'/.test(readFileSync(file, 'utf8')))
+      .map((file) => file.replace(repoRoot + '/', ''))
+      .sort();
+        // Все три читают один и тот же файл конфигурации — реестр ключей. Это не состояние рана.
+    expect(touchingFs).toEqual(['src/api/auth.ts', 'src/api/config.ts', 'src/api/main.ts']);
+  });
+
+  it('статически: единственный движок в пакете — внешний воркер, локальных адаптеров нет', () => {
+    const offenders: string[] = [];
+    for (const file of readdirSync(resolve(repoRoot, 'src/adapters'))) {
+      if (file !== 'external-worker-adapter.ts') offenders.push(`src/adapters/${file}`);
+    }
+    if (existsSync(resolve(repoRoot, 'src/runner'))) offenders.push('src/runner');
+    if (existsSync(resolve(repoRoot, 'src/isolation'))) offenders.push('src/isolation');
+    if (existsSync(resolve(repoRoot, 'src/storage'))) offenders.push('src/storage');
+    expect(offenders).toEqual([]);
   });
 
   it('рестарт процесса забывает ран: клиент повторяет submit с новым ключом (эпик, шаг 6)', async () => {
