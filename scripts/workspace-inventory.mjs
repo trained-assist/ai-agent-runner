@@ -22,16 +22,17 @@ import { fileURLToPath } from 'node:url';
 // распаковать на любой машине, не подгоняя пути.
 const DIST = join(dirname(fileURLToPath(import.meta.url)), '..', 'dist', 'workspace');
 const { parseCleanList, cleanListRulesOf } = await import(`file://${DIST}/clean-list.js`);
-const { compileCleanListRules, compilePolicy, matchRule, classifyPath } = await import(`file://${DIST}/policy.js`);
+const { compileCleanListRules, compilePolicy, matchRule, classifyPath, buildMigrationPolicy } = await import(`file://${DIST}/policy.js`);
 
 function parseArgv(argv) {
-  const options = { root: null, cleanList: null, json: false, only: null };
+  const options = { root: null, cleanList: null, json: false, only: null, compressed: false };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === '--root') options.root = argv[++i];
     else if (arg === '--clean-list') options.cleanList = argv[++i];
     else if (arg === '--only') options.only = argv[++i];
     else if (arg === '--json') options.json = true;
+    else if (arg === '--compressed') options.compressed = true;
     else if (arg === '-h' || arg === '--help') {
       process.stdout.write('Usage: node workspace-inventory.mjs --root <dir> --clean-list <file> [--only name1,name2] [--json]\n');
       process.exit(0);
@@ -49,15 +50,17 @@ function parseArgv(argv) {
 
 const options = parseArgv(process.argv.slice(2));
 const parsed = parseCleanList(readFileSync(options.cleanList, 'utf8'));
-const policy = compilePolicy({
-  policyId: `inventory-clean-list-v${parsed.version}`,
-  version: 1,
-  // Щедрые лимиты: инвентарь измеряет, а не отказывает.
-  textMaxBytes: 1024 * 1024,
-  maxFiles: 5_000_000,
-  maxTotalBytes: 1024 * 1024 * 1024 * 1024,
-  rules: compileCleanListRules(cleanListRulesOf(parsed)),
-});
+const policy = compilePolicy(
+  buildMigrationPolicy({
+    policyId: `inventory-clean-list-v${parsed.version}`,
+    cleanListRules: compileCleanListRules(cleanListRulesOf(parsed)),
+    compress: options.compressed,
+    // Щедрые лимиты: инвентарь измеряет, а не отказывает.
+    textMaxBytes: 1024 * 1024,
+    maxFiles: 5_000_000,
+    maxTotalBytes: 1024 * 1024 * 1024 * 1024,
+  }),
+);
 
 /** Категория исключения по причине из clean list — для сводки, а не для решения. */
 function categorize(reason) {
@@ -160,7 +163,7 @@ if (options.json) {
   process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
 } else {
   const totals = { publishable: { files: 0, bytes: 0 }, heavy: { files: 0, bytes: 0 }, excluded: { files: 0, bytes: 0 }, byCategory: {} };
-  process.stdout.write(`inventory: ${profiles.length} профилей, clean list v${parsed.version}\n\n`);
+  process.stdout.write(`inventory: ${profiles.length} профилей, clean list v${parsed.version}${options.compressed ? ' + сжатие' : ''}\n\n`);
   process.stdout.write(`${'profile'.padEnd(34)} ${'текст'.padStart(12)} ${'heavy'.padStart(12)} ${'исключено'.padStart(14)}  категории\n`);
   for (const [name, item] of Object.entries(report)) {
     totals.publishable.files += item.publishable.files;

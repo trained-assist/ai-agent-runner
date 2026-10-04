@@ -5,6 +5,8 @@ import {
   compileCleanListRules,
   compilePolicy,
   DEFAULT_EXPORT_POLICY,
+  MIGRATION_COMPRESSION_EXCLUDES,
+  buildMigrationPolicy,
   assertWorkspaceDir,
   classifyPath,
   matchRule,
@@ -241,5 +243,65 @@ describe('legacy clean list compatibility', () => {
     expect(matchRule(policy, 'node_modules').action).toBe('exclude');
     // Причина из clean list сохраняется: она объясняет решение оператору.
     expect(matchRule(policy, 'opencode.db').reason).toMatch(/engine runtime state/);
+  });
+});
+
+describe('migration compression excludes engine state, not user text', () => {
+  it('drops agent home, session traces and generated indices', () => {
+    const policy = compilePolicy({
+      policyId: 'migration',
+      version: 1,
+      textMaxBytes: 1024,
+      maxFiles: 100,
+      maxTotalBytes: 1024 * 1024,
+      rules: [...DEFAULT_EXPORT_POLICY.rules, ...MIGRATION_COMPRESSION_EXCLUDES],
+    });
+    for (const path of [
+      '.agent-home/agent-data/engineering-workspaces/repo-maps/x/search/chunks.json',
+      '.agent-tokens/alice/token',
+      '.session-traces/session.jsonl',
+      '.mcp-runs/run-1/log',
+      '.run-inputs/snap-1/file.md',
+      'projects/app/repo-maps/abc/search/embed-abc.json',
+      '.opencode-mcp.json',
+      '.system-prompt.txt',
+    ]) {
+      expect(matchRule(policy, path).action, path).toBe('exclude');
+    }
+    // Пользовательский текст остаётся.
+    for (const path of ['persona/system.md', 'contexts/notes.md', 'projects/app/src/index.md', 'agent-notes.md']) {
+      expect(matchRule(policy, path).action, path).toBe('publish');
+    }
+  });
+});
+
+describe('buildMigrationPolicy keeps the mandatory layer first', () => {
+  it('excludes secrets even when the clean list is silent about them', () => {
+    // Clean list знает про auth.json, но молчит про *.key и .ssh — обязательный слой
+    // модуля обязан их исключить, иначе импорт опубликует закрытый ключ.
+    const policy = compilePolicy(
+      buildMigrationPolicy({
+        policyId: 'migration',
+        compress: true,
+        cleanListRules: compileCleanListRules([{ pattern: '*.md', action: 'KEEP', reason: 'text' }]),
+      }),
+    );
+    expect(matchRule(policy, 'deck/source/signing.key').action).toBe('exclude');
+    expect(matchRule(policy, 'deploy/id_rsa').action).toBe('exclude');
+    expect(matchRule(policy, '.ssh/config').action).toBe('exclude');
+    expect(matchRule(policy, '.agent-home/agent-data/x.json').action).toBe('exclude');
+    expect(matchRule(policy, 'notes/a.md').action).toBe('publish');
+  });
+
+  it('lets an explicit clean-list KEEP win over compression but never over secrets', () => {
+    const policy = compilePolicy(
+      buildMigrationPolicy({
+        policyId: 'migration',
+        compress: true,
+        cleanListRules: compileCleanListRules([{ pattern: 'auth.json', action: 'KEEP', reason: 'wrong on purpose' }]),
+      }),
+    );
+    // Обязательный слой стоит первым — даже KEEP из clean list не вернёт credential.
+    expect(matchRule(policy, 'auth.json').action).toBe('exclude');
   });
 });

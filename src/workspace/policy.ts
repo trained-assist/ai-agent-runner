@@ -121,6 +121,72 @@ export const DEFAULT_REGENERABLE_EXCLUDES: readonly ExportRule[] = [
   { pattern: '.DS_Store', action: 'exclude', reason: 'служебный файл файловой системы' },
 ];
 
+/**
+ * Сжатие образа при миграции: состояние, которое порождает движок/агент, а не пользователь.
+ *
+ * Почему отдельным набором, а не в `MANDATORY_EXCLUDES`: это расширение границы профиля, и
+ * его применение — осознанное решение миграции. По архитектуре (ARCH §5.1) HOME движка и
+ * его база создаются на каждый ран и не являются рабочим состоянием профиля; индексы
+ * поиска и трассы сессий — сгенерированы и воспроизводимы.
+ *
+ * Inventory реальных профилей показал, что именно эти пути дают основную массу «текста»:
+ * в одном профиле `.agent-home/agent-data/**` — 266 МБ (один файл эмбеддингов 247 МБ),
+ * `.session-traces/**` — 68 МБ. Их исключение сжимает образ на порядок.
+ *
+ * Порядок важен: набор добавляется ПЕРЕД правилами clean list — первое совпадение
+ * выигрывает, и KEEP-правило (`*.json` → publish) иначе вернуло бы движковое состояние в
+ * образ. Эти же правила стоит внести в legacy `config/profile-clean-list.yaml` (он —
+ * единственное определение границы профиля); до этого набор применяется явно на миграции.
+ */
+export const MIGRATION_COMPRESSION_EXCLUDES: readonly ExportRule[] = [
+  { pattern: '.agent-home', action: 'exclude', reason: 'HOME движка: auth, конфиг, кэши, agent-data — на каждый ран создаётся заново (ARCH §5.1), не образ профиля' },
+  { pattern: '.agent-tokens', action: 'exclude', reason: 'per-profile credentials — никогда не в образе' },
+  { pattern: '.session-traces', action: 'exclude', reason: 'трассы сессий — класс sessions, место в object storage (M2)' },
+  { pattern: '.mcp-runs', action: 'exclude', reason: 'scratch MCP-запусков рана' },
+  { pattern: '.run-inputs', action: 'exclude', reason: 'материализованные входы рана (#52)' },
+  { pattern: '.playwright-mcp', action: 'exclude', reason: 'scratch браузерного MCP' },
+  { pattern: 'repo-maps', action: 'exclude', reason: 'сгенерированная карта репозитория' },
+  { pattern: 'chunks.json', action: 'exclude', reason: 'сгенерированные чанки поискового индекса' },
+  { pattern: 'embed-*.json', action: 'exclude', reason: 'сгенерированные эмбеддинги поискового индекса' },
+  { pattern: '.system-prompt.txt', action: 'exclude', reason: 'сгенерированный системный промпт движка' },
+  { pattern: '.skills-resolved.json', action: 'exclude', reason: 'сгенерированный список скилов рана' },
+  { pattern: '.opencode-mcp.json', action: 'exclude', reason: 'сгенерированный конфиг MCP движка (может нести секреты)' },
+  { pattern: '.pin_state.json', action: 'exclude', reason: 'служебное состояние агента' },
+];
+
+/**
+ * Сборка политики миграции из трёх слоёв в правильном порядке (первое совпадение выигрывает):
+ *
+ *   1. `MANDATORY_EXCLUDES` — секреты, git, входы рана. Не отключаются никогда: даже если
+ *      clean list про какую-то форму credential'а молчит, она обязана остаться вне образа;
+ *   2. `MIGRATION_COMPRESSION_EXCLUDES` — движковое состояние и сгенерированные индексы;
+ *   3. правила clean list — граница профиля.
+ *
+ * Без этого порядка KEEP-правило clean list (`*.json` → publish) или его молчание про
+ * `*.key` вернули бы в образ то, что обязано быть исключено.
+ */
+export function buildMigrationPolicy(input: {
+  policyId: string;
+  cleanListRules: readonly ExportRule[];
+  compress?: boolean;
+  textMaxBytes?: number;
+  maxFiles?: number;
+  maxTotalBytes?: number;
+}): ExportPolicy {
+  return {
+    policyId: input.policyId,
+    version: 1,
+    textMaxBytes: input.textMaxBytes ?? DEFAULT_EXPORT_POLICY.textMaxBytes,
+    maxFiles: input.maxFiles ?? DEFAULT_EXPORT_POLICY.maxFiles,
+    maxTotalBytes: input.maxTotalBytes ?? DEFAULT_EXPORT_POLICY.maxTotalBytes,
+    rules: [
+      ...MANDATORY_EXCLUDES,
+      ...(input.compress ? MIGRATION_COMPRESSION_EXCLUDES : []),
+      ...input.cleanListRules,
+    ],
+  };
+}
+
 export const DEFAULT_EXPORT_POLICY: ExportPolicy = {
   policyId: 'profile-workspace-v1',
   version: 1,

@@ -126,14 +126,12 @@ const service = new WorkspaceService({
   },
   admin: createGitHubRepositoryAdmin({ tokenRef: TOKEN_REF, resolveToken: async () => TOKEN }),
   journal,
-  policy: {
+  policy: buildMigrationPolicy({
     policyId: `rehearsal-clean-list-v${cleanListVersion ?? 'default'}`,
-    version: 1,
-    textMaxBytes: 1024 * 1024,
-    maxFiles: 5000,
+    cleanListRules: policyRules,
+    compress: true,
     maxTotalBytes: 512 * 1024 * 1024,
-    rules: policyRules,
-  },
+  }),
 });
 
 // ── копии профилей ────────────────────────────────────────────────────────────
