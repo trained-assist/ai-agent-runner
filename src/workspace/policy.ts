@@ -113,6 +113,39 @@ export const MANDATORY_EXCLUDES: readonly ExportRule[] = [
  * Каталоги, которые не имеет смысла публиковать: воспроизводимы и раздувают образ.
  * Это не credential-ы, поэтому решение «не публиковать» здесь явное и перечислимое.
  */
+/**
+ * Архивы и бинарные контейнеры — это артефакты, а не текст: они уходят в object storage по
+ * ref и материализуются при чтении. Без этого правила маленькие архивы (сотни килобайт)
+ * попадали бы прямо в git, раздувая образ прикладным содержимым, которое никто не читает
+ * глазами, а распаковывает по ссылке.
+ */
+export const MIGRATION_BINARY_EXCLUDES: readonly ExportRule[] = [
+  { pattern: '*.tar', action: 'heavy', reason: 'архив — ref в object storage, не текст в git' },
+  { pattern: '*.tar.gz', action: 'heavy', reason: 'архив — ref в object storage, не текст в git' },
+  { pattern: '*.tgz', action: 'heavy', reason: 'архив — ref в object storage, не текст в git' },
+  { pattern: '*.zip', action: 'heavy', reason: 'архив — ref в object storage, не текст в git' },
+  { pattern: '*.7z', action: 'heavy', reason: 'архив — ref в object storage, не текст в git' },
+  { pattern: '*.dmg', action: 'heavy', reason: 'образ диска — ref в object storage' },
+  { pattern: '*.iso', action: 'heavy', reason: 'образ диска — ref в object storage' },
+  { pattern: '*.pdf', action: 'heavy', reason: 'документ — ref в object storage' },
+  { pattern: '*.sqlite', action: 'heavy', reason: 'база данных — ref в object storage' },
+  { pattern: '*.db', action: 'heavy', reason: 'база данных — ref в object storage' },
+];
+
+/**
+ * Каталоги, которые движок создаёт как рабочий вывод: сборки, песочницы, чекауты,
+ * одноразовые каталоги работы. В образе профиля им не место — они воспроизводимы, а в
+ * случае сомнения лежат в `other` при отчёте инвентаря.
+ */
+export const MIGRATION_GENERATED_EXCLUDES: readonly ExportRule[] = [
+  { pattern: 'dist', action: 'exclude', reason: 'сборка (build output) — воспроизводима' },
+  { pattern: 'sandbox', action: 'exclude', reason: 'песочница агента — одноразовый чекаут' },
+  { pattern: 'checkout', action: 'exclude', reason: 'чекаут агента — одноразовая копия' },
+  { pattern: '*_clone', action: 'exclude', reason: 'клон агента (суффикс имени каталога)' },
+  { pattern: '.work', action: 'exclude', reason: 'рабочий каталог агента (scratch)' },
+  { pattern: 'release', action: 'exclude', reason: 'каталог релиза агента' },
+];
+
 export const DEFAULT_REGENERABLE_EXCLUDES: readonly ExportRule[] = [
   { pattern: 'node_modules', action: 'exclude', reason: 'восстанавливается установкой' },
   { pattern: '.venv', action: 'exclude', reason: 'восстанавливается установкой' },
@@ -181,7 +214,8 @@ export function buildMigrationPolicy(input: {
     maxTotalBytes: input.maxTotalBytes ?? DEFAULT_EXPORT_POLICY.maxTotalBytes,
     rules: [
       ...MANDATORY_EXCLUDES,
-      ...(input.compress ? MIGRATION_COMPRESSION_EXCLUDES : []),
+      ...DEFAULT_REGENERABLE_EXCLUDES,
+      ...(input.compress ? [...MIGRATION_COMPRESSION_EXCLUDES, ...MIGRATION_BINARY_EXCLUDES, ...MIGRATION_GENERATED_EXCLUDES] : []),
       ...input.cleanListRules,
     ],
   };

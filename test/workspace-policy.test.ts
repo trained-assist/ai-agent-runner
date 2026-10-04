@@ -305,3 +305,39 @@ describe('buildMigrationPolicy keeps the mandatory layer first', () => {
     expect(matchRule(policy, 'auth.json').action).toBe('exclude');
   });
 });
+
+describe('migration compression: archives stay out of git, generated dirs stay out of the image', () => {
+  const policy = compilePolicy(
+    buildMigrationPolicy({
+      policyId: 'migration',
+      compress: true,
+      cleanListRules: compileCleanListRules([{ pattern: '*.md', action: 'KEEP', reason: 'text' }]),
+    }),
+  );
+
+  it('treats archives, images and databases as heavy artifacts, not as git content', () => {
+    for (const path of ['projects/app/release.tar', 'projects/app/architecture.tar.gz', 'docs/bundle.zip', 'media/d.dmg', 'data/state.db', 'docs/spec.pdf']) {
+      expect(matchRule(policy, path).action, path).toBe('heavy');
+    }
+    // Маленький архив тоже артефакт: по размеру он прошёл бы в git, а по смыслу не текст.
+    expect(classifyPath(policy, 'projects/tiny.tar', 500).action).toBe('heavy');
+  });
+
+  it('drops build output, sandboxes, agent checkouts and scratch work dirs', () => {
+    for (const path of [
+      'projects/recruiting/iteration-5/sandbox/checkout-1234/dist/index.js',
+      'projects/app/dist/bundle.js',
+      'projects/app/.work/arch-review/req.json',
+      'projects/app/checkout/src/main.py',
+      'projects/app/source_clone/README.md',
+      'projects/app/release/binary',
+    ]) {
+      expect(matchRule(policy, path).action, path).toBe('exclude');
+    }
+  });
+
+  it('keeps the regenerable layer (node_modules) that buildMigrationPolicy must not drop', () => {
+    expect(matchRule(policy, 'projects/app/node_modules/x/index.js').action).toBe('exclude');
+    expect(matchRule(policy, 'projects/app/src/index.js').action).toBe('publish');
+  });
+});

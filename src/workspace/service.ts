@@ -48,7 +48,8 @@ import {
   type ResolveWorkspaceConflictResult,
   type SyncWorkspaceResult,
 } from './contract.js';
-import { CANDIDATE_REF_PREFIX, candidateRefFor, DEFAULT_BRANCH } from './git/local-git.js';
+import { branchRef, isWorkspaceBranch, runBranchName, syncBranchName } from './branches.js';
+import { DEFAULT_BRANCH } from './git/local-git.js';
 import type { WorkspaceJournalPort } from './journal.js';
 import {
   DEFAULT_EXPORT_POLICY,
@@ -953,7 +954,7 @@ export class WorkspaceService {
         reason: 'the publication has no durable candidate to complete; the engine must not be re-run to obtain one',
       });
     }
-    const remoteCandidate = await this.git.candidateRefCommit(mirror, candidateRefFor(record.publicationId));
+    const remoteCandidate = await this.git.candidateRefCommit(mirror, branchRef(record.branch));
     if (remoteCandidate !== candidate && !(await this.git.hasCommit(mirror, candidate))) {
       return this.patchPublication(record, {
         status: 'pending',
@@ -1113,8 +1114,8 @@ export class WorkspaceService {
       author: COMMIT_AUTHOR,
       metadata: { publicationId: publication.publicationId, conflictId: conflict.conflictId, candidateId: candidate.candidateId },
     });
-    const candidatePush = await this.git.pushCandidateRef(mirror, {
-      ref: candidateRefFor(publication.publicationId),
+    const candidatePush = await this.git.pushRef(mirror, {
+      ref: branchRef(publication.branch),
       commit,
       credentials: { tokenRef: input.credentialTokenRef },
     });
@@ -1177,7 +1178,7 @@ export class WorkspaceService {
     // отказа (например, тяжёлые байты, которые не ушли в object storage). Оно важнее
     // вывода из `changes`: при отказе до расчёта манифеста changes ещё пуст.
     const retained = [...new Set([...record.cleanup.retained, ...record.changes.map((item) => item.path)])];
-    if (record.candidateCommit) retained.push(`git:${candidateRefFor(record.publicationId)}`);
+    if (record.candidateCommit) retained.push(`git:${record.branch}`);
     return {
       cleanupAllowed: false,
       reason: `publication ${record.publicationId} is "${record.status}"${record.reason ? `: ${record.reason}` : ''}; the unpublished state must survive the workspace removal`,
@@ -1227,6 +1228,8 @@ export class WorkspaceService {
       runId: input.runId,
       ownerGeneration: input.ownerGeneration,
       baseRevision: input.baseRevision,
+      // Ветка рана — единица результата; для host-синхронизации (без рана) — своя ветка.
+      branch: input.runId ? runBranchName(input.runId) : syncBranchName(publicationId),
     });
     // Запись ДО внешнего вызова: падение после этого места оставляет читаемый след.
     this.journal.putPublication(record);
@@ -1375,95 +1378,117 @@ export class WorkspaceService {
     // Область слияния = пути рана плюс те, что он удалил: удаление не выражается деревом.
     const scope = new Set([...runTree.keys(), ...base.keys()]);
 
+    // 1. Коммит рана — изолированная работа, основанная на том, что ран видел. Он живёт в
+    //    ветке рана и не зависит от того, куда ушла основная ветка за время рана.
+    const runCommit =
+      input.runRevision ??
+      (await this.git.commitTree(mirror, {
+        tree: input.runTreeSha,
+        parents: record.baseRevision === EMPTY_TREE ? [] : [record.baseRevision],
+        message: input.message,
+        author: COMMIT_AUTHOR,
+        metadata: { publicationId: record.publicationId, baseRevision: record.baseRevision, manifestHash: record.manifestHash, kind: 'run' },
+      }));
+
+    // 2. Ветка рана публикуется ДО основной: это durable-кандидат. После смерти VM
+    //    публикация доводится с неё, а не повторным движком; пользователь видит её целиком.
+    const candidatePush = await this.git.pushRef(mirror, {
+      ref: branchRef(record.branch),
+      commit: runCommit,
+      credentials: { tokenRef: input.credentialTokenRef },
+    });
+    const withCandidate = this.patchPublication(record, {
+      candidateCommit: runCommit,
+      candidatePushed: candidatePush.outcome === 'pushed',
+      status: 'publishing',
+    });
+    if (candidatePush.outcome === 'unknown') {
+      return this.patchPublication(withCandidate, {
+        status: 'pending',
+        outcomeUnknown: true,
+        reason: candidatePush.detail ?? 'the run branch push has an unknown outcome; reconcile before retrying',
+        cleanup: { cleanupAllowed: false, reason: 'the run branch push outcome is unknown', retained: withCandidate.changes.map((item) => item.path) },
+      });
+    }
+    if (candidatePush.outcome !== 'pushed') {
+      return this.patchPublication(withCandidate, {
+        status: 'failed',
+        reason: `the profile repository rejected the run branch ${record.branch}: ${candidatePush.detail ?? 'no detail'}`,
+        cleanup: { cleanupAllowed: false, reason: 'the run branch was not published', retained: withCandidate.changes.map((item) => item.path) },
+      });
+    }
+
+    // 3. Основная ветка обновляется из ветки рана: fast-forward, если она не двигалась,
+    //    иначе — явный merge-коммит. Так merge системный, а не «грязная» запись в main.
     for (let attempt = 1; attempt <= this.mergeAttempts; attempt += 1) {
       await this.git.fetch(mirror, { tokenRef: input.credentialTokenRef });
       const head = await this.git.head(mirror, binding.branch);
-      const current = head === null ? new Map<string, { mode: string; oid: string }>() : toTreeMap(await this.git.listTree(mirror, head));
-
-      let writes: { path: string; oid: string | null; mode?: string }[];
-      const parents: string[] = head ? [head] : [];
+      let mainCommit: string;
       if (head === record.baseRevision || head === null) {
-        writes = diffWrites(base, runTree);
+        // Ветка рана основана на текущей голове — main догоняет её без merge-коммита.
+        mainCommit = runCommit;
       } else {
+        const current = toTreeMap(await this.git.listTree(mirror, head));
         const merged = await mergeTrees(this.git, mirror, { base, run: runTree, current, scope });
         if (!merged.clean) {
-          return this.recordConflict(record, binding, mirror, {
+          return this.recordConflict(withCandidate, binding, mirror, {
             base,
             runTreeSha: input.runTreeSha,
-            currentRevision: head ?? EMPTY_TREE,
+            currentRevision: head,
             entries: merged.conflicts,
             attempts: attempt,
-            runRevision: input.runRevision,
+            runRevision: runCommit,
           });
         }
-        writes = merged.writes;
+        const tree = await this.git.writeTree(mirror, head, merged.writes);
+        mainCommit = await this.git.commitTree(mirror, {
+          tree,
+          // Два родителя: голова профиля и ветка рана. Результат рана виден в истории, а не
+          // растворяется в одном коммите.
+          parents: [head, runCommit],
+          message: `merge ${record.branch} into ${binding.branch}`,
+          author: COMMIT_AUTHOR,
+          metadata: { publicationId: record.publicationId, baseRevision: record.baseRevision, manifestHash: record.manifestHash, kind: 'merge' },
+        });
       }
 
-      const tree = await this.git.writeTree(mirror, head, writes);
-      const commit = await this.git.commitTree(mirror, {
-        tree,
-        parents,
-        message: input.message,
-        author: COMMIT_AUTHOR,
-        metadata: {
-          publicationId: record.publicationId,
-          baseRevision: record.baseRevision,
-          manifestHash: record.manifestHash,
-          expectedHeadRevision: head ?? 'null',
-        },
-      });
-
-      // Durable-кандидат до попытки опубликовать голову: после смерти VM публикация
-      // доводится с этого ref'а, а не повторным движком.
-      const candidatePush = await this.git.pushCandidateRef(mirror, {
-        ref: candidateRefFor(record.publicationId),
-        commit,
-        credentials: { tokenRef: input.credentialTokenRef },
-      });
-      const withCandidate = this.patchPublication(record, {
-        candidateCommit: commit,
-        candidatePushed: candidatePush.outcome === 'pushed',
-        expectedHeadRevision: head,
-        mergeAttempts: attempt,
-        status: 'publishing',
-      });
-
+      const prepared = this.patchPublication(withCandidate, { expectedHeadRevision: head, mergeAttempts: attempt });
       const push = await this.git.pushBranch(mirror, {
         branch: binding.branch,
-        commit,
+        commit: mainCommit,
         expectedHead: head,
         credentials: { tokenRef: input.credentialTokenRef },
       });
 
       if (push.outcome === 'pushed') {
-        return this.patchPublication(withCandidate, {
+        return this.patchPublication(prepared, {
           status: 'published',
-          committedRevision: commit,
+          committedRevision: mainCommit,
           outcomeUnknown: false,
           reason: null,
           committedAt: this.now(),
-          cleanup: this.cleanupForPublished(withCandidate),
+          cleanup: this.cleanupForPublished(prepared),
         });
       }
       if (push.outcome === 'unknown') {
-        return this.patchPublication(withCandidate, {
+        return this.patchPublication(prepared, {
           status: 'pending',
           outcomeUnknown: true,
-          reason: push.detail ?? 'the push outcome is unknown; reconcile with the profile repository before retrying',
-          cleanup: { cleanupAllowed: false, reason: 'the push outcome is unknown', retained: withCandidate.changes.map((item) => item.path) },
+          reason: push.detail ?? 'the merge push has an unknown outcome; reconcile before retrying',
+          cleanup: { cleanupAllowed: false, reason: 'the merge push outcome is unknown', retained: prepared.changes.map((item) => item.path) },
         });
       }
       if (push.outcome === 'rejected') {
-        return this.patchPublication(withCandidate, {
+        return this.patchPublication(prepared, {
           status: 'failed',
-          reason: `the profile repository rejected the publication: ${push.detail ?? 'no detail'}`,
-          cleanup: { cleanupAllowed: false, reason: 'the publication was rejected', retained: withCandidate.changes.map((item) => item.path) },
+          reason: `the profile repository rejected the merge into ${binding.branch}: ${push.detail ?? 'no detail'}`,
+          cleanup: { cleanupAllowed: false, reason: 'the merge was rejected', retained: prepared.changes.map((item) => item.path) },
         });
       }
       // head_changed: следующая попытка пересчитает merge против новой головы.
     }
 
-    const exhausted = this.patchPublication(record, { mergeAttempts: this.mergeAttempts });
+    const exhausted = this.patchPublication(withCandidate, { mergeAttempts: this.mergeAttempts });
     const head = await this.git.head(mirror, binding.branch);
     return this.recordConflict(
       exhausted,
@@ -1475,7 +1500,7 @@ export class WorkspaceService {
         currentRevision: head ?? EMPTY_TREE,
         entries: [{ path: `${binding.branch} (head)`, kind: 'content', runSha256: null, currentSha256: null }],
         attempts: this.mergeAttempts,
-        runRevision: input.runRevision,
+        runRevision: runCommit,
       },
       `the profile head kept changing during ${this.mergeAttempts} publication attempts`,
     );
@@ -1534,7 +1559,7 @@ export class WorkspaceService {
       cleanup: {
         cleanupAllowed: false,
         reason: 'the run changes are not published; the candidate ref and the run workspace must both survive',
-        retained: [...record.changes.map((item) => item.path), ...(record.candidateCommit ? [`git:${candidateRefFor(record.publicationId)}`] : [])],
+        retained: [...record.changes.map((item) => item.path), ...(record.candidateCommit ? [`git:${record.branch}`] : [])],
       },
     });
   }
@@ -1736,6 +1761,7 @@ export class WorkspaceService {
     runId: string | null;
     ownerGeneration: number | null;
     baseRevision: string;
+    branch: string;
   }): WorkspacePublication {
     const at = this.now();
     return {
@@ -1758,6 +1784,7 @@ export class WorkspaceService {
       artifacts: [],
       conflictId: null,
       candidateId: null,
+      branch: input.branch,
       candidateCommit: null,
       candidatePushed: false,
       outcomeUnknown: false,

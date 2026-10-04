@@ -36,6 +36,8 @@ import {
 export const DEFAULT_GIT_TIMEOUT_MS = 60_000;
 export const DEFAULT_BRANCH = 'main';
 export const CANDIDATE_REF_PREFIX = 'refs/workspace/publications/';
+export const RUN_BRANCH_REF_PREFIX = 'refs/heads/agent-run/';
+export const SYNC_BRANCH_REF_PREFIX = 'refs/heads/profile-sync/';
 
 /**
  * Статический askpass-помошник: значение подставляется из окружения процесса, в файл
@@ -411,11 +413,26 @@ export function createLocalGitPort(options: LocalGitPortOptions): GitRepositoryP
       return pushAuthenticated(mirror, ['push', 'origin', `${input.commit}:refs/heads/${input.branch}`], input.credentials);
     },
 
-    async pushCandidateRef(mirror, input) {
-      if (!input.ref.startsWith(CANDIDATE_REF_PREFIX)) {
-        throw new WorkspaceError('WORKSPACE_INVALID', `candidate ref must start with ${CANDIDATE_REF_PREFIX}, got "${input.ref}"`);
+    async pushRef(mirror, input) {
+      // Разрешены только ветки рана/синхронизации и легаси-кандидаты: молчаливая запись
+      // в произвольную ветку профиля запрещена (main обновляется только CAS-merge'ом).
+      const allowed =
+        input.ref.startsWith(RUN_BRANCH_REF_PREFIX) || input.ref.startsWith(SYNC_BRANCH_REF_PREFIX) || input.ref.startsWith(CANDIDATE_REF_PREFIX);
+      if (!allowed) {
+        throw new WorkspaceError(
+          'WORKSPACE_INVALID',
+          `refusing to push "${input.ref}": only ${RUN_BRANCH_REF_PREFIX}*, ${SYNC_BRANCH_REF_PREFIX}* and ${CANDIDATE_REF_PREFIX}* are allowed`,
+        );
       }
       return pushAuthenticated(mirror, ['push', 'origin', `${input.commit}:${input.ref}`], input.credentials);
+    },
+
+    async deleteRef(mirror, input) {
+      const allowed = input.ref.startsWith(RUN_BRANCH_REF_PREFIX) || input.ref.startsWith(SYNC_BRANCH_REF_PREFIX);
+      if (!allowed) {
+        throw new WorkspaceError('WORKSPACE_INVALID', `refusing to delete "${input.ref}": only run/sync branches are removable`);
+      }
+      return pushAuthenticated(mirror, ['push', 'origin', `:${input.ref}`], input.credentials);
     },
 
     async hasCommit(mirror, commit) {

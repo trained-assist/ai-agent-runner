@@ -24,6 +24,8 @@ import {
   mirrorTree,
   readFileAt,
   remoteTree,
+  remoteRef,
+  remoteParents,
   tempDir,
   writeFiles,
   type Harness,
@@ -911,3 +913,112 @@ function execHeadLog(h: Harness, fullName: string): string[] {
   const out = execFileSync('git', ['--git-dir', dir, 'log', '--format=%H %s', 'main']).toString('utf8');
   return out.split('\n').filter(Boolean);
 }
+
+describe('каждый ран публикует свою ветку (agent-run/<runId>)', () => {
+  it('создаёт ветку рана и указывает её в публикации', async () => {
+    const h = harness();
+    await ensureProfile(h, ALICE);
+    const base = runWorkspace({ 'notes/base.md': 'base\n' });
+    const basePublication = await h.service.publishRunChanges({
+      operationId: 'pub-base',
+      ...ALICE,
+      runId: 'run-base',
+      workspacePath: base,
+      baseRevision: EMPTY_TREE,
+    });
+    const a = runWorkspace({ 'notes/base.md': 'base\n', 'notes/a.md': 'value\n' });
+    const publication = await h.service.publishRunChanges({
+      operationId: 'pub-branch',
+      ...ALICE,
+      runId: 'run-42',
+      workspacePath: a,
+      baseRevision: basePublication.committedRevision as string,
+    });
+    expect(publication.status).toBe('published');
+    expect(publication.branch).toBe('agent-run/run-42');
+    // Ветка существует в remote и указывает на коммит рана.
+    expect(remoteRef(h.admin, `${OWNER}/profile-alice`, 'refs/heads/agent-run/run-42')).toBe(publication.candidateCommit);
+    // Основная ветка догнала ветку рана без merge-коммита: ран основан на текущей голове.
+    expect(remoteRef(h.admin, `${OWNER}/profile-alice`, 'refs/heads/main')).toBe(publication.candidateCommit);
+    expect(remoteParents(h.admin, `${OWNER}/profile-alice`, publication.committedRevision as string)).toHaveLength(1);
+  });
+
+  it('делает merge-коммит с двумя родителями, когда основная ветка ушла вперёд', async () => {
+    const h = harness();
+    await ensureProfile(h, ALICE);
+    const base = runWorkspace({ 'notes/base.md': 'base\n' });
+    const basePublication = await h.service.publishRunChanges({
+      operationId: 'pub-base',
+      ...ALICE,
+      runId: 'run-base',
+      workspacePath: base,
+      baseRevision: EMPTY_TREE,
+    });
+    const baseRevision = basePublication.committedRevision as string;
+
+    // Два рана от одной базы: второй публикуется поверх ушедшей головы.
+    const runA = runWorkspace({ 'notes/base.md': 'base\n', 'notes/a.md': 'from A\n' });
+    const runB = runWorkspace({ 'notes/base.md': 'base\n', 'notes/b.md': 'from B\n' });
+    await h.service.publishRunChanges({ operationId: 'pub-a', ...ALICE, runId: 'run-a', workspacePath: runA, baseRevision });
+    const pubB = await h.service.publishRunChanges({ operationId: 'pub-b', ...ALICE, runId: 'run-b', workspacePath: runB, baseRevision });
+
+    expect(pubB.status).toBe('published');
+    expect(pubB.branch).toBe('agent-run/run-b');
+    const mergeCommit = pubB.committedRevision as string;
+    const parents = remoteParents(h.admin, `${OWNER}/profile-alice`, mergeCommit);
+    expect(parents).toHaveLength(2);
+    // Второй родитель — вершина ветки рана.
+    expect(parents).toContain(remoteRef(h.admin, `${OWNER}/profile-alice`, 'refs/heads/agent-run/run-b'));
+    // Обе работы сохранены.
+    const tree = remoteTree(h.admin, `${OWNER}/profile-alice`);
+    expect(tree['notes/a.md']).toBe('from A\n');
+    expect(tree['notes/b.md']).toBe('from B\n');
+  });
+
+  it('сохраняет ветку рана при конфликте — работа не теряется', async () => {
+    const h = harness();
+    await ensureProfile(h, ALICE);
+    const base = runWorkspace({ 'notes/shared.md': 'line1\nline2\nline3\n' });
+    const basePublication = await h.service.publishRunChanges({
+      operationId: 'pub-base',
+      ...ALICE,
+      runId: 'run-base',
+      workspacePath: base,
+      baseRevision: EMPTY_TREE,
+    });
+    const baseRevision = basePublication.committedRevision as string;
+    const runA = runWorkspace({ 'notes/shared.md': 'line1\nfrom A\nline3\n' });
+    const runB = runWorkspace({ 'notes/shared.md': 'line1\nfrom B\nline3\n' });
+    await h.service.publishRunChanges({ operationId: 'pub-a', ...ALICE, runId: 'run-a', workspacePath: runA, baseRevision });
+    const pubB = await h.service.publishRunChanges({ operationId: 'pub-b', ...ALICE, runId: 'run-b', workspacePath: runB, baseRevision });
+
+    expect(pubB.status).toBe('conflict');
+    // Ветка рана B опубликована до merge — версия B доступна и не потеряна.
+    const branchCommit = remoteRef(h.admin, `${OWNER}/profile-alice`, 'refs/heads/agent-run/run-b');
+    expect(branchCommit).toBe(pubB.candidateCommit);
+    const branchTree = remoteTree(h.admin, `${OWNER}/profile-alice`, 'agent-run/run-b');
+    expect(branchTree['notes/shared.md']).toBe('line1\nfrom B\nline3\n');
+  });
+
+  it('sync publish без рана получает отдельную ветку, а не основную', async () => {
+    const h = harness();
+    await ensureProfile(h, ALICE);
+    const a = runWorkspace({ 'notes/a.md': 'sync\n' });
+    const sync = await h.service.syncProfileWorkspace({ operationId: 'sync-1', ...ALICE, direction: 'publish', workspacePath: a, baseRevision: EMPTY_TREE });
+    expect(sync.status).toBe('published');
+    const publication = h.journal.findPublicationByOperation('sync-1');
+    expect(publication?.branch).toMatch(/^profile-sync\//);
+    expect(remoteRef(h.admin, `${OWNER}/profile-alice`, `refs/heads/${publication?.branch}`)).toBeTruthy();
+  });
+
+  it('строит URL-ы ветки и merge, не зная внутренностей', async () => {
+    const { runBranchName, branchUrl, mergeUrl, artifactUrl, syncBranchName } = await import('../src/workspace/branches.js');
+    expect(runBranchName('run-1')).toBe('agent-run/run-1');
+    expect(syncBranchName('wspub-1')).toBe('profile-sync/wspub-1');
+    expect(branchUrl('o/p', 'agent-run/run-1')).toBe('https://github.com/o/p/tree/agent-run/run-1');
+    expect(mergeUrl('o/p', 'agent-run/run-1', 'main')).toBe('https://github.com/o/p/compare/main...agent-run/run-1');
+    expect(mergeUrl('o/p', 'agent-run/run-1', null)).toBe('https://github.com/o/p/tree/agent-run/run-1');
+    expect(artifactUrl('o/p', 'abc123', 'report.md')).toBe('https://github.com/o/p/blob/abc123/report.md');
+    expect(() => runBranchName('bad/../id')).toThrowError(/cannot be a git branch segment/);
+  });
+});
