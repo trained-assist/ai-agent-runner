@@ -18,7 +18,7 @@ import { PreflightError } from '../src/contracts/validate.js';
 import { validateRunResult } from '../src/contracts/result.js';
 import { validateRunnerEvent } from '../src/contracts/events.js';
 import { adapterFor, startMockWorker } from './external-worker-harness.js';
-import { makeRunSpec } from './helpers.js';
+import { makeRunSpec } from './run-spec-fixture.js';
 
 const TIMES = { startedAt: '2026-10-04T10:00:00.000Z', finishedAt: '2026-10-04T10:00:45.000Z' };
 

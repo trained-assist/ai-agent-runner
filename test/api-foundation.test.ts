@@ -18,7 +18,7 @@ import {
 } from '../src/api/contracts.js';
 import { StatelessStore, isTerminalApiState, type AdmissionRecord } from '../src/api/stateless-store.js';
 import { ApiError } from '../src/api/errors.js';
-import { makeRunSpec } from './helpers.js';
+import { makeRunSpec } from './run-spec-fixture.js';
 
 function tempDir(): string {
   return mkdtempSync(join(tmpdir(), 'ai-agent-runner-api-'));

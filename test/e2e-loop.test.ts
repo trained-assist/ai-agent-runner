@@ -142,32 +142,34 @@ describe('e2e: serverless API поверх внешнего воркера (#74)
     expect(h.service.store.counts().events).toBeGreaterThan(0);
   }, 30000);
 
-  it('статически: обслуживающий путь API ничего не пишет на диск и не спавнит процессы', () => {
-    // Критерий приёмки «API не пишет на диск» проверяется по коду, а не по каталогу: иначе
-    // проверка зависела бы от того, что в tmpdir не пишет кто-то ещё. Чтение конфига
-    // (реестр ключей) допустимо — запрещены запись и порождение процессов.
-    const sources = ['src/api', 'src/adapters/external-worker-adapter.ts', 'src/redact.ts'];
+  it('статически: во всём пакете нет ни записи на диск, ни порождения процессов', () => {
+    // Критерий приёмки «API не пишет на диск» и «API не запускает процессы» проверяется по
+    // коду всего пакета, а не по каталогу в tmp: иначе проверка зависела бы от того, что
+    // туда не пишет кто-то ещё. После удаления runner/isolation/storage в `src/` не осталось
+    // ничего, кроме контрактов, API и адаптера воркера — поэтому проверка покрывает всё.
+    //
+    // Чтение файла конфигурации (реестр ключей) допустимо: это не состояние. Запись —
+    // запрещена.
     const files: string[] = [];
     const walk = (target: string): void => {
-      if (!existsSync(target)) return;
       const stat = statSync(target);
       if (stat.isDirectory()) for (const entry of readdirSync(target)) walk(resolve(target, entry));
       else if (target.endsWith('.ts')) files.push(target);
     };
-    for (const source of sources) walk(resolve(repoRoot, source));
+    walk(resolve(repoRoot, 'src'));
 
     // Имена ловим как вызовы (`spawn(`), а не как слова: упоминание в комментарии запретом не является.
-    const forbidden: RegExp[] = [
-      /node:child_process/,
-      /['"]child_process['"]/,
-      /\b(?:writeFileSync|appendFileSync|mkdirSync|rmSync|renameSync|unlinkSync|copyFileSync|chmodSync|createWriteStream)\s*\(/,
-      /\b(?:spawn|spawnSync|execFile|execSync|fork)\s*\(/,
+    const forbidden: Array<[RegExp, string]> = [
+      [/node:child_process/, 'порождение процессов'],
+      [/'child_process'/, 'порождение процессов'],
+      [/\b(?:spawn|spawnSync|execFile|execSync|fork)\s*\(/, 'порождение процессов'],
+      [/\b(?:writeFileSync|appendFileSync|mkdirSync|mkdtempSync|rmSync|renameSync|unlinkSync|copyFileSync|chmodSync|createWriteStream|openSync)\s*\(/, 'запись на диск'],
     ];
     const offenders: string[] = [];
     for (const file of files) {
       const text = readFileSync(file, 'utf8');
-      for (const pattern of forbidden) {
-        if (pattern.test(text)) offenders.push(`${file} → ${pattern}`);
+      for (const [pattern, why] of forbidden) {
+        if (pattern.test(text)) offenders.push(`${file.replace(repoRoot + '/', '')} — ${why}`);
       }
     }
     expect(offenders).toEqual([]);
@@ -178,7 +180,7 @@ describe('e2e: serverless API поверх внешнего воркера (#74)
       .filter((file) => /from 'node:fs'/.test(readFileSync(file, 'utf8')))
       .map((file) => file.replace(repoRoot + '/', ''))
       .sort();
-        // Все три читают один и тот же файл конфигурации — реестр ключей. Это не состояние рана.
+    // `src/api/config.ts` тоже читает реестр ключей — конфигурацию, а не состояние рана.
     expect(touchingFs).toEqual(['src/api/auth.ts', 'src/api/config.ts', 'src/api/main.ts']);
   });
 

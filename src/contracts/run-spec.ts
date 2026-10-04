@@ -12,11 +12,40 @@ import {
   isUtcTimestamp,
   type ValidationResult,
 } from './validate.js';
-import { isSafeRelativePath } from '../storage/local-paths.js';
-import { isRegionId } from '../release/placement.js';
-import { isIsolationMode, type IsolationMode } from '../isolation/contract.js';
 
 export const RUN_SPEC_CONTRACT_VERSION = 1 as const;
+
+/**
+ * Граница рана. Объявлена здесь, а не в модуле изоляции: изоляцию обеспечивает внешний
+ * воркер на своей машине (issue #73, требование 6), а наш API только передаёт требование
+ * клиента воркеру и валидирует само значение.
+ */
+export type IsolationMode = 'per_run_unix_identity' | 'none';
+
+export const ISOLATION_MODES: readonly IsolationMode[] = ['per_run_unix_identity', 'none'];
+
+export function isIsolationMode(value: unknown): value is IsolationMode {
+  return typeof value === 'string' && (ISOLATION_MODES as readonly string[]).includes(value);
+}
+
+/** Идентификатор региона для ограничений размещения: `sandbox-ru`, `eu-west-1`, `none`. */
+export function isRegionId(value: unknown): value is string {
+  return typeof value === 'string' && /^[a-z0-9][a-z0-9-]{0,49}$/.test(value);
+}
+
+/**
+ * Относительный путь внутри рабочего каталога рана: без корня, без `..`, без управляющих
+ * символов. Раньше жил в модуле хранилища, но контракт `RunSpec` не должен зависеть от
+ * того, хранит ли API байты: путь проверяется на входе и уходит воркеру как есть.
+ */
+export function isSafeRelativePath(value: unknown): value is string {
+  if (typeof value !== 'string' || value.length === 0 || value.length > 512) return false;
+  if (/[\u0000-\u001f]/.test(value)) return false;
+  if (value.startsWith('/') || value.startsWith('~')) return false;
+  if (value.includes('\\')) return false;
+  const segments = value.split('/');
+  return !segments.some((segment) => segment === '' || segment === '.' || segment === '..');
+}
 
 export interface EngineModelSettings {
   model?: string;

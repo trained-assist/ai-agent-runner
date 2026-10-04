@@ -3,14 +3,14 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Agent Runner \u2014 lifecycle of ai-agent-job runs (RunSpec, engine adapters, scoped events, fault injection) plus external Serverless Agent API (admission/result, idempotent receipts, replayable events) for a single VM",
+  "description": "Serverless Agent API: stateless orchestrator that launches agent runs through an external worker (contracts + HTTP API + worker adapter)",
   "license": "UNLICENSED",
   "engines": {
     "node": ">=20"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "build": "tsc -p tsconfig.build.json && node scripts/copy-mcp-fixtures.mjs && node scripts/copy-isolation-probe.mjs",
+    "build": "tsc -p tsconfig.build.json",
     "start": "node dist/api/main.js",
     "test": "vitest run",
     "test:watch": "vitest"
@@ -20,7 +20,5 @@
     "typescript": "^5.6.3",
     "vitest": "^2.1.9"
   },
-  "dependencies": {
-    "@google-cloud/storage": "^7.22.0"
-  }
+  "dependencies": {}
 }
