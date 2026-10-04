@@ -23,7 +23,11 @@ describe('http auth, scopes and structured refusals', () => {
     expect(health.status).toBe(200);
     expect(await health.json()).toMatchObject({
       status: 'ok',
+<<<<<<< HEAD
       workers: [{ engine: 'github-actions-agent-run' }],
+=======
+      workers: [{ engine: 'azure-dynamic-ip-agent-run' }],
+>>>>>>> 4998441 (rename(worker): основной движок — azure-dynamic-ip-agent-run)
     });
 
     const noAuth = await fetch(`${h.base}/v1/runs/run_x/status`);

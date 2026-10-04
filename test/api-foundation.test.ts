@@ -25,7 +25,11 @@ function tempDir(): string {
 }
 
 describe('api key registry', () => {
+<<<<<<< HEAD
   const principal: Principal = { principalId: 'p-alpha', profileId: 'profile-a', scopes: ['runs:read', 'runs:write'], engines: ['github-actions-agent-run'] };
+=======
+  const principal: Principal = { principalId: 'p-alpha', profileId: 'profile-a', scopes: ['runs:read', 'runs:write'], engines: ['azure-dynamic-ip-agent-run'] };
+>>>>>>> 4998441 (rename(worker): основной движок — azure-dynamic-ip-agent-run)
 
   it('generates keys that are never the plaintext stored in records', () => {
     const key = generateApiKey();
@@ -42,7 +46,11 @@ describe('api key registry', () => {
     const registry = KeyRegistry.fromRecords([keyRecordFor(key, principal), keyRecordFor(generateApiKey(), { principalId: 'p-beta', profileId: 'profile-b', scopes: ['runs:read'] })]);
 
     const found = registry.authenticate(`Bearer ${key}`);
+<<<<<<< HEAD
     expect(found).toMatchObject({ principalId: 'p-alpha', profileId: 'profile-a', scopes: ['runs:read', 'runs:write'], engines: ['github-actions-agent-run'] });
+=======
+    expect(found).toMatchObject({ principalId: 'p-alpha', profileId: 'profile-a', scopes: ['runs:read', 'runs:write'], engines: ['azure-dynamic-ip-agent-run'] });
+>>>>>>> 4998441 (rename(worker): основной движок — azure-dynamic-ip-agent-run)
     found!.scopes.push('runs:read');
     const again = registry.authenticate(`Bearer ${key}`);
     expect(again!.scopes).toEqual(['runs:read', 'runs:write']);

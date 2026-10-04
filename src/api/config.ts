@@ -17,7 +17,7 @@ export const DEFAULT_API_PORT = 8787;
 export const DEFAULT_API_HOST = '0.0.0.0';
 
 export interface WorkerConfig {
-  /** Имя движка, которым этот воркер отвечает: `github-actions-agent-run`, … */
+  /** Имя движка, которым этот воркер отвечает: `azure-dynamic-ip-agent-run`, `eu-vm-agent-run`, … */
   engine: string;
   baseUrl: string;
   token: string;
