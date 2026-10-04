@@ -47,6 +47,26 @@ export function buildSnapshotView(snapshot: WorkspaceSnapshot): SnapshotView {
   };
 }
 
+/**
+ * Снимок в руках его рана и его principal'а. Общая проверка для действий по снимку:
+ * раньше `commit`/`abandon` брали `snapshotId` как есть, и чужой principal мог выпустить
+ * в мир снимок с чужими указателями на байты.
+ */
+function requireOwnedSnapshot(
+  snapshots: WorkspaceSnapshotStore,
+  principal: Principal,
+  runId: string,
+  snapshotId: string,
+): WorkspaceSnapshot {
+  const snapshot = snapshots.get(snapshotId);
+  if (!snapshot) throw new ApiError('NOT_FOUND', `snapshot ${snapshotId} not found`);
+  if (snapshot.runId !== runId) throw new ApiError('FORBIDDEN', `snapshot ${snapshotId} does not belong to run ${runId}`);
+  if (snapshot.profileId !== principal.profileId) {
+    throw new ApiError('FORBIDDEN', `snapshot ${snapshotId} belongs to a different principal`);
+  }
+  return snapshot;
+}
+
 export async function handleSnapshotAction(
   deps: SnapshotRouteDeps,
   principal: Principal,
@@ -74,13 +94,17 @@ export async function handleSnapshotAction(
       case 'commit': {
         const snapshotId = readString(body, 'snapshotId', 100);
         if (!snapshotId) throw new ApiError('INVALID_REQUEST', 'snapshotId is required');
-        const committed = deps.snapshots.commit(snapshotId);
+        // Снимок коммитится только его раном и его владельцем: иначе чужой principal мог бы
+        // выпустить в мир указатель на данные, которые сам не проверял.
+        const snapshot = requireOwnedSnapshot(deps.snapshots, principal, runId, snapshotId);
+        const committed = deps.snapshots.commit(snapshot.snapshotId);
         return { status: 200, view: buildSnapshotView(committed) };
       }
       case 'abandon': {
         const snapshotId = readString(body, 'snapshotId', 100);
         if (!snapshotId) throw new ApiError('INVALID_REQUEST', 'snapshotId is required');
-        const abandoned = deps.snapshots.abandon(snapshotId);
+        const snapshot = requireOwnedSnapshot(deps.snapshots, principal, runId, snapshotId);
+        const abandoned = deps.snapshots.abandon(snapshot.snapshotId);
         return { status: 200, view: buildSnapshotView(abandoned) };
       }
       default:
@@ -105,10 +129,7 @@ export async function handleSnapshotFileAction(
   body: unknown,
 ): Promise<{ status: number; view: SnapshotView }> {
   deps.service.status(principal, runId);
-  const snapshot = deps.snapshots.get(snapshotId);
-  if (!snapshot) throw new ApiError('NOT_FOUND', `snapshot ${snapshotId} not found`);
-  if (snapshot.runId !== runId) throw new ApiError('FORBIDDEN', `snapshot ${snapshotId} does not belong to run ${runId}`);
-  if (snapshot.profileId !== principal.profileId) throw new ApiError('FORBIDDEN', `snapshot ${snapshotId} belongs to a different principal`);
+  const snapshot = requireOwnedSnapshot(deps.snapshots, principal, runId, snapshotId);
 
   if (method === 'POST') {
     const action = readString(body, 'action', 50);

@@ -384,6 +384,14 @@ describe('materialize over the HTTP chain', () => {
     });
     expect(asForeign.status).toBe(404);
 
+    // Снимок коммитится только СВОИМ раном: через чужой ран (того же principal'а) — отказ.
+    const carrierRunId = await submitRun(api, alphaKey, 'mat-carrier', submitBody({}));
+    const foreignRunCommit = await postJson(api, alphaKey, `/v1/runs/${carrierRunId}/snapshot`, {
+      action: 'commit',
+      snapshotId,
+    });
+    expect(foreignRunCommit.status).toBe(403);
+
     const linked = await postJson(api, alphaKey, `/v1/runs/${firstRunId}/snapshot-file/${snapshotId}`, {
       action: 'link',
       path: 'ran.txt',
