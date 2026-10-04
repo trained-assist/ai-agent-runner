@@ -810,6 +810,27 @@ describe('workspace hygiene', () => {
     expect(again.headRevision).toBeTruthy();
   });
 
+  it('reads verified bytes for the materializer by path, and refuses forbidden paths', async () => {
+    const h = harness({ policyTextMaxBytes: 1024 });
+    await ensureProfile(h, ALICE);
+    const a = runWorkspace({ 'notes/a.md': 'text\n', 'media/blob.bin': Buffer.alloc(2048, 4), 'auth.json': 'secret' });
+    const publication = await h.service.publishRunChanges({
+      operationId: 'pub-a',
+      ...ALICE,
+      runId: 'run-a',
+      workspacePath: a,
+      baseRevision: EMPTY_TREE,
+    });
+    const revision = publication.committedRevision as string;
+
+    expect((await h.service.readProfileBlob({ ...ALICE, revision, path: 'notes/a.md' })).toString('utf8')).toBe('text\n');
+    const heavy = await h.service.readProfileBlob({ ...ALICE, revision, path: 'media/blob.bin' });
+    expect(heavy.length).toBe(2048);
+    await expect(h.service.readProfileBlob({ ...ALICE, revision, path: 'auth.json' })).rejects.toMatchObject({ code: 'WORKSPACE_PATH_DENIED' });
+    await expect(h.service.readProfileBlob({ ...ALICE, revision, path: '../escape.md' })).rejects.toMatchObject({ code: 'WORKSPACE_PATH_DENIED' });
+    await expect(h.service.readProfileBlob({ ...ALICE, revision, path: 'notes/missing.md' })).rejects.toMatchObject({ code: 'WORKSPACE_NOT_FOUND' });
+  });
+
   it('reads a nested path tree without losing its structure', async () => {
     const h = harness();
     await ensureProfile(h, ALICE);

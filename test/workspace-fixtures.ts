@@ -15,6 +15,7 @@ import { sha256Hex } from '../src/storage/blob-store.js';
 import type { ProfileRepositoryBinding } from '../src/workspace/contract.js';
 import { MemoryWorkspaceJournal } from '../src/workspace/journal.js';
 import { createLocalGitPort } from '../src/workspace/git/local-git.js';
+import { DEFAULT_EXPORT_POLICY } from '../src/workspace/policy.js';
 import { WorkspaceService, type WorkspaceServiceDeps } from '../src/workspace/service.js';
 import type {
   BindingStorePort,
@@ -73,6 +74,8 @@ export class FakeRepositoryAdmin implements RepositoryAdminPort {
   readonly publicRepos = new Set<string>();
   readonly failFor = new Set<string>();
   created = 0;
+  /** Репозитории, созданные этой админкой: только их `created` истинно. */
+  private readonly owned = new Set<string>();
 
   constructor(rootDir: string) {
     this.rootDir = rootDir;
@@ -89,15 +92,23 @@ export class FakeRepositoryAdmin implements RepositoryAdminPort {
     const fullName = `${input.owner}/${input.name}`;
     if (this.failFor.has(fullName)) throw new Error(`injected admin failure for ${fullName}`);
     const dir = join(this.rootDir, `${input.owner}--${input.name}.git`);
+    let created = false;
     if (!existsFile(dir)) {
       mkdirSync(dir, { recursive: true });
       execFileSync('git', ['init', '-q', '--bare', dir]);
+      // Ветка по умолчанию — main (а не master): иначе clone такого репозитория
+      // выглядит пустым, и приёмка получала бы пустые деревья вместо данных профиля.
+      execFileSync('git', ['--git-dir', dir, 'symbolic-ref', 'HEAD', 'refs/heads/main']);
       this.created += 1;
+      created = true;
     }
+    this.owned.add(fullName);
     return {
       fullName,
       url: `file://${dir}`,
-      created: false,
+      // `created` означает «создан этим вызовом»: им пользуется ensure, чтобы отличить
+      // свой пустой репозиторий от чужого существующего (его нужно проверить маркером).
+      created: created || !this.owned.has(fullName) ? created : false,
       private: !this.publicRepos.has(fullName),
     };
   }
@@ -117,6 +128,18 @@ function existsFile(path: string): boolean {
   }
 }
 
+/** Дерево из локального зеркала модуля: так читаются кандидаты ранов, которых нет в remote. */
+export async function mirrorTree(h: Harness, bindingId: string, revision: string): Promise<Record<string, string>> {
+  const binding = await h.bindings.get(bindingId);
+  if (!binding) throw new Error(`no binding ${bindingId}`);
+  const mirror = await h.git.ensureMirror(binding, {});
+  const out: Record<string, string> = {};
+  for (const entry of await h.git.listTree(mirror, revision)) {
+    out[entry.path] = (await h.git.readBlob(mirror, entry.oid)).toString('utf8');
+  }
+  return out;
+}
+
 /** Прямая публикация в «remote» мимо сервиса: имитация другого писателя профиля. */
 export function commitToRemote(
   admin: FakeRepositoryAdmin,
@@ -128,6 +151,7 @@ export function commitToRemote(
   if (!existsFile(dir)) {
     mkdirSync(dir, { recursive: true });
     execFileSync('git', ['init', '-q', '--bare', dir]);
+    execFileSync('git', ['--git-dir', dir, 'symbolic-ref', 'HEAD', 'refs/heads/main']);
   }
   const work = tempDir('workspace-remote-');
   execFileSync('git', ['clone', '-q', dir, work]);
@@ -145,6 +169,13 @@ export function commitToRemote(
 export function remoteTree(admin: FakeRepositoryAdmin, fullName: string, revision = 'main'): Record<string, string> {
   const dir = admin.pathOf(fullName);
   const out: Record<string, string> = {};
+  // Отсутствующая ветка — пустое состояние, а не падение фикстуры: так проверяется, что
+  // публикация действительно не дошла до remote.
+  try {
+    execFileSync('git', ['--git-dir', dir, 'rev-parse', '--verify', '--quiet', revision], { stdio: ['ignore', 'ignore', 'ignore'] });
+  } catch {
+    return out;
+  }
   const raw = execFileSync('git', ['--git-dir', dir, 'ls-tree', '-r', revision]).toString('utf8');
   for (const line of raw.split('\n').filter(Boolean)) {
     const meta = line.split('\t')[0] ?? '';
@@ -273,7 +304,9 @@ export function harness(options: { interception?: GitInterception; mergeAttempts
   const mirrorDir = join(root, 'mirrors');
   mkdirSync(stateDir, { recursive: true });
   mkdirSync(mirrorDir, { recursive: true });
-  const base = createLocalGitPort({ rootDir: mirrorDir });
+  // Резолвер credential'а в приёмке всегда есть: «remote» — file:// и токен не используется,
+  // но наличие резолвера проверяет, что интегратор не забудет его подключить.
+  const base = createLocalGitPort({ rootDir: mirrorDir, resolveCredential: async () => 'test-token' });
   const git = interceptGit(base, options.interception ?? {});
   const admin = new FakeRepositoryAdmin(join(root, 'remote'));
   const objects = new MemoryObjects();
@@ -287,15 +320,16 @@ export function harness(options: { interception?: GitInterception; mergeAttempts
     journal,
     ...(options.mergeAttempts !== undefined ? { mergeAttempts: options.mergeAttempts } : {}),
     ...(options.resolutionAttempts !== undefined ? { resolutionAttempts: options.resolutionAttempts } : {}),
+    // Порог «тяжёлого» файла меняется без потери правил исключения: иначе тест на
+    // тяжёлые артефакты тихо публиковал бы credential'ы.
     ...(options.policyTextMaxBytes !== undefined
       ? {
           policy: {
+            ...DEFAULT_EXPORT_POLICY,
             policyId: 'test-policy',
-            version: 1,
             textMaxBytes: options.policyTextMaxBytes,
             maxFiles: 500,
             maxTotalBytes: 32 * 1024 * 1024,
-            rules: [],
           },
         }
       : {}),

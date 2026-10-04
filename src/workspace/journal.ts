@@ -179,15 +179,19 @@ export class WorkspaceJournal implements WorkspaceJournalPort {
           { detail: { operationId: input.operationId, recordedMethod: existing.method, requestedMethod: input.method } },
         );
       }
-      if (existing.status === 'failed') {
-        // Неизвестный исход и отказ — разные вещи: повтор отказа должен быть возможен
-        // (с тем же payload), повтор неизвестного исхода — не новая операция.
-        throw new WorkspaceError('WORKSPACE_OPERATION_CONFLICT', `operation ${input.operationId} previously failed: ${existing.error?.message ?? 'unknown error'}`, {
-          detail: { operationId: input.operationId, code: existing.error?.code ?? null },
-        });
-      }
+      // Отказ — не результат: тот же operationId с тем же payload повторяется после
+      // починки причины (например, после восстановления object storage). Защищён от
+      // повтора только completed-результат, у которого есть что вернуть.
+      if (existing.status === 'failed') return this.executeAndRecord(input, hash);
       return { replayed: true, result: existing.result as T };
     }
+    return this.executeAndRecord(input, hash);
+  }
+
+  private async executeAndRecord<T>(
+    input: { operationId: string; method: string; payload: unknown; execute: () => Promise<T> },
+    hash: string,
+  ): Promise<{ replayed: boolean; result: T }> {
     try {
       const result = await input.execute();
       const record: WorkspaceOperationRecord = {
@@ -203,8 +207,8 @@ export class WorkspaceJournal implements WorkspaceJournalPort {
       this.persist();
       return { replayed: false, result };
     } catch (err) {
-      // Отказ фиксируется, но помечается failed: тот же operationId можно повторить после
-      // починки причины, тогда как completed-результат не переигрывается никогда.
+      // Отказ фиксируется как failed: тот же operationId с тем же payload можно повторить
+      // после починки причины, тогда как completed-результат не переигрывается никогда.
       const record: WorkspaceOperationRecord = {
         operationId: input.operationId,
         method: input.method,
@@ -396,10 +400,17 @@ export class MemoryWorkspaceJournal implements WorkspaceJournalPort {
         throw new WorkspaceError('WORKSPACE_OPERATION_CONFLICT', `operation ${input.operationId} was already executed with a different payload`);
       }
       if (existing.status === 'failed') {
-        throw new WorkspaceError('WORKSPACE_OPERATION_CONFLICT', `operation ${input.operationId} previously failed: ${existing.error?.message ?? 'unknown error'}`);
+        return this.executeAndRecord(input, hash);
       }
       return { replayed: true, result: existing.result as T };
     }
+    return this.executeAndRecord(input, hash);
+  }
+
+  private async executeAndRecord<T>(
+    input: { operationId: string; method: string; payload: unknown; execute: () => Promise<T> },
+    hash: string,
+  ): Promise<{ replayed: boolean; result: T }> {
     try {
       const result = await input.execute();
       this.state.operations[input.operationId] = {

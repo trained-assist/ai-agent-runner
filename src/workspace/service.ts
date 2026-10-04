@@ -23,7 +23,7 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { sha256Hex } from '../storage/blob-store.js';
 import { mimeForName } from '../storage/export-manifest.js';
-import { resolveInsideRoot } from '../storage/local-paths.js';
+import { isSafeRelativePath, resolveInsideRoot } from '../storage/local-paths.js';
 import {
   ARTIFACT_INDEX_PATH,
   changeSetHash,
@@ -792,6 +792,48 @@ export class WorkspaceService {
       }
     }
     return changes.sort((a, b) => a.path.localeCompare(b.path));
+  }
+
+  // ── чтение байтов для materializer'а ─────────────────────────────────────────
+
+  /**
+   * Байты одного разрешённого пути на конкретной ревизии.
+   *
+   * Существует, чтобы интегратор не писал git-код при подключении materializer'а
+   * (#52/#69): получает манифест, затем по одному пути — verified-байты. Для тяжёлого
+   * объекта читается object storage с проверкой checksum, для текста — blob'а git.
+   * Запрещённый политикой путь и выход за пределы workspace — отказ, а не пустой файл.
+   */
+  async readProfileBlob(input: {
+    tenantId: string;
+    profileId: string;
+    revision: string;
+    path: string;
+    credentialTokenRef?: string;
+  }): Promise<Buffer> {
+    const principal = this.principal(input.tenantId, input.profileId, input.credentialTokenRef);
+    if (!isCommitSha(input.revision) && input.revision !== EMPTY_TREE) {
+      throw new WorkspaceError('WORKSPACE_INVALID', `revision "${input.revision}" is neither a commit sha nor the empty tree`);
+    }
+    if (typeof input.path !== 'string' || !isSafeRelativePath(input.path)) {
+      throw new WorkspaceError('WORKSPACE_PATH_DENIED', `invalid profile path "${String(input.path)}"`);
+    }
+    const decision = matchRule(this.policy, input.path);
+    if (decision.action === 'exclude') {
+      throw new WorkspaceError('WORKSPACE_PATH_DENIED', `path "${input.path}" is excluded from the profile image: ${decision.reason}`);
+    }
+    const binding = await this.requireBinding(principal.tenantId, principal.profileId);
+    const mirror = await this.mirrorFor(binding, principal.credentialTokenRef);
+    const declared = (await this.readArtifactIndex(mirror, input.revision)).get(input.path);
+    if (declared) return this.readArtifactBytes(declared);
+    const entry = toTreeMap(await this.git.listTree(mirror, input.revision)).get(input.path);
+    if (!entry) {
+      throw new WorkspaceError('WORKSPACE_NOT_FOUND', `path "${input.path}" does not exist at revision ${input.revision}`);
+    }
+    if (entry.mode === '120000') {
+      throw new WorkspaceError('WORKSPACE_PATH_DENIED', `path "${input.path}" is a symlink and is never materialized`);
+    }
+    return this.git.readBlob(mirror, entry.oid);
   }
 
   // ── publish_run_changes ──────────────────────────────────────────────────────
