@@ -47,6 +47,23 @@ function exitCode(child: ExitOnce): Promise<number> {
 }
 
 /**
+ * Код выхода ПОСЛЕ полного слива stdio. 'exit' приходит сразу после смерти процесса,
+ * а буферы stdout/stderr могут ещё не быть прочитаны — для быстрых команд (getent
+ * отдаёт 70 байт за ~1 мс) на загруженном event loop это гонка: считыватель видел
+ * пустой `out` и честно объявлял слот «не unix account».
+ *
+ * Ждём события 'close' самого процесса: оно приходит строго после 'exit' И после
+ * закрытия обоих stdio-потоков, поэтому к моменту резолва вывод уже в буферах.
+ * Слушаем именно процесс, а не потоки: у потоков 'close' мог случиться ДО того,
+ * как мы подписались, и тогда промис зависал бы.
+ */
+export function exitCodeAndDrain(child: ExitOnce): Promise<number> {
+  return new Promise((resolve) => {
+    child.once('close', (code) => resolve(code ?? 1));
+  });
+}
+
+/**
  * Реализация границы на Unix-идентичностях хоста.
  *
  * Слот = непривилегированный Unix-пользователь пула (`ta-agent-N`). На время рана слот
@@ -413,7 +430,11 @@ export class UnixCleanRoomProvider implements CleanRoomProvider {
     child.stderr.on('data', (chunk: Buffer) => {
       err += chunk.toString();
     });
-    const code = await exitCode(child);
+    // 'close', а не 'exit': 'exit' приходит, когда процесс умер, а stdio ещё могут быть
+    // не дочитаны. getent отдаёт 70 байт и выходит за ~1 мс, поэтому на  busy event loop
+    // (два рана стартуют одновременно) 'exit' срабатывал до 'data' — out оставался пустым,
+    // и слот честно читался как «не unix account». 'close' ждёт закрытия обоих потоков.
+    const code = await exitCodeAndDrain(child);
     const line = out.split('\n').find((entry) => entry.trim().length > 0) ?? '';
     const parts = line.split(':');
     if (code !== 0 || parts.length < 4) {
