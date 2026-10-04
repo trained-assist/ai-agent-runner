@@ -1,67 +1,93 @@
-# ТЗ: внешний OpenCode-воркер (запуск opencode-рана по запросу нашего API)
+# ТЗ: внешний воркер `dynamic-ip-azure-agent-run`
 
-**Для:** агента в внешнем репозитории, который будет запускать opencode-раны по запросу
-нашего Serverless Agent API и подключаться как опция движка (`engine.name`).
+**Для:** внешней команды (отдельный репозиторий). Воркер запускает opencode-раны по запросу
+нашего API.
 
-**Статус:** черновик для передачи во внешний репозиторий.
+**Имя движка:** `dynamic-ip-azure-agent-run` (Azure VM, динамический IP).
 
 ---
 
-## 1. Цель
+## 1. Где что живёт
 
-Наш API (`ai-agent-runner`, Serverless Agent API) умеет запускать раны через движки
-(`fake`, `opencode`). Нужен **внешний воркер** в отдельном репозитории, который:
+| Компонент | Где | Примечание |
+|---|---|---|
+| **Наш API** (`ai-agent-runner`) | VM, systemd, `169.58.15.230:8787` | НЕ Cloudflare. Cloudflare Worker `trained-assist-control-plane` — это резолвер секретов (токены GitHub), не раннер |
+| **Внешний воркер** (этот ТЗ) | Azure VM, динамический IP | Строит внешняя команда |
+| **Клиент** | Любой, кто дёргает `POST /v1/runs` | Выбирает движок через `engine.name` |
 
-1. Принимает запрос от нашего API (HTTP).
-2. Запускает opencode-ран в своём окружении.
-3. Возвращает результат в формате, который наш API уже умеет принимать.
+## 2. Кто что строит
 
-Воркер подключается как **новая опция движка** — регистрируется в `engines` нашего API,
-клиент выбирает её в `POST /v1/runs` через `engine.name`.
+| Сторона | Строит |
+|---|---|
+| **Внешняя команда** | Воркер: HTTP-эндпоинт, запуск opencode, возврат результата |
+| **Мы (агент в этом репо)** | `DynamicIpAzureAdapter` — адаптер в нашем API, который дёргает воркер |
 
-## 2. Роль в системе
+Направление вызовов: **наш API → воркер**. Воркер не знает про наш API, он просто
+принимает запрос и возвращает результат.
+
+## 3. Как подключаемся
 
 ```
 Клиент
-  │  POST /v1/runs  { engine: { name: "external-opencode", adapterVersion: "1" }, … }
+  │  POST /v1/runs  { "engine": { "name": "dynamic-ip-azure-agent-run", "adapterVersion": "1" }, … }
   ▼
-Наш Serverless Agent API (ai-agent-runner)
-  │  ExternalOpenCodeAdapter.start(ctx)  ← новый адаптер, вызывает воркер по HTTP
-  │  POST {воркер}/v1/launch  { RunSpec }
+Наш API (VM, 169.58.15.230:8787)
+  │  DynamicIpAzureAdapter.start(ctx)
+  │  POST {worker-endpoint}/v1/launch  { LaunchRequest }
   ▼
-Внешний OpenCode-воркер (этот ТЗ)
-  │  spawn opencode, захват stdout/stderr/exit
-  │  POST {воркер}/v1/launch → { LaunchResult }
+Внешний воркер (Azure, динамический IP)
+  │  spawn opencode → захват stdout/stderr/exit
+  │  → { LaunchResult }
   ▼
-Наш API маппит LaunchResult → RunResult + RunnerEvent, дальше обычный lifecycle
+Наш API маппит LaunchResult → RunResult + RunnerEvent → обычный lifecycle
 ```
 
-**Разделение ответственности:**
+**Наш API владеет:** lifecycle, идемпотентность, события, артефакты, persistence,
+cleanup, auth, изоляция.
 
-| Сторона | Ответственность |
-|---|---|
-| Наш API | lifecycle рана, идемпотентность, события (sequence/replay), артефакты, persistence, cleanup, auth, изоляция (per_run_unix_identity) |
-| Внешний воркер | запуск opencode, захват вывода, таймаут, возврат результата |
+**Воркер владеет:** запуск opencode, захват вывода, таймаут, возврат результата.
+Воркер **stateless** — весь контекст приходит в запросе.
 
-Воркер **не** должен знать про наши артефакты, persistence, cleanup и идемпотентность —
-это делает наш API. Воркер отвечает только за «запустил opencode и вернул результат».
+## 4. Динамический IP
 
-## 3. Контракт запроса (наш API → воркер)
+IP воркера меняется. Наш API должен знать текущий эндпоинт. Два варианта (выбрать один):
 
-### 3.1. Эндпоинт
+### Вариант А (рекомендуется): воркер регистрирует эндпоинт
 
 ```
-POST {WORKER_URL}/v1/launch
+POST {наш API}/v1/engines/dynamic-ip-azure-agent-run/endpoint
+{ "url": "https://<new-ip>:8080", "token": "<shared-secret>" }
+```
+
+- Воркер вызывает этот эндпоинт при старте и при смене IP.
+- Наш API хранит последний известный эндпоинт.
+- Если эндпоинт не зарегистрирован — наш API отказывает с `WORKER_UNREACHABLE`.
+
+### Вариант Б: стабильный DNS
+
+- Воркер имеет DNS-имя (например, `worker.example.com`), IP за ним динамический.
+- Наш API резолвит DNS при каждом запуске.
+- Регистрация не нужна.
+
+**ТЗ не привязывается к варианту** — адаптер нашего API принимает эндпоинт из конфига
+(`DYNAMIC_IP_AZURE_URL`), а как он обновляется — решает внешняя команда.
+
+## 5. Контракт запроса (наш API → воркер)
+
+### 5.1. Эндпоинт
+
+```
+POST {worker-endpoint}/v1/launch
 Content-Type: application/json
-Authorization: Bearer {WORKER_TOKEN}     ← общий секрет, выдаётся нашему API
+Authorization: Bearer {WORKER_TOKEN}
 ```
 
-### 3.2. Тело запроса — `LaunchRequest`
+### 5.2. Тело — `LaunchRequest`
 
 ```jsonc
 {
-  // === Идентификация рана (наш API генерирует, воркер не валидирует) ===
-  "runId": "run_0fdd061d-14c3-42ea-b182-9393ff3564fa",
+  // Идентификация рана (наш API генерирует)
+  "runId": "run_0fdd061d-…",
   "jobId": "job-…",
   "userTaskId": "task_…",
   "profileId": "profile-…",
@@ -69,260 +95,164 @@ Authorization: Bearer {WORKER_TOKEN}     ← общий секрет, выдаё
   "operationId": "op-…",
   "ownerGeneration": 1,
 
-  // === Движок ===
+  // Движок
   "engine": {
-    "name": "external-opencode",
+    "name": "dynamic-ip-azure-agent-run",
     "adapterVersion": "1",
-    "modelSettings": { "model": "free", "temperature": 0.2 }
+    "modelSettings": { "model": "free" }
   },
 
-  // === Вход ===
+  // Вход (всегда непусто)
   "input": {
-    "inlinePrompt": "Сделай задачу …"    // всегда непусто (наш API гарантирует)
+    "inlinePrompt": "Сделай задачу …"
   },
 
-  // === Окружение запуска ===
-  "cwd": "/abs/path/to/workspace",        // абсолютный путь, куда воркер клонировал репозиторий
-  "envAllowlist": ["PATH", "HOME", "NODE_ENV"],  // только эти имена попадают в env процесса
-  "env": {                                // значения для envAllowlist (наш API собирает)
+  // Окружение запуска
+  "cwd": "/abs/path/to/workspace",           // репозиторий уже склонирован нашим API
+  "envAllowlist": ["PATH", "HOME", "NODE_ENV"],
+  "env": {                                   // значения для envAllowlist
     "PATH": "/usr/local/bin:/usr/bin:/bin",
     "HOME": "/home/runner"
   },
 
-  // === Лимиты ===
+  // Лимиты
   "limits": {
-    "timeoutMs": 300000,                  // воркер обязан убить процесс по истечении
-    "maxOutputBytes": 1048576,            //  cap на суммарный stdout+stderr
+    "timeoutMs": 300000,                     // воркер обязан убить процесс по истечении
+    "maxOutputBytes": 1048576,              // cap на stdout+stderr
     "maxLogBytes": 1048576
   },
 
-  // === Репозиторий (уже склонирован нашим API, воркер НЕ клонирует) ===
-  "repository": {
-    "fullName": "owner/name"
-    // token сюда не приходит — клонирование делает наш API
-  },
+  // Репозиторий (уже склонирован, воркер НЕ клонирует)
+  "repository": { "fullName": "owner/name" },
 
-  // === Изоляция (наш API решает, воркер исполняет) ===
+  // Изоляция
   "isolation": { "mode": "per_run_unix_identity" },
 
-  // === Объявленные выходы (наш API заберёт после завершения) ===
+  // Объявленные выходы (наш API заберёт после завершения)
   "outputs": [
     { "path": "report.md", "name": "report.md", "mime": "text/markdown" }
-  ],
-
-  // === Манифест агента (опционально, ищется в cwd после выхода) ===
-  // .agent/final-manifest.json — наш API читает сам, воркер не обязан
+  ]
 }
 ```
 
-### 3.3. Обязательные поля запроса
+**Обязательные поля:** `runId`, `input.inlinePrompt`, `cwd`, `envAllowlist`,
+`limits.timeoutMs`. Остальные опциональны, но если присутствуют — воркер обязан учесть.
 
-`runId`, `input.inlinePrompt`, `cwd`, `envAllowlist`, `limits.timeoutMs` — всегда присутствуют.
-Остальные — опциональны, но если присутствуют, воркер обязан их учесть.
+## 6. Контракт ответа (воркер → наш API)
 
-## 4. Контракт ответа (воркер → наш API)
-
-### 4.1. Успешный запуск (HTTP 200)
+### 6.1. Успех (HTTP 200)
 
 ```jsonc
 {
-  "runId": "run_0fdd061d-…",              // эхо запроса
-  "status": "started",                    // started | failed
-  "pid": 12345,                           // pid процесса opencode (для отладки)
+  "runId": "run_0fdd061d-…",                 // эхо
+  "status": "started",                       // started | failed
+  "pid": 12345,
 
-  // === Заполняется при status="started", обновляется по мере выполнения ===
-  // Воркер может возвращать промежуточные результаты через отдельный эндпоинт
-  // (см. §4.3) или только финальный — тогда поля ниже заполняются в /v1/result.
-
-  // === Финальный результат (заполняется всегда, даже при failed) ===
-  "exitCode": 0,                          // number | null (null если убит по сигналу/таймауту)
-  "exitSignal": null,                     // string | null
-  "exitReason": "completed",               // см. §4.4
-  "stdout": "…",                          // полный stdout (обрезан до maxOutputBytes)
-  "stderr": "…",                          // полный stderr (обрезан до maxOutputBytes)
-  "answer": "…",                          // текст ответа агента (если удалось извлечь)
-  "answerSource": "engine_stdout",        // engine_stdout | agent_file | null
-  "durationMs": 45230,                    // фактическая длительность рана
-  "timedOut": false,                      // true если убит по limits.timeoutMs
-  "killedByTimeout": false
+  // Финальный результат (заполняется всегда)
+  "exitCode": 0,                             // number | null
+  "exitSignal": null,                        // string | null
+  "exitReason": "completed",                  // см. таблицу ниже
+  "stdout": "…",                             // обрезан до maxOutputBytes
+  "stderr": "…",
+  "answer": "…",                             // текст ответа агента (если извлёк)
+  "answerSource": "engine_stdout",           // engine_stdout | agent_file | null
+  "durationMs": 45230,
+  "timedOut": false,
+  "outputTruncated": false
 }
 ```
 
-### 4.2. Немедленный отказ (HTTP 4xx/5xx, процесс не запускался)
+### 6.2. Немедленный отказ (процесс не запускался)
 
 ```jsonc
 {
   "runId": "run_0fdd061d-…",
   "status": "failed",
-  "exitReason": "startup_failure",        // startup_failure | preflight_refused
+  "exitReason": "startup_failure",
   "failure": {
-    "code": "OPENCODE_BINARY_MISSING",     // машиночитаемый код
-    "failureClass": "engine",             // preflight | engine | runtime | finalization
-    "safeSummary": "opencode binary not found at /usr/local/bin/opencode",
+    "code": "OPENCODE_BINARY_MISSING",
+    "failureClass": "engine",                // preflight | engine | runtime | finalization
+    "safeSummary": "opencode binary not found",
     "retryable": false
   }
 }
 ```
 
-Коды отказов (воркер выбирает подходящий):
-
-| Код | Когда | retryable |
-|---|---|---|
-| `OPENCODE_BINARY_MISSING` | бинарь opencode не найден | false |
-| `OPENCODE_STARTUP_FAILED` | процесс стартовал, но сразу упал (< 2s) | true |
-| `OPENCODE_TIMEOUT` | убит по `limits.timeoutMs` | true |
-| `OPENCODE_CRASH` | упал с сигналом (не по таймауту) | true |
-| `OPENCODE_OUTPUT_TRUNCATED` | превышен `maxOutputBytes` | false |
-| `WORKER_INTERNAL` | внутренняя ошибка воркера | true |
-
-### 4.3. Потоковые события (опционально, рекомендуется)
-
-Если воркер хочет отдавать события в реальном времени (для `log`-событий нашего API),
-он может зарегистрировать callback при запуске:
-
-```jsonc
-// В LaunchRequest (опциональное поле):
-"callback": {
-  "url": "https://our-api.internal/v1/runs/{runId}/events",  // наш API принимает события
-  "token": "…"                                               // одноразовый токен на ран
-}
-```
-
-Формат события — `RunnerEvent` (schemaVersion 1), как в нашем API. Если callback не
-передан — воркер возвращает только финальный результат, наш API сгенерирует `log`-события
-из `stdout`/`stderr`.
-
-### 4.4. `exitReason` (согласованно с нашим `RunResult`)
+### 6.3. `exitReason`
 
 | exitReason | Когда |
 |---|---|
-| `completed` | процесс завершился с exit code 0 |
-| `nonzero_exit` | процесс завершился с exit code ≠ 0 |
+| `completed` | exit code 0 |
+| `nonzero_exit` | exit code ≠ 0 |
 | `startup_failure` | процесс не смог стартовать |
 | `timeout` | убит по `limits.timeoutMs` |
 | `crash` | убит сигналом (не таймаут) |
-| `cancelled` | наш API запросил отмену (см. §6) |
+| `cancelled` | наш API запросил отмену |
 
-## 5. Требования к запуску opencode
+### 6.4. Коды отказов
 
-### 5.1. Команда
+| Код | Когда | retryable |
+|---|---|---|
+| `OPENCODE_BINARY_MISSING` | бинарь не найден | false |
+| `OPENCODE_STARTUP_FAILED` | стартовал, сразу упал (< 2s) | true |
+| `OPENCODE_TIMEOUT` | убит по таймауту | true |
+| `OPENCODE_CRASH` | убит сигналом | true |
+| `OPENCODE_OUTPUT_TRUNCATED` | превышен `maxOutputBytes` | false |
+| `WORKER_INTERNAL` | внутренняя ошибка воркера | true |
 
-```bash
-opencode run "<prompt>"
-```
+## 7. Требования к воркеру
 
-- Бинарь: `opencode` (ищется в `PATH`, либо явный путь из конфига воркера).
-- Аргументы: `run`, затем `input.inlinePrompt` как один аргумент.
-- Дополнительные флаги (модель и т.д.) — из конфига воркера, не из запроса.
+1. **Команда:** `opencode run "<prompt>"`, `cwd` = `LaunchRequest.cwd`.
+2. **env процесса:** только переменные из `envAllowlist`, значения из `env`. Секреты
+   хоста и токены в процесс не передаются.
+3. **Таймаут:** убить дерево процессов по `limits.timeoutMs` (SIGTERM → через 5s SIGKILL).
+4. **Отмена:** `POST {worker}/v1/runs/{runId}/cancel` → убить дерево, вернуть `cancelled`.
+5. **Изоляция:** если `isolation.mode = "per_run_unix_identity"` — запускать opencode под
+   Unix-идентичностью рана (setpriv/runuser), не под service UID. Если не поддерживаете —
+   отказывайте с `ISOLATION_UNSUPPORTED`, `failureClass: "preflight"`.
+6. **Вывод:** stdout/stderr захватываются, ограничиваются `maxOutputBytes`, при
+   превышении сохраняется хвост + флаг `outputTruncated`.
+7. **Логи:** секреты и токены не логируются в открытом виде.
+8. **Stateless:** повторный запрос с тем же `runId` не ломит состояние.
 
-### 5.2. Окружение процесса
+## 8. Артефакты
 
-- `cwd` = `LaunchRequest.cwd` (абсолютный путь, репозиторий уже склонирован нашим API).
-- `env` = только переменные из `envAllowlist`, значения из `LaunchRequest.env`.
-  Воркер **не** должен передавать свои секреты, токены и переменные хоста в процесс.
-- `detached: true` (новая процессная группа), `stdio: pipe`.
+Воркер **не** загружает артефакты и **не** пишет в storage — это делает наш API.
+Воркер только оставляет файлы в `cwd`. Наш API после завершения прочитает:
+`outputs` (объявленные клиентом), `.agent/final-manifest.json`, `answer.txt`.
 
-### 5.3. Таймаут
-
-- Воркер обязан убить процесс (и его дерево) по истечении `limits.timeoutMs`.
-- Убийство — `SIGTERM`, через 5s — `SIGKILL`.
-- При таймауте: `exitReason: "timeout"`, `timedOut: true`, `killedByTimeout: true`.
-
-### 5.4. Изоляция
-
-- Если `isolation.mode = "per_run_unix_identity"` — воркер запускает opencode под
-  Unix-идентичностью рана (setpriv/runuser), а не под service UID воркера.
-- Воркер обязан поддержать это, если хочет получать запросы с таким режимом.
-- Если воркер не поддерживает изоляцию — он отказывает с `failureClass: "preflight"`,
-  код `ISOLATION_UNSUPPORTED`, наш API не будет отправлять ему такие раны.
-
-### 5.5. Захват вывода
-
-- `stdout` и `stderr` захватываются порционно, суммарно ограничиваются `maxOutputBytes`.
-- При превышении — хвост сохраняется, в ответе флаг `outputTruncated: true`.
-- Вывод **не** должен попадать в логи воркера в открытом виде, если он может содержать
-  секреты (наш API применяет redaction, но воркер не должен логировать построчно).
-
-## 6. Отмена рана
-
-Наш API может запросить отмену:
-
-```
-POST {WORKER_URL}/v1/runs/{runId}/cancel
-Authorization: Bearer {WORKER_TOKEN}
-```
-
-Воркер обязан:
-
-1. Найти процесс по `runId`.
-2. Послать `SIGTERM` дереву процессов, через 5s — `SIGKILL`.
-3. Вернуть `{ "runId": "…", "status": "cancelled" }`.
-
-Если процесс уже завершился — вернуть текущий статус (идемпотентно).
-
-## 7. Артефакты и выходы
-
-- Воркер **не** загружает артефакты и **не** пишет в storage — это делает наш API.
-- Воркер только оставляет файлы в `cwd` (workspace рана).
-- Наш API после завершения прочитает:
-  - `outputs` — объявленные клиентом пути (проверка на выход из workspace).
-  - `.agent/final-manifest.json` — финальный манифест агента (если opencode его создал).
-  - `answer.txt` — текст ответа (из манифеста или хвоста stdout).
-- Воркер может вернуть `answer` и `answerSource` в ответе, чтобы наш API не искал.
-
-## 8. Идемпотентность и состояния
-
-- Воркер не обязан хранить состояние между запросами — наш API хранит `admissions`,
-  `events`, `result`.
-- Повторный `POST /v1/launch` с тем же `runId` — воркер может вернуть текущий статус
-  или отказать с `409 RUN_ALREADY_ACTIVE` (наш API обработает).
-- Воркер должен быть stateless относительно рана: весь контекст приходит в запросе.
-
-## 9. Ограничения и отказы (честно)
-
-- Воркер не знает про наши артефакты, persistence, cleanup, идемпотентность — только
-  запускает и возвращает результат.
-- Воркер не клонирует репозиторий — клонирование делает наш API.
-- Воркер не передаёт токены и секреты в процесс opencode.
-- Воркер обязан убить процесс по таймауту и по отмене.
-- Воркер обязан поддержать `per_run_unix_identity`, если хочет получать изолированные раны.
-
-## 10. Приёмка (чеклист для внешнего агента)
+## 9. Приёмка (чеклист)
 
 - [ ] `POST /v1/launch` принимает `LaunchRequest`, запускает `opencode run "<prompt>"` в `cwd`.
-- [ ] Процесс стартует под идентичностью рана (per_run_unix_identity), не под service UID.
-- [ ] `env` процесса = только `envAllowlist`, без секретов хоста.
-- [ ] Таймаут: процесс убивается по `limits.timeoutMs`, `exitReason: "timeout"`.
+- [ ] env процесса = только `envAllowlist`, без секретов.
+- [ ] Таймаут: процесс убивается, `exitReason: "timeout"`.
 - [ ] Отмена: `POST /v1/runs/{runId}/cancel` убивает дерево, возвращает `cancelled`.
-- [ ] Ответ содержит `exitCode`, `exitReason`, `stdout`, `stderr`, `answer`, `durationMs`.
-- [ ] При отсутствии бинаря — `OPENCODE_BINARY_MISSING`, `retryable: false`.
-- [ ] При превышении `maxOutputBytes` — хвост сохраняется, флаг `outputTruncated`.
-- [ ] Секреты и токены не попадают в логи воркера и в процесс.
-- [ ] Воркер stateless: повторный запрос с тем же `runId` не ломит состояние.
-- [ ] Наш API может зарегистрировать воркер как `engine.name = "external-opencode"` и
-      получить полный цикл submit → events → result → artifacts.
+- [ ] Ответ: `exitCode`, `exitReason`, `stdout`, `stderr`, `answer`, `durationMs`.
+- [ ] Бинарь не найден → `OPENCODE_BINARY_MISSING`, `retryable: false`.
+- [ ] Изоляция `per_run_unix_identity` поддержана (или отказ `ISOLATION_UNSUPPORTED`).
+- [ ] Секреты не в логах и не в процессе.
+- [ ] Эндпоинт регистрируется в нашем API (Вариант А) или есть стабильный DNS (Вариант Б).
+- [ ] Наш API регистрирует движок как `dynamic-ip-azure-agent-run` и получает полный цикл
+      submit → events → result → artifacts.
 
-## 11. Интеграция с нашим API (что делаем мы)
+## 10. Что делаем мы (агент в этом репо)
 
-1. Новый адаптер `ExternalOpenCodeAdapter implements EngineAdapter`:
-   - `name = "external-opencode"`.
-   - `start(ctx)` → `POST {WORKER_URL}/v1/launch` с `LaunchRequest` (маппинг из `RunSpec`).
-   - Потоковые события из воркера → `ctx.onLog`.
-   - Финальный `LaunchResult` → `ctx.onExit` + `RunResult`.
-2. Регистрация в `engines` нашего API: `["fake", "opencode", "external-opencode"]`.
-3. Конфиг воркера: `EXTERNAL_OPENCODE_URL`, `EXTERNAL_OPENCODE_TOKEN` (env).
-4. Тесты: `test/external-opencode-adapter.test.ts` — мок воркера, проверка маппинга.
+1. `DynamicIpAzureAdapter implements EngineAdapter`:
+   - `name = "dynamic-ip-azure-agent-run"`.
+   - `start(ctx)` → `POST {endpoint}/v1/launch` с `LaunchRequest` (маппинг из `RunSpec`).
+   - `LaunchResult` → `ctx.onExit` + `RunResult`.
+2. Эндпоинт воркера приходит из конфига: `DYNAMIC_IP_AZURE_URL`, `DYNAMIC_IP_AZURE_TOKEN`.
+3. Регистрация в `engines`: `["fake", "opencode", "dynamic-ip-azure-agent-run"]`.
+4. Тесты: `test/dynamic-ip-azure-adapter.test.ts` — мок воркера, проверка маппинга.
 
-## 12. Ссылки на контракты (в нашем репозитории)
+## 11. Контракты в нашем репозитории
 
 | Контракт | Файл |
 |---|---|
-| `RunSpec` (contractVersion 1) | `src/contracts/run-spec.ts` |
-| `RunnerEvent` (schemaVersion 1) | `src/contracts/events.ts` |
-| `RunResult` (schemaVersion 1) | `src/contracts/result.ts` |
-| `EngineAdapter` / `EngineStartContext` / `EngineHandle` | `src/adapters/engine/engine-adapter.ts` |
-| Пример адаптера (локальный opencode) | `src/adapters/engine/opencode-adapter.ts` |
-| Приёмка запроса (submit) | `src/api/contracts.ts` |
+| `RunSpec` | `src/contracts/run-spec.ts` |
+| `RunnerEvent` | `src/contracts/events.ts` |
+| `RunResult` | `src/contracts/result.ts` |
+| `EngineAdapter` | `src/adapters/engine/engine-adapter.ts` |
+| Пример адаптера | `src/adapters/engine/opencode-adapter.ts` |
 | Маршруты API | `src/api/server.ts` |
-| Деплой на VM (не CI) | `docs/API-SERVICE.md` |
-| Лимиты CI | `docs/GITHUB-ACTIONS-CAPABILITY.md` |
+| Деплой на VM | `docs/API-SERVICE.md` |
