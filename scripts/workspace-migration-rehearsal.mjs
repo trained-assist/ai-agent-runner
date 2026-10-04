@@ -73,9 +73,18 @@ if (!OWNER || !TOKEN_REF || !TOKEN) {
   process.exit(1);
 }
 
-const { WorkspaceService, WorkspaceJournal, createLocalGitPort, createGitHubRepositoryAdmin, parseCleanList, cleanListRulesOf, compileCleanListRules } = await import(
-  `file://${DIST}/index.js`
-);
+const {
+  WorkspaceService,
+  WorkspaceJournal,
+  createLocalGitPort,
+  createGitHubRepositoryAdmin,
+  parseCleanList,
+  cleanListRulesOf,
+  compileCleanListRules,
+  buildMigrationPolicy,
+  compilePolicy,
+  prepareProfileTree,
+} = await import(`file://${DIST}/index.js`);
 const { createLocalFsBlobStore } = await import(`file://${REPO_ROOT}/dist/storage/local-fs.js`);
 
 const stateDir = options.state ?? mkdtempSync(join(tmpdir(), 'workspace-rehearsal-state-'));

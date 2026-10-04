@@ -341,3 +341,20 @@ describe('migration compression: archives stay out of git, generated dirs stay o
     expect(matchRule(policy, 'projects/app/src/index.js').action).toBe('publish');
   });
 });
+
+describe('M3 archive files are addressed correctly by the migration policy', () => {
+  const policy = compilePolicy(
+    buildMigrationPolicy({
+      policyId: 'migration',
+      compress: true,
+      cleanListRules: compileCleanListRules([{ pattern: '*.md', action: 'KEEP', reason: 'text' }]),
+    }),
+  );
+
+  it('treats a git bundle and an untracked tar as heavy, a patch and a manifest as text', () => {
+    expect(matchRule(policy, '.profile-changes/repo/local.bundle').action).toBe('heavy');
+    expect(matchRule(policy, '.profile-changes/repo/untracked.tar').action).toBe('heavy');
+    expect(matchRule(policy, '.profile-changes/repo/uncommitted.patch').action).toBe('publish');
+    expect(matchRule(policy, '.profile-changes/repo/local.manifest.json').action).toBe('publish');
+  });
+});
