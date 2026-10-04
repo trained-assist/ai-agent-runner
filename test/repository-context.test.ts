@@ -231,7 +231,7 @@ describe('repository context: stateless API (#74)', () => {
 
 
   it('кривой fullName и пустой токен → 400 INVALID_REPOSITORY', () => {
-    const api = new AgentApi({ worker: idleWorker() });
+    const api = new AgentApi({ workers: [idleWorker()] });
     for (const repository of [{ fullName: 'owner' }, { fullName: 'a/b/c' }, { fullName: '../escape' }, { fullName: 'a/b', token: '' }]) {
       let thrown: ApiError | null = null;
       try {
@@ -249,7 +249,7 @@ describe('repository context: stateless API (#74)', () => {
     const worker = await startMockWorker();
     onTestFinished(() => worker.close());
     const logs: Record<string, unknown>[] = [];
-    const api = new AgentApi({ worker: adapterFor(worker), logger: (entry) => logs.push(entry) });
+    const api = new AgentApi({ workers: [adapterFor(worker)], logger: (entry) => logs.push(entry) });
     onTestFinished(() => api.dispose());
 
     const receipt = api.submit(alpha, 'idem-repository-secret', submitBody({ repository: { fullName: 'owner/name', token: SECRET_TOKEN } }));
@@ -271,7 +271,7 @@ describe('repository context: stateless API (#74)', () => {
   });
 
   it('тот же Idempotency-Key с другим токеном = дедуп, а не IDEMPOTENCY_CONFLICT', () => {
-    const api = new AgentApi({ worker: idleWorker() });
+    const api = new AgentApi({ workers: [idleWorker()] });
     const first = api.submit(alpha, 'idem-rotated-token', submitBody({ repository: { fullName: 'owner/name', token: SECRET_TOKEN } }));
     const second = api.submit(alpha, 'idem-rotated-token', submitBody({ repository: { fullName: 'owner/name', token: 'other-token-9999' } }));
     expect(second.deduplicated).toBe(true);
@@ -280,7 +280,7 @@ describe('repository context: stateless API (#74)', () => {
 
   it('без repository клиент получает репозиторий по умолчанию, объявленный хостом', () => {
     const api = new AgentApi({
-      worker: idleWorker(),
+      workers: [idleWorker()],
       defaultRepository: 'org/default-repo',
     });
     const receipt = api.submit(alpha, 'idem-default-repo', submitBody({ repository: {} }));
