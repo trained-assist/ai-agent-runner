@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import type { LaunchArtifact, LaunchRepo, WorkerCancelResult } from '../adapters/external-worker-adapter.js';
 import {
   admissionEvents,
@@ -107,6 +108,16 @@ const POLL_BASE_DELAY_MS = 500;
 const POLL_MAX_DELAY_MS = 10_000;
 /** Запас сверх лимита рана на выгрузку лога и пуш ветки до уничтожения среды. */
 const DEFAULT_RESULT_GRACE_MS = 60_000;
+
+/**
+ * Стабильный идентификатор операции: производный от попытки `(userTaskId, generation)`,
+ * а не свежий на каждый submit. Воркер дедуплицирует по нему — поэтому он обязан
+ * переживать рестарт API (контракт внешнего worker, п. 2).
+ */
+export function attemptOperationId(userTaskId: string, ownerGeneration: number): string {
+  const digest = createHash('sha256').update(`${userTaskId}:${ownerGeneration}`).digest('hex');
+  return `op_${digest.slice(0, 24)}`;
+}
 
 const defaultLogger: ApiLogger = (entry) => {
   process.stdout.write(`${JSON.stringify(entry)}\n`);
@@ -700,6 +711,15 @@ export class AgentApi {
     });
   }
 
+  /**
+   * Идентификатор операции для внешнего worker, стабильный в пределах одной попытки.
+   *
+   * Воркер дедуплицирует запуски по `operationId` (контракт п. 2). Свежий id на каждый
+   * submit делал дедупликацию бессмысленной: после рестарта API повтор с новым ключом
+   * принёс бы воркеру новый `operationId`, и тот обязан был запустить второй агент
+   * там, где первый ещё идёт. Ключ попытки — `(userTaskId, ownerGeneration)`: он
+   * переживает рестарт и меняется ровно тогда, когда началась новая попытка.
+   */
   private buildSpec(
     request: SubmitRequest,
     context: { principal: Principal; requestId: string; userTaskId: string; jobId: string; ownerGeneration: number },
@@ -715,7 +735,7 @@ export class AgentApi {
       contractVersion: 1,
       jobId: context.jobId,
       runId,
-      operationId: newApiId('op'),
+      operationId: attemptOperationId(context.userTaskId, context.ownerGeneration),
       userTaskId: context.userTaskId,
       profileId: context.principal.profileId,
       conversationId: request.conversationId ?? newApiId('conv'),
