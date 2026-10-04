@@ -478,6 +478,7 @@ curl -X POST localhost:8080/v1/runs \
 6. **MCP lifecycle + scoped bindings (P13, сделано)** — per-run stdio процессы, handshake/readiness/timeout/cleanup, общий capability handler на MCP и API facade; дальше — доменные tools (P14) и интеграционная песочница (P15).
 6. **Worker API и межмашинные leases/fencing** — при переходе к нескольким workers (ARCHITECTURE §9, пп. 5–6).
 7. **Интеграция с GitHub** — текстовой образ профиля выгружается в приватные репозитории `profiles-artifacts` ([trained-assist-agent#1921](https://github.com/trained-assist/trained-assist-agent/issues/1921)); **не в этом slice**, только roadmap-строка — решение за владельцем (PR #13 arch-репо, открытый вопрос §8.3).
+8. **Внешний OpenCode-воркер** — запуск opencode-рана по запросу нашего API из отдельного репозитория; ТЗ и контракты — [docs/TZ-EXTERNAL-OPENCODE-WORKER.md](docs/TZ-EXTERNAL-OPENCODE-WORKER.md).
 
 Отложено из P04–P06 (вне этого этапа): callback delivery, квоты/конкурентность по principals (caps), `awaiting_user` durable prompt+response, multi-VM admission — контракты местами зарезервированы, реализация следует за control plane.
 
