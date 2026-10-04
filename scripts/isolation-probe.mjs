@@ -1052,10 +1052,11 @@ async function main() {
     let runA;
     let snapshotId;
     let artifact;
+    let resultA;
     try {
       await worker.waitHealthy();
       runA = await startRun(worker, { outputs: [{ path: ENGINE_OUTPUT }] });
-      const resultA = await waitTerminal(worker, runA.body.runId, 40_000);
+      resultA = await waitTerminal(worker, runA.body.runId, 40_000);
       check('ран A отработал и сохранил выход', resultA.outcome === 'succeeded' && (resultA.outputRefs ?? []).length === 1, `${String(resultA.outcome)}/${JSON.stringify(resultA.outputRefs ?? [])}`);
       const listing = await runArtifacts(worker, runA.body.runId);
       artifact = listing.find((entry) => entry.name === ENGINE_OUTPUT);
@@ -1073,6 +1074,7 @@ async function main() {
       ...isolationEnv(slotsFlag, { AGENT_API_FAKE_SCENARIO: 'timeout' }),
     }).start();
     let runB;
+    let viewBState;
     try {
       await workerB.waitHealthy();
       runB = await startRun(workerB, { prompt: 'hold the run', refs: [{ ref: 'prior', snapshotId }] });
@@ -1090,7 +1092,7 @@ async function main() {
       const foreign = other ? execAsSlot(other, '/usr/bin/cat', [materialized]) : null;
       check('вход читает идентичность рана B', own.code === 0, `${own.code}: ${firstLine(`${own.stderr}${own.stdout}`)}`);
       check('вход НЕ читает чужой слот', foreign === null || foreign.code !== 0, foreign ? `${foreign.code}: ${firstLine(`${foreign.stderr}${foreign.stdout}`)}` : 'один слот');
-      const viewBState = runView(workerB.state(runB.body.runId));
+      viewBState = runView(workerB.state(runB.body.runId));
     } finally {
       // Ран B гасится ЗДЕСЬ, а не в общей копилке шагов: все воркеры пробы делят один
       // dataDir, и живой ран на поднятии следующего воркера означал бы recover(), который
@@ -1106,6 +1108,8 @@ async function main() {
       ...isolationEnv(slotsFlag, { AGENT_API_FAKE_SCENARIO: 'timeout' }),
     }).start();
     let runC;
+    let resultC;
+    let typesC;
     try {
       await workerC.waitHealthy();
       // Новый воркер поднялся на ТОМ ЖЕ dataDir, где лежит состояние только что погашенного
@@ -1114,9 +1118,9 @@ async function main() {
       const stateB = join(spec.dataDir, 'runs', runB.body.runId, 'state.json');
       check('состояние прошлого рана пережило старт нового воркера', existsSync(stateB) && readJson(stateB).runId === runB.body.runId, stateB);
       runC = await startRun(workerC, { prompt: 'must be refused', refs: [{ ref: 'theirs', snapshotId }] });
-      const resultC = await waitTerminal(workerC, runC.body.runId, 30_000);
+      resultC = await waitTerminal(workerC, runC.body.runId, 30_000);
       const stateC = workerC.state(runC.body.runId);
-      const typesC = workerC.events(runC.body.runId).map((event) => event.type);
+      typesC = workerC.events(runC.body.runId).map((event) => event.type);
       check('чужой principal отказан по владельцу снимка', resultC.failure?.code === 'MATERIALIZE_REF_FOREIGN', String(resultC.failure?.code));
       check('отказ помечен неповторяемым', resultC.failure?.retryable === false, String(resultC.failure?.retryable));
       check('отказ произошёл ДО спавна движка', !typesC.includes('started'), typesC.join(','));
@@ -1134,10 +1138,11 @@ async function main() {
     const portD = await freePort(spec.port + 73);
     const workerD = new Worker({ ...spec, port: portD }, clientKey, { AGENT_API_PORT: String(portD), ...isolationEnv(slotsFlag) }).start();
     let runD;
+    let resultD;
     try {
       await workerD.waitHealthy();
       runD = await startRun(workerD, { prompt: 'must be refused', refs: [{ ref: 'prior', snapshotId }] });
-      const resultD = await waitTerminal(workerD, runD.body.runId, 30_000);
+      resultD = await waitTerminal(workerD, runD.body.runId, 30_000);
       const stateD = workerD.state(runD.body.runId);
       check('подменённые байты → отказ по дайджесту', resultD.failure?.code === 'MATERIALIZE_BYTES_MISMATCH', String(resultD.failure?.code));
       check('отказ по дайджесту неповторяем', resultD.failure?.retryable === false, String(resultD.failure?.retryable));
@@ -1151,10 +1156,12 @@ async function main() {
     // Ран без ref'а не видит данные прошлых ранов: входы не достаются «по умолчанию».
     const portE = await freePort(spec.port + 74);
     const workerE = new Worker({ ...spec, port: portE }, clientKey, { AGENT_API_PORT: String(portE), ...isolationEnv(slotsFlag) }).start();
+    let runE;
+    let resultE;
     try {
       await workerE.waitHealthy();
-      const runE = await startRun(workerE, { prompt: 'no inputs' });
-      const resultE = await waitTerminal(workerE, runE.body.runId, 40_000);
+      runE = await startRun(workerE, { prompt: 'no inputs' });
+      resultE = await waitTerminal(workerE, runE.body.runId, 40_000);
       const stateE = workerE.state(runE.body.runId);
       check('ран без ref отработал', resultE.outcome === 'succeeded', String(resultE.outcome));
       check('ран без ref не видит входы прошлых ранов', !existsSync(join(stateE.spec.cwd, '.inputs')), stateE.spec.cwd);
