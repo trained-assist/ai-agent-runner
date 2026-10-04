@@ -1,3 +1,4 @@
+import { appendFileSync, readFileSync, renameSync } from 'node:fs';
 import { TERMINAL_EVENT_TYPES, type RunnerEvent } from '../contracts/events.js';
 import type { RunResult } from '../contracts/result.js';
 import type { RunSpec } from '../contracts/run-spec.js';
@@ -5,9 +6,15 @@ import type { LaunchArtifact, LaunchRepo } from '../adapters/external-worker-ada
 import type { ApiRunState } from './contracts.js';
 
 /**
- * In-memory состояние API (epic #74, шаг 1/6). Никакого диска: приёмные записи и прогресс
- * ранов живут в памяти процесса и теряются при рестарте. Это осознанный контракт — клиент
- * повторяет submit с новым `Idempotency-Key`, а не ждёт, что API вспомнит его задачу.
+ * In-memory состояние API (эпик #74). Приёмные записи и прогресс ранов живут в памяти
+ * процесса — но приёмные записи дублируются в долговечный журнал, чтобы дедупликация по
+ * `Idempotency-Key` переживала рестарт API (пересчитанный критический путь, шаг 1).
+ * Без этого свойства повторный submit с тем же ключом после рестарта запускал бы
+ * второй ран там, где первый ещё идёт.
+ *
+ * Журнал — построчный JSON (по записи на строку), дописывается атомарно. При чтении
+ * повреждённые хвостовые строки пропускаются: журнал — оптимизация восстановления,
+ * а не источник истины для несохранённого выхода.
  */
 
 export const STATELESS_STORE_SCHEMA_VERSION = 1 as const;
@@ -78,12 +85,57 @@ export class StatelessStore {
   private readonly byPrincipalTask = new Map<string, AdmissionRecord[]>();
   private readonly progress = new Map<string, RunProgress>();
   private readonly limits: StatelessStoreLimits;
+  /** Куда дублируются приёмные записи; null = дедупликация только в памяти процесса. */
+  private readonly persistPath: string | null;
 
-  constructor(limits: Partial<StatelessStoreLimits> = {}) {
+  constructor(limits: Partial<StatelessStoreLimits> = {}, persistPath: string | null = null) {
     this.limits = { ...DEFAULT_STATELESS_LIMITS, ...limits };
+    this.persistPath = persistPath;
+    if (persistPath) this.replay(persistPath);
   }
 
-  put(record: AdmissionRecord): void {
+  /**
+   * Дописать приёмную запись в долговечный журнал. Одна строка = одна запись, поэтому
+   * запись переживает падение процесса целиком (строка либо есть, либо нет).
+   */
+  private append(record: AdmissionRecord): void {
+    if (!this.persistPath) return;
+    try {
+      appendFileSync(this.persistPath, `${JSON.stringify(record)}\n`, 'utf8');
+    } catch (err) {
+      // Журнал не должен ронять приём задачи: при недоступном журнале дедупликация
+      // сохраняется в памяти процесса, а факт отказа виден в логе.
+      console.warn(`[stateless-store] persist failed for ${record.requestId}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  /** Восстановить приёмные записи из журнала. Повреждённые хвостовые строки пропускаются. */
+  private replay(path: string): void {
+    let raw: string;
+    try {
+      raw = readFileSync(path, 'utf8');
+    } catch {
+      return; // журнала ещё нет — это первый запуск
+    }
+    let restored = 0;
+    for (const line of raw.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      try {
+        const record = JSON.parse(trimmed) as AdmissionRecord;
+        if (record.schemaVersion !== STATELESS_STORE_SCHEMA_VERSION) continue;
+        if (typeof record.runId !== 'string' || record.runId.length === 0) continue;
+        this.index(record);
+        restored += 1;
+      } catch {
+        // Обрыв записи в момент падения — пропускаем хвост, сохраняем остальное.
+      }
+    }
+    if (restored > 0) console.warn(`[stateless-store] restored ${restored} admission records from ${path}`);
+  }
+
+  /** Перестроить индексы из записи без проверки лимита (восстановление при старте). */
+  private index(record: AdmissionRecord): void {
     this.byAdmission.set(admissionKey(record.principalId, record.idempotencyKey), record);
     this.byRun.set(record.runId, record);
     const indexKey = taskKey(record.principalId, record.userTaskId);
@@ -91,6 +143,11 @@ export class StatelessStore {
     attempts.push(record);
     attempts.sort((left, right) => left.ownerGeneration - right.ownerGeneration);
     this.byPrincipalTask.set(indexKey, attempts);
+  }
+
+  put(record: AdmissionRecord): void {
+    this.index(record);
+    this.append(record);
     this.evictIfNeeded();
   }
 

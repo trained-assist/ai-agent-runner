@@ -1,5 +1,6 @@
-import { statSync } from 'node:fs';
+import { mkdirSync, statSync } from 'node:fs';
 import { createServer } from 'node:http';
+import { dirname } from 'node:path';
 import {
   DEFAULT_CANCEL_DEADLINE_MS,
   DEFAULT_LAUNCH_DEADLINE_MS,
@@ -10,6 +11,12 @@ import { KeyRegistry } from './auth.js';
 import { createAgentApiServer } from './server.js';
 import { AgentApi, type ApiLogger } from './service.js';
 import { loadAgentApiConfig, requireKeyRegistry } from './config.js';
+
+/** Путь журнала приёмных записей: явный env, без значения — дедупликация только в памяти. */
+function admissionLogFile(raw: string | undefined): string | null {
+  const value = raw?.trim();
+  return value && value.length > 0 ? value : null;
+}
 
 async function main(): Promise<void> {
   const config = loadAgentApiConfig();
@@ -28,11 +35,23 @@ async function main(): Promise<void> {
         log,
       }),
   );
+  // Журнал приёмных записей: дедупликация по `Idempotency-Key` переживает рестарт API.
+  // Без него повторный submit с тем же ключом после рестарта запустил бы второй ран.
+  // Путь задаётся `AGENT_API_ADMISSION_LOG`; каталог создаётся, если его нет.
+  const admissionLogPath = admissionLogFile(config.env['AGENT_API_ADMISSION_LOG']);
+  if (admissionLogPath) {
+    try {
+      mkdirSync(dirname(admissionLogPath), { recursive: true, mode: 0o700 });
+    } catch (err) {
+      log({ event: 'admission_log_unavailable', message: err instanceof Error ? err.message : String(err) });
+    }
+  }
   const service = new AgentApi({
     workers,
     logger: log,
     env: config.env,
     ...(config.defaultRepository ? { defaultRepository: config.defaultRepository } : {}),
+    ...(admissionLogPath ? { admissionLogPath } : {}),
   });
   const server = createAgentApiServer(service, { keys, logger: log });
   // Терминальные раны не переживают себя: без этого процесса память только растёт, а у

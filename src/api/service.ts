@@ -1,7 +1,5 @@
 import type { LaunchArtifact, LaunchRepo, WorkerCancelResult } from '../adapters/external-worker-adapter.js';
 import {
-  CANCEL_UNKNOWN_RUN_BACKOFF_MS,
-  CANCEL_UNKNOWN_RUN_RETRIES,
   admissionEvents,
   artifactUrl,
   branchUrl,
@@ -92,6 +90,11 @@ export interface AgentApiOptions {
    */
   defaultRepository?: string;
   store?: StatelessStore;
+  /**
+   * Журнал приёмных записей: дедупликация по `Idempotency-Key` переживает рестарт API.
+   * Без него — только память процесса (контракт эпика #74, шаг 6).
+   */
+  admissionLogPath?: string;
 }
 
 const defaultLogger: ApiLogger = (entry) => {
@@ -114,7 +117,7 @@ export class AgentApi {
       throw new Error('AgentApi requires at least one external worker: without it there is no way to launch an agent');
     }
     this.workers = options.workers;
-    this.store = options.store ?? new StatelessStore();
+    this.store = options.store ?? new StatelessStore({}, options.admissionLogPath ?? null);
     this.maxActiveRuns = options.maxActiveRuns ?? DEFAULT_STATELESS_LIMITS.maxActiveRuns;
     this.logger = options.logger ?? defaultLogger;
     this.clock = options.clock ?? (() => new Date());
@@ -386,7 +389,7 @@ export class AgentApi {
     this.store.markCancelRequested(runId, 'cancel');
     let receipt: WorkerCancelResult;
     try {
-      receipt = await this.cancelWithLaunchRace(runId, worker);
+      receipt = await worker.cancel(runId);
     } catch (err) {
       this.log({ event: 'cancel_failed', runId, message: err instanceof Error ? err.message : String(err) });
       return { runId, status: 'rejected', reason: 'cancel request did not reach the worker' };
@@ -531,34 +534,94 @@ export class AgentApi {
   }
 
   /**
-   * Отмена может прийти раньше, чем воркер зарегистрирует ран: контракт `launch` синхронный,
-   * и запрос о cancel иногда обгоняет сам launch. Пока ран в полёте, `unknown_run` означает
-   * «ещё не вижу», поэтому запрос повторяется; если ран так и не появился — отказ, а не
-   * «остановлено».
+   * Ставит ран в работу и ведёт его поллером. Соединение не держится: воркер отвечает
+   * квитанцией, дальше мы сами спрашиваем его о статусе и забираем результат.
+   *
+   * Поллер живёт в фоне и переживает запросы клиента: клиент опрашивает `status`/`events`
+   * так же, как раньше, и видит прогресс без изменений со своей стороны.
    */
-  private async cancelWithLaunchRace(runId: string, worker: ExternalWorker): Promise<WorkerCancelResult> {
-    let receipt = await worker.cancel(runId);
-    for (let attempt = 0; attempt < CANCEL_UNKNOWN_RUN_RETRIES; attempt += 1) {
-      if (receipt.status !== 'unknown_run' || !this.inFlight.has(runId)) break;
-      await new Promise((resolve) => setTimeout(resolve, CANCEL_UNKNOWN_RUN_BACKOFF_MS));
-      if (!this.inFlight.has(runId)) break;
-      receipt = await worker.cancel(runId);
-    }
-    return receipt;
-  }
-
   private async execute(record: AdmissionRecord): Promise<void> {
     const run = this.store.open(record.runId, record.createdAt);
     const startedAt = this.nowIso();
     run.state = 'running';
     run.updatedAt = startedAt;
-    // Журнал рана появляется до сетевого вызова: принятый ран виден сразу, а не после ответа воркера.
+    // Журнал рана появляется до сетевого вызова: принятый ран виден сразу.
     this.store.append(record.runId, admissionEvents(record.spec, startedAt));
+    const worker = this.workerFor(record.spec.engine.name);
+    if (!worker) {
+      this.finalize(record, workerTransportFailure(record.spec, new Error('worker is not configured'), { startedAt, finishedAt: this.nowIso() }));
+      return;
+    }
     this.inFlight.add(record.runId);
     try {
-      const launch = await this.workerFor(record.spec.engine.name)!.launch(record.spec);
+      const receipt = await worker.launch(record.spec);
+      if (this.disposed || this.store.progressOf(record.runId) === null) return;
+      this.log({
+        event: 'worker_accepted',
+        runId: record.runId,
+        engine: record.spec.engine.name,
+        worker: worker.baseUrl,
+        operationId: receipt.operationId,
+        statusUrl: receipt.statusUrl,
+      });
+      void this.pollUntilTerminal(record, worker, startedAt);
+    } catch (err) {
       if (this.disposed) return;
-      const mapping = mapLaunchResult(record.spec, launch, { startedAt, finishedAt: this.nowIso() }, { workerBaseUrl: this.workerFor(record.spec.engine.name)?.baseUrl ?? null });
+      this.log({ event: 'run_failed', runId: record.runId, message: err instanceof Error ? err.message : String(err) });
+      this.finalize(record, workerTransportFailure(record.spec, err, { startedAt, finishedAt: this.nowIso() }, { workerBaseUrl: worker.baseUrl }));
+    } finally {
+      this.inFlight.delete(record.runId);
+    }
+  }
+
+  /**
+   * Опрос воркера до терминального статуса. Таймаут ожидания не означает, что ран не
+   * состоялся: воркер мог принять задачу и даже завершить её, пока не было связи. Поэтому
+   * по истечении бюджета ран переходит в `unknown`, а поллер продолжает reconcile —
+   * спрашивать воркер о существующем запуске, не запуская заново.
+   */
+  private async pollUntilTerminal(record: AdmissionRecord, worker: ExternalWorker, startedAt: string): Promise<void> {
+    const budgetMs = record.spec.limits.timeoutMs + this.resultGraceMs;
+    const deadline = Date.now() + budgetMs;
+    let attempt = 0;
+    for (;;) {
+      if (this.disposed || this.store.progressOf(record.runId) === null) return;
+      let status: WorkerRunStatus;
+      try {
+        status = (await worker.status(record.runId)).status;
+      } catch (err) {
+        this.log({ event: 'worker_status_failed', runId: record.runId, message: err instanceof Error ? err.message : String(err) });
+        status = 'unknown';
+      }
+      this.log({ event: 'worker_status', runId: record.runId, status, attempt });
+
+      if (status === 'succeeded' || status === 'failed' || status === 'cancelled') {
+        await this.collectResult(record, worker, startedAt);
+        return;
+      }
+      if (status === 'unknown') {
+        // Исход неизвестн, но ран мог состояться. Помечаем и продолжаем спрашивать:
+        // следующий ответ воркера вернёт результат, и ран закроется нормально.
+        this.markUnknown(record, 'worker_reported_unknown');
+      }
+      if (Date.now() >= deadline) {
+        this.markUnknown(record, 'budget_exceeded');
+        if (!this.inFlight.has(record.runId)) return;
+        // Reconcile: воркер помнит operationId, поэтому мы можем спрашивать бесконечно,
+        // не рискуя вторым запуском. Клиент видит unknown и решает сам.
+        continue;
+      }
+      await this.pollBackoff(attempt);
+      attempt += 1;
+    }
+  }
+
+  /** Забрать финальный результат у воркера и закрыть ран. */
+  private async collectResult(record: AdmissionRecord, worker: ExternalWorker, startedAt: string): Promise<void> {
+    if (this.disposed || this.store.progressOf(record.runId) === null) return;
+    try {
+      const launch = await worker.result(record.runId);
+      const mapping = mapLaunchResult(record.spec, launch, { startedAt, finishedAt: this.nowIso() }, { workerBaseUrl: worker.baseUrl });
       this.finalize(record, mapping);
       this.log({
         event: 'run_finished',
@@ -571,16 +634,33 @@ export class AgentApi {
         repo: mapping.repo?.fullName ?? null,
       });
     } catch (err) {
-      if (this.disposed) return;
-      this.log({
-        event: 'run_failed',
-        runId: record.runId,
-        message: err instanceof Error ? err.message : String(err),
-      });
-      this.finalize(record, workerTransportFailure(record.spec, err, { startedAt, finishedAt: this.nowIso() }, { workerBaseUrl: this.workerFor(record.spec.engine.name)?.baseUrl ?? null }));
-    } finally {
-      this.inFlight.delete(record.runId);
+      if (err instanceof ResultNotReadyError) {
+        // Воркер сказал «терминальный», но результата нет: честный отказ, а не успех.
+        this.log({ event: 'worker_result_missing', runId: record.runId });
+        this.markUnknown(record, 'result_missing');
+        return;
+      }
+      this.log({ event: 'run_failed', runId: record.runId, message: err instanceof Error ? err.message : String(err) });
+      this.finalize(record, workerTransportFailure(record.spec, err, { startedAt, finishedAt: this.nowIso() }, { workerBaseUrl: worker.baseUrl }));
     }
+  }
+
+  /**
+   * Перевод рана в `unknown`. Идемпотентно: повторный вызов не затирает уже терминальное
+   * состояние и не плодит записей в журнале.
+   */
+  private markUnknown(record: AdmissionRecord, reason: string): void {
+    const run = this.store.progressOf(record.runId);
+    if (!run || isTerminalApiState(run.state) || run.state === 'unknown') return;
+    run.state = 'unknown';
+    run.updatedAt = this.nowIso();
+    this.log({ event: 'run_outcome_unknown', runId: record.runId, reason, engine: record.spec.engine.name });
+  }
+
+  /** Экспоненциальная пауза опроса с потолком, чтобы не молотить воркер в пустую. */
+  private async pollBackoff(attempt: number): Promise<void> {
+    const delayMs = Math.min(POLL_MAX_DELAY_MS, POLL_BASE_DELAY_MS * 2 ** Math.min(attempt, 5));
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
   }
 
   /** Воркер по имени движка. Имя движка — это адрес воркера, а не его внутренняя деталь. */
