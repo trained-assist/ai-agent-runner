@@ -8,6 +8,9 @@
 
 export * from './contract.js';
 export * from './policy.js';
+export * from './clean-list.js';
+export * from './working-copy.js';
+export * from './branches.js';
 export * from './ports.js';
 export * from './journal.js';
 export * from './tree.js';

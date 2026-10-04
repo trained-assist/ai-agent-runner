@@ -128,6 +128,24 @@ function existsFile(path: string): boolean {
   }
 }
 
+/** Значение ref в remote (или null, если его нет). */
+export function remoteRef(admin: FakeRepositoryAdmin, fullName: string, ref: string): string | null {
+  const dir = admin.pathOf(fullName);
+  try {
+    const out = execFileSync('git', ['--git-dir', dir, 'rev-parse', '--verify', '--quiet', ref], { encoding: 'utf8' }).trim();
+    return out.length > 0 ? out : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Родители коммита в remote: merge-коммит имеет двух, обычный — одного. */
+export function remoteParents(admin: FakeRepositoryAdmin, fullName: string, commit: string): string[] {
+  const dir = admin.pathOf(fullName);
+  const out = execFileSync('git', ['--git-dir', dir, 'rev-list', '--parents', '-n', '1', commit], { encoding: 'utf8' }).trim();
+  return out.split(/\s+/).slice(1);
+}
+
 /** Дерево из локального зеркала модуля: так читаются кандидаты ранов, которых нет в remote. */
 export async function mirrorTree(h: Harness, bindingId: string, revision: string): Promise<Record<string, string>> {
   const binding = await h.bindings.get(bindingId);

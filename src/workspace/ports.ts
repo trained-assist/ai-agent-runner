@@ -115,13 +115,16 @@ export interface GitRepositoryPort {
     input: { branch: string; commit: string; expectedHead: string | null; credentials: GitCredentials },
   ): Promise<{ outcome: PushOutcome; detail: string | null }>;
   /**
-   * Push неканонического ref кандидата (`refs/workspace/publications/<id>`).
-   * Он не трогает голову профиля и существует ровно для восстановления публикации.
+   * Push ветки рана (`refs/heads/agent-run/<runId>`) или ветки синхронизации. Она не трогает
+   * основную ветку профиля и служит durable-кандидатом: переживает смерть VM, видна
+   * пользователю и мержится одним действием.
    */
-  pushCandidateRef(
+  pushRef(
     mirror: GitMirror,
     input: { ref: string; commit: string; credentials: GitCredentials },
   ): Promise<{ outcome: PushOutcome; detail: string | null }>;
+  /** Удаление ветки рана после успешного merge (уборка — отдельным явным вызовом). */
+  deleteRef?(mirror: GitMirror, input: { ref: string; credentials: GitCredentials }): Promise<{ outcome: PushOutcome; detail: string | null }>;
   /** Есть ли коммит в репозитории (для сверки неизвестного исхода push). */
   hasCommit(mirror: GitMirror, commit: string): Promise<boolean>;
   /** Является ли `ancestor` предком `commit` (публикация уже применена иначе). */
