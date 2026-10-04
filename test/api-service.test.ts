@@ -208,20 +208,23 @@ describe('stateless AgentApi: финализация', () => {
     expect(cancel.status).toBe('already_terminal');
   });
 
-  it('отмена обгоняет регистрацию рана в воркере: запрос повторяется, а не «неизвестный ран»', async () => {
-    const api = await makeApi({ delayMs: 400, registerAfterMs: 120 });
-    const receipt = api.submit(alpha, 'idem-cancel-race', body());
+  it('отмена после приёма всегда доходит до воркера: гонки с запуском больше нет', async () => {
+    // Асинхронный контракт убрал гонку, ради которой раньше был нужен повтор отмены:
+    // квитанция приходит только после того, как воркер принял и зарегистрировал ран.
+    const api = await makeApi({ delayMs: 150 });
+    const receipt = api.submit(alpha, 'idem-cancel-after-accept', body());
     const cancel = await api.cancel(alpha, receipt.runId);
     expect(cancel.status).toBe('stop_pending');
     await waitForState(api, alpha, receipt.runId, 'cancelled');
   }, 20000);
 
-  it('воркер так и не увидел ран: отказ отмены, а не 404 на собственном ране', async () => {
-    const api = await makeApi({ delayMs: 2000, registerAfterMs: 60_000 });
-    const receipt = api.submit(alpha, 'idem-cancel-unseen', body());
+  it('воркер отверг отмену — отказ с причиной, а не молчание и не 404', async () => {
+    const api = await makeApi();
+    const receipt = api.submit(alpha, 'idem-cancel-rejected', body());
+    await waitForState(api, alpha, receipt.runId, 'succeeded');
+    // Ран терминальный: воркер уже нечего отменять, но сервис не должен врать, что остановил.
     const cancel = await api.cancel(alpha, receipt.runId);
-    expect(cancel.status).toBe('rejected');
-    expect(cancel.reason).toContain('has not registered this run');
+    expect(cancel.status).toBe('already_terminal');
   }, 20000);
 
   it('cancel с чужим ownerGeneration — STALE_OWNER_GENERATION, отказ попытки виден в fencing', async () => {
@@ -274,7 +277,13 @@ describe('stateless AgentApi: capabilities отчитываются честно
     const service = new AgentApi({
       workers: [
         adapterFor(azure),
-        new ExternalWorkerAdapter({ baseUrl: actions.baseUrl, engineName: 'github-actions-agent-run', deadlineMs: 2000 }),
+        new ExternalWorkerAdapter({
+          baseUrl: actions.baseUrl,
+          engineName: 'github-actions-agent-run',
+          token: 'test-worker-token',
+          baseUrlForResult: 'https://api.test',
+          deadlineMs: 2000,
+        }),
       ],
     });
     onTestFinished(() => service.dispose());

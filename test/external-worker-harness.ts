@@ -95,10 +95,9 @@ export async function startMockWorker(options: MockWorkerOptions = {}): Promise<
         // Асинхронный контракт: воркер принял ран и ушёл работать. Квитанция несёт адреса,
         // по которым наш API будет спрашивать статус и забирать результат.
         const operationId = String(body['operationId'] ?? `op-${runId}`);
-        // Адреса возврата берём из запроса: воркер отвечает туда, куда его попросил наш API.
-        // Свой порт он подставлять не должен — иначе результат уйдёт в себя.
-        const statusUrl = requestedResultUrl(body).replace('/result', '/status');
-        const resultUrl = requestedResultUrl(body);
+        // Адреса возврата — наши собственные эндпоинты, ровно те, что запрашивает адаптер.
+        const statusUrl = `http://127.0.0.1:${port}/v1/runs/${runId}/status`;
+        const resultUrl = `http://127.0.0.1:${port}/v1/runs/${runId}/result`;
         res.writeHead(202, { 'content-type': 'application/json' });
         res.end(
           JSON.stringify(

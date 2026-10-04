@@ -296,18 +296,66 @@ describe('runLogRef и artifactUrl', () => {
 });
 
 describe('ExternalWorkerAdapter по HTTP', () => {
-  it('launch уходит на POST /v1/launch с Bearer-токеном и возвращает LaunchResult', async () => {
+  it('launch возвращает квитанцию сразу: runId, operationId и адреса status/result', async () => {
     const worker = await startMockWorker();
     try {
-      const adapter = new ExternalWorkerAdapter({ baseUrl: worker.baseUrl, token: 'shared-secret', deadlineMs: 5000 });
+      const adapter = new ExternalWorkerAdapter({
+        baseUrl: worker.baseUrl,
+        token: 'shared-secret',
+        deadlineMs: 5000,
+        baseUrlForResult: 'https://api.test',
+      });
       const spec = makeRunSpec({ runId: 'run-http-1', input: { inlinePrompt: 'сделай отчёт' }, repository: { fullName: 'owner/name' } });
-      const result = await adapter.launch(spec);
+      const receipt = await adapter.launch(spec);
 
       expect(worker.launches).toHaveLength(1);
-      expect(worker.launches[0]!['runId']).toBe('run-http-1');
       expect(worker.lastAuthorization()).toBe('Bearer shared-secret');
+      // Никакого LaunchResult: соединение закрылось, ран ещё не отработал.
+      expect(receipt.runId).toBe('run-http-1');
+      expect(receipt.status).toBe('accepted');
+      expect(receipt.operationId).toBe(spec.operationId);
+      expect(receipt.statusUrl).toContain('/v1/runs/run-http-1/status');
+      // Адрес возврата результата уходит в запросе — воркеру не нужно знать, где мы.
+      expect(worker.launches[0]!['resultUrl']).toBe('https://api.test/v1/worker/launches/run-http-1/result');
+    } finally {
+      await worker.close();
+    }
+  });
+
+  it('status и result читаются отдельными вызовами; до готовности result — ResultNotReadyError', async () => {
+    const worker = await startMockWorker({ terminalStatus: 'running' });
+    try {
+      const adapter = adapterFor(worker);
+      const spec = makeRunSpec({ runId: 'run-http-poll', input: { inlinePrompt: 'x' } });
+      const receipt = await adapter.launch(spec);
+
+      expect((await adapter.status(receipt.runId)).status).toBe('running');
+      // Ран ещё идёт: результата нет, и это не ошибка, а «не готов».
+      await expect(adapter.result(receipt.runId)).rejects.toMatchObject({ code: 'RESULT_NOT_READY' });
+    } finally {
+      await worker.close();
+    }
+  });
+
+  it('result отдаёт LaunchResult, когда ран терминальный', async () => {
+    const worker = await startMockWorker();
+    try {
+      const adapter = adapterFor(worker);
+      const receipt = await adapter.launch(makeRunSpec({ runId: 'run-http-done', input: { inlinePrompt: 'x' } }));
+      const result = await adapter.result(receipt.runId);
       expect(result.exitReason).toBe('completed');
       expect(result.repo.fullName).toBe('owner/name');
+    } finally {
+      await worker.close();
+    }
+  });
+
+  it('статус unknown у воркера — исход неизвестен, а не failed', async () => {
+    const worker = await startMockWorker({ registerAfterMs: 60_000 });
+    try {
+      const adapter = adapterFor(worker);
+      const receipt = await adapter.launch(makeRunSpec({ runId: 'run-http-unknown', input: { inlinePrompt: 'x' } }));
+      expect((await adapter.status(receipt.runId)).status).toBe('unknown');
     } finally {
       await worker.close();
     }
@@ -358,16 +406,17 @@ describe('ExternalWorkerAdapter по HTTP', () => {
     }
   });
 
-  it('таймаут launch обрывает HTTP-запрос и пытается остановить осиротевший ран', async () => {
+  it('таймаут launch обрывает HTTP-запрос: воркер не принял задачу, повтор безопасен', async () => {
     const worker = await startMockWorker({ delayMs: 3000 });
     try {
       const adapter = adapterFor(worker, { deadlineMs: 150 });
       await expect(adapter.launch(makeRunSpec({ runId: 'run-http-timeout', input: { inlinePrompt: 'x' } }))).rejects.toMatchObject({
-        code: 'WORKER_LAUNCH_TIMEOUT',
-        retryable: false,
+        code: 'WORKER_LAUNCH_UNREACHABLE',
+        // Ран не принят — никто его не выполняет, поэтому повтор не создаст второй.
+        retryable: true,
       });
-      // Отмена ушла воркеру: иначе он доработал бы ран, который уже никто не ждёт.
-      expect(worker.cancels).toContain('run-http-timeout');
+      // Отменять нечего: задача не дошла до воркера, и осиротевшего рана нет.
+      expect(worker.cancels).not.toContain('run-http-timeout');
     } finally {
       await worker.close();
     }
@@ -377,7 +426,12 @@ describe('ExternalWorkerAdapter по HTTP', () => {
     const worker = await startMockWorker({ httpStatus: 500 });
     const logs: Record<string, unknown>[] = [];
     try {
-      const adapter = new ExternalWorkerAdapter({ baseUrl: worker.baseUrl, deadlineMs: 5000, log: (entry) => logs.push(entry) });
+      const adapter = new ExternalWorkerAdapter({
+        baseUrl: worker.baseUrl,
+        baseUrlForResult: 'https://api.test',
+        deadlineMs: 5000,
+        log: (entry) => logs.push(entry),
+      });
       await expect(adapter.launch(makeRunSpec({ runId: 'run-http-err', input: { inlinePrompt: 'x' } }))).rejects.toMatchObject({
         code: 'WORKER_HTTP_ERROR',
       });

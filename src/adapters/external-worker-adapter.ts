@@ -33,6 +33,19 @@ export const ADMISSION_EVENT_COUNT = 2;
 
 export const WORKER_STATUSES: readonly WorkerRunStatus[] = ['accepted', 'running', 'succeeded', 'failed', 'cancelled', 'unknown'];
 
+/**
+ * Повторы отмены: маршрут отмены синхронный и быстрый, поэтому повторяем только на
+ * сетевую ошибку. Гонки с запуском больше нет — квитанция приходит после регистрации рана.
+ */
+export const CANCEL_DELIVERY_RETRIES = 3;
+export const CANCEL_DELIVERY_BACKOFF_MS = 40;
+
+/**
+ * Запас сверх `limits.timeoutMs` рана, прежде чем API признает ран потерянным: воркер
+ * принял задачу, но результат не вернул. По умолчанию минута — на выгрузку лога и пуш.
+ */
+export const RESULT_WATCHDOG_GRACE_MS = 60_000;
+
 /** Статус рана у воркера. `unknown` — исход установить нельзя, это не `failed`. */
 export type WorkerRunStatus = 'accepted' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'unknown';
 
@@ -887,6 +900,8 @@ export class ExternalWorkerAdapter implements ExternalWorker {
       if (err instanceof PreflightError && err.code === 'WORKER_HTTP_ERROR') throw new ResultNotReadyError(runId);
       throw err;
     }
+    // 409 — ожидаемый ответ «результата ещё нет», а не нарушение контракта.
+    if (response.status === 409) throw new ResultNotReadyError(runId);
     const validated = validateLaunchResult(await readJson(response), runId);
     if (!validated.ok) {
       throw new PreflightError(
