@@ -17,7 +17,7 @@ describe('конфигурация воркеров', () => {
     const config = loadAgentApiConfig({ ...base, EXTERNAL_WORKER_URL: 'https://worker.example', EXTERNAL_WORKER_TOKEN: 'secret' });
     expect(config.workers).toEqual([
       {
-        engine: 'dynamic-ip-azure-agent-run',
+        engine: 'github-actions-agent-run',
         baseUrl: 'https://worker.example',
         token: 'secret',
         launchDeadlineMs: 600000,
@@ -30,12 +30,12 @@ describe('конфигурация воркеров', () => {
     const config = loadAgentApiConfig({
       ...base,
       AGENT_API_WORKERS: JSON.stringify([
-        { engine: 'dynamic-ip-azure-agent-run', baseUrl: 'https://azure.example', token: 'a' },
-        { engine: 'github-actions-agent-run', baseUrl: 'https://receiver.example', token: 'b' },
+        { engine: 'github-actions-agent-run', baseUrl: 'https://gha.example', token: 'a' },
+        { engine: 'dynamic-ip-azure-agent-run', baseUrl: 'https://azure.example', token: 'b' },
       ]),
     });
-    expect(config.workers.map((worker) => worker.engine)).toEqual(['dynamic-ip-azure-agent-run', 'github-actions-agent-run']);
-    expect(config.workers.map((worker) => worker.baseUrl)).toEqual(['https://azure.example', 'https://receiver.example']);
+    expect(config.workers.map((worker) => worker.engine)).toEqual(['github-actions-agent-run', 'dynamic-ip-azure-agent-run']);
+    expect(config.workers.map((worker) => worker.baseUrl)).toEqual(['https://gha.example', 'https://azure.example']);
   });
 
   it('имя движка можно переопределить и в одиночном формате', () => {

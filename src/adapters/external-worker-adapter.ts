@@ -25,7 +25,7 @@ import { redactSecrets, truncateLine } from '../redact.js';
  * юзера, сам складывает артефакты в него и сам грузит лог сессии в Google Storage.
  */
 
-export const EXTERNAL_WORKER_ENGINE = 'dynamic-ip-azure-agent-run';
+export const EXTERNAL_WORKER_ENGINE = 'github-actions-agent-run';
 export const EXTERNAL_WORKER_ADAPTER_VERSION = '1';
 
 /** Сколько событий рана API пишет до сетевого вызова: `claimed` + `inputs_materialized`. */
@@ -227,9 +227,10 @@ export interface ExternalWorkerOptions {
   /** Публичный адрес нашего API: воркер шлёт результат на callback resultUrl. */
   baseUrlForResult?: string;
   /**
-   * Имя движка, которым этот воркер отвечает. По умолчанию — `dynamic-ip-azure-agent-run`
-   * (Azure VM). Второй воркер (например, получатель раннеров на GitHub Actions) объявляет
-   * своё: имя движка — это адрес воркера, а не его внутренняя деталь.
+   * Имя движка, которым этот воркер отвечает. По умолчанию — `github-actions-agent-run`:
+   * агент запускается раннером GitHub Actions, это основной путь. Другой воркер (например,
+   * Azure VM с динамическим IP) объявляет своё имя: движок — это адрес воркера, а не его
+   * внутренняя деталь.
    */
   engineName?: string;
   token?: string;

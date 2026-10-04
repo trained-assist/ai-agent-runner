@@ -65,7 +65,7 @@ describe('GET /v1/capabilities: декларация, а не догадки (#7
     expect(caps.artifacts.shareLink).toBe(false);
     expect(caps.artifacts.ingestEndpoint).toBe('absent');
     expect(caps.artifacts.listPerRun).toBe(true);
-    expect(caps.engines).toEqual(['dynamic-ip-azure-agent-run']);
+    expect(caps.engines).toEqual(['github-actions-agent-run']);
     expect(caps.cancel).toEqual({ requestedReceipt: true, terminalConfirmation: true });
 
     // Никаких credentials в декларации.

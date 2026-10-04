@@ -58,7 +58,7 @@ describe('e2e: serverless API поверх внешнего воркера (#74)
     expect(await waitForTerminal(h.base, alphaKey, receipt.runId)).toBe('succeeded');
     expect(h.worker.launches).toHaveLength(1);
     expect(h.worker.launches[0]!['runId']).toBe(receipt.runId);
-    expect((h.worker.launches[0]!['engine'] as { name: string }).name).toBe('dynamic-ip-azure-agent-run');
+    expect((h.worker.launches[0]!['engine'] as { name: string }).name).toBe('github-actions-agent-run');
     expect((h.worker.launches[0]!['repository'] as { branch: string }).branch).toBe(`agent-run/${receipt.runId}`);
 
     const result = (await (await getResult(h.base, alphaKey, receipt.runId)).json()) as { outcome: string; logPath: string; outputRefs: string[] };
