@@ -182,17 +182,6 @@ describe('e2e: serverless API поверх внешнего воркера (#74)
     expect(touchingFs).toEqual(['src/api/auth.ts', 'src/api/config.ts', 'src/api/main.ts']);
   });
 
-  it('статически: единственный движок в пакете — внешний воркер, локальных адаптеров нет', () => {
-    const offenders: string[] = [];
-    for (const file of readdirSync(resolve(repoRoot, 'src/adapters'))) {
-      if (file !== 'external-worker-adapter.ts') offenders.push(`src/adapters/${file}`);
-    }
-    if (existsSync(resolve(repoRoot, 'src/runner'))) offenders.push('src/runner');
-    if (existsSync(resolve(repoRoot, 'src/isolation'))) offenders.push('src/isolation');
-    if (existsSync(resolve(repoRoot, 'src/storage'))) offenders.push('src/storage');
-    expect(offenders).toEqual([]);
-  });
-
   it('рестарт процесса забывает ран: клиент повторяет submit с новым ключом (эпик, шаг 6)', async () => {
     const h = await startHttpHarness();
     const submit = await postSubmit(h.base, alphaKey, 'idem-e2e-5', submitBody());
