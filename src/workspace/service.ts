@@ -153,6 +153,16 @@ export interface PublishRunChangesInput {
   message?: string;
 }
 
+export interface PublishRunBranchInput {
+  operationId: string;
+  tenantId: string;
+  profileId: string;
+  runId: string;
+  /** Имя ветки рана; по умолчанию `agent-run/<runId>`. */
+  branch?: string;
+  credentialTokenRef?: string;
+}
+
 export interface GetPublicationInput {
   publicationId?: string;
   operationId?: string;
@@ -880,6 +890,81 @@ export class WorkspaceService {
           ownerGeneration: input.ownerGeneration ?? null,
           message: input.message ?? `run ${input.runId} publishes profile workspace`,
         });
+      },
+    });
+    return result;
+  }
+
+  // ── publish_run_branch ───────────────────────────────────────────────────────
+
+  /**
+   * Публикация уже запушенной ветки рана: воркер (внешний, эфемерная VM) сам клонировал
+   * репозиторий, закоммитил результат в `agent-run/<runId>` и запушил. Модуль только
+   * проверяет ветку и мержит её в основную — то же CAS-ядро, что у `publish_run_changes`,
+   * но источником служит ветка, а не каталог на хосте.
+   *
+   * Нужна потому, что stateless-API не имеет доступа к файловой системе воркера: хосту
+   * нечего сканировать, он видит только ref в общем репозитории. База слияния —
+   * общий предок головы и ветки рана, поэтому «что видел ран» определяется корректно.
+   */
+  async publishRunBranch(input: PublishRunBranchInput): Promise<WorkspacePublication> {
+    const { result } = await this.journal.runOperation({
+      operationId: input.operationId,
+      method: 'publish_run_branch',
+      payload: { tenantId: input.tenantId, profileId: input.profileId, runId: input.runId, branch: input.branch ?? null },
+      execute: async () => {
+        const principal = this.principal(input.tenantId, input.profileId, input.credentialTokenRef);
+        const binding = await this.requireBinding(principal.tenantId, principal.profileId);
+        const mirror = await this.mirrorFor(binding, principal.credentialTokenRef);
+        await this.git.fetch(mirror, { tokenRef: principal.credentialTokenRef });
+
+        const branch = input.branch ?? runBranchName(input.runId);
+        const runCommit = await this.git.candidateRefCommit(mirror, branchRef(branch));
+        if (!runCommit) {
+          throw new WorkspaceError('WORKSPACE_NOT_FOUND', `run branch "${branch}" is not in ${binding.repository}; the worker must push it before publication`, {
+            detail: { branch, repository: binding.repository },
+          });
+        }
+        const head = await this.git.head(mirror, binding.branch);
+        // «Что видел ран» = общий предок головы и ветки рана. Так изменения рана отличаются
+        // от того, что успела опубликовать основная ветка за время рана.
+        const baseRevision = head ? (await this.git.mergeBase(mirror, head, runCommit)) ?? EMPTY_TREE : EMPTY_TREE;
+
+        const runTreeSha = `${runCommit}^{tree}`;
+        const base = toTreeMap(await this.git.listTree(mirror, baseRevision));
+        const runTree = toTreeMap(await this.git.listTree(mirror, runCommit));
+        const changes = await buildChangeSet(this.git, mirror, { base, candidate: runTree });
+
+        const record = this.newPublication({
+          publicationId: this.newId('wspub'),
+          operationId: input.operationId,
+          origin: 'run',
+          binding,
+          runId: input.runId,
+          ownerGeneration: null,
+          baseRevision,
+          branch,
+        });
+        this.journal.putPublication(record);
+        const prepared = this.patchPublication(record, {
+          status: 'publishing',
+          candidateCommit: runCommit,
+          candidatePushed: true,
+          changes,
+          manifestHash: changeSetHash(changes),
+        });
+
+        const outcome = await this.attemptPublication({
+          record: prepared,
+          binding,
+          mirror,
+          credentialTokenRef: principal.credentialTokenRef,
+          runTreeSha,
+          runRevision: runCommit,
+          message: `run ${input.runId} publishes ${branch}`,
+        });
+        if (outcome.status === 'published') await this.updateBindingHead(binding, outcome.committedRevision);
+        return outcome;
       },
     });
     return result;

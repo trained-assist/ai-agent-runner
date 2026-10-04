@@ -19,9 +19,10 @@
  */
 
 import { execFileSync, spawnSync } from 'node:child_process';
-import { mkdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { WorkspaceError } from './contract.js';
+import { matchRule, type CompiledPolicy } from './policy.js';
 
 export const WORKING_COPY_BUNDLE = 'local.bundle';
 export const WORKING_COPY_PATCH = 'uncommitted.patch';
@@ -269,6 +270,82 @@ function sizeOf(path: string): number {
   } catch {
     return 0;
   }
+}
+
+export const PROFILE_CHANGES_DIR = '.profile-changes';
+
+export interface PreparedWorkingCopy {
+  /** Относительный путь рабочей копии внутри профиля. */
+  path: string;
+  /** Куда положен архив (относительно профиля) или null, если архивировать нечего. */
+  archivePath: string | null;
+  bytes: number;
+  state: WorkingCopyState;
+}
+
+export interface PrepareTreeResult {
+  workingCopies: PreparedWorkingCopy[];
+  /** Сколько копий архивировано (с изменениями). */
+  archived: number;
+  bytes: number;
+}
+
+/**
+ * Готовит дерево профиля к импорту: находит git-рабочие копии, архивирует изменения
+ * «грязных» в `<корень>/.profile-changes/<путь>/`, чтобы обычный скан их опубликовал, а
+ * чистые клоны просто не попали в образ.
+ *
+ * Пишет ТОЛЬКО в `.profile-changes` внутри переданного корня и никогда не трогает сами
+ * копии. Вызывающий решает, какой корень безопасен (копия профиля, не живой профиль).
+ * Рабочие копии под путями, которые политика исключает (`node_modules`, `.agent-home`),
+ * пропускаются: архивировать воспроизводимое — только мусорить.
+ */
+export function prepareProfileTree(
+  sourceDir: string,
+  options: { policy: CompiledPolicy; archiveRootName?: string },
+): PrepareTreeResult {
+  const archiveRootName = options.archiveRootName ?? PROFILE_CHANGES_DIR;
+  const result: PrepareTreeResult = { workingCopies: [], archived: 0, bytes: 0 };
+
+  const walk = (dir: string, rel: string): void => {
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    const hasGit = entries.some((entry) => entry.name === '.git');
+    if (hasGit) {
+      // Рабочая копия — один юнит: внутрь не спускаемся (вложенные субмодули не разбираем).
+      if (rel.length === 0 || matchRule(options.policy, rel).action === 'exclude') return;
+      const state = inspectWorkingCopy(dir);
+      if (!state.hasIrreplaceableState) {
+        result.workingCopies.push({ path: rel, archivePath: null, bytes: 0, state });
+        return;
+      }
+      const archiveDir = join(sourceDir, archiveRootName, ...rel.split('/'));
+      const archive = archiveWorkingCopy(dir, { outDir: archiveDir });
+      result.workingCopies.push({
+        path: rel,
+        archivePath: archive.bytes > 0 ? join(archiveRootName, ...rel.split('/')) : null,
+        bytes: archive.bytes,
+        state,
+      });
+      result.archived += 1;
+      result.bytes += archive.bytes;
+      return;
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
+      const childRel = rel ? `${rel}/${entry.name}` : entry.name;
+      // Исключённые поддеревья не обходим: там нет рабочих копий профиля.
+      if (matchRule(options.policy, childRel).action === 'exclude') continue;
+      walk(join(dir, entry.name), childRel);
+    }
+  };
+
+  walk(sourceDir, '');
+  return result;
 }
 
 /** Удаление артефактов архива — только явным вызовом (модуль сам ничего не чистит). */

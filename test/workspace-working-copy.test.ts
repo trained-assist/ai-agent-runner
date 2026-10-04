@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { archiveWorkingCopy, inspectWorkingCopy } from '../src/workspace/working-copy.js';
+import { archiveWorkingCopy, inspectWorkingCopy, prepareProfileTree } from '../src/workspace/working-copy.js';
 
 const roots: string[] = [];
 function tempDir(prefix: string): string {
@@ -126,5 +126,46 @@ describe('archive only the changes', () => {
     const after = execFileSync('git', ['-C', work, 'status', '--porcelain'], { encoding: 'utf8' });
     expect(after).toBe(before);
     expect(existsSync(join(work, 'base.txt'))).toBe(true);
+  });
+});
+
+describe('prepareProfileTree — готовит дерево профиля к импорту', () => {
+  it('архивирует изменения рабочих копий в .profile-changes и пропускает чистые клоны', async () => {
+    const { compilePolicy, DEFAULT_EXPORT_POLICY } = await import('../src/workspace/policy.js');
+    const { prepareProfileTree } = await import('../src/workspace/working-copy.js');
+    const policy = compilePolicy(DEFAULT_EXPORT_POLICY);
+
+    const profile = tempDir('profile-');
+    // Чистый клон: не архивируется.
+    const clean = cloneWithRemote();
+    execFileSync('cp', ['-R', clean.work, join(profile, 'clean-clone')]);
+    // Грязный клон: архивируется.
+    const dirty = cloneWithRemote();
+    git(dirty.work, 'checkout', '-qb', 'wip');
+    writeFileSync(join(dirty.work, 'wip.txt'), 'unfinished\n');
+    git(dirty.work, 'add', 'wip.txt');
+    git(dirty.work, 'commit', '-qm', 'wip');
+    writeFileSync(join(dirty.work, 'base.txt'), 'dirty\n');
+    execFileSync('cp', ['-R', dirty.work, join(profile, 'dirty-clone')]);
+    // Клон под node_modules: политика исключает — пропускается, не мусорит.
+    const buried = cloneWithRemote();
+    git(buried.work, 'commit', '-q', '--allow-empty', '-m', 'local');
+    mkdirSync(join(profile, 'node_modules', 'dep'), { recursive: true });
+    execFileSync('cp', ['-R', buried.work, join(profile, 'node_modules', 'dep')]);
+
+    const result = prepareProfileTree(profile, { policy });
+    const byPath = Object.fromEntries(result.workingCopies.map((item) => [item.path, item]));
+    expect(byPath['clean-clone']?.archivePath).toBeNull();
+    expect(byPath['dirty-clone']?.archivePath).toBe('.profile-changes/dirty-clone');
+    expect(byPath['dirty-clone']?.bytes).toBeGreaterThan(0);
+    expect(byPath['node_modules/dep']).toBeUndefined();
+
+    // Архив реально лёг в дерево и содержит брошенную ветку.
+    const archiveDir = join(profile, '.profile-changes', 'dirty-clone');
+    expect(existsSync(join(archiveDir, 'local.bundle'))).toBe(true);
+    expect(existsSync(join(archiveDir, 'uncommitted.patch'))).toBe(true);
+    expect(existsSync(join(archiveDir, 'local.manifest.json'))).toBe(true);
+    // Чистый клон не оставил архива.
+    expect(existsSync(join(profile, '.profile-changes', 'clean-clone'))).toBe(false);
   });
 });

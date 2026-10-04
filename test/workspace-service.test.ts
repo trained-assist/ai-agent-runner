@@ -19,6 +19,7 @@ import { EMPTY_TREE, WorkspaceError } from '../src/workspace/contract.js';
 import {
   cleanupTempDirs,
   commitToRemote,
+  commitToRemoteBranch,
   harness,
   listFiles,
   mirrorTree,
@@ -1020,5 +1021,82 @@ describe('каждый ран публикует свою ветку (agent-run/
     expect(mergeUrl('o/p', 'agent-run/run-1', null)).toBe('https://github.com/o/p/tree/agent-run/run-1');
     expect(artifactUrl('o/p', 'abc123', 'report.md')).toBe('https://github.com/o/p/blob/abc123/report.md');
     expect(() => runBranchName('bad/../id')).toThrowError(/cannot be a git branch segment/);
+  });
+});
+
+describe('publish_run_branch — merge уже запушенной воркером ветки', () => {
+  it('мержит ветку, которую воркер запушил сам, без каталога на хосте', async () => {
+    const h = harness();
+    await ensureProfile(h, ALICE);
+    const base = runWorkspace({ 'notes/base.md': 'base\n' });
+    const basePublication = await h.service.publishRunChanges({
+      operationId: 'pub-base',
+      ...ALICE,
+      runId: 'run-base',
+      workspacePath: base,
+      baseRevision: EMPTY_TREE,
+    });
+    // Внешний воркер клонировал репозиторий и запушил ветку рана.
+    const workerCommit = commitToRemoteBranch(h.admin, `${OWNER}/profile-alice`, 'agent-run/run-worker', {
+      'notes/base.md': 'base\n',
+      'notes/worker.md': 'worker result\n',
+    });
+
+    const publication = await h.service.publishRunBranch({
+      operationId: 'pub-worker',
+      ...ALICE,
+      runId: 'run-worker',
+    });
+    expect(publication.status).toBe('published');
+    expect(publication.branch).toBe('agent-run/run-worker');
+    expect(publication.candidateCommit).toBe(workerCommit);
+    expect(publication.changes.map((item) => item.path)).toContain('notes/worker.md');
+    // Основная ветка получила результат, ветка рана указывает на коммит воркера.
+    expect(remoteTree(h.admin, `${OWNER}/profile-alice`)['notes/worker.md']).toBe('worker result\n');
+    expect(remoteRef(h.admin, `${OWNER}/profile-alice`, 'refs/heads/agent-run/run-worker')).toBe(workerCommit);
+    void basePublication;
+  });
+
+  it('делает merge-коммит, когда основная ветка ушла вперёд после ветки воркера', async () => {
+    const h = harness();
+    await ensureProfile(h, ALICE);
+    const base = runWorkspace({ 'notes/base.md': 'base\n' });
+    const basePublication = await h.service.publishRunChanges({
+      operationId: 'pub-base',
+      ...ALICE,
+      runId: 'run-base',
+      workspacePath: base,
+      baseRevision: EMPTY_TREE,
+    });
+    const workerCommit = commitToRemoteBranch(h.admin, `${OWNER}/profile-alice`, 'agent-run/run-w', {
+      'notes/base.md': 'base\n',
+      'notes/worker.md': 'w\n',
+    });
+    // Параллельная публикация в main уже после ветки воркера.
+    const other = runWorkspace({ 'notes/base.md': 'base\n', 'notes/other.md': 'o\n' });
+    await h.service.publishRunChanges({
+      operationId: 'pub-other',
+      ...ALICE,
+      runId: 'run-other',
+      workspacePath: other,
+      baseRevision: basePublication.committedRevision as string,
+    });
+
+    const publication = await h.service.publishRunBranch({ operationId: 'pub-w', ...ALICE, runId: 'run-w' });
+    expect(publication.status).toBe('published');
+    const parents = remoteParents(h.admin, `${OWNER}/profile-alice`, publication.committedRevision as string);
+    expect(parents).toHaveLength(2);
+    expect(parents).toContain(workerCommit);
+    const tree = remoteTree(h.admin, `${OWNER}/profile-alice`);
+    expect(tree['notes/worker.md']).toBe('w\n');
+    expect(tree['notes/other.md']).toBe('o\n');
+  });
+
+  it('отказывает, если воркер не запушил ветку', async () => {
+    const h = harness();
+    await ensureProfile(h, ALICE);
+    await expect(h.service.publishRunBranch({ operationId: 'pub-missing', ...ALICE, runId: 'nope' })).rejects.toMatchObject({
+      code: 'WORKSPACE_NOT_FOUND',
+    });
   });
 });

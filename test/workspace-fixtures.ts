@@ -184,6 +184,29 @@ export function commitToRemote(
   return sha;
 }
 
+/** Прямая публикация ветки мимо сервиса: имитация внешнего воркера, пушащего ветку рана. */
+export function commitToRemoteBranch(
+  admin: FakeRepositoryAdmin,
+  fullName: string,
+  branch: string,
+  files: Record<string, string>,
+  message = 'worker run',
+): string {
+  const dir = admin.pathOf(fullName);
+  const work = tempDir('workspace-worker-');
+  execFileSync('git', ['clone', '-q', dir, work]);
+  execFileSync('git', ['-C', work, 'config', 'user.email', 'worker@fixture.test']);
+  execFileSync('git', ['-C', work, 'config', 'user.name', 'worker']);
+  execFileSync('git', ['-C', work, 'checkout', '-q', '-b', branch]);
+  writeFiles(work, files);
+  execFileSync('git', ['-C', work, 'add', '-A']);
+  execFileSync('git', ['-C', work, 'commit', '-q', '-m', message]);
+  execFileSync('git', ['-C', work, 'push', '-q', 'origin', `HEAD:refs/heads/${branch}`]);
+  const sha = execFileSync('git', ['-C', work, 'rev-parse', 'HEAD']).toString('utf8').trim();
+  rmSync(work, { recursive: true, force: true });
+  return sha;
+}
+
 export function remoteTree(admin: FakeRepositoryAdmin, fullName: string, revision = 'main'): Record<string, string> {
   const dir = admin.pathOf(fullName);
   const out: Record<string, string> = {};
