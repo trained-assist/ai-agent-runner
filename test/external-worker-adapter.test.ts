@@ -8,6 +8,8 @@ import {
   mapLaunchResult,
   branchUrl,
   mergeUrl,
+  repoHasCommit,
+  isRetrievableLogUrl,
   runBranchName,
   runLogRef,
   validateLaunchResult,
@@ -295,6 +297,53 @@ describe('runLogRef и artifactUrl', () => {
   it('имя ветки рана выводится из runId и не путается с ветками юзера', () => {
     expect(runBranchName('run_abc')).toBe('agent-run/run_abc');
     expect(runBranchName('run_abc', 'bots')).toBe('bots/run_abc');
+  });
+});
+
+describe('реальные расхождения с воркером на GitHub Actions', () => {
+  // Эти три случая пришли с боевого воркера: локальные тесты их не видели, потому что
+  // мок всегда отвечал «идеально». Агент в GHA живёт на другой машине и коммитит не всегда.
+
+  it('pid не обязателен: агент в GHA запущен на другой машине, локального PID нет', () => {
+    const spec = makeRunSpec({ runId: 'run-1' });
+    const result = launchResult();
+    delete (result as { pid?: unknown }).pid;
+    const validated = validateLaunchResult(result, 'run-1');
+    expect(validated.ok, validated.ok ? '' : validated.errors.join('; ')).toBe(true);
+    // И `started`-событие без pid не выдумывается: pid нет — значит и утверждать нечего.
+    const mapping = mapLaunchResult(spec, validated.ok ? validated.value : result, TIMES);
+    expect(mapping.events.some((event) => event.type === 'started')).toBe(false);
+  });
+
+  it('repo.commit = null (ничего не запушено) — это не отказ, а ран без выходов', () => {
+    const spec = makeRunSpec({ runId: 'run-1', outputs: [] });
+    const result = launchResult({ artifacts: [], repo: { fullName: 'owner/name', branch: 'agent-run/run-1', commit: null } });
+    const validated = validateLaunchResult(result, 'run-1');
+    expect(validated.ok, validated.ok ? '' : validated.errors.join('; ')).toBe(true);
+
+    const mapping = mapLaunchResult(spec, validated.ok ? validated.value : result, TIMES);
+    expect(mapping.result.outcome).toBe('succeeded');
+    // Ссылка на файл не может быть `/blob/null/…` — она адресует ветку, а не коммит.
+    const repo = { fullName: 'owner/name', branch: 'agent-run/run-1', commit: null };
+    expect(repoHasCommit(repo)).toBe(false);
+    expect(artifactUrl(repo, 'report.md')).toBe('https://github.com/owner/name/tree/agent-run/run-1/report.md');
+    // И сравнивать нечего: merge ведёт на страницу ветки, а не в пустой compare.
+    expect(mergeUrl({ ...repo, baseRef: 'main' })).toBe('https://github.com/owner/name/tree/agent-run/run-1');
+  });
+
+  it('null-SHA тоже означает «ничего не запушено», а не валидный коммит', () => {
+    const zero = { fullName: 'owner/name', branch: 'agent-run/run-1', commit: '0000000000000000000000000000000000000000' };
+    expect(repoHasCommit(zero)).toBe(false);
+    expect(artifactUrl(zero, 'a.md')).toContain('/tree/agent-run/run-1/a.md');
+    const real = { fullName: 'owner/name', branch: 'agent-run/run-1', commit: 'abc1234' };
+    expect(repoHasCommit(real)).toBe(true);
+    expect(artifactUrl(real, 'a.md')).toBe('https://github.com/owner/name/blob/abc1234/a.md');
+  });
+
+  it('logUrl со схемой local:// не превращается в битый редирект', () => {
+    // Воркер без бакета держит лог у себя и отдаёт `local://…`: это честный ответ, но не URL.
+    expect(isRetrievableLogUrl('local://run-1/session.log')).toBe(false);
+    expect(isRetrievableLogUrl('https://storage.googleapis.com/b/runs/1/session.log')).toBe(true);
   });
 });
 

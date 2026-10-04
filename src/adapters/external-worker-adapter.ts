@@ -66,10 +66,28 @@ export interface LaunchRepo {
   fullName: string;
   /** Ветка рана: воркер создал её, закоммитил в неё `outputs` и запушил. */
   branch: string;
-  /** HEAD этой ветки на момент ответа. */
-  commit: string;
+  /**
+   * HEAD ветки на момент ответа. `null` (или null-SHA) означает «в ветку ничего не
+   * запушено»: ран без выходов заканчивается законно, и это не отказ.
+   */
+  commit: string | null;
   /** Ветка, от которой ответвлялся ран (если воркер её сообщил). */
   baseRef?: string;
+}
+
+const NULL_SHA = /^0{7,64}$/;
+
+/**
+ * Можно ли отдать клиенту лог по этой ссылке. Воркер без бакета держит лог у себя и
+ * возвращает `local://…`: это честный ответ, но не URL, и редиректить на него нельзя.
+ */
+export function isRetrievableLogUrl(logUrl: string | null): boolean {
+  return typeof logUrl === 'string' && /^https?:\/\//.test(logUrl);
+}
+
+/** Есть ли в ветке рана хоть один коммит: null-SHA и пустая строка означают «ничего нет». */
+export function repoHasCommit(repo: LaunchRepo): boolean {
+  return typeof repo.commit === 'string' && repo.commit.length > 0 && !NULL_SHA.test(repo.commit);
 }
 
 /**
@@ -292,7 +310,11 @@ export function runLogRef(launch: LaunchResult | null, workerBaseUrl: string | n
 
 /** Ссылка на файл в репозитории юзера: воркер коммитит артефакты, мы только адресуем их. */
 export function artifactUrl(repo: LaunchRepo, path: string): string {
-  return `https://github.com/${repo.fullName}/blob/${repo.commit}/${path}`;
+  // Файл адресуем коммитом, но если в ветку ничего не запушено — ссылка на ветку:
+  // `/blob/null/...` был бы битой ссылкой, а не «артефакт без коммита».
+  return repoHasCommit(repo)
+    ? `https://github.com/${repo.fullName}/blob/${repo.commit}/${path}`
+    : `https://github.com/${repo.fullName}/tree/${repo.branch}/${path}`;
 }
 
 /** Страница ветки рана: отсюда видно весь результат и отсюда GitHub предлагает merge/PR. */
@@ -305,7 +327,8 @@ export function branchUrl(repo: LaunchRepo): string {
  * известной базы честнее отдать страницу ветки: GitHub сам предложит merge.
  */
 export function mergeUrl(repo: LaunchRepo): string {
-  return repo.baseRef
+  // Сравнивать нечего, если в ветке нет коммитов: отдаём страницу ветки.
+  return repo.baseRef && repoHasCommit(repo)
     ? `https://github.com/${repo.fullName}/compare/${repo.baseRef}...${repo.branch}`
     : branchUrl(repo);
 }
@@ -405,7 +428,15 @@ export function validateLaunchResult(input: unknown, expectedRunId: string): Val
   const collector = new ErrorCollector();
   if (!checkObject(input, 'launch', collector)) return collector.finish(undefined as never);
   // `failure` появляется только на отказе воркера (issue #73) — остальное обяза��тельно.
-  checkKeys(input, LAUNCH_RESULT_KEYS, LAUNCH_RESULT_KEYS.filter((key) => key !== 'failure'), 'launch', collector);
+  // `failure` — только на отказе, `pid` — необязателен: агент в GitHub Actions запущен на
+  // другой машине, и локального PID у нашего API нет. Оба поля отклика на этой машине.
+  checkKeys(
+    input,
+    LAUNCH_RESULT_KEYS,
+    LAUNCH_RESULT_KEYS.filter((key) => key !== 'failure' && key !== 'pid'),
+    'launch',
+    collector,
+  );
 
   if (input['runId'] !== expectedRunId) collector.push(`launch.runId: expected echo of ${expectedRunId}`);
   if (input['status'] !== 'started' && input['status'] !== 'failed') collector.push('launch.status: expected started | failed');
@@ -451,10 +482,17 @@ export function validateLaunchResult(input: unknown, expectedRunId: string): Val
   if (!checkObject(input['repo'], 'launch.repo', collector)) {
     // уже сообщено
   } else {
-    checkKeys(input['repo'], ['fullName', 'branch', 'commit', 'baseRef'], ['fullName', 'branch', 'commit'], 'launch.repo', collector);
+    checkKeys(input['repo'], ['fullName', 'branch', 'commit', 'baseRef'], ['fullName', 'branch'], 'launch.repo', collector);
     checkString(input['repo']['fullName'], 'launch.repo.fullName', collector, 200);
     checkString(input['repo']['branch'], 'launch.repo.branch', collector, 200);
-    checkString(input['repo']['commit'], 'launch.repo.commit', collector, 64);
+    // `commit` может быть null или null-SHA: это «в ветку ничего не запушено», а не отказ.
+    // Требовать непустой SHA нельзя — ран без выходов заканчивается законно.
+    const commit = input['repo']['commit'];
+    if (commit !== null && commit !== undefined) {
+      if (typeof commit !== 'string' || commit.length === 0 || commit.length > 64) {
+        collector.push('launch.repo.commit: expected a sha string, null, or omitted');
+      }
+    }
     if (input['repo']['baseRef'] !== undefined) checkString(input['repo']['baseRef'], 'launch.repo.baseRef', collector, 200);
   }
 
