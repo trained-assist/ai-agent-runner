@@ -1,6 +1,6 @@
 import { describe, expect, it, onTestFinished } from 'vitest';
 import { ApiError } from '../src/api/errors.js';
-import { AgentApi } from '../src/api/service.js';
+import { AgentApi, attemptOperationId } from '../src/api/service.js';
 import { StatelessStore } from '../src/api/stateless-store.js';
 import type { Principal } from '../src/api/auth.js';
 import { adapterFor, startMockWorker, type MockWorkerOptions } from './external-worker-harness.js';
@@ -322,6 +322,17 @@ describe('stateless AgentApi: capabilities отчитываются честно
 
   it('пустой реестр воркеров — отказ на старте, а не API без способа запустить агента', () => {
     expect(() => new AgentApi({ workers: [] })).toThrowError(/at least one external worker/);
+  });
+
+  it('operationId стабилен в пределах попытки — на этом держится дедупликация воркера', () => {
+    // Контракт внешнего worker, п. 2: воркер помнит принятые operationId. Свежий id на
+    // каждый submit делал дедупликацию бессмысленной — после рестарта API повтор с новым
+    // ключом принёс бы воркеру новый operationId, и тот запустил бы второй агент.
+    expect(attemptOperationId('ut-alpha', 1)).toBe(attemptOperationId('ut-alpha', 1));
+    // Новая попытка — новый ключ: иначе воркер склеил бы разные попытки в одну.
+    expect(attemptOperationId('ut-alpha', 1)).not.toBe(attemptOperationId('ut-alpha', 2));
+    expect(attemptOperationId('ut-alpha', 1)).not.toBe(attemptOperationId('ut-beta', 1));
+    expect(attemptOperationId('ut-alpha', 1)).toMatch(/^op_[0-9a-f]{24}$/);
   });
 
   it('у ядра нет recovery: состояние живёт в памяти и вычищается по TTL', async () => {

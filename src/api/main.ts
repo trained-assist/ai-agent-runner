@@ -37,8 +37,11 @@ async function main(): Promise<void> {
   );
   // Журнал приёмных записей: дедупликация по `Idempotency-Key` переживает рестарт API.
   // Без него повторный submit с тем же ключом после рестарта запустил бы второй ран.
-  // Путь задаётся `AGENT_API_ADMISSION_LOG`; каталог создаётся, если его нет.
-  const admissionLogPath = admissionLogFile(config.env['AGENT_API_ADMISSION_LOG']);
+  //
+  // Читаем из `process.env`, а не из `config.env`: `config.env` — это пул переменных,
+  // которые уходят ВОРКЕРУ в каждом ране (envAllowlist). Хостовая настройка API не должна
+  // лежать в пуле, который видят агенты, — иначе путь к журналу утекает в каждый ран.
+  const admissionLogPath = admissionLogFile(process.env['AGENT_API_ADMISSION_LOG']);
   if (admissionLogPath) {
     try {
       mkdirSync(dirname(admissionLogPath), { recursive: true, mode: 0o700 });
