@@ -86,12 +86,27 @@ const workspace = new WorkspaceService({
   bindings: bindingStore,           // host-owned: tenant/profile → repository
   admin: repositoryAdmin,           // host-owned: create private repo (org credential здесь)
   journal: new WorkspaceJournal(join(stateDir, 'workspace')),  // init() при старте
-  policy: compiledExportPolicy,     // см. H2
 });
 ```
 
-`journal.init()` при старте воркера: durable-записи переживают рестарт, битый журнал
-останавливает старт, а не сбрасывается молча.
+### Где живёт организационный credential
+
+Организационный токен **не** попадает ни в `RunSpec`, ни в события, ни в окружение
+движка: он читается хостом через резолвер и уходит только в заголовок `Authorization`
+запроса к GitHub API (и в `GIT_ASKPASS` для git-транспорта). В этой системе резолвер —
+секрет Cloudflare Worker `trained-assist-control-plane`:
+
+| Секрет | Значение |
+|---|---|
+| `PROFILES_ARTIFACTS_GITHUB_TOKEN` | токен с `Contents:R/W` на org `profiles-artifacts` (создание приватных репозиториев профилей) |
+
+`tokenRef` для вызова — строка-ссылка, например `github:profiles-artifacts`; резолвер
+сопоставляет её с секретом и возвращает значение только в процесс хоста. В журнале и в
+логах пишется только `tokenRef`, никогда значение.
+
+> Сейчас в секрете лежит личный OAuth-токен владельца с широкими правами. Для боевого
+> контура его нужно заменить на fine-grained PAT с `Contents:R/W` на `profiles-artifacts`
+> (и на право удаления репозитория, если понадобится откат) — имя секрета менять не нужно.
 
 ### H2. Политика экспорта
 
@@ -166,6 +181,31 @@ const cleanup = workspace.evaluateWorkspaceCleanup({ publicationId });
 голова успела измениться, кандидат не публикуется, а возвращается новый конфликт.
 Запуск resolver-агента (если он нужен) — зона интегратора: модуль ждёт готовое дерево
 кандидата и evidence.
+
+### Живая проверка (уже выполнена)
+
+`scripts/workspace-live-probe.mjs` прогоняет восемь методов на настоящем GitHub в org
+`profiles-artifacts`: создаёт приватный одноразовый репозиторий, проходит полный цикл и
+удаляет репозиторий и состояние в конце. Прогон 04.10.2026: **11/11 шагов** (ensure,
+идемпотентный ensure, publish, prepare с хэшами, тяжёлый артефакт 3 МБ по ref, два рана с
+автоматическим merge, same-file конфликт с чтением кандидата, stale candidate,
+durable-статус после «рестарта», отказ чужому tenant). Транзиентные сбои сети
+(`Connection reset by peer`) повторяются с backoff — классификатор отличает их от
+финальных ошибок (401/403, «not found», «does not appear to be a git repository»).
+
+```bash
+npm run build
+WORKSPACE_LIVE_OWNER=profiles-artifacts \
+WORKSPACE_LIVE_TOKEN_REF=github:profiles-artifacts \
+WORKSPACE_LIVE_TOKEN=<token> \
+node scripts/workspace-live-probe.mjs          # --keep оставляет репозиторий и state
+```
+  policy: compiledExportPolicy,     // см. H2
+});
+```
+
+`journal.init()` при старте воркера: durable-записи переживают рестарт, битый журнал
+останавливает старт, а не сбрасывается молча.
 
 ## Чего модуль не делает
 
