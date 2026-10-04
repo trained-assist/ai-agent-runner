@@ -31,6 +31,11 @@ export const EXTERNAL_WORKER_ADAPTER_VERSION = '1';
 /** Сколько событий рана API пишет до сетевого вызова: `claimed` + `inputs_materialized`. */
 export const ADMISSION_EVENT_COUNT = 2;
 
+/** Статус рана у воркера. `unknown` — исход установить нельзя, это не `failed`. */
+export type WorkerRunStatus = 'accepted' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'unknown';
+
+export const WORKER_STATUSES: readonly WorkerRunStatus[] = ['accepted', 'running', 'succeeded', 'failed', 'cancelled', 'unknown'];
+
 /** Префикс веток ранов. Ветка рана — это его результат, а не мусор в ветке по умолчанию. */
 export const DEFAULT_BRANCH_PREFIX = 'agent-run';
 
