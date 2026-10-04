@@ -96,6 +96,9 @@ export async function startHttpHarness(options: HttpHarnessOptions = {}): Promis
   });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
   const port = (server.address() as AddressInfo).port;
+  // Адрес нашего API становится известен только после старта: воркер получает его в
+  // `LaunchRequest.resultUrl`, и результат приходит на реальный порт харнесса.
+  adapter.setResultBaseUrl(`http://127.0.0.1:${port}`);
 
   const harness: HttpHarness = {
     base: `http://127.0.0.1:${port}`,

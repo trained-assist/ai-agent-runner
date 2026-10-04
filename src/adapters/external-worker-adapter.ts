@@ -31,10 +31,11 @@ export const EXTERNAL_WORKER_ADAPTER_VERSION = '1';
 /** Сколько событий рана API пишет до сетевого вызова: `claimed` + `inputs_materialized`. */
 export const ADMISSION_EVENT_COUNT = 2;
 
+export const WORKER_STATUSES: readonly WorkerRunStatus[] = ['accepted', 'running', 'succeeded', 'failed', 'cancelled', 'unknown'];
+
 /** Статус рана у воркера. `unknown` — исход установить нельзя, это не `failed`. */
 export type WorkerRunStatus = 'accepted' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'unknown';
 
-export const WORKER_STATUSES: readonly WorkerRunStatus[] = ['accepted', 'running', 'succeeded', 'failed', 'cancelled', 'unknown'];
 
 /** Префикс веток ранов. Ветка рана — это его результат, а не мусор в ветке по умолчанию. */
 export const DEFAULT_BRANCH_PREFIX = 'agent-run';
@@ -94,8 +95,47 @@ export interface LaunchRequest {
   env: Record<string, string>;
   limits: { timeoutMs: number; maxOutputBytes: number; maxLogBytes: number };
   repository: { fullName: string; branch: string };
+  /**
+   * Куда воркер вернёт `LaunchResult` для этого рана: `POST {resultUrl}` с общим секретом
+   * в `Authorization`. Адрес приходит в запросе, поэтому воркеру не нужно знать, где мы.
+   */
+  resultUrl: string;
   isolation: { mode: string };
   outputs?: Array<{ path: string; name?: string; mime?: string }>;
+}
+
+/**
+ * Квитанция запуска. `POST {worker}/v1/launch` отвечает ею сразу: воркер принял ран и ушёл
+ * работать, соединение закрывается. Финальный результат читается отдельно — по `statusUrl`
+ * и `resultUrl`, которые воркер сообщает в квитанции.
+ *
+ * Так воркер остаётся stateless (результат негде хранить), а наш API не держит HTTP-запрос
+ * весь ран — что важно, если сам API уедет на Cloudflare Worker, где длинный запрос
+ * невозможен.
+ */
+export interface LaunchReceipt {
+  runId: string;
+  operationId: string;
+  status: 'accepted';
+  statusUrl: string;
+  resultUrl: string;
+}
+
+/** Статус рана у воркера. `unknown` — исход установить нельзя, это не `failed`. */
+export type WorkerRunStatus = 'accepted' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'unknown';
+
+export interface WorkerStatusView {
+  runId: string;
+  status: WorkerRunStatus;
+  updatedAt?: string;
+}
+
+/** Результат ещё не готов: воркер отвечает 409, а не пустым телом. */
+export class ResultNotReadyError extends Error {
+  readonly code = 'RESULT_NOT_READY';
+  constructor(runId: string) {
+    super(`result of run ${runId} is not ready yet`);
+  }
 }
 
 export interface LaunchResult {
@@ -260,7 +300,10 @@ export function mergeUrl(repo: LaunchRepo): string {
  * (`options.env`) и передаются только те, что разрешил клиент в `envAllowlist` — секреты
  * хоста в процесс агента не попадают (issue #73, требование 4).
  */
-export function launchRequestFromSpec(spec: RunSpec, options: { env?: Record<string, string> } = {}): LaunchRequest {
+export function launchRequestFromSpec(
+  spec: RunSpec,
+  options: { env?: Record<string, string>; resultUrl: string } = { resultUrl: '' },
+): LaunchRequest {
   if (spec.input?.refs && spec.input.refs.length > 0) {
     throw new PreflightError('INPUT_REFS_UNSUPPORTED', 'input.refs require a durable workspace; the stateless API passes the prompt inline only', {
       failureClass: 'preflight',
@@ -307,9 +350,40 @@ export function launchRequestFromSpec(spec: RunSpec, options: { env?: Record<str
       maxLogBytes: spec.limits.maxLogBytes ?? 0,
     },
     repository: { fullName: spec.repository?.fullName ?? '', branch: runBranchName(spec.runId) },
+    resultUrl: options.resultUrl,
     isolation: { mode: spec.isolation?.mode ?? 'none' },
     ...(outputs.length > 0 ? { outputs } : {}),
   };
+}
+
+const RECEIPT_KEYS = ['runId', 'operationId', 'status', 'statusUrl', 'resultUrl'] as const;
+
+export function validateLaunchReceipt(input: unknown, expectedRunId: string): ValidationResult<LaunchReceipt> {
+  const collector = new ErrorCollector();
+  if (!checkObject(input, 'receipt', collector)) return collector.finish(undefined as never);
+  checkKeys(input, RECEIPT_KEYS, RECEIPT_KEYS, 'receipt', collector);
+  if (input['runId'] !== expectedRunId) collector.push(`receipt.runId: expected echo of ${expectedRunId}`);
+  if (!isSafeId(input['operationId'])) collector.push('receipt.operationId: expected id');
+  if (input['status'] !== 'accepted') collector.push('receipt.status: expected accepted');
+  checkString(input['statusUrl'], 'receipt.statusUrl', collector, 500);
+  checkString(input['resultUrl'], 'receipt.resultUrl', collector, 500);
+  return collector.finish(input as unknown as LaunchReceipt);
+}
+
+const STATUS_KEYS = ['runId', 'status', 'updatedAt'] as const;
+
+export function validateWorkerStatus(input: unknown, expectedRunId: string): ValidationResult<WorkerStatusView> {
+  const collector = new ErrorCollector();
+  if (!checkObject(input, 'status', collector)) return collector.finish(undefined as never);
+  checkKeys(input, STATUS_KEYS, ['runId', 'status'], 'status', collector);
+  if (input['runId'] !== expectedRunId) collector.push(`status.runId: expected echo of ${expectedRunId}`);
+  if (typeof input['status'] !== 'string' || !(WORKER_STATUSES as readonly string[]).includes(input['status'])) {
+    collector.push(`status.status: expected one of ${WORKER_STATUSES.join(', ')}`);
+  }
+  if (input['updatedAt'] !== undefined && !isUtcTimestamp(input['updatedAt'])) {
+    collector.push('status.updatedAt: expected UTC ISO timestamp');
+  }
+  return collector.finish(input as unknown as WorkerStatusView);
 }
 
 export function validateLaunchResult(input: unknown, expectedRunId: string): ValidationResult<LaunchResult> {
@@ -697,6 +771,7 @@ export class ExternalWorkerAdapter implements ExternalWorker {
   private readonly fetchImpl: typeof fetch;
   private readonly now: () => Date;
   private readonly log: (entry: Record<string, unknown>) => void;
+  private baseUrlForResult: string | undefined;
 
   constructor(options: ExternalWorkerOptions) {
     this.name = options.engineName ?? EXTERNAL_WORKER_ENGINE;
@@ -708,26 +783,26 @@ export class ExternalWorkerAdapter implements ExternalWorker {
     this.fetchImpl = options.fetchImpl ?? globalThis.fetch;
     this.now = options.now ?? (() => new Date());
     this.log = options.log ?? (() => undefined);
+    this.baseUrlForResult = options.baseUrlForResult;
   }
 
-  async launch(spec: RunSpec): Promise<LaunchResult> {
-    const request = launchRequestFromSpec(spec, { env: this.env });
+  async launch(spec: RunSpec): Promise<LaunchReceipt> {
     const base = this.baseUrl;
     if (!base) {
-      throw new PreflightError('WORKER_NOT_CONFIGURED', 'EXTERNAL_WORKER_URL is not set; the API cannot launch a run', {
+      throw new PreflightError('WORKER_NOT_CONFIGURED', 'no external worker URL is configured for this engine', {
         failureClass: 'preflight',
         retryable: false,
       });
     }
+    const request = launchRequestFromSpec(spec, { env: this.env, resultUrl: this.resultUrlFor(spec) });
     const url = `${trimTrailingSlash(base)}/v1/launch`;
     const headers: Record<string, string> = { 'content-type': 'application/json' };
     if (this.token) headers['authorization'] = `Bearer ${this.token}`;
     this.log({ event: 'worker_launch', runId: spec.runId, url, engine: spec.engine.name, timeoutMs: spec.limits.timeoutMs });
 
-    // Таймаут обрывает сам HTTP-запрос, а не только перестаёт его ждать: иначе на воркере
-    // остаётся осиротевший ран, который доживает свой limits.timeoutMs впустую.
-    // Таймаут обрывает сам HTTP-запрос, а не только перестаёт его ждать: иначе у воркера
-    // остаётся осиротевший ран, который доживает свой limits.timeoutMs впустую.
+    // Запрос короткий: воркер отвечает квитанцией сразу и уходит работать. Держать соединение
+    // весь ран не нужно — результат читается отдельно, поэтому таймаут здесь честно означает
+    // «воркер не принял задачу», а не «ран идёт долго».
     const controller = new AbortController();
     let response: Response;
     try {
@@ -738,63 +813,134 @@ export class ExternalWorkerAdapter implements ExternalWorker {
         () => controller.abort(),
       );
     } catch (err) {
-      const timedOut = controller.signal.aborted;
-      this.log({
-        event: 'worker_launch_failed',
-        runId: spec.runId,
-        timedOut,
-        message: err instanceof Error ? err.message : String(err),
+      // Обрываем запрос только по таймауту: abort после успешного ответа убил бы тело,
+      // которое мы ещё не прочитали.
+      if (controller.signal.aborted) controller.abort();
+      this.log({ event: 'worker_launch_failed', runId: spec.runId, message: err instanceof Error ? err.message : String(err) });
+      throw new PreflightError('WORKER_LAUNCH_UNREACHABLE', 'the external worker did not accept the run', {
+        failureClass: 'runtime',
+        // Ран не принят — никто его не выполняет, поэтому повтор не создаст второй.
+        retryable: true,
       });
-      if (timedOut) {
-        await this.cancelOrphan(spec.runId);
-        throw new PreflightError('WORKER_LAUNCH_TIMEOUT', `the external worker did not answer the launch within ${this.deadlineMs}ms`, {
-          failureClass: 'runtime',
-          // Повтор опасен: воркер мог запустить агента и без нас. Исход рана неизвестен.
-          retryable: false,
-        });
-      }
-      throw err;
     }
     if (!response.ok) {
       const detail = truncateLine(redactSecrets(await readBody(response)), 300);
       this.log({ event: 'worker_launch_http_error', runId: spec.runId, status: response.status, detail });
-      throw new PreflightError(
-        'WORKER_HTTP_ERROR',
-        `the external worker answered ${response.status} on launch`,
-        { failureClass: 'runtime', retryable: true },
-      );
+      throw new PreflightError('WORKER_HTTP_ERROR', `the external worker answered ${response.status} on launch`, {
+        failureClass: 'runtime',
+        retryable: true,
+      });
     }
-    const raw = await readJson(response);
-    const validated = validateLaunchResult(raw, spec.runId);
+    const validated = validateLaunchReceipt(await readJson(response), spec.runId);
     if (!validated.ok) {
       this.log({ event: 'worker_launch_invalid', runId: spec.runId, errors: validated.errors });
       throw new PreflightError(
         'WORKER_PROTOCOL_INVALID',
-        `the external worker returned a launch result that does not match the contract: ${validated.errors.join('; ')}`,
+        `the external worker answered launch outside the contract: ${validated.errors.join('; ')}`,
         { failureClass: 'runtime', retryable: true },
       );
     }
-    this.log({
-      event: 'worker_launch_ok',
-      runId: spec.runId,
-      status: validated.value.status,
-      exitReason: validated.value.exitReason,
-      exitCode: validated.value.exitCode,
-      durationMs: validated.value.durationMs,
-      artifacts: validated.value.artifacts.length,
-      logUrl: validated.value.logUrl,
-      repo: validated.value.repo.fullName,
-    });
+    this.log({ event: 'worker_launch_accepted', runId: spec.runId, engine: spec.engine.name, statusUrl: validated.value.statusUrl });
     return validated.value;
   }
 
-  /** Лучшее усилие остановить ран, который остался у воркера после обрыва launch. */
-  private async cancelOrphan(runId: string): Promise<void> {
+  /**
+   * Статус рана у воркера. Именно этот вызов даёт нашему API пережить собственный рестарт:
+   * воркер помнит принятые `operationId`, и мы можем спросить «что с этим раном» в любой
+   * момент, не запуская заново.
+   */
+  async status(runId: string): Promise<WorkerStatusView> {
+    const base = this.baseUrl;
+    if (!base) {
+      throw new PreflightError('WORKER_NOT_CONFIGURED', 'no external worker URL is configured for this engine', {
+        failureClass: 'preflight',
+        retryable: false,
+      });
+    }
+    const url = `${trimTrailingSlash(base)}/v1/runs/${runId}/status`;
+    const response = await this.getJson(url, this.deadlineMs, 'worker status');
+    const validated = validateWorkerStatus(await readJson(response), runId);
+    if (!validated.ok) {
+      throw new PreflightError(
+        'WORKER_PROTOCOL_INVALID',
+        `the external worker answered status outside the contract: ${validated.errors.join('; ')}`,
+        { failureClass: 'runtime', retryable: true },
+      );
+    }
+    return validated.value;
+  }
+
+  /** Финальный результат. Пока ран идёт, воркер отвечает 409 — мы поднимаем `ResultNotReadyError`. */
+  async result(runId: string): Promise<LaunchResult> {
+    const base = this.baseUrl;
+    if (!base) {
+      throw new PreflightError('WORKER_NOT_CONFIGURED', 'no external worker URL is configured for this engine', {
+        failureClass: 'preflight',
+        retryable: false,
+      });
+    }
+    const url = `${trimTrailingSlash(base)}/v1/runs/${runId}/result`;
+    let response: Response;
     try {
-      await this.cancel(runId);
-      this.log({ event: 'worker_orphan_cancel_requested', runId });
+      response = await this.getJson(url, this.deadlineMs, 'worker result');
     } catch (err) {
-      this.log({ event: 'worker_orphan_cancel_failed', runId, message: err instanceof Error ? err.message : String(err) });
+      if (err instanceof PreflightError && err.code === 'WORKER_HTTP_ERROR') throw new ResultNotReadyError(runId);
+      throw err;
+    }
+    const validated = validateLaunchResult(await readJson(response), runId);
+    if (!validated.ok) {
+      throw new PreflightError(
+        'WORKER_PROTOCOL_INVALID',
+        `the external worker answered result outside the contract: ${validated.errors.join('; ')}`,
+        { failureClass: 'runtime', retryable: true },
+      );
+    }
+    return validated.value;
+  }
+
+
+
+  /** Адрес, по которому воркер вернёт результат этого рана. */
+  resultUrlFor(spec: RunSpec): string {
+    const base = this.baseUrlForResult;
+    if (!base) {
+      throw new PreflightError('RESULT_URL_UNSET', 'the API does not know its own public URL, so it cannot tell the worker where to send the result', {
+        failureClass: 'preflight',
+        retryable: false,
+      });
+    }
+    return `${trimTrailingSlash(base)}/v1/worker/launches/${spec.runId}/result`;
+  }
+
+  /**
+   * Задать публичный адрес API после старта: порт сервера известен только тогда, а воркеру
+   * он нужен в каждом запросе запуска.
+   */
+  setResultBaseUrl(baseUrl: string): void {
+    this.baseUrlForResult = baseUrl;
+  }
+
+  /** Сверка предъявленного секрета: результат рана принимает только его воркер. */
+  matchesToken(presented: string): boolean {
+    if (!this.token || typeof presented !== 'string' || presented.length === 0) return false;
+    // timingSafeEqual требует равной длины и бросает на неравной, поэтому длину сверяем
+    // отдельно: токен не той длины — это «не наш», а не 500.
+    const left = Buffer.from(presented);
+    const right = Buffer.from(this.token);
+    if (left.length !== right.length) return false;
+    return timingSafeEqual(left, right);
+  }
+
+  /** Короткий GET с Bearer-токеном; 409 на результате — ожидаемый ответ «ещё не готово». */
+  private async getJson(url: string, deadlineMs: number, label: string): Promise<Response> {
+    const headers: Record<string, string> = { accept: 'application/json' };
+    if (this.token) headers['authorization'] = `Bearer ${this.token}`;
+    const controller = new AbortController();
+    try {
+      return await withDeadline(this.fetchImpl(url, { method: 'GET', headers, signal: controller.signal }), deadlineMs, label, () => controller.abort());
+    } catch (err) {
+      if (controller.signal.aborted) controller.abort();
+      throw err;
     }
   }
 
@@ -805,23 +951,30 @@ export class ExternalWorkerAdapter implements ExternalWorker {
     const headers: Record<string, string> = { 'content-type': 'application/json' };
     if (this.token) headers['authorization'] = `Bearer ${this.token}`;
     this.log({ event: 'worker_cancel', runId });
-    let response: Response;
-    try {
-      response = await withDeadline(this.fetchImpl(url, { method: 'POST', headers, body: '{}' }), this.cancelDeadlineMs, 'worker cancel');
-    } catch (err) {
-      this.log({ event: 'worker_cancel_failure', runId, message: err instanceof Error ? err.message : String(err) });
-      return { status: 'rejected', reason: 'cancel request did not reach the worker' };
+
+    let last = 'the worker did not answer the cancel request';
+    for (let attempt = 0; attempt < CANCEL_DELIVERY_RETRIES; attempt += 1) {
+      if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, CANCEL_DELIVERY_BACKOFF_MS));
+      let response: Response;
+      try {
+        response = await withDeadline(this.fetchImpl(url, { method: 'POST', headers, body: '{}' }), this.cancelDeadlineMs, 'worker cancel');
+      } catch (err) {
+        last = err instanceof Error ? err.message : String(err);
+        continue;
+      }
+      if (!response.ok) {
+        this.log({ event: 'worker_cancel_http_error', runId, status: response.status });
+        return { status: 'rejected', reason: `the worker answered ${response.status} on cancel` };
+      }
+      const raw = await readJson(response);
+      const record = typeof raw === 'object' && raw !== null && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
+      const status = record['status'];
+      if (status === 'cancelled') return { status: 'cancelled' };
+      if (status === 'unknown_run') return { status: 'unknown_run' };
+      return { status: 'rejected', reason: typeof record['reason'] === 'string' ? record['reason'] : 'the worker did not confirm the cancellation' };
     }
-    if (!response.ok) {
-      this.log({ event: 'worker_cancel_http_error', runId, status: response.status });
-      return { status: 'rejected', reason: `the worker answered ${response.status} on cancel` };
-    }
-    const raw = await readJson(response);
-    const record = typeof raw === 'object' && raw !== null && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
-    const status = record['status'];
-    if (status === 'cancelled') return { status: 'cancelled' };
-    if (status === 'unknown_run') return { status: 'unknown_run' };
-    return { status: 'rejected', reason: typeof record['reason'] === 'string' ? record['reason'] : 'the worker did not confirm the cancellation' };
+    this.log({ event: 'worker_cancel_failed', runId, reason: last });
+    return { status: 'rejected', reason: `cancel request did not reach the worker: ${last}` };
   }
 }
 

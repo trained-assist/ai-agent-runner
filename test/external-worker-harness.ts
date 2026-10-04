@@ -48,11 +48,13 @@ function sha256Hex(value: string): string {
 export async function startMockWorker(options: MockWorkerOptions = {}): Promise<MockWorker> {
   const launches: Array<Record<string, unknown>> = [];
   const cancels: string[] = [];
+  const results: Array<Record<string, unknown>> = [];
   const live = new Set<{ runId: string; cancelled: boolean; pending: boolean }>();
   let lastAuthorization: string | undefined;
 
   const defaults = {
     exitReason: 'completed' as const,
+    terminalStatus: 'succeeded' as const,
     exitCode: 0,
     answer: 'Готово, отчёт в report.md',
     answerSource: 'engine_stdout' as const,
@@ -90,30 +92,61 @@ export async function startMockWorker(options: MockWorkerOptions = {}): Promise<
           return;
         }
         if (settings.delayMs) await new Promise((resolve) => setTimeout(resolve, settings.delayMs));
-        const exitReason = record.cancelled === true ? 'cancelled' : settings.exitReason;
-        const payload = settings.malformed
-          ? { runId, status: 'started' }
-          : {
-              runId,
-              status: 'started',
-              pid: 4242,
-              exitCode: exitReason === 'cancelled' ? null : settings.exitCode,
-              exitSignal: exitReason === 'crash' ? 'SIGKILL' : null,
-              exitReason,
-              stdout: settings.stdout,
-              stderr: settings.stderr,
-              answer: settings.answer,
-              answerSource: settings.answerSource,
-              durationMs: 1234,
-              timedOut: exitReason === 'timeout',
-              outputTruncated: false,
-              artifacts: settings.artifacts,
-              logUrl: settings.logUrl === null ? undefined : String(settings.logUrl).replace('PLACEHOLDER', runId),
-              // Ветку рана просил наш API — воркер коммитит и пушит именно её.
-              repo: { ...settings.repo, branch: String(requestedBranch(body)) },
-            };
+        // Асинхронный контракт: воркер принял ран и ушёл работать. Квитанция несёт адреса,
+        // по которым наш API будет спрашивать статус и забирать результат.
+        const operationId = String(body['operationId'] ?? `op-${runId}`);
+        // Адреса возврата берём из запроса: воркер отвечает туда, куда его попросил наш API.
+        // Свой порт он подставлять не должен — иначе результат уйдёт в себя.
+        const statusUrl = requestedResultUrl(body).replace('/result', '/status');
+        const resultUrl = requestedResultUrl(body);
+        res.writeHead(202, { 'content-type': 'application/json' });
+        res.end(
+          JSON.stringify(
+            settings.malformed
+              ? { runId }
+              : { runId, operationId, status: 'accepted', statusUrl, resultUrl },
+          ),
+        );
+        // Автодоставка повторяет обычное поведение воркера: принял ран → отработал → отдал
+        // результат. Тест, который этого не хочет, выключает её через `autoDeliver`.
+        if (worker.autoDeliver) {
+          const delay = settings.resultDelayMs ?? 20;
+          setTimeout(() => {
+            worker.deliverResult(runId).catch((err) => console.log('DELIVER FAILED', err instanceof Error ? err.message : String(err)));
+          }, delay);
+        }
+        return;
+      }
+
+      // Статус рана: наш API опрашивает его, пока ран не станет терминальным.
+      const statusMatch = /^\/v1\/runs\/([^/]+)\/status$/.exec(url.pathname);
+      if (statusMatch) {
+        const runId = statusMatch[1]!;
+        const record = [...live].find((entry) => entry.runId === runId);
+        if (!record || record.pending) {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ runId, status: 'unknown', updatedAt: new Date().toISOString() }));
+          return;
+        }
+        const status = record.cancelled ? 'cancelled' : settings.terminalStatus;
         res.writeHead(200, { 'content-type': 'application/json' });
-        res.end(JSON.stringify(payload));
+        res.end(JSON.stringify({ runId, status, updatedAt: new Date().toISOString() }));
+        return;
+      }
+
+      // Результат рана: отдаём только когда ран терминальный, иначе 409.
+      const resultMatch = /^\/v1\/runs\/([^/]+)\/result$/.exec(url.pathname);
+      if (resultMatch) {
+        const runId = resultMatch[1]!;
+        const record = [...live].find((entry) => entry.runId === runId);
+        if (!record || record.pending || !TERMINAL.has(settings.terminalStatus)) {
+          res.writeHead(409, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ runId, status: 'not_ready' }));
+          return;
+        }
+        const exitReason = record.cancelled ? 'cancelled' : settings.exitReason;
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify(buildResult(runId, exitReason, settings)));
         return;
       }
       const cancelMatch = /^\/v1\/runs\/([^/]+)\/cancel$/.exec(url.pathname);
@@ -145,14 +178,84 @@ export async function startMockWorker(options: MockWorkerOptions = {}): Promise<
     baseUrl,
     launches,
     cancels,
+    results,
+    autoDeliver: true,
+    resultSink: null,
     options,
     lastAuthorization: () => lastAuthorization,
+    async deliverResult(runId: string, over: Partial<LaunchResult> = {}, token?: string) {
+      const launch = launches.find((entry) => entry['runId'] === runId);
+      const resultUrl = launch ? requestedResultUrl(launch) : '';
+      if (!resultUrl) throw new Error(`run ${runId} was never launched; no resultUrl to post to`);
+      const cancelled = [...live].some((entry) => entry.runId === runId && entry.cancelled);
+      const exitReason = cancelled ? 'cancelled' : settings.exitReason;
+      const payload = {
+        runId,
+        status: 'started',
+        pid: 4242,
+        exitCode: exitReason === 'cancelled' ? null : (settings['exitCode'] as number | undefined) ?? 0,
+        exitSignal: exitReason === 'crash' ? 'SIGKILL' : null,
+        exitReason,
+        stdout: (settings['stdout'] as string | undefined) ?? '',
+        stderr: (settings['stderr'] as string | undefined) ?? '',
+        answer: settings['answer'] as string | undefined ?? null,
+        answerSource: (settings['answerSource'] as string | undefined) ?? null,
+        durationMs: 1234,
+        timedOut: exitReason === 'timeout',
+        outputTruncated: false,
+        artifacts: (settings['artifacts'] as unknown[] | undefined) ?? [],
+        logUrl: settings['logUrl'] === null ? undefined : String(settings['logUrl']).replace('PLACEHOLDER', runId),
+        repo: { fullName: 'owner/name', branch: `agent-run/${runId}`, commit: 'abc1234', baseRef: 'main' },
+        ...over,
+      } as unknown as LaunchResult;
+      if (settings.malformedResult) delete (payload as Partial<LaunchResult>).artifacts;
+      results.push(payload as unknown as Record<string, unknown>);
+      // Воркер предъявляет тот же общий секрет, которым мы аутентифицировали его на launch.
+      const bearer = token ?? lastAuthorization?.replace(/^Bearer\s+/i, '');
+      if (worker.resultSink) {
+        return { status: 202, ok: true, body: await worker.resultSink(runId, payload, bearer) } as unknown as Response;
+      }
+      const headers: Record<string, string> = { 'content-type': 'application/json' };
+      if (bearer !== undefined) headers['authorization'] = `Bearer ${bearer}`;
+      return fetch(resultUrl, { method: 'POST', headers, body: JSON.stringify(payload) });
+    },
     async close() {
       server.closeAllConnections();
       await new Promise<void>((resolve) => server.close(() => resolve()));
     },
   };
   return worker;
+}
+
+/** Статусы, при которых воркер отдаёт результат, а не 409. */
+const TERMINAL = new Set(['succeeded', 'failed', 'cancelled']);
+
+/** Тело результата рана по настройкам мока. */
+function buildResult(runId: string, exitReason: string, settings: MockWorkerOptions & Record<string, unknown>): Record<string, unknown> {
+  return {
+    runId,
+    status: 'started',
+    pid: 4242,
+    exitCode: exitReason === 'cancelled' ? null : (settings['exitCode'] as number | undefined) ?? 0,
+    exitSignal: exitReason === 'crash' ? 'SIGKILL' : null,
+    exitReason,
+    stdout: (settings['stdout'] as string | undefined) ?? '',
+    stderr: (settings['stderr'] as string | undefined) ?? '',
+    answer: settings['answer'] as string | undefined ?? null,
+    answerSource: (settings['answerSource'] as string | undefined) ?? null,
+    durationMs: 1234,
+    timedOut: exitReason === 'timeout',
+    outputTruncated: false,
+    artifacts: (settings['artifacts'] as unknown[] | undefined) ?? [],
+    logUrl: settings['logUrl'] === null ? undefined : String(settings['logUrl']).replace('PLACEHOLDER', runId),
+    repo: { fullName: 'owner/name', branch: `agent-run/${runId}`, commit: 'abc1234', baseRef: 'main' },
+  };
+}
+
+/** Адрес возврата результата, который наш API передал воркеру в запросе запуска. */
+function requestedResultUrl(body: Record<string, unknown>): string {
+  const url = body['resultUrl'];
+  return typeof url === 'string' ? url : '';
 }
 
 function requestedBranch(body: Record<string, unknown>): string {
@@ -170,13 +273,16 @@ async function readBody(req: IncomingMessage): Promise<string> {
 
 export function adapterFor(
   worker: MockWorker,
-  options: { token?: string; env?: Record<string, string>; deadlineMs?: number } = {},
+  options: { token?: string; env?: Record<string, string>; deadlineMs?: number; engineName?: string; noResultBase?: boolean } = {},
 ): ExternalWorkerAdapter {
   return new ExternalWorkerAdapter({
     baseUrl: worker.baseUrl,
     ...(options.token ? { token: options.token } : {}),
+    ...(options.engineName ? { engineName: options.engineName } : {}),
     ...(options.env ? { env: options.env } : {}),
     deadlineMs: options.deadlineMs ?? 5000,
     cancelDeadlineMs: 2000,
+    // Тесты без HTTP-сервера всё равно получают осмысленный LaunchRequest.resultUrl.
+    ...(options.noResultBase ? {} : { baseUrlForResult: 'https://api.test' }),
   });
 }
