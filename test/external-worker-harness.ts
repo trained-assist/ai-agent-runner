@@ -15,7 +15,7 @@ export interface MockWorkerOptions {
   stdout?: string;
   stderr?: string;
   artifacts?: Array<{ path: string; name: string; mime: string; sha256: string; size: number }>;
-  repo?: { fullName: string; commit: string };
+  repo?: { fullName: string; commit: string; baseRef?: string };
   logUrl?: string | null;
   /** Задержка ответа, чтобы успеть проверить статус `running`. */
   delayMs?: number;
@@ -59,7 +59,7 @@ export async function startMockWorker(options: MockWorkerOptions = {}): Promise<
     stdout: 'opencode run finished',
     stderr: '',
     artifacts: [{ path: 'report.md', name: 'report.md', mime: 'text/markdown', sha256: sha256Hex('report.md'), size: 1234 }],
-    repo: { fullName: 'owner/name', commit: 'abc1234' },
+    repo: { fullName: 'owner/name', commit: 'abc1234', baseRef: 'main' },
     logUrl: 'https://storage.googleapis.com/agent-logs/runs/PLACEHOLDER/session.log',
   };
   const settings = { ...defaults, ...options };
@@ -109,7 +109,8 @@ export async function startMockWorker(options: MockWorkerOptions = {}): Promise<
               outputTruncated: false,
               artifacts: settings.artifacts,
               logUrl: settings.logUrl === null ? undefined : String(settings.logUrl).replace('PLACEHOLDER', runId),
-              repo: settings.repo,
+              // Ветку рана просил наш API — воркер коммитит и пушит именно её.
+              repo: { ...settings.repo, branch: String(requestedBranch(body)) },
             };
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify(payload));
@@ -152,6 +153,13 @@ export async function startMockWorker(options: MockWorkerOptions = {}): Promise<
     },
   };
   return worker;
+}
+
+function requestedBranch(body: Record<string, unknown>): string {
+  const repository = body['repository'];
+  if (typeof repository !== 'object' || repository === null) return '';
+  const branch = (repository as Record<string, unknown>)['branch'];
+  return typeof branch === 'string' ? branch : '';
 }
 
 async function readBody(req: IncomingMessage): Promise<string> {

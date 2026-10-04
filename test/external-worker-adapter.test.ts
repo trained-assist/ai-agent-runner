@@ -6,6 +6,9 @@ import {
   launchRequestFromSpec,
   admissionEvents,
   mapLaunchResult,
+  branchUrl,
+  mergeUrl,
+  runBranchName,
   runLogRef,
   validateLaunchResult,
   workerTransportFailure,
@@ -36,7 +39,7 @@ function launchResult(over: Partial<LaunchResult> = {}): LaunchResult {
     outputTruncated: false,
     artifacts: [{ path: 'report.md', name: 'report.md', mime: 'text/markdown', sha256: 'a'.repeat(64), size: 1234 }],
     logUrl: 'https://storage.googleapis.com/agent-logs/runs/run-1/session.log',
-    repo: { fullName: 'owner/name', commit: 'abc1234' },
+    repo: { fullName: 'owner/name', branch: 'agent-run/run-1', commit: 'abc1234', baseRef: 'main' },
     ...over,
   };
 }
@@ -58,6 +61,8 @@ describe('launch request: RunSpec → LaunchRequest (issue #73)', () => {
     expect(request.input.inlinePrompt).toBe('сделай отчёт');
     expect(request.limits).toEqual({ timeoutMs: 300_000, maxOutputBytes: 1_048_576, maxLogBytes: 1_048_576 });
     expect(request.repository.fullName).toBe('owner/name');
+    // Ветку называет наш API: только он знает runId, поэтому имя уникально и не конфликтует.
+    expect(request.repository.branch).toBe(`agent-run/${spec.runId}`);
     expect(request.isolation.mode).toBe('per_run_unix_identity');
     expect(request.outputs).toEqual([{ path: 'report.md', name: 'report.md', mime: 'text/markdown' }]);
     // В процесс агента уходят только переменные из envAllowlist; секрет хоста остаётся здесь.
@@ -122,7 +127,7 @@ describe('маппинг LaunchResult → RunResult + RunnerEvent (epic #74, ш�
     expect(mapping.result.cleanup).toBe('completed');
     expect(mapping.result.cleanupReason).toContain('external worker owns the workspace');
     expect(mapping.logUrl).toBe('https://storage.googleapis.com/agent-logs/runs/run-1/session.log');
-    expect(mapping.repo).toEqual({ fullName: 'owner/name', commit: 'abc1234' });
+    expect(mapping.repo).toEqual({ fullName: 'owner/name', branch: 'agent-run/run-1', commit: 'abc1234', baseRef: 'main' });
     for (const event of mapping.events) expect(validateRunnerEvent(event).ok).toBe(true);
     const types = mapping.events.map((event) => event.type);
     expect(types).toContain('started');
@@ -272,10 +277,21 @@ describe('runLogRef и artifactUrl', () => {
     expect(runLogRef(null, null, 'run-1')).toBe('worker://unconfigured/v1/runs/run-1');
   });
 
-  it('артефакт адресуется коммитом в репозитории юзера', () => {
-    expect(artifactUrl({ fullName: 'owner/name', commit: 'abc1234' }, 'docs/report.md')).toBe(
-      'https://github.com/owner/name/blob/abc1234/docs/report.md',
-    );
+  it('артефакт адресуется коммитом, ветка рана — страницей, результат — ссылкой на merge', () => {
+    const repo = { fullName: 'owner/name', branch: 'agent-run/run-1', commit: 'abc1234', baseRef: 'main' };
+    expect(artifactUrl(repo, 'docs/report.md')).toBe('https://github.com/owner/name/blob/abc1234/docs/report.md');
+    expect(branchUrl(repo)).toBe('https://github.com/owner/name/tree/agent-run/run-1');
+    expect(mergeUrl(repo)).toBe('https://github.com/owner/name/compare/main...agent-run/run-1');
+  });
+
+  it('без известной базы отдаём страницу ветки, а не выдуманный compare', () => {
+    const repo = { fullName: 'owner/name', branch: 'agent-run/run-1', commit: 'abc1234' };
+    expect(mergeUrl(repo)).toBe(branchUrl(repo));
+  });
+
+  it('имя ветки рана выводится из runId и не путается с ветками юзера', () => {
+    expect(runBranchName('run_abc')).toBe('agent-run/run_abc');
+    expect(runBranchName('run_abc', 'bots')).toBe('bots/run_abc');
   });
 });
 

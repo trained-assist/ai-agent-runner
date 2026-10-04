@@ -66,7 +66,7 @@ API больше не используется** и удаляется отде�
 | `GET /v1/runs/{id}/status` | состояние рана, курсор событий, `answer` агента |
 | `GET /v1/runs/{id}/result` | `RunResult` после терминального состояния, иначе `409 RESULT_NOT_READY` |
 | `GET /v1/runs/{id}/events` | страница событий (`?cursor=&limit=`) либо SSE на `Accept: text/event-stream` |
-| `GET /v1/runs/{id}/artifacts` | список ссылок на файлы в репозитории юзера + `logUrl` |
+| `GET /v1/runs/{id}/artifacts` | ветка рана, ссылка на merge, ссылки на файлы по коммиту и `logUrl` |
 | `GET /v1/runs/{id}/log` | `302` на ссылку лога в Google Storage |
 | `POST /v1/runs/{id}/cancel` | пробрасывает отмену воркеру; `202` — принята, `200` — уже терминальный |
 
@@ -96,8 +96,25 @@ POST /v1/runs  →  202 receipt           память: AdmissionRecord + соб
 так и не появился — отказ (`409`), а не «остановлено».
 
 **Отказ воркера.** Транспортный обрыв, HTTP-ошибка или тело вне контракта дают терминальный
-`failed` с `exitReason: worker_crash` и `failure.code = WORKER_UNREACHABLE`, `retryable: true`.
-Ран никогда не остаётся в `running` навсегда.
+`failed` с `exitReason: worker_crash` и кодом причины (`WORKER_UNREACHABLE`, `WORKER_HTTP_ERROR`,
+`WORKER_PROTOCOL_INVALID`, `WORKER_LAUNCH_TIMEOUT`). Пре-флайт-отказ клиента (`input.refs`,
+нет промпта) сохраняет свой код и `retryable: false`. Ран никогда не остаётся в `running`
+навсегда.
+
+## 4.1 Результат рана — ветка
+
+Каждый ран получает **свою ветку** `agent-run/<runId>` в репозитории юзера: имя задаёт API,
+воркер клонирует репозиторий, создаёт ветку, коммитит в неё объявленные `outputs` и пушит.
+`GET /v1/runs/{id}/artifacts` отдаёт три уровня адреса:
+
+| Поле | Пример | Что это |
+|---|---|---|
+| `artifacts[].url` | `https://github.com/owner/name/blob/abc1234/report.md` | конкретный файл на коммите |
+| `branchUrl` | `https://github.com/owner/name/tree/agent-run/run_…` | весь результат рана |
+| `mergeUrl` | `https://github.com/owner/name/compare/main...agent-run/run_…` | куда его смержить |
+
+Наше API **не мержит** — у него нет кредов на push и merge чужой работы без спроса. Решение
+о слиянии принимает человек или control plane, получив `mergeUrl`. Подробности — ТЗ воркера §8.1.
 
 ---
 

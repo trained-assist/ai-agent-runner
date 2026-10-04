@@ -266,7 +266,7 @@ describe('repository context: stateless API (#74)', () => {
       launch: worker.launches,
     });
     expect(dump).not.toContain(SECRET_TOKEN);
-    expect(worker.launches[0]!['repository']).toEqual({ fullName: 'owner/name' });
+    expect(worker.launches[0]!['repository']).toEqual({ fullName: 'owner/name', branch: `agent-run/${receipt.runId}` });
     expect((worker.launches[0]!['repository'] as Record<string, unknown>)['token']).toBeUndefined();
   });
 

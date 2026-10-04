@@ -31,6 +31,9 @@ export const EXTERNAL_WORKER_ADAPTER_VERSION = '1';
 /** Сколько событий рана API пишет до сетевого вызова: `claimed` + `inputs_materialized`. */
 export const ADMISSION_EVENT_COUNT = 2;
 
+/** Префикс веток ранов. Ветка рана — это его результат, а не мусор в ветке по умолчанию. */
+export const DEFAULT_BRANCH_PREFIX = 'agent-run';
+
 export const DEFAULT_LAUNCH_DEADLINE_MS = 10 * 60 * 1000;
 export const DEFAULT_CANCEL_DEADLINE_MS = 30 * 1000;
 export const MAX_LOG_EVENT_CHARS = 10_000;
@@ -45,7 +48,21 @@ export interface LaunchArtifact {
 
 export interface LaunchRepo {
   fullName: string;
+  /** Ветка рана: воркер создал её, закоммитил в неё `outputs` и запушил. */
+  branch: string;
+  /** HEAD этой ветки на момент ответа. */
   commit: string;
+  /** Ветка, от которой ответвлялся ран (если воркер её сообщил). */
+  baseRef?: string;
+}
+
+/**
+ * Имя ветки рана. Генерирует наше API, а не воркер: только API знает `runId`, поэтому имя
+ * уникально, трассируемо до рана и не может столкнуться с ветками самого юзера. Ветка —
+ * единица результата: всё, что ран сделал, лежит в ней и мержится одним действием.
+ */
+export function runBranchName(runId: string, prefix = DEFAULT_BRANCH_PREFIX): string {
+  return `${prefix}/${runId}`;
 }
 
 export interface LaunchFailure {
@@ -71,7 +88,7 @@ export interface LaunchRequest {
   envAllowlist: string[];
   env: Record<string, string>;
   limits: { timeoutMs: number; maxOutputBytes: number; maxLogBytes: number };
-  repository: { fullName: string };
+  repository: { fullName: string; branch: string };
   isolation: { mode: string };
   outputs?: Array<{ path: string; name?: string; mime?: string }>;
 }
@@ -212,6 +229,21 @@ export function artifactUrl(repo: LaunchRepo, path: string): string {
   return `https://github.com/${repo.fullName}/blob/${repo.commit}/${path}`;
 }
 
+/** Страница ветки рана: отсюда видно весь результат и отсюда GitHub предлагает merge/PR. */
+export function branchUrl(repo: LaunchRepo): string {
+  return `https://github.com/${repo.fullName}/tree/${repo.branch}`;
+}
+
+/**
+ * Ссылка на сравнение ветки рана с базой — то место, где результат рана мержится. Без
+ * известной базы честнее отдать страницу ветки: GitHub сам предложит merge.
+ */
+export function mergeUrl(repo: LaunchRepo): string {
+  return repo.baseRef
+    ? `https://github.com/${repo.fullName}/compare/${repo.baseRef}...${repo.branch}`
+    : branchUrl(repo);
+}
+
 /**
  * Сборка `LaunchRequest` из `RunSpec`. Значения окружения берутся из хостового пула
  * (`options.env`) и передаются только те, что разрешил клиент в `envAllowlist` — секреты
@@ -263,7 +295,7 @@ export function launchRequestFromSpec(spec: RunSpec, options: { env?: Record<str
       maxOutputBytes: spec.limits.maxOutputBytes ?? 0,
       maxLogBytes: spec.limits.maxLogBytes ?? 0,
     },
-    repository: { fullName: spec.repository?.fullName ?? '' },
+    repository: { fullName: spec.repository?.fullName ?? '', branch: runBranchName(spec.runId) },
     isolation: { mode: spec.isolation?.mode ?? 'none' },
     ...(outputs.length > 0 ? { outputs } : {}),
   };
@@ -319,9 +351,11 @@ export function validateLaunchResult(input: unknown, expectedRunId: string): Val
   if (!checkObject(input['repo'], 'launch.repo', collector)) {
     // уже сообщено
   } else {
-    checkKeys(input['repo'], ['fullName', 'commit'], ['fullName', 'commit'], 'launch.repo', collector);
+    checkKeys(input['repo'], ['fullName', 'branch', 'commit', 'baseRef'], ['fullName', 'branch', 'commit'], 'launch.repo', collector);
     checkString(input['repo']['fullName'], 'launch.repo.fullName', collector, 200);
+    checkString(input['repo']['branch'], 'launch.repo.branch', collector, 200);
     checkString(input['repo']['commit'], 'launch.repo.commit', collector, 64);
+    if (input['repo']['baseRef'] !== undefined) checkString(input['repo']['baseRef'], 'launch.repo.baseRef', collector, 200);
   }
 
   const failure = input['failure'];

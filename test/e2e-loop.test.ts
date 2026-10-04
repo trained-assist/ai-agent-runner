@@ -25,6 +25,26 @@ import {
  */
 
 describe('e2e: serverless API поверх внешнего воркера (#74)', () => {
+  it('два параллельных рана одного репозитория получают разные ветки и не мешают друг другу', async () => {
+    const h = await startHttpHarness({ worker: { delayMs: 120 } });
+    const [first, second] = await Promise.all([
+      postSubmit(h.base, alphaKey, 'idem-branch-1', submitBody({ outputs: [{ path: 'a.md' }] })),
+      postSubmit(h.base, alphaKey, 'idem-branch-2', submitBody({ outputs: [{ path: 'b.md' }] })),
+    ]);
+    const one = (await first.json()) as { runId: string };
+    const two = (await second.json()) as { runId: string };
+    expect(one.runId).not.toBe(two.runId);
+
+    expect(await waitForTerminal(h.base, alphaKey, one.runId)).toBe('succeeded');
+    expect(await waitForTerminal(h.base, alphaKey, two.runId)).toBe('succeeded');
+
+    const branches = (await (await getArtifacts(h.base, alphaKey, one.runId)).json()) as { repo: { branch: string } };
+    const other = (await (await getArtifacts(h.base, alphaKey, two.runId)).json()) as { repo: { branch: string } };
+    expect(branches.repo.branch).toBe(`agent-run/${one.runId}`);
+    expect(other.repo.branch).toBe(`agent-run/${two.runId}`);
+    expect(branches.repo.branch).not.toBe(other.repo.branch);
+  }, 30000);
+
   it('submit → worker → result → GitHub-артефакты → logUrl в GCS', async () => {
     const h = await startHttpHarness();
 
@@ -34,11 +54,12 @@ describe('e2e: serverless API поверх внешнего воркера (#74)
     expect(receipt.deduplicated).toBe(false);
     expect(receipt.runId).toMatch(/^run_/);
 
-    // Ран ушёл во внешний воркер ровно один раз и с предписанным движком.
+    // Ран ушёл во внешний воркер ровно один раз и с предписанным движком и веткой.
     expect(await waitForTerminal(h.base, alphaKey, receipt.runId)).toBe('succeeded');
     expect(h.worker.launches).toHaveLength(1);
     expect(h.worker.launches[0]!['runId']).toBe(receipt.runId);
     expect((h.worker.launches[0]!['engine'] as { name: string }).name).toBe('dynamic-ip-azure-agent-run');
+    expect((h.worker.launches[0]!['repository'] as { branch: string }).branch).toBe(`agent-run/${receipt.runId}`);
 
     const result = (await (await getResult(h.base, alphaKey, receipt.runId)).json()) as { outcome: string; logPath: string; outputRefs: string[] };
     expect(result.outcome).toBe('succeeded');
@@ -48,12 +69,18 @@ describe('e2e: serverless API поверх внешнего воркера (#74)
     // Артефакты — ссылки на GitHub, а не байты.
     const artifacts = (await (await getArtifacts(h.base, alphaKey, receipt.runId)).json()) as {
       count: number;
-      repo: { fullName: string; commit: string };
+      repo: { fullName: string; branch: string; commit: string };
+      branchUrl: string;
+      mergeUrl: string;
       logUrl: string;
       artifacts: Array<{ path: string; url: string; size: number; sha256: string }>;
     };
     expect(artifacts.count).toBe(1);
-    expect(artifacts.repo).toEqual({ fullName: 'owner/name', commit: 'abc1234' });
+    // Каждый ран — своя ветка в репозитории юзера, результат мержится из неё.
+    expect(artifacts.repo.branch).toBe(`agent-run/${receipt.runId}`);
+    expect(artifacts.repo.commit).toBe('abc1234');
+    expect(artifacts.branchUrl).toBe(`https://github.com/owner/name/tree/agent-run/${receipt.runId}`);
+    expect(artifacts.mergeUrl).toContain(`compare/main...agent-run/${receipt.runId}`);
     expect(artifacts.artifacts[0]).toMatchObject({
       path: 'report.md',
       url: 'https://github.com/owner/name/blob/abc1234/report.md',

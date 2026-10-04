@@ -10,6 +10,9 @@
 > в этом документе (в первую очередь §8 «Артефакты») помечены как устаревшие: воркер **сам**
 > коммитит артефакты в репозиторий юзера и грузит лог сессии в Google Storage, а наше API
 > возвращает ссылки и байт не хранит.
+>
+> Решение владельца от 04.10.2026: артефакты публикует **воркер**, наше API в их публикации
+> не участвует. Схема «воркер оставил файлы в `cwd`, наш API их забирает и публикует» отклонена.
 
 ---
 
@@ -128,8 +131,8 @@ Authorization: Bearer {WORKER_TOKEN}
     "maxLogBytes": 1048576
   },
 
-  // Репозиторий (уже склонирован, воркер НЕ клонирует)
-  "repository": { "fullName": "owner/name" },
+  // Репозиторий и ветка рана: воркер клонирует и работает в этой ветке (§8.1)
+  "repository": { "fullName": "owner/name", "branch": "agent-run/run_0fdd061d-…" },
 
   // Изоляция
   "isolation": { "mode": "per_run_unix_identity" },
@@ -217,28 +220,69 @@ Authorization: Bearer {WORKER_TOKEN}
 2. **env процесса:** только переменные из `envAllowlist`, значения из `env`. Секреты
    хоста и токены в процесс не передаются.
 3. **Таймаут:** убить дерево процессов по `limits.timeoutMs` (SIGTERM → через 5s SIGKILL).
-4. **Отмена:** `POST {worker}/v1/runs/{runId}/cancel` → убить дерево, вернуть `cancelled`.
-5. **Изоляция:** если `isolation.mode = "per_run_unix_identity"` — запускать opencode под
+4. **Ветка рана:** создать `repository.branch`, коммитить в неё, запушить её (§8.1). Не
+   коммитить в ветку по умолчанию. Креды на push — свои, из секретов воркера.
+5. **Отмена:** `POST {worker}/v1/runs/{runId}/cancel` → убить дерево, вернуть `cancelled`.
+6. **Изоляция:** если `isolation.mode = "per_run_unix_identity"` — запускать opencode под
    Unix-идентичностью рана (setpriv/runuser), не под service UID. Если не поддерживаете —
    отказывайте с `ISOLATION_UNSUPPORTED`, `failureClass: "preflight"`.
-6. **Вывод:** stdout/stderr захватываются, ограничиваются `maxOutputBytes`, при
+7. **Вывод:** stdout/stderr захватываются, ограничиваются `maxOutputBytes`, при
    превышении сохраняется хвост + флаг `outputTruncated`.
-7. **Логи:** секреты и токены не логируются в открытом виде. Лог сессии загружается в GCS,
+8. **Логи:** секреты и токены не логируются в открытом виде. Лог сессии загружается в GCS,
    возвращается `logUrl`.
-8. **Stateless:** повторный запрос с тем же `runId` не ломит состояние.
-9. **Артефакты:** коммитит в `repository.fullName` и возвращает `artifacts[]` + `repo` (issue #73).
+9. **Stateless:** повторный запрос с тем же `runId` не ломит состояние.
+10. **Артефакты:** коммитит `outputs` в ветку `repository.branch`, пушит её и возвращает
+    `artifacts[]` + `repo` (issue #73, §8.1).
 
 ## 8. Артефакты
 
-**Устарело.** Актуальная версия — issue #73: воркер **сам** складывает `outputs` в репозиторий
-`repository.fullName` и возвращает в `LaunchResult` список `artifacts[]` (`path`/`name`/`mime`/
-`sha256`/`size`) вместе с `repo: {fullName, commit}` и `logUrl` на лог сессии в Google Storage.
-Наше API не читает `cwd` и не хранит байты — оно адресует то, что вернул воркер
-(`https://github.com/<owner>/<name>/blob/<commit>/<path>` и `logUrl`).
+**Решено (владелец, 04.10.2026): коммитит воркер.** Агент во время сессии пишет нужное ему
+в свой рабочий каталог; этот каталог — эфемерный, он живёт на машине воркера и умирает вместе
+с ней, поэтому держать результат там нельзя. Долговечно попадает **объявленное клиентом в
+`outputs`**, и единственное место, которое его принимает, — репозиторий самого юзера.
 
-Прежняя схема (воркер оставляет файлы в `cwd`, наш API публикует их через
-`WorkspaceService.publishRunChanges`) требует от нашего API доступа к диску воркера и потому
-в stateless-модели невозможна.
+### 8.1 Каждый ран — своя ветка
+
+Результат рана кладётся не в ветку по умолчанию, а в **отдельную ветку рана**: клон → ветка →
+всё дальше в ветке. Имя ветки задаёт наше API, поле `repository.branch` в `LaunchRequest`.
+
+Почему так: результат рана — это предложение изменения, а не готовое состояние ветки. В ветке
+видно ровно то, что сделал агент, её можно открыть в PR, отрецензировать, откатить одним
+движением и смержить одним действием. Прямой коммит в ветку по умолчанию этого не даёт: правки
+смешиваются с чужой работой, их не отличить от чужих, а откат — только revert-ом чужого коммита.
+
+| Что | Кто | Значение |
+|---|---|---|
+| Имя ветки | наше API | `agent-run/<runId>` — уникально и трассируемо до рана, не конфликтует с ветками юзера |
+| База | воркер | ветка, от которой ответвляется ран (по умолчанию — дефолтная ветка репозитория) |
+| Коммит | воркер | `outputs` коммитятся в ветку рана |
+| Пуш | воркер | ветка пушится в `repository.fullName` |
+| Merge | человек или control plane | наше API **не мержит**: оно строит ссылку `compare/<base>...<branch>` и отдаёт её клиенту |
+
+Механика:
+
+1. Воркер клонирует `repository.fullName` в `cwd`, создаёт ветку `repository.branch`.
+2. Агент работает в `cwd` (то есть в этой ветке) и пишет объявленные `outputs`.
+3. Воркер коммитит `outputs` в ветку рана и пушит её.
+4. Воркер возвращает в `LaunchResult` `artifacts[]` (`path`/`name`/`mime`/`sha256`/`size`),
+   `repo: {fullName, branch, commit, baseRef}` и `logUrl` на лог сессии в Google Storage.
+5. Наше API ничего не читает с диска воркера и не хранит байт — оно адресует то, что вернули:
+   `https://github.com/<owner>/<name>/blob/<commit>/<path>` (файл на коммите),
+   `.../tree/<branch>` (ветка целиком) и `.../compare/<baseRef>...<branch>` (куда мержить).
+
+**Требование к воркеру: у него должны быть креды на push в репозиторий юзера.** Токен,
+который клиент прислал в `repository.token`, наше API наружу не передаёт и не должен: он нужен
+воркеру на постоянной основе (deploy key или GitHub App), а не в теле каждого запроса.
+
+Требование к контракту: `artifacts[]` и `repo` обязательны, даже если список пуст (тогда это
+значит «объявленных выходов не было», а не «воркер не смог»); `repo.branch` обязателен, без него
+клиент не сможет найти результат.
+
+**Почему не «забирает наш API».** Наш API stateless: у него нет ни диска, ни сетевого доступа
+к машине воркера — она эфемерная и может быть уже убита. Схема с забором `cwd` потребовала бы
+либо вернуть воркеру статус «мы забираем», либо держать воркер живым до вычитки, и то и другое
+ломает «после рана VM можно убить». Публикация через `WorkspaceService` в нашем API отклонена
+по той же причине — это путь в durable-хранилище, которого у оркестратора нет.
 
 ## 9. Приёмка (чеклист)
 
@@ -249,20 +293,27 @@ Authorization: Bearer {WORKER_TOKEN}
 - [ ] Ответ: `exitCode`, `exitReason`, `stdout`, `stderr`, `answer`, `durationMs`.
 - [ ] Бинарь не найден → `OPENCODE_BINARY_MISSING`, `retryable: false`.
 - [ ] Изоляция `per_run_unix_identity` поддержана (или отказ `ISOLATION_UNSUPPORTED`).
+- [ ] Ветка рана создана, `outputs` закоммичены в неё, ветка запушена в `repository.fullName`.
+- [ ] В ответе `repo.branch` — та самая ветка, `repo.commit` — её HEAD, `repo.baseRef` — база.
+- [ ] У воркера есть креды на push в репозиторий юзера (проверено пробным ран'ом).
 - [ ] Секреты не в логах и не в процессе.
 - [ ] Эндпоинт регистрируется в нашем API (Вариант А) или есть стабильный DNS (Вариант Б).
 - [ ] Наш API регистрирует движок как `dynamic-ip-azure-agent-run` и получает полный цикл
-      submit → events → result → artifacts.
+      submit → events → result → artifacts (ссылки на коммит, ветку и merge).
 
-## 10. Что делаем мы (агент в этом репо)
+## 10. Что делаем мы (агент в этом репо) — сделано в #74
 
-1. `DynamicIpAzureAdapter implements EngineAdapter`:
-   - `name = "dynamic-ip-azure-agent-run"`.
-   - `start(ctx)` → `POST {endpoint}/v1/launch` с `LaunchRequest` (маппинг из `RunSpec`).
-   - `LaunchResult` → `ctx.onExit` + `RunResult`.
-2. Эндпоинт воркера приходит из конфига: `DYNAMIC_IP_AZURE_URL`, `DYNAMIC_IP_AZURE_TOKEN`.
-3. Регистрация в `engines`: `["fake", "opencode", "dynamic-ip-azure-agent-run"]`.
-4. Тесты: `test/dynamic-ip-azure-adapter.test.ts` — мок воркера, проверка маппинга.
+1. `ExternalWorkerAdapter` в `src/adapters/external-worker-adapter.ts`:
+   - `name = "dynamic-ip-azure-agent-run"`;
+   - `launch(spec)` → `POST {endpoint}/v1/launch` с `LaunchRequest` (маппинг из `RunSpec`,
+     включая имя ветки рана `agent-run/<runId>`);
+   - `LaunchResult` → `RunResult` + `RunnerEvent[]`;
+   - `cancel(runId)` → `POST {endpoint}/v1/runs/{runId}/cancel`.
+2. Эндпоинт и токен приходят из конфига: `EXTERNAL_WORKER_URL`/`EXTERNAL_WORKER_TOKEN`
+   (принимаются и `DYNAMIC_IP_AZURE_*` из ранней редакции ТЗ, `EXTERNAL_WORKER_*` приоритетнее).
+3. `engines` = `["dynamic-ip-azure-agent-run"]` — единственный, больше никаких локальных движков.
+4. Тесты: `test/external-worker-adapter.test.ts` (контракт и маппинг) и
+   `test/e2e-loop.test.ts` (полный цикл с мок-воркером, включая разные ветки у параллельных ранов).
 
 ## 11. Контракты в нашем репозитории
 
@@ -271,7 +322,7 @@ Authorization: Bearer {WORKER_TOKEN}
 | `RunSpec` | `src/contracts/run-spec.ts` |
 | `RunnerEvent` | `src/contracts/events.ts` |
 | `RunResult` | `src/contracts/result.ts` |
-| `EngineAdapter` | `src/adapters/engine/engine-adapter.ts` |
-| Пример адаптера | `src/adapters/engine/opencode-adapter.ts` |
+| `LaunchRequest` / `LaunchResult` | `src/adapters/external-worker-adapter.ts` |
+| Ветка рана и ссылки на результат | `runBranchName`, `artifactUrl`, `branchUrl`, `mergeUrl` там же |
 | Маршруты API | `src/api/server.ts` |
 | Деплой на VM | `docs/API-SERVICE.md` |

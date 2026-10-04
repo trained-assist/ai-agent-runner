@@ -82,14 +82,20 @@ describe('GET /v1/runs/{id}/artifacts: ссылки на GitHub, а не бай�
 
     const view = (await (await getArtifacts(h.base, alphaKey, receipt.runId)).json()) as {
       runId: string;
-      repo: { fullName: string; commit: string };
+      repo: { fullName: string; branch: string; commit: string; baseRef?: string };
+      branchUrl: string;
+      mergeUrl: string;
       count: number;
       logUrl: string;
       artifacts: Array<{ path: string; name: string; mime: string; size: number; sha256: string; url: string }>;
       note: string;
     };
     expect(view.runId).toBe(receipt.runId);
-    expect(view.repo).toEqual({ fullName: 'owner/name', commit: 'abc1234' });
+    // Результат рана — отдельная ветка: её видно целиком и из неё GitHub предлагает merge.
+    expect(view.repo.branch).toBe(`agent-run/${receipt.runId}`);
+    expect(view.repo.fullName).toBe('owner/name');
+    expect(view.branchUrl).toBe(`https://github.com/owner/name/tree/agent-run/${receipt.runId}`);
+    expect(view.mergeUrl).toBe(`https://github.com/owner/name/compare/main...agent-run/${receipt.runId}`);
     expect(view.count).toBe(1);
     expect(view.artifacts[0]).toMatchObject({
       path: 'report.md',
@@ -101,6 +107,7 @@ describe('GET /v1/runs/{id}/artifacts: ссылки на GitHub, а не бай�
     expect(view.artifacts[0]!.sha256).toHaveLength(64);
     expect(view.logUrl).toMatch(/^https:\/\/storage\.googleapis\.com\//);
     expect(view.note).toContain('the API stores no bytes');
+    expect(view.note).toContain('merges nothing');
     // В ответе нет ни байт, ни base64 — только ссылки и метаданные.
     expect(Object.keys(view.artifacts[0]!).sort()).toEqual(['mime', 'name', 'path', 'sha256', 'size', 'url']);
   });

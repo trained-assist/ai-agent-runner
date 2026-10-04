@@ -4,7 +4,9 @@ import {
   CANCEL_UNKNOWN_RUN_RETRIES,
   admissionEvents,
   artifactUrl,
+  branchUrl,
   mapLaunchResult,
+  mergeUrl,
   workerTransportFailure,
   type ExternalWorker,
   type LaunchMapping,
@@ -62,6 +64,10 @@ export interface RunArtifactsView {
   conversationId: string;
   userTaskId: string;
   repo: LaunchRepo | null;
+  /** Страница ветки рана: результат целиком, отсюда GitHub предлагает merge. */
+  branchUrl: string | null;
+  /** Куда мержить результат рана: сравнение с базой, если воркер её сообщил, иначе ветка. */
+  mergeUrl: string | null;
   count: number;
   artifacts: RunArtifactLink[];
   logUrl: string | null;
@@ -338,10 +344,12 @@ export class AgentApi {
       conversationId: record.spec.conversationId,
       userTaskId: record.userTaskId,
       repo,
+      branchUrl: repo ? branchUrl(repo) : null,
+      mergeUrl: repo ? mergeUrl(repo) : null,
       count: artifacts.length,
       artifacts,
       logUrl: run?.logUrl ?? null,
-      note: 'artifacts are committed to the user repository by the external worker; the API stores no bytes',
+      note: 'the worker committed this run into its own branch of the user repository; the API stores no bytes and merges nothing',
     };
   }
 
