@@ -19,20 +19,12 @@ const alpha: Principal = {
   principalId: 'p-alpha',
   profileId: 'profile-a',
   scopes: ['runs:read', 'runs:write'],
-<<<<<<< HEAD
-  engines: ['github-actions-agent-run'],
-=======
   engines: ['azure-dynamic-ip-agent-run'],
->>>>>>> 4998441 (rename(worker): основной движок — azure-dynamic-ip-agent-run)
 };
 
 function body(over: Record<string, unknown> = {}): Record<string, unknown> {
   return {
-<<<<<<< HEAD
-    engine: { name: 'github-actions-agent-run', adapterVersion: '1' },
-=======
     engine: { name: 'azure-dynamic-ip-agent-run', adapterVersion: '1' },
->>>>>>> 4998441 (rename(worker): основной движок — azure-dynamic-ip-agent-run)
     limits: { timeoutMs: 15000 },
     envAllowlist: [],
     input: { inlinePrompt: 'hello agent' },
@@ -73,11 +65,7 @@ describe('stateless AgentApi: приём запроса', () => {
 
   it('кривое тело — INVALID_REQUEST, кривой repository — INVALID_REPOSITORY', async () => {
     const api = await makeApi();
-<<<<<<< HEAD
-    expect(() => api.submit(alpha, 'idem-bad-body', { engine: 'github-actions-agent-run' })).toThrowError(
-=======
     expect(() => api.submit(alpha, 'idem-bad-body', { engine: 'azure-dynamic-ip-agent-run' })).toThrowError(
->>>>>>> 4998441 (rename(worker): основной движок — azure-dynamic-ip-agent-run)
       expect.objectContaining({ code: 'INVALID_REQUEST' }),
     );
     try {
@@ -126,22 +114,14 @@ describe('stateless AgentApi: приём запроса', () => {
       expect.unreachable('an engine the worker does not implement must be refused');
     } catch (err) {
       expect((err as ApiError).code).toBe('ENGINE_NOT_ALLOWED');
-<<<<<<< HEAD
-      expect((err as ApiError).details).toMatchObject({ engines: ['github-actions-agent-run'] });
-=======
       expect((err as ApiError).details).toMatchObject({ engines: ['azure-dynamic-ip-agent-run'] });
->>>>>>> 4998441 (rename(worker): основной движок — azure-dynamic-ip-agent-run)
     }
   });
 
   it('input.refs и ран без промпта — preflight-отказ с retryable=false, а не «воркер недоступен»', async () => {
     const api = await makeApi();
     const refs = api.submit(alpha, 'idem-refs', {
-<<<<<<< HEAD
-      engine: { name: 'github-actions-agent-run', adapterVersion: '1' },
-=======
       engine: { name: 'azure-dynamic-ip-agent-run', adapterVersion: '1' },
->>>>>>> 4998441 (rename(worker): основной движок — azure-dynamic-ip-agent-run)
       limits: { timeoutMs: 5000 },
       envAllowlist: [],
       input: { refs: [{ ref: 'snap-1', snapshotId: 'snapshot-1' }] },
@@ -268,11 +248,7 @@ describe('stateless AgentApi: capabilities отчитываются честно
     const caps = api.capabilities();
     expect(caps.isolation.mode).toBe('none');
     expect(caps.isolation.launcher).toBeNull();
-<<<<<<< HEAD
-    expect(caps.engines).toEqual(['github-actions-agent-run']);
-=======
     expect(caps.engines).toEqual(['azure-dynamic-ip-agent-run']);
->>>>>>> 4998441 (rename(worker): основной движок — azure-dynamic-ip-agent-run)
     expect(caps.artifacts.export.enabled).toBe(false);
     expect(caps.artifacts.download).toBe(false);
     expect(caps.artifacts.shareLink).toBe(false);
@@ -303,13 +279,8 @@ describe('stateless AgentApi: capabilities отчитываются честно
     onTestFinished(() => actions.close());
     const service = new AgentApi({
       workers: [
-<<<<<<< HEAD
-        // Явно называем Azure-воркер: дефолтное имя теперь github-actions-agent-run.
-        adapterFor(azure, { engineName: 'dynamic-ip-azure-agent-run' }),
-=======
         // Дефолт — Azure GHA; вторая машина объявлена явно, иначе оба воркера были бы одним.
         adapterFor(azure),
->>>>>>> 4998441 (rename(worker): основной движок — azure-dynamic-ip-agent-run)
         new ExternalWorkerAdapter({
           baseUrl: actions.baseUrl,
           engineName: 'eu-vm-agent-run',
@@ -327,11 +298,7 @@ describe('stateless AgentApi: capabilities отчитываются честно
     expect(service.health().workers.map((entry) => entry.engine)).toEqual(['azure-dynamic-ip-agent-run', 'eu-vm-agent-run']);
 
     // Каждый движок обслуживает свой воркер: launch ушёл туда, куда просили.
-<<<<<<< HEAD
-    const first = service.submit(fleet, 'idem-fleet-azure', body({ engine: { name: 'dynamic-ip-azure-agent-run', adapterVersion: '1' } }));
-=======
     const first = service.submit(fleet, 'idem-fleet-azure', body({ engine: { name: 'azure-dynamic-ip-agent-run', adapterVersion: '1' } }));
->>>>>>> 4998441 (rename(worker): основной движок — azure-dynamic-ip-agent-run)
     await waitForState(service, fleet, first.runId, 'succeeded');
     expect(azure.launches).toHaveLength(1);
     expect(actions.launches).toHaveLength(0);

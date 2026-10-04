@@ -21,11 +21,7 @@ export const alphaPrincipal: Principal = {
   principalId: 'p-alpha',
   profileId: 'profile-a',
   scopes: ['runs:read', 'runs:write'],
-<<<<<<< HEAD
-  engines: ['github-actions-agent-run'],
-=======
   engines: ['azure-dynamic-ip-agent-run'],
->>>>>>> 4998441 (rename(worker): основной движок — azure-dynamic-ip-agent-run)
 };
 export const betaPrincipal: Principal = { principalId: 'p-beta', profileId: 'profile-b', scopes: ['runs:read', 'runs:write'] };
 export const readerPrincipal: Principal = { principalId: 'p-reader', profileId: 'profile-r', scopes: ['runs:read'] };
@@ -122,11 +118,7 @@ export async function startHttpHarness(options: HttpHarnessOptions = {}): Promis
 
 export function submitBody(over: Record<string, unknown> = {}): Record<string, unknown> {
   return {
-<<<<<<< HEAD
-    engine: { name: 'github-actions-agent-run', adapterVersion: '1' },
-=======
     engine: { name: 'azure-dynamic-ip-agent-run', adapterVersion: '1' },
->>>>>>> 4998441 (rename(worker): основной движок — azure-dynamic-ip-agent-run)
     limits: { timeoutMs: 15000 },
     envAllowlist: [],
     input: { inlinePrompt: 'hello agent' },
