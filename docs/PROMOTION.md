@@ -1,3 +1,7 @@
+> **Статус (epic #74).** Промоушен-контур (`/v1/release`, когорта, откат, placement) не входит
+> в stateless API: его состояние живёт на диске, а обслуживающий путь диска не имеет. Документ
+> описывает доставленную функциональность библиотеки `src/release/`; проба
+> `scripts/promotion-probe.mjs` и workflow `promotion-probe.yml` удалены вместе с маршрутом.
 # Promotion и fleet acceptance (P29, этап I10)
 
 Карточка [#68](https://github.com/trained-assist/trained-agent-architecture/issues/68),

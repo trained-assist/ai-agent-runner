@@ -1,3 +1,6 @@
+> **Статус (epic #74).** Сценарий написан против API до серверless-переработки: durable store,
+> `/v1/artifacts/{id}`, out-of-band ingest артефактов. В обслуживающем пути артефакты — это
+> ссылки на репозиторий юзера, лог — ссылка на Google Storage (см. `docs/API-SERVICE.md`).
 # Сквозной сценарий шага 7 (M1) — control plane ↔ Runner
 
 Сценарий из [эпика M1 #109](https://github.com/trained-assist/trained-agent-architecture/issues/109), шаг 7

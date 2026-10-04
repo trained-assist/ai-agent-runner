@@ -5,6 +5,12 @@
 
 **Имя движка:** `dynamic-ip-azure-agent-run` (Azure VM, динамический IP).
 
+> **Актуальность контракта.** Канонический контракт `LaunchRequest`/`LaunchResult` —
+> [issue #73](https://github.com/trained-assist/ai-agent-runner/issues/73). Расхождения с ним
+> в этом документе (в первую очередь §8 «Артефакты») помечены как устаревшие: воркер **сам**
+> коммитит артефакты в репозиторий юзера и грузит лог сессии в Google Storage, а наше API
+> возвращает ссылки и байт не хранит.
+
 ---
 
 ## 1. Где что живёт
@@ -220,14 +226,19 @@ Authorization: Bearer {WORKER_TOKEN}
 7. **Логи:** секреты и токены не логируются в открытом виде. Лог сессии загружается в GCS,
    возвращается `logUrl`.
 8. **Stateless:** повторный запрос с тем же `runId` не ломит состояние.
-9. **Артефакты:** оставляет файлы в `cwd`, не публикует в GitHub (это делает наш API).
+9. **Артефакты:** коммитит в `repository.fullName` и возвращает `artifacts[]` + `repo` (issue #73).
 
 ## 8. Артефакты
 
-Воркер **не** загружает артефакты и **не** пушит в GitHub — это делает наш API через
-`WorkspaceService.publishRunChanges` (модуль `src/workspace/`, PR #131).
-Воркер только оставляет файлы в `cwd` (workspace рана). Наш API после завершения прочитает
-`outputs` (объявленные клиентом) и `.agent/final-manifest.json`, затем опубликует в GitHub.
+**Устарело.** Актуальная версия — issue #73: воркер **сам** складывает `outputs` в репозиторий
+`repository.fullName` и возвращает в `LaunchResult` список `artifacts[]` (`path`/`name`/`mime`/
+`sha256`/`size`) вместе с `repo: {fullName, commit}` и `logUrl` на лог сессии в Google Storage.
+Наше API не читает `cwd` и не хранит байты — оно адресует то, что вернул воркер
+(`https://github.com/<owner>/<name>/blob/<commit>/<path>` и `logUrl`).
+
+Прежняя схема (воркер оставляет файлы в `cwd`, наш API публикует их через
+`WorkspaceService.publishRunChanges`) требует от нашего API доступа к диску воркера и потому
+в stateless-модели невозможна.
 
 ## 9. Приёмка (чеклист)
 

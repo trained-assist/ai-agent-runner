@@ -1,0 +1,825 @@
+import { randomUUID } from 'node:crypto';
+import { RUNNER_EVENT_SCHEMA_VERSION, type RunnerEvent } from '../contracts/events.js';
+import { RUN_RESULT_SCHEMA_VERSION, type ExitReason, type FailureClass, type RunFailure, type RunOutcome, type RunResult } from '../contracts/result.js';
+import { validateRunResult } from '../contracts/result.js';
+import type { OutputSpec, RunSpec } from '../contracts/run-spec.js';
+import {
+  ErrorCollector,
+  PreflightError,
+  checkArray,
+  checkKeys,
+  checkObject,
+  checkString,
+  isSafeId,
+  isUtcTimestamp,
+  type ValidationResult,
+} from '../contracts/validate.js';
+import { redactSecrets, truncateLine } from '../redact.js';
+
+/**
+ * Адаптер внешнего воркера (issue #73, epic #74 шаг 2). Единственный способ запустить агента:
+ * HTTP-вызов `POST {worker}/v1/launch`. Никакого spawn, никакого диска — весь контекст рана
+ * приходит в запросе, весь результат возвращается в ответе.
+ *
+ * Контракт — issue #73: `LaunchRequest` → `LaunchResult`. Воркер сам клонирует репозиторий
+ * юзера, сам складывает артефакты в него и сам грузит лог сессии в Google Storage.
+ */
+
+export const EXTERNAL_WORKER_ENGINE = 'dynamic-ip-azure-agent-run';
+export const EXTERNAL_WORKER_ADAPTER_VERSION = '1';
+
+/** Сколько событий рана API пишет до сетевого вызова: `claimed` + `inputs_materialized`. */
+export const ADMISSION_EVENT_COUNT = 2;
+
+export const DEFAULT_LAUNCH_DEADLINE_MS = 10 * 60 * 1000;
+export const DEFAULT_CANCEL_DEADLINE_MS = 30 * 1000;
+export const MAX_LOG_EVENT_CHARS = 10_000;
+
+export interface LaunchArtifact {
+  path: string;
+  name: string;
+  mime: string;
+  sha256: string;
+  size: number;
+}
+
+export interface LaunchRepo {
+  fullName: string;
+  commit: string;
+}
+
+export interface LaunchFailure {
+  code: string;
+  failureClass: FailureClass;
+  safeSummary: string;
+  retryable: boolean;
+}
+
+export type LaunchAnswerSource = 'engine_stdout' | 'agent_file' | null;
+
+export interface LaunchRequest {
+  runId: string;
+  jobId: string;
+  userTaskId: string;
+  profileId: string;
+  conversationId: string;
+  operationId: string;
+  ownerGeneration: number;
+  engine: { name: string; adapterVersion: string; modelSettings?: { model?: string } };
+  input: { inlinePrompt: string };
+  cwd: string;
+  envAllowlist: string[];
+  env: Record<string, string>;
+  limits: { timeoutMs: number; maxOutputBytes: number; maxLogBytes: number };
+  repository: { fullName: string };
+  isolation: { mode: string };
+  outputs?: Array<{ path: string; name?: string; mime?: string }>;
+}
+
+export interface LaunchResult {
+  runId: string;
+  status: 'started' | 'failed';
+  pid?: number | null;
+  exitCode: number | null;
+  exitSignal: string | null;
+  exitReason: ExitReason;
+  stdout: string;
+  stderr: string;
+  answer?: string | null;
+  answerSource?: LaunchAnswerSource;
+  durationMs: number;
+  timedOut: boolean;
+  outputTruncated: boolean;
+  artifacts: LaunchArtifact[];
+  logUrl: string;
+  repo: LaunchRepo;
+  failure?: LaunchFailure;
+}
+
+export interface WorkerCancelResult {
+  status: 'cancelled' | 'rejected' | 'unknown_run';
+  reason?: string;
+}
+
+/** Порт, который использует stateless-ядро API. Реализация — `ExternalWorkerAdapter`. */
+export interface ExternalWorker {
+  readonly name: string;
+  readonly baseUrl: string | null;
+  launch(spec: RunSpec): Promise<LaunchResult>;
+  cancel(runId: string): Promise<WorkerCancelResult>;
+}
+
+/**
+ * Гонка отмены с запуском. Контракт воркера синхронный (`launch` = весь ран), поэтому отмена
+ * может прийти раньше, чем воркер зарегистрирует ран. `unknown_run` в такой ситуации означает
+ * «ещё не вижу», а не «не существует», и API повторяет запрос, пока ран в полёте.
+ */
+export const CANCEL_UNKNOWN_RUN_RETRIES = 5;
+export const CANCEL_UNKNOWN_RUN_BACKOFF_MS = 40;
+
+/** Проверка текста, который в норме может быть пустым (stderr, stdout без вывода). */
+function checkText(value: unknown, path: string, collector: ErrorCollector, maxLen: number): void {
+  if (typeof value !== 'string') {
+    collector.push(`${path}: expected string`);
+    return;
+  }
+  if (value.length > maxLen) collector.push(`${path}: longer than ${maxLen}`);
+  if (/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/.test(value)) {
+    collector.push(`${path}: control characters are not allowed`);
+  }
+}
+
+export interface ExternalWorkerOptions {
+  baseUrl: string;
+  token?: string;
+  /**
+   * Хостовый пул значений окружения. В `LaunchRequest.env` уходит только пересечение с
+   * `envAllowlist` рана, поэтому секреты хоста в процесс агента не попадают (issue #73, п. 4).
+   */
+  env?: Record<string, string>;
+  /** Таймаут ожидания ответа воркера на launch. По умолчанию 10 минут. */
+  deadlineMs?: number;
+  cancelDeadlineMs?: number;
+  fetchImpl?: typeof fetch;
+  now?: () => Date;
+  log?: (entry: Record<string, unknown>) => void;
+}
+
+const LAUNCH_RESULT_KEYS = [
+  'runId',
+  'status',
+  'pid',
+  'exitCode',
+  'exitSignal',
+  'exitReason',
+  'stdout',
+  'stderr',
+  'answer',
+  'answerSource',
+  'durationMs',
+  'timedOut',
+  'outputTruncated',
+  'artifacts',
+  'logUrl',
+  'repo',
+  'failure',
+] as const;
+
+const LAUNCH_FAILURE_KEYS = ['code', 'failureClass', 'safeSummary', 'retryable'] as const;
+
+const EXIT_REASONS: readonly ExitReason[] = [
+  'completed',
+  'nonzero_exit',
+  'startup_failure',
+  'timeout',
+  'crash',
+  'cancelled',
+  'worker_crash',
+  'preflight_refused',
+];
+
+const ANSWER_SOURCES: readonly LaunchAnswerSource[] = ['engine_stdout', 'agent_file', null];
+
+export function trimTrailingSlash(value: string): string {
+  return value.endsWith('/') ? value.slice(0, -1) : value;
+}
+
+/**
+ * Ссылка на лог рана. В serverless-модели это НЕ путь в файловой системе: успешный ран —
+ * ссылка GCS, которую вернул воркер; недоступный воркер — его собственный URL рана, где лог
+ * лежал бы, если бы воркер успел его написать. `RunResult.logPath` обязан быть непустой
+ * строкой, поэтому подставлять сюда пустоту нельзя.
+ */
+/** Строка вывода агента в виде, пригодном для события рана: без секретов и управляющих символов. */
+export function logMessage(text: string): string {
+  return truncateLine(redactSecrets(text).replace(/[\u0000-\u001f\u007f]/g, ' ').trim(), MAX_LOG_EVENT_CHARS - 32);
+}
+
+/** Безопасное краткое описание отказа: секреты вырезаны, длина укладывается в контракт. */
+export function safeSummary(message: string): string {
+  // truncateLine дописывает маркер обрезки, поэтому режем заранее с запасом.
+  return truncateLine(redactSecrets(message), 450);
+}
+
+export function runLogRef(launch: LaunchResult | null, workerBaseUrl: string | null, runId: string): string {
+  if (launch?.logUrl) return launch.logUrl;
+  const base = workerBaseUrl ?? 'worker://unconfigured';
+  return `${trimTrailingSlash(base)}/v1/runs/${runId}`;
+}
+
+/** Ссылка на файл в репозитории юзера: воркер коммитит артефакты, мы только адресуем их. */
+export function artifactUrl(repo: LaunchRepo, path: string): string {
+  return `https://github.com/${repo.fullName}/blob/${repo.commit}/${path}`;
+}
+
+/**
+ * Сборка `LaunchRequest` из `RunSpec`. Значения окружения берутся из хостового пула
+ * (`options.env`) и передаются только те, что разрешил клиент в `envAllowlist` — секреты
+ * хоста в процесс агента не попадают (issue #73, требование 4).
+ */
+export function launchRequestFromSpec(spec: RunSpec, options: { env?: Record<string, string> } = {}): LaunchRequest {
+  if (spec.input?.refs && spec.input.refs.length > 0) {
+    throw new PreflightError('INPUT_REFS_UNSUPPORTED', 'input.refs require a durable workspace; the stateless API passes the prompt inline only', {
+      failureClass: 'preflight',
+      retryable: false,
+    });
+  }
+  const prompt = spec.input?.inlinePrompt;
+  if (!prompt) {
+    throw new PreflightError('INLINE_PROMPT_REQUIRED', 'the external worker runs an agent from input.inlinePrompt and there is nothing else to run', {
+      failureClass: 'preflight',
+      retryable: false,
+    });
+  }
+  const env: Record<string, string> = {};
+  for (const name of spec.envAllowlist) {
+    const value = options.env?.[name];
+    if (value !== undefined) env[name] = value;
+  }
+  const outputs: LaunchRequest['outputs'] = (spec.outputs ?? []).map((output: OutputSpec) => ({
+    path: output.path,
+    ...(output.name !== undefined ? { name: output.name } : {}),
+    ...(output.mime !== undefined ? { mime: output.mime } : {}),
+  }));
+  return {
+    runId: spec.runId,
+    jobId: spec.jobId,
+    userTaskId: spec.userTaskId,
+    profileId: spec.profileId,
+    conversationId: spec.conversationId,
+    operationId: spec.operationId,
+    ownerGeneration: spec.ownerGeneration,
+    engine: {
+      name: spec.engine.name,
+      adapterVersion: spec.engine.adapterVersion,
+      ...(spec.engine.modelSettings?.model !== undefined ? { modelSettings: { model: spec.engine.modelSettings.model } } : {}),
+    },
+    input: { inlinePrompt: prompt },
+    cwd: spec.cwd,
+    envAllowlist: [...spec.envAllowlist],
+    env,
+    limits: {
+      timeoutMs: spec.limits.timeoutMs,
+      maxOutputBytes: spec.limits.maxOutputBytes ?? 0,
+      maxLogBytes: spec.limits.maxLogBytes ?? 0,
+    },
+    repository: { fullName: spec.repository?.fullName ?? '' },
+    isolation: { mode: spec.isolation?.mode ?? 'none' },
+    ...(outputs.length > 0 ? { outputs } : {}),
+  };
+}
+
+export function validateLaunchResult(input: unknown, expectedRunId: string): ValidationResult<LaunchResult> {
+  const collector = new ErrorCollector();
+  if (!checkObject(input, 'launch', collector)) return collector.finish(undefined as never);
+  // `failure` появляется только на отказе воркера (issue #73) — остальное обяза��тельно.
+  checkKeys(input, LAUNCH_RESULT_KEYS, LAUNCH_RESULT_KEYS.filter((key) => key !== 'failure'), 'launch', collector);
+
+  if (input['runId'] !== expectedRunId) collector.push(`launch.runId: expected echo of ${expectedRunId}`);
+  if (input['status'] !== 'started' && input['status'] !== 'failed') collector.push('launch.status: expected started | failed');
+  if (input['pid'] !== undefined && input['pid'] !== null && (typeof input['pid'] !== 'number' || !Number.isInteger(input['pid']))) {
+    collector.push('launch.pid: expected integer or null');
+  }
+  if (input['exitCode'] !== null && typeof input['exitCode'] !== 'number') collector.push('launch.exitCode: expected number or null');
+  if (input['exitSignal'] !== null && typeof input['exitSignal'] !== 'string') collector.push('launch.exitSignal: expected string or null');
+  if (typeof input['exitReason'] !== 'string' || !(EXIT_REASONS as readonly string[]).includes(input['exitReason'])) {
+    collector.push(`launch.exitReason: expected one of ${EXIT_REASONS.join(', ')}`);
+  }
+  checkText(input['stdout'], 'launch.stdout', collector, 1_000_000);
+  checkText(input['stderr'], 'launch.stderr', collector, 1_000_000);
+  if (input['answer'] !== undefined && input['answer'] !== null) checkText(input['answer'], 'launch.answer', collector, 1_000_000);
+  if (input['answerSource'] !== undefined && !(ANSWER_SOURCES as readonly LaunchAnswerSource[]).includes(input['answerSource'] as LaunchAnswerSource)) {
+    collector.push('launch.answerSource: expected engine_stdout | agent_file | null');
+  }
+  if (typeof input['durationMs'] !== 'number' || !Number.isInteger(input['durationMs']) || input['durationMs'] < 0) {
+    collector.push('launch.durationMs: expected non-negative integer');
+  }
+  if (typeof input['timedOut'] !== 'boolean') collector.push('launch.timedOut: expected boolean');
+  if (typeof input['outputTruncated'] !== 'boolean') collector.push('launch.outputTruncated: expected boolean');
+
+  // Артефакты, лог и репозиторий — обязательная часть контракта (issue #73): без них ран
+  // нельзя ни показать клиенту, ни проверить, что воркер реально сложил выходы.
+  if (!checkArray(input['artifacts'], 'launch.artifacts', collector)) {
+    // уже сообщено
+  } else {
+    input['artifacts'].forEach((artifact, index) => {
+      const path = `launch.artifacts[${index}]`;
+      if (!checkObject(artifact, path, collector)) return;
+      checkKeys(artifact, ['path', 'name', 'mime', 'sha256', 'size'], ['path', 'name', 'mime', 'sha256', 'size'], path, collector);
+      checkString(artifact['path'], `${path}.path`, collector, 512);
+      checkString(artifact['name'], `${path}.name`, collector, 200);
+      checkString(artifact['mime'], `${path}.mime`, collector, 100);
+      checkString(artifact['sha256'], `${path}.sha256`, collector, 64);
+      if (typeof artifact['size'] !== 'number' || !Number.isInteger(artifact['size']) || (artifact['size'] as number) < 0) {
+        collector.push(`${path}.size: expected non-negative integer`);
+      }
+    });
+  }
+  checkString(input['logUrl'], 'launch.logUrl', collector, 500);
+  if (!checkObject(input['repo'], 'launch.repo', collector)) {
+    // уже сообщено
+  } else {
+    checkKeys(input['repo'], ['fullName', 'commit'], ['fullName', 'commit'], 'launch.repo', collector);
+    checkString(input['repo']['fullName'], 'launch.repo.fullName', collector, 200);
+    checkString(input['repo']['commit'], 'launch.repo.commit', collector, 64);
+  }
+
+  const failure = input['failure'];
+  if (failure !== undefined) {
+    if (!checkObject(failure, 'launch.failure', collector)) {
+      // уже сообщено
+    } else {
+      checkKeys(failure, LAUNCH_FAILURE_KEYS, LAUNCH_FAILURE_KEYS, 'launch.failure', collector);
+      checkString(failure['code'], 'launch.failure.code', collector, 100);
+      checkString(failure['safeSummary'], 'launch.failure.safeSummary', collector, 500);
+      if (typeof failure['retryable'] !== 'boolean') collector.push('launch.failure.retryable: expected boolean');
+      if (failure['failureClass'] !== undefined && !(['preflight', 'engine', 'runtime', 'finalization'] as const).includes(failure['failureClass'] as FailureClass)) {
+        collector.push('launch.failure.failureClass: expected preflight | engine | runtime | finalization');
+      }
+    }
+  }
+
+  return collector.finish(input as unknown as LaunchResult);
+}
+
+export interface LaunchMapping {
+  result: RunResult;
+  events: RunnerEvent[];
+  artifacts: LaunchArtifact[];
+  repo: LaunchRepo | null;
+  logUrl: string | null;
+  answer: string | null;
+}
+
+export interface LaunchMappingOptions {
+  /** Базовый URL воркера: источник ссылки на лог, когда воркер её не вернул. */
+  workerBaseUrl?: string | null;
+}
+
+/**
+ * События приёма рана: их API пишет сразу, до сетевого вызова, — иначе журнал пуст всё время,
+ * пока воркер думает, и клиент не отличает «ран принят» от «ран потерян».
+ */
+export function admissionEvents(spec: RunSpec, startedAt: string): RunnerEvent[] {
+  const events: RunnerEvent[] = [];
+  pushRunnerEvent(events, spec, 1, 'claimed', { operationId: spec.operationId }, startedAt);
+  pushRunnerEvent(
+    events,
+    spec,
+    2,
+    'inputs_materialized',
+    {
+      status: 'nothing_to_materialize',
+      declared: 0,
+      requested: 0,
+      files: 0,
+      bytes: 0,
+      entries: [],
+      reason: 'stateless API passes the prompt inline; there is no durable workspace to materialize into',
+    },
+    startedAt,
+  );
+  return events;
+}
+
+function pushRunnerEvent(
+  events: RunnerEvent[],
+  spec: RunSpec,
+  sequence: number,
+  type: RunnerEvent['type'],
+  payload: Record<string, unknown>,
+  timestamp: string,
+): void {
+  events.push({
+    schemaVersion: RUNNER_EVENT_SCHEMA_VERSION,
+    eventId: `evt_${randomUUID()}`,
+    runId: spec.runId,
+    jobId: spec.jobId,
+    userTaskId: spec.userTaskId,
+    profileId: spec.profileId,
+    ownerGeneration: spec.ownerGeneration,
+    sequence,
+    timestamp,
+    type,
+    payload,
+  } as RunnerEvent);
+}
+
+/**
+ * Маппинг `LaunchResult` → `RunResult` + `RunnerEvent` (epic #74, шаг 2). События синтезируются
+ * из ответа воркера: у API нет ни процесса, ни файла событий, поэтому журнал рана — это то,
+ * что воркер сообщил о себе, плюс ссылки на артефакты и лог. События приёма (`claimed`,
+ * `inputs_materialized`) пишет `admissionEvents` до сетевого вызова — они в этот список не
+ * входят, но продолжают нумерацию.
+ */
+export function mapLaunchResult(
+  spec: RunSpec,
+  launch: LaunchResult,
+  times: { startedAt: string; finishedAt: string },
+  options: LaunchMappingOptions = {},
+): LaunchMapping {
+  const outcome: RunOutcome = launch.exitReason === 'completed' ? 'succeeded' : launch.exitReason === 'cancelled' ? 'cancelled' : 'failed';
+  const failure = launchFailureFor(spec, launch, outcome);
+  const artifacts = launch.artifacts ?? [];
+  const repo = launch.repo ?? null;
+  const logUrl = launch.logUrl ?? null;
+  const outputRefs = artifacts.map((artifact) => (repo ? artifactUrl(repo, artifact.path) : artifact.path));
+  const persistence = artifacts.length > 0 ? 'persisted' : 'not_required';
+  const result: RunResult = {
+    schemaVersion: RUN_RESULT_SCHEMA_VERSION,
+    runId: spec.runId,
+    jobId: spec.jobId,
+    userTaskId: spec.userTaskId,
+    profileId: spec.profileId,
+    ownerGeneration: spec.ownerGeneration,
+    outcome,
+    exitReason: launch.exitReason,
+    exitCode: launch.exitCode,
+    exitSignal: launch.exitSignal,
+    exitObserved: launch.exitCode !== null || launch.exitSignal !== null,
+    startedAt: times.startedAt,
+    finishedAt: times.finishedAt,
+    ...(failure ? { failure } : {}),
+    usage: { status: 'unknown' },
+    outputRefs,
+    persistence,
+    persistenceReason:
+      persistence === 'persisted'
+        ? `artifacts are committed to ${repo?.fullName ?? 'the user repository'} at ${repo?.commit ?? 'unknown'}; the API keeps no bytes`
+        : 'the worker reported no artifacts',
+    cleanup: 'completed',
+    cleanupReason: 'the external worker owns the workspace and tears it down with its ephemeral host; there is nothing to clean on the API host',
+    logPath: runLogRef(launch, options.workerBaseUrl ?? null, spec.runId),
+  };
+  const validated = validateRunResult(result);
+  if (!validated.ok) {
+    throw new PreflightError('LAUNCH_RESULT_INVALID', `mapped run result is invalid: ${validated.errors.join('; ')}`, {
+      failureClass: 'runtime',
+      retryable: true,
+    });
+  }
+  return {
+    result: validated.value,
+    events: runnerEventsFromLaunch(spec, launch, times, artifacts, repo, logUrl),
+    artifacts,
+    repo,
+    logUrl,
+    answer: launch.answer ?? null,
+  };
+}
+
+function launchFailureFor(spec: RunSpec, launch: LaunchResult, outcome: RunOutcome): RunFailure | null {
+  if (outcome !== 'failed') return null;
+  if (launch.failure) {
+    return {
+      code: launch.failure.code,
+      failureClass: launch.failure.failureClass,
+      // safeSummary приходит извне: тот же фильтр секретов, что и для своих сообщений.
+      safeSummary: safeSummary(launch.failure.safeSummary),
+      retryable: launch.failure.retryable,
+    };
+  }
+  switch (launch.exitReason) {
+    case 'nonzero_exit':
+      return {
+        code: 'AGENT_NONZERO_EXIT',
+        failureClass: 'engine',
+        safeSummary: `agent exited with code ${launch.exitCode ?? 'unknown'}`,
+        retryable: false,
+      };
+    case 'timeout':
+      return { code: 'AGENT_TIMEOUT', failureClass: 'engine', safeSummary: 'agent was killed by the worker timeout', retryable: true };
+    case 'crash':
+      return { code: 'AGENT_CRASH', failureClass: 'engine', safeSummary: `agent was killed by signal ${launch.exitSignal ?? 'unknown'}`, retryable: true };
+    case 'startup_failure':
+      return { code: 'AGENT_STARTUP_FAILED', failureClass: 'engine', safeSummary: 'agent process failed to start', retryable: true };
+    case 'worker_crash':
+      return { code: 'WORKER_CRASH', failureClass: 'runtime', safeSummary: 'the external worker crashed while running the agent', retryable: true };
+    case 'preflight_refused':
+      return { code: 'PREFLIGHT_REFUSED', failureClass: 'preflight', safeSummary: 'the worker refused the run before starting the agent', retryable: false };
+    default:
+      return { code: 'AGENT_FAILED', failureClass: 'engine', safeSummary: `agent run ended with exitReason ${launch.exitReason}`, retryable: true };
+  }
+}
+
+function runnerEventsFromLaunch(
+  spec: RunSpec,
+  launch: LaunchResult,
+  times: { startedAt: string; finishedAt: string },
+  artifacts: LaunchArtifact[],
+  repo: LaunchRepo | null,
+  logUrl: string | null,
+): RunnerEvent[] {
+  // Два события приёма уже записаны до вызова воркера, поэтому нумерация продолжается с трёх.
+  const events: RunnerEvent[] = [];
+  let sequence = ADMISSION_EVENT_COUNT;
+  const push = (type: RunnerEvent['type'], payload: Record<string, unknown>, timestamp: string): void => {
+    sequence += 1;
+    pushRunnerEvent(events, spec, sequence, type, payload, timestamp);
+  };
+
+  if (typeof launch.pid === 'number' && launch.pid > 0) push('started', { pid: launch.pid }, times.startedAt);
+
+  for (const [stream, text] of [['stdout', launch.stdout], ['stderr', launch.stderr]] as const) {
+    // Событие рана не имеет права содержать управляющие символы (в т.ч. перевод строки) —
+    // иначе его отвергнет общий валидатор RunnerEvent. Запас по длине оставлен под маркер
+    // обрезки, который truncateLine дописывает сам.
+    const message = logMessage(text);
+    if (message.length > 0) push('log', { stream, level: 'info', message }, times.startedAt);
+  }
+  if (logUrl) {
+    push('log', { stream: 'runner', level: 'info', message: `session log: ${logUrl}` }, times.startedAt);
+  }
+  push('exit', { code: launch.exitCode, signal: launch.exitSignal }, times.finishedAt);
+  push('finalizing', { reason: 'external worker returned the run result' }, times.finishedAt);
+  // Полей ровно столько, сколько объявляет AgentExitResolvedEvent: fromManifest — счётчик
+  // файлов, прочитанных из манифеста агента, reason — строка (в контракте он не nullable).
+  const answered = typeof launch.answer === 'string' && launch.answer.length > 0;
+  push(
+    'agent_exit_resolved',
+    {
+      manifest: 'ok',
+      declared: spec.outputs?.length ?? 0,
+      fromManifest: launch.answerSource === 'agent_file' ? 1 : 0,
+      answerSource: launch.answerSource ?? null,
+      answerChars: launch.answer?.length ?? 0,
+      planned: artifacts.length,
+      reason: answered ? 'the worker reported the agent answer' : 'the worker reported no answer',
+    },
+    times.finishedAt,
+  );
+  artifacts.forEach((artifact) => {
+    push(
+      'artifact_exported',
+      {
+        artifactId: `art-${artifact.sha256.slice(0, 24)}`,
+        sourcePath: artifact.path,
+        size: artifact.size,
+        sha256: artifact.sha256,
+        mime: artifact.mime,
+        version: 1,
+      },
+      times.finishedAt,
+    );
+  });
+
+  const outcome: RunOutcome = launch.exitReason === 'completed' ? 'succeeded' : launch.exitReason === 'cancelled' ? 'cancelled' : 'failed';
+  if (outcome === 'succeeded') {
+    push('succeeded', { outcome, exitReason: launch.exitReason, exitCode: launch.exitCode }, times.finishedAt);
+  } else if (outcome === 'cancelled') {
+    push('cancelled', { outcome, exitReason: launch.exitReason, reason: 'cancelled by the API or the worker' }, times.finishedAt);
+  } else {
+    const failure = launchFailureFor(spec, launch, outcome);
+    push(
+      'failed',
+      {
+        outcome,
+        exitReason: launch.exitReason,
+        code: failure?.code ?? 'AGENT_FAILED',
+        safeSummary: failure?.safeSummary ?? launch.exitReason,
+      },
+      times.finishedAt,
+    );
+  }
+  return events;
+}
+
+/**
+ * Отказ воркера на уровне транспорта: ран не получил `LaunchResult`, но обязан завершиться.
+ * Функция не бросает — иначе ран навсегда остался бы в `running`, а клиент не узнал бы ничего.
+ */
+export function workerTransportFailure(
+  spec: RunSpec,
+  err: unknown,
+  times: { startedAt: string; finishedAt: string },
+  options: LaunchMappingOptions = {},
+): LaunchMapping {
+  const message = err instanceof Error ? err.message : String(err);
+  // Отказ на границе воркера не всегда «воркер недоступен»: preflight-отказ (нет промпта,
+  // refs без workspace) и таймаут launch несут собственный код, класс и retryable.
+  const typed = err instanceof PreflightError ? err : null;
+  const failure: RunFailure = {
+    code: typed?.code ?? 'WORKER_UNREACHABLE',
+    failureClass: typed?.failureClass ?? 'runtime',
+    safeSummary: safeSummary(typed ? typed.message : message),
+    retryable: typed?.retryable ?? true,
+  };
+  const preflightRefusal = typed?.failureClass === 'preflight';
+  const result: RunResult = {
+    schemaVersion: RUN_RESULT_SCHEMA_VERSION,
+    runId: spec.runId,
+    jobId: spec.jobId,
+    userTaskId: spec.userTaskId,
+    profileId: spec.profileId,
+    ownerGeneration: spec.ownerGeneration,
+    outcome: 'failed',
+    exitReason: preflightRefusal ? 'preflight_refused' : 'worker_crash',
+    exitCode: null,
+    exitSignal: null,
+    exitObserved: false,
+    startedAt: times.startedAt,
+    finishedAt: times.finishedAt,
+    failure,
+    usage: { status: 'unknown' },
+    outputRefs: [],
+    persistence: 'not_required',
+    persistenceReason: 'the worker never returned a result, so there is nothing that could have been persisted',
+    cleanup: 'completed',
+    cleanupReason: 'the external worker owns the workspace; a failed launch leaves nothing to clean on the API host',
+    logPath: runLogRef(null, options.workerBaseUrl ?? null, spec.runId),
+  };
+  const events: RunnerEvent[] = [];
+  let sequence = ADMISSION_EVENT_COUNT;
+  sequence += 1;
+  pushRunnerEvent(
+    events,
+    spec,
+    sequence,
+    'failed',
+    { outcome: 'failed', exitReason: result.exitReason, code: failure.code, safeSummary: failure.safeSummary },
+    times.finishedAt,
+  );
+  return { result, events, artifacts: [], repo: null, logUrl: null, answer: null };
+}
+
+export class ExternalWorkerAdapter implements ExternalWorker {
+  readonly name = EXTERNAL_WORKER_ENGINE;
+  readonly baseUrl: string | null;
+  private readonly token: string | undefined;
+  private readonly env: Record<string, string>;
+  private readonly deadlineMs: number;
+  private readonly cancelDeadlineMs: number;
+  private readonly fetchImpl: typeof fetch;
+  private readonly now: () => Date;
+  private readonly log: (entry: Record<string, unknown>) => void;
+
+  constructor(options: ExternalWorkerOptions) {
+    this.baseUrl = options.baseUrl;
+    this.token = options.token;
+    this.env = options.env ?? {};
+    this.deadlineMs = options.deadlineMs ?? DEFAULT_LAUNCH_DEADLINE_MS;
+    this.cancelDeadlineMs = options.cancelDeadlineMs ?? DEFAULT_CANCEL_DEADLINE_MS;
+    this.fetchImpl = options.fetchImpl ?? globalThis.fetch;
+    this.now = options.now ?? (() => new Date());
+    this.log = options.log ?? (() => undefined);
+  }
+
+  async launch(spec: RunSpec): Promise<LaunchResult> {
+    const request = launchRequestFromSpec(spec, { env: this.env });
+    const base = this.baseUrl;
+    if (!base) {
+      throw new PreflightError('WORKER_NOT_CONFIGURED', 'EXTERNAL_WORKER_URL is not set; the API cannot launch a run', {
+        failureClass: 'preflight',
+        retryable: false,
+      });
+    }
+    const url = `${trimTrailingSlash(base)}/v1/launch`;
+    const headers: Record<string, string> = { 'content-type': 'application/json' };
+    if (this.token) headers['authorization'] = `Bearer ${this.token}`;
+    this.log({ event: 'worker_launch', runId: spec.runId, url, engine: spec.engine.name, timeoutMs: spec.limits.timeoutMs });
+
+    // Таймаут обрывает сам HTTP-запрос, а не только перестаёт его ждать: иначе на воркере
+    // остаётся осиротевший ран, который доживает свой limits.timeoutMs впустую.
+    // Таймаут обрывает сам HTTP-запрос, а не только перестаёт его ждать: иначе у воркера
+    // остаётся осиротевший ран, который доживает свой limits.timeoutMs впустую.
+    const controller = new AbortController();
+    let response: Response;
+    try {
+      response = await withDeadline(
+        this.fetchImpl(url, { method: 'POST', headers, body: JSON.stringify(request), signal: controller.signal }),
+        this.deadlineMs,
+        'worker launch',
+        () => controller.abort(),
+      );
+    } catch (err) {
+      const timedOut = controller.signal.aborted;
+      this.log({
+        event: 'worker_launch_failed',
+        runId: spec.runId,
+        timedOut,
+        message: err instanceof Error ? err.message : String(err),
+      });
+      if (timedOut) {
+        await this.cancelOrphan(spec.runId);
+        throw new PreflightError('WORKER_LAUNCH_TIMEOUT', `the external worker did not answer the launch within ${this.deadlineMs}ms`, {
+          failureClass: 'runtime',
+          // Повтор опасен: воркер мог запустить агента и без нас. Исход рана неизвестен.
+          retryable: false,
+        });
+      }
+      throw err;
+    }
+    if (!response.ok) {
+      const detail = truncateLine(redactSecrets(await readBody(response)), 300);
+      this.log({ event: 'worker_launch_http_error', runId: spec.runId, status: response.status, detail });
+      throw new PreflightError(
+        'WORKER_HTTP_ERROR',
+        `the external worker answered ${response.status} on launch`,
+        { failureClass: 'runtime', retryable: true },
+      );
+    }
+    const raw = await readJson(response);
+    const validated = validateLaunchResult(raw, spec.runId);
+    if (!validated.ok) {
+      this.log({ event: 'worker_launch_invalid', runId: spec.runId, errors: validated.errors });
+      throw new PreflightError(
+        'WORKER_PROTOCOL_INVALID',
+        `the external worker returned a launch result that does not match the contract: ${validated.errors.join('; ')}`,
+        { failureClass: 'runtime', retryable: true },
+      );
+    }
+    this.log({
+      event: 'worker_launch_ok',
+      runId: spec.runId,
+      status: validated.value.status,
+      exitReason: validated.value.exitReason,
+      exitCode: validated.value.exitCode,
+      durationMs: validated.value.durationMs,
+      artifacts: validated.value.artifacts.length,
+      logUrl: validated.value.logUrl,
+      repo: validated.value.repo.fullName,
+    });
+    return validated.value;
+  }
+
+  /** Лучшее усилие остановить ран, который остался у воркера после обрыва launch. */
+  private async cancelOrphan(runId: string): Promise<void> {
+    try {
+      await this.cancel(runId);
+      this.log({ event: 'worker_orphan_cancel_requested', runId });
+    } catch (err) {
+      this.log({ event: 'worker_orphan_cancel_failed', runId, message: err instanceof Error ? err.message : String(err) });
+    }
+  }
+
+  async cancel(runId: string): Promise<WorkerCancelResult> {
+    const base = this.baseUrl;
+    if (!base) return { status: 'unknown_run', reason: 'worker is not configured' };
+    const url = `${trimTrailingSlash(base)}/v1/runs/${runId}/cancel`;
+    const headers: Record<string, string> = { 'content-type': 'application/json' };
+    if (this.token) headers['authorization'] = `Bearer ${this.token}`;
+    this.log({ event: 'worker_cancel', runId });
+    let response: Response;
+    try {
+      response = await withDeadline(this.fetchImpl(url, { method: 'POST', headers, body: '{}' }), this.cancelDeadlineMs, 'worker cancel');
+    } catch (err) {
+      this.log({ event: 'worker_cancel_failure', runId, message: err instanceof Error ? err.message : String(err) });
+      return { status: 'rejected', reason: 'cancel request did not reach the worker' };
+    }
+    if (!response.ok) {
+      this.log({ event: 'worker_cancel_http_error', runId, status: response.status });
+      return { status: 'rejected', reason: `the worker answered ${response.status} on cancel` };
+    }
+    const raw = await readJson(response);
+    const record = typeof raw === 'object' && raw !== null && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
+    const status = record['status'];
+    if (status === 'cancelled') return { status: 'cancelled' };
+    if (status === 'unknown_run') return { status: 'unknown_run' };
+    return { status: 'rejected', reason: typeof record['reason'] === 'string' ? record['reason'] : 'the worker did not confirm the cancellation' };
+  }
+}
+
+async function readBody(response: Response): Promise<string> {
+  try {
+    return await response.text();
+  } catch {
+    return '';
+  }
+}
+
+/** Тело ответа разбирается один раз; нечитаемый JSON — тоже нарушение контракта. */
+async function readJson(response: Response): Promise<unknown> {
+  const text = await readBody(response);
+  if (text.trim() === '') return undefined;
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    return undefined;
+  }
+}
+
+async function withDeadline<T>(promise: Promise<T>, deadlineMs: number, label: string, onTimeout?: () => void): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => {
+          onTimeout?.();
+          reject(new Error(`${label} timed out after ${deadlineMs}ms`));
+        }, deadlineMs);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+export function isSafeRunId(value: unknown): value is string {
+  return isSafeId(value);
+}
+
+export function isUtcTimestampValue(value: unknown): value is string {
+  return isUtcTimestamp(value);
+}

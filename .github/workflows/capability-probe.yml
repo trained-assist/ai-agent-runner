@@ -96,10 +96,10 @@ jobs:
           echo "$OUT" | tail -3
           echo "$OUT" | grep -qi "pong" && echo "opencode через ladder: OK (pong)" | tee -a "$GITHUB_STEP_SUMMARY"
 
-      - name: E2E acceptance loop (fake engines, без reboot)
-        # passwordless sudo на GitHub-hosted раннере — штатное свойство хоста,
-        # поэтому sudo-проба в CI в режиме report (см. --sudo-policy в доках цикла)
-        run: ./scripts/e2e-loop.sh --sudo-policy report
+      - name: E2E acceptance loop (stateless API + мок внешнего воркера)
+        # Драйвер scripts/e2e-loop.sh удалён вместе с дисковой моделью API (epic #74);
+        # приёмка идёт через vitest по HTTP-контракту с мок-воркером.
+        run: npx vitest run test/e2e-loop.test.ts test/external-worker-adapter.test.ts
 
       - name: Reboot-шаг — невозможен (документируем)
         run: |

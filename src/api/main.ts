@@ -1,71 +1,36 @@
-import { chmodSync, mkdirSync, readFileSync, statSync } from 'node:fs';
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { tmpdir } from 'node:os';
-import { isAbsolute, join, resolve, sep } from 'node:path';
-import { FakeEngine, fakeScenarioResult, type FakeScenario } from '../adapters/engine/fake-engine.js';
-import { OpenCodeAdapter } from '../adapters/engine/opencode-adapter.js';
-import { ArtifactStore } from '../storage/artifact-store.js';
-import { createBlobStore } from '../storage/create-blob-store.js';
-import { RunExportStore } from '../storage/export.js';
-import { ShareTokenIssuer } from '../storage/share.js';
-import { UploadSessionStore } from '../storage/upload-session.js';
-import { WorkspaceSnapshotStore } from '../storage/workspace-snapshot.js';
-import { InputMaterializer } from '../storage/input-materializer.js';
-import { cohortFromEnv, type CohortPolicy } from '../release/cohort.js';
-import { DispatchOwnerStore } from '../release/dispatch-owner.js';
-import { releaseIdentity, releaseManifestFromEnv, type ReleaseManifest } from '../release/manifest.js';
-import { allowedEnginesForRegion, parsePlacementPolicyText, type PlacementPolicy } from '../release/placement.js';
-import { PromotionJournal, ReleaseStateController } from '../release/promotion.js';
-import { faultRegistry, parseFaultPoints } from '../faults/env.js';
+import { statSync } from 'node:fs';
+import { createServer } from 'node:http';
+import {
+  DEFAULT_CANCEL_DEADLINE_MS,
+  DEFAULT_LAUNCH_DEADLINE_MS,
+  ExternalWorkerAdapter,
+} from '../adapters/external-worker-adapter.js';
 import { KeyRegistry } from './auth.js';
-import { handleArtifactRequest, type ArtifactRouteDeps } from './artifact-route.js';
-import { ApiError } from './errors.js';
 import { createAgentApiServer } from './server.js';
-import { AgentApi, type ApiLogger, type PromotionRuntime } from './service.js';
-import type { CleanRoomProvider } from '../isolation/contract.js';
-import { UnixCleanRoomProvider } from '../isolation/clean-room.js';
-import { loadEngineConfigTemplates } from '../isolation/engine-config.js';
+import { AgentApi, type ApiLogger } from './service.js';
 
 export const DEFAULT_API_PORT = 8787;
 export const DEFAULT_API_HOST = '0.0.0.0';
 
+/**
+ * Конфигурация процесса (epic #74). Ни `dataDir`, ни release manifest, ни ключей к состоянию
+ * на диске: у сервеless-оркестратора их просто нет. Единственный секрет — общий токен воркера,
+ * он приходит из окружения.
+ */
 export interface AgentApiProcessConfig {
   host: string;
   port: number;
-  dataDir: string;
   keyRegistryPath: string;
-  shareSecret: string;
-  ephemeralShareSecret: boolean;
-  region: string;
-  environment: string;
-  fakeScenario: FakeScenario;
-  /**
-   * Управляемые точки сбоя для приёмки lifecycle (#52), по образцу `AGENT_API_FAKE_SCENARIO`:
-   * список `точка` или `точка:count`, где count = сколько раз сработает отказ (`once` при
-   * отсутствии). Нужны, чтобы упасть в конкретный момент (например, в sweep) по-настоящему,
-   * а не «примерно тогда, когда процесс уже умер». Пустой список = отказов нет.
-   */
-  faults: string[];
-  releaseManifestPath: string;
-  cohort: CohortPolicy;
-  /** Файл состояния релиза: вход отката, читается при старте (AC-324). */
-  releaseStatePath: string;
-  /** Общий реестр владения задачами флота; без него установка одиночная. */
-  ownerStorePath: string;
-  /** Политика размещения (P30): регион × провайдер × credentials × резидентность. */
-  placementPolicyPath: string;
-  /**
-   * Граница Agent clean room (issue #51). Пустой слот `slots` = провайдер не настроен:
-   * движок идёт под service UID, и capabilities это объявляют честно. Непустой список
-   * поднимает per-run Unix-идентичности; отказ границы валит раны, а не расширяет права.
-   */
-  isolation: { slots: string[]; toolPaths: string[] };
-  /**
-   * Каталог хостовых шаблонов конфигурации движка (#51). Своя HOME рана убирает у движка
-   * конфиг пользователя сервиса, поэтому provider/model кладёт хост: один read-only файл
-   * `<engine>.json` на движок, копия уезжает в run-scoped XDG_CONFIG_HOME вместе со sweep.
-   */
-  engineConfigDir: string;
+  worker: {
+    baseUrl: string;
+    token: string;
+    launchDeadlineMs: number;
+    cancelDeadlineMs: number;
+  };
+  /** Пулы значений окружения, которые можно передать воркеру (по envAllowlist рана). */
+  env: Record<string, string>;
+  /** Репозиторий по умолчанию, когда клиент не объявил `repository` (воркер клонирует его сам). */
+  defaultRepository: string | null;
 }
 
 function envValue(name: string): string | undefined {
@@ -75,15 +40,34 @@ function envValue(name: string): string | undefined {
   return trimmed === '' ? undefined : trimmed;
 }
 
-function describePath(path: string): string {
-  if (isAbsolute(path)) return path;
-  return `${process.cwd()}${sep}${path}`;
+function intEnv(name: string, fallback: number): number {
+  const raw = envValue(name);
+  if (raw === undefined) return fallback;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 1) {
+    throw new Error(`${name}: expected a positive integer, got "${raw}"`);
+  }
+  return value;
 }
 
-function isInsideTemporary(path: string): boolean {
-  const temp = resolve(tmpdir());
-  const resolved = resolve(path);
-  return resolved === temp || resolved.startsWith(`${temp}${sep}`);
+/** `AGENT_API_ENV='{"PATH":"/usr/bin","LANG":"C.UTF-8"}'` — значения, отдаваемые воркеру. */
+function parseEnvPool(raw: string | undefined): Record<string, string> {
+  if (raw === undefined) return {};
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error('AGENT_API_ENV: expected a JSON object of environment name → value');
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new Error('AGENT_API_ENV: expected a JSON object of environment name → value');
+  }
+  const pool: Record<string, string> = {};
+  for (const [name, value] of Object.entries(parsed as Record<string, unknown>)) {
+    if (typeof value !== 'string') throw new Error(`AGENT_API_ENV.${name}: expected a string value`);
+    pool[name] = value;
+  }
+  return pool;
 }
 
 export function loadAgentApiConfig(env: Record<string, string | undefined> = process.env): AgentApiProcessConfig {
@@ -93,69 +77,43 @@ export function loadAgentApiConfig(env: Record<string, string | undefined> = pro
     throw new Error(`AGENT_API_PORT: expected an integer in [1, 65535], got "${portRaw}"`);
   }
 
-  const dataDir = resolve(env['AGENT_API_DATA_DIR']?.trim() || 'data');
-  if (isInsideTemporary(dataDir)) {
-    throw new Error(`AGENT_API_DATA_DIR must be a durable directory, not a temporary one: ${dataDir}`);
-  }
-
   const keyRegistryPath = env['AGENT_API_KEY_REGISTRY']?.trim();
   if (!keyRegistryPath) {
     throw new Error('AGENT_API_KEY_REGISTRY is required: path to a mode-0600 key registry JSON file with a principals array');
   }
 
-  const releaseManifestPath = env['AGENT_API_RELEASE_MANIFEST']?.trim();
-  if (!releaseManifestPath) {
-    throw new Error('AGENT_API_RELEASE_MANIFEST is required: pinned release/config manifest (P29, AC-170)');
+  // ТЗ внешнего воркера (docs/TZ-EXTERNAL-OPENCODE-WORKER.md §10.2) называет переменные
+  // DYNAMIC_IP_AZURE_*, epic #74 — EXTERNAL_WORKER_*. Принимаем оба имени, второе приоритетнее.
+  const baseUrl = env['EXTERNAL_WORKER_URL']?.trim() || env['DYNAMIC_IP_AZURE_URL']?.trim();
+  if (!baseUrl) {
+    throw new Error('EXTERNAL_WORKER_URL is required: base URL of the external worker that launches the agent');
   }
-
-  const fakeScenarioRaw = env['AGENT_API_FAKE_SCENARIO']?.trim() || 'success';
-  const fakeScenario = fakeScenarioResult(fakeScenarioRaw);
-  if (!fakeScenario.ok) throw new Error(`AGENT_API_FAKE_SCENARIO: ${fakeScenario.errors.join('; ')}`);
-
-  const host = env['AGENT_API_HOST']?.trim() || DEFAULT_API_HOST;
-  const faults = parseFaultPoints(env['AGENT_API_FAULTS']);
-  const shareSecret = env['ARTIFACT_SHARE_SECRET']?.trim();
-  const isolationSlots = splitList(env['AGENT_API_ISOLATION_SLOTS']);
-  const isolationToolPaths = splitList(env['AGENT_API_ISOLATION_TOOL_PATHS']);
-  if (isolationSlots.length > 0 && isolationToolPaths.length === 0) {
-    throw new Error('AGENT_API_ISOLATION_TOOL_PATHS is required when AGENT_API_ISOLATION_SLOTS is set: shared read-only tool directories');
+  if (!/^https?:\/\//.test(baseUrl)) {
+    throw new Error(`EXTERNAL_WORKER_URL: expected an http(s) URL, got "${baseUrl}"`);
   }
+  const token = env['EXTERNAL_WORKER_TOKEN']?.trim() || env['DYNAMIC_IP_AZURE_TOKEN']?.trim() || '';
+
   return {
-    host,
+    host: env['AGENT_API_HOST']?.trim() || DEFAULT_API_HOST,
     port,
-    dataDir,
-    keyRegistryPath: describePath(keyRegistryPath),
-    shareSecret: shareSecret ?? '',
-    ephemeralShareSecret: shareSecret === undefined,
-    region: env['AGENT_API_REGION']?.trim() || 'sandbox',
-    environment: env['AGENT_API_ENVIRONMENT']?.trim() || 'sandbox',
-    fakeScenario: fakeScenario.value,
-    faults,
-    releaseManifestPath: describePath(releaseManifestPath),
-    cohort: cohortFromEnv(env),
-    releaseStatePath: describePath(env['AGENT_API_RELEASE_STATE']?.trim() || join(dataDir, 'release-state.json')),
-    ownerStorePath: env['AGENT_API_OWNER_STORE']?.trim() ? describePath(env['AGENT_API_OWNER_STORE'].trim()) : '',
-    placementPolicyPath: env['AGENT_API_PLACEMENT_POLICY']?.trim() ? describePath(env['AGENT_API_PLACEMENT_POLICY'].trim()) : '',
-    isolation: { slots: isolationSlots, toolPaths: isolationToolPaths },
-    engineConfigDir: env['AGENT_API_ENGINE_CONFIG_DIR']?.trim() ?? '',
+    keyRegistryPath,
+    worker: {
+      baseUrl,
+      token,
+      launchDeadlineMs: intEnv('EXTERNAL_WORKER_LAUNCH_DEADLINE_MS', DEFAULT_LAUNCH_DEADLINE_MS),
+      cancelDeadlineMs: intEnv('EXTERNAL_WORKER_CANCEL_DEADLINE_MS', DEFAULT_CANCEL_DEADLINE_MS),
+    },
+    env: parseEnvPool(env['AGENT_API_ENV']),
+    defaultRepository: env['RUNNER_DEFAULT_REPO']?.trim() || null,
   };
 }
 
-/** Список из env-переменной: запятые и пробелы как разделители, пустые элементы отброшены. */
-function splitList(raw: string | undefined): string[] {
-  return (raw ?? '')
-    .split(/[,\s]+/)
-    .map((entry) => entry.trim())
-    .filter((entry) => entry.length > 0);
-}
-
-/**
- * Управляемые точки сбоя из env (`AGENT_API_FAULTS=cleanup:1,export`): разбор и реестр живут
- * в `src/faults/env.ts`, чтобы правило формата проверялось тестом, а не только на старте сервиса.
- */
-
 function requireKeyRegistry(path: string): KeyRegistry {
-  if (!exists(path)) throw new Error(`key registry not found: ${path}`);
+  try {
+    statSync(path);
+  } catch {
+    throw new Error(`key registry not found: ${path}`);
+  }
   const registry = KeyRegistry.loadFile(path);
   if (registry.size() === 0) {
     throw new Error(`key registry ${path} holds no keys; refusing to start an API that cannot authenticate anyone`);
@@ -163,190 +121,41 @@ function requireKeyRegistry(path: string): KeyRegistry {
   return registry;
 }
 
-function exists(path: string): boolean {
-  try {
-    statSync(path);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function writeJson(res: ServerResponse, status: number, data: unknown): void {
-  const payload = JSON.stringify(data);
-  res.writeHead(status, {
-    'content-type': 'application/json; charset=utf-8',
-    'content-length': Buffer.byteLength(payload),
-  });
-  res.end(payload);
-}
-
 async function main(): Promise<void> {
-  // API держит ключи и состояние ранов: umask по умолчанию оставлял бы файлы 0644, а слоту
-  // выдаётся проходимость к dataDir. Слот не должен получить на чтение то, что Runner
-  // создаёт рядом со своим каталогом, поэтому процесс стартует с закрытым umask.
-  process.umask(0o077);
   const config = loadAgentApiConfig();
-  const manifest: ReleaseManifest = releaseManifestFromEnv(process.env);
-  const identity = releaseIdentity(manifest);
   const log: ApiLogger = (entry) => {
-    // Каждая строка журнала несёт закреплённый релиз и машину: прод и песочница различимы
-    // в логах без догадок (SANDBOX · I10).
-    process.stdout.write(`${JSON.stringify({ ts: new Date().toISOString(), ...identity, ...entry })}\n`);
+    process.stdout.write(`${JSON.stringify({ ts: new Date().toISOString(), ...entry })}\n`);
   };
-  const journal = new PromotionJournal({
-    path: join(config.dataDir, 'promotion.jsonl'),
-    releaseId: manifest.releaseId,
-    workerId: manifest.host.workerId,
-    region: manifest.host.region,
-  });
-  const releaseState = new ReleaseStateController({
-    path: config.releaseStatePath,
-    releaseId: manifest.releaseId,
-    previousReleaseId: envPreviousReleaseId(),
-    journal,
-    cohortId: config.cohort.cohortId,
-  });
-  const owners = config.ownerStorePath
-    ? new DispatchOwnerStore({
-        path: config.ownerStorePath,
-        workerId: manifest.host.workerId,
-        onEvent: (event) => {
-          log({ ...event, event: `ownership_${event.event}` });
-          // drain/failover/fenced — переходы состояния флота: они обязаны жить в durable-журнале
-          // с причиной, иначе «почему задача сменила владельца» читается только из логов процесса.
-          const kind = ownerEventKind(event.event);
-          if (kind !== null) {
-            journal.append({
-              kind,
-              reason: event.reason,
-              ownerGeneration: event.ownerGeneration,
-              detail: {
-                principalId: event.principalId,
-                userTaskId: event.userTaskId,
-                ...(event.previousOwnerWorkerId !== undefined ? { previousOwnerWorkerId: event.previousOwnerWorkerId } : {}),
-              },
-            });
-          }
-        },
-      })
-    : undefined;
-  const promotion: PromotionRuntime = { manifest, cohort: config.cohort, state: releaseState, journal };
-  if (owners) promotion.owners = owners;
-  let placement: PlacementPolicy | undefined;
-  if (config.placementPolicyPath !== '') {
-    placement = parsePlacementPolicyText(readFileSync(config.placementPolicyPath, 'utf8'));
-    promotion.placement = placement;
-  }
-
-  mkdirSync(config.dataDir, { recursive: true, mode: 0o700 });
-  chmodSync(config.dataDir, 0o700);
-  if (statSync(config.dataDir).mode & 0o077) {
-    throw new Error(`data directory ${config.dataDir} must not be group/world accessible (expected mode 0700)`);
-  }
-
   const keys = requireKeyRegistry(config.keyRegistryPath);
-  if (config.ephemeralShareSecret) {
-    log({ event: 'share_secret_ephemeral', message: 'ARTIFACT_SHARE_SECRET is unset; links issued by this process will not survive a restart' });
-  }
-  const shareSecret = config.shareSecret === '' ? undefined : config.shareSecret;
-
-  const blob = createBlobStore({ env: process.env, localRoot: join(config.dataDir, 'blobs') });
-  const artifacts = new ArtifactStore({ rootDir: config.dataDir, blob });
-  const exports = new RunExportStore({ rootDir: config.dataDir, artifacts });
-  const uploads = new UploadSessionStore({ rootDir: config.dataDir });
-  const snapshots = new WorkspaceSnapshotStore({ rootDir: config.dataDir });
-  // Материализация входов из снимков (issue #52, шаг 1): байты лежат в том же хранилище,
-  // что и экспорт, поэтому указатель снимка проверяется тем же ArtifactStore.
-  const inputs = new InputMaterializer({ snapshots, artifacts });
-  const tokens = new ShareTokenIssuer(shareSecret !== undefined ? { secret: shareSecret } : {});
-  const baseUrl = process.env['ARTIFACT_BASE_URL']?.trim();
-
-  // Граница Agent clean room (issue #51). Настроена только явным списком слотов: без него
-  // движок идёт под service UID, и capabilities объявляют это честно. С настроенной
-  // границей отказ (нет setpriv/runuser, слот не на хосте, проба не прошла) валит раны.
-  let isolation: CleanRoomProvider | undefined;
-  if (config.isolation.slots.length > 0) {
-    const provider = new UnixCleanRoomProvider({
-      rootDir: config.dataDir,
-      policy: {
-        mode: 'per_run_unix_identity',
-        slots: config.isolation.slots,
-        toolPaths: config.isolation.toolPaths,
-      },
-      log: (message) => log({ event: 'clean_room', message }),
-    });
-    const selfTest = await provider.selfTest();
-    log({ event: 'clean_room_self_test', ok: selfTest.ok, detail: selfTest.detail, slots: config.isolation.slots.length });
-    isolation = provider;
-  }
-  // Шаблоны конфигурации движка нужны ровно при настроенной границе: без неё движок и так
-  // читает свой конфиг. Нечитаемый каталог/шаблон валит старт, молчаливый отказ — нет.
-  const engineConfigTemplates = isolation ? loadEngineConfigTemplates(config.engineConfigDir) : null;
-  if (engineConfigTemplates) {
-    log({
-      event: 'engine_config_templates',
-      dir: engineConfigTemplates.dir,
-      engines: engineConfigTemplates.engines,
-      secrets: false,
-    });
-  }
-
-  const faults = faultRegistry(config.faults);
-  if (faults) log({ event: 'faults_injected', points: config.faults, note: 'managed failures for lifecycle acceptance (#52)' });
+  const worker = new ExternalWorkerAdapter({
+    baseUrl: config.worker.baseUrl,
+    ...(config.worker.token ? { token: config.worker.token } : {}),
+    deadlineMs: config.worker.launchDeadlineMs,
+    cancelDeadlineMs: config.worker.cancelDeadlineMs,
+    log,
+  });
   const service = new AgentApi({
-    rootDir: config.dataDir,
-    adapters: { fake: new FakeEngine(config.fakeScenario), opencode: new OpenCodeAdapter() },
-    host: {
-      region: config.region,
-      environment: config.environment,
-      release: manifest.releaseId,
-      workerId: manifest.host.workerId,
-      ...(placement ? { allowedEngines: allowedEnginesForRegion(placement, manifest.host.region) } : {}),
-    },
+    worker,
     logger: log,
-    blob,
-    exports,
-    uploads,
-    snapshots,
-    inputs,
-    promotion,
-    ...(faults ? { faults } : {}),
-    ...(isolation ? { isolation } : {}),
-    ...(engineConfigTemplates ? { engineConfigTemplates } : {}),
+    env: config.env,
+    ...(config.defaultRepository ? { defaultRepository: config.defaultRepository } : {}),
   });
-  const recovery = await service.recover();
-
-  const artifactDeps: ArtifactRouteDeps = { artifacts, keys, tokens, logger: log };
-  const apiServerOptions: Parameters<typeof createAgentApiServer>[1] = { keys, logger: log, artifacts, exports, tokens, uploads, snapshots };
-  if (baseUrl) apiServerOptions.baseUrl = baseUrl;
-  const apiServer = createAgentApiServer(service, apiServerOptions);
-
-  const server: Server = createServer((req, res) => {
-    handleArtifactRequest(req, res, artifactDeps)
-      .then((status) => {
-        if (status === null) apiServer.emit('request', req, res);
-      })
-      .catch((err: unknown) => {
-        const apiError = err instanceof ApiError ? err : new ApiError('INTERNAL', 'internal error');
-        if (!(err instanceof ApiError)) {
-          log({ event: 'artifact_internal_error', message: err instanceof Error ? err.message : String(err) });
-        }
-        if (res.headersSent) res.end();
-        else writeJson(res, apiError.status, apiError.body());
-      });
-  });
+  const server = createAgentApiServer(service, { keys, logger: log });
+  // Терминальные раны не переживают себя: без этого процесса память только растёт, а у
+  // stateless-сервиса нет ни файла, ни внешнего сборщика мусора.
+  const sweeper = setInterval(() => {
+    const dropped = service.store.sweep();
+    if (dropped > 0) log({ event: 'store_swept', dropped });
+  }, 60_000);
+  sweeper.unref?.();
 
   let stopping = false;
   let stopped = false;
   const finish = (): void => {
     if (stopped) return;
     stopped = true;
-    try {
-      service.dispose({ killProcesses: true });
-    } catch (err) {
-      log({ event: 'dispose_failed', message: err instanceof Error ? err.message : String(err) });
-    }
+    clearInterval(sweeper);
+    service.dispose();
     log({ event: 'stopped' });
     process.exit(0);
   };
@@ -379,78 +188,18 @@ async function main(): Promise<void> {
       event: 'api_listening',
       host: config.host,
       port: config.port,
-      dataDir: config.dataDir,
       keyRegistry: config.keyRegistryPath,
       keys: keys.size(),
-      engines: ['fake', 'opencode'],
-      fakeScenario: config.fakeScenario,
+      engine: worker.name,
+      worker: worker.baseUrl,
+      workerAuth: config.worker.token === '' ? 'none' : 'bearer',
+      storage: 'stateless: receipts and run progress live in process memory',
+      artifacts: 'github links returned by the worker; the API keeps no bytes',
+      logs: 'google storage links returned by the worker',
       health: '/healthz',
-      release: {
-        ...identity,
-        builtAt: manifest.builtAt,
-        engines: [...manifest.engines],
-        paidEngines: [...manifest.paid.engines],
-        bindings: manifest.bindings.length,
-        retention: manifest.retention,
-        cohort: { cohortId: config.cohort.cohortId, mode: config.cohort.mode, rolloutPercent: config.cohort.rolloutPercent, principals: config.cohort.principals.length },
-        servingReleaseId: releaseState.snapshot().servingReleaseId,
-        rolledBack: releaseState.paused,
-        ownerStore: config.ownerStorePath === '' ? 'single_worker' : 'shared_fleet_registry',
-      },
-      recovery: {
-        scanned: recovery.scanned,
-        resumedQueued: recovery.resumedQueued,
-        orphaned: recovery.orphaned,
-        lost: recovery.lost,
-        terminal: recovery.terminal,
-        healed: recovery.healed,
-      },
-      artifactExport: { enabled: true, versions: 'runs/<runId>/export/v<N>.json' },
       startedAt: new Date().toISOString(),
     });
-    // Первая запись журнала промоушена: что закреплено и в каком состоянии обслуживание.
-    journal.append({
-      kind: 'release_pinned',
-      reason: 'service start with a pinned release manifest',
-      servingReleaseId: releaseState.snapshot().servingReleaseId,
-      cohortId: config.cohort.cohortId,
-      detail: {
-        sourceCommit: manifest.sourceCommit,
-        configVersion: manifest.configVersion,
-        environment: manifest.host.environment,
-        paidProfilesAllowed: manifest.paid.allowed,
-        rolledBack: releaseState.paused,
-        retention: manifest.retention,
-        ownerStore: config.ownerStorePath === '' ? 'single_worker' : 'shared_fleet_registry',
-      },
-    });
-    journal.append({
-      kind: 'cohort_configured',
-      reason: `cohort ${config.cohort.cohortId} is ${config.cohort.mode}`,
-      cohortId: config.cohort.cohortId,
-      detail: { mode: config.cohort.mode, rolloutPercent: config.cohort.rolloutPercent, principals: config.cohort.principals.length },
-    });
   });
-}
-
-/** Предыдущий релиз для отката: без него rollback некуда возвращать. */
-function envPreviousReleaseId(): string | null {
-  const previous = process.env['AGENT_API_PREVIOUS_RELEASE']?.trim();
-  return previous === undefined || previous === '' ? null : previous;
-}
-
-/** События реестра владения, которые являются переходами состояния флота (P29/P30). */
-function ownerEventKind(event: string): 'drain' | 'failover' | 'fenced' | null {
-  switch (event) {
-    case 'drained':
-      return 'drain';
-    case 'failover_granted':
-      return 'failover';
-    case 'fenced':
-      return 'fenced';
-    default:
-      return null;
-  }
 }
 
 main().catch((err: unknown) => {

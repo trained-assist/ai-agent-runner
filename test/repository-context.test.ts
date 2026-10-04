@@ -1,13 +1,15 @@
 import { afterEach, describe, expect, it, onTestFinished } from 'vitest';
-import { existsSync, readFileSync, mkdtempSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
+
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { FakeEngine } from '../src/adapters/engine/fake-engine.js';
 import type { Principal } from '../src/api/auth.js';
 import { ApiError } from '../src/api/errors.js';
 import { AgentApi } from '../src/api/service.js';
+import { adapterFor, startMockWorker } from './external-worker-harness.js';
+import type { ExternalWorkerAdapter } from '../src/adapters/external-worker-adapter.js';
+import { waitFor } from './helpers.js';
 import { validateRunSpec, type RunSpec } from '../src/contracts/run-spec.js';
-import { isTerminalState } from '../src/runner/state-machine.js';
 import { specHash } from '../src/runner/util.js';
 import { buildRepositoryUrl, planClone, repositoryBaseUrl, resolveCloneSource } from '../src/runner/repository.js';
 import { createHarness, removeDirWithRetry } from './helpers.js';
@@ -207,53 +209,29 @@ describe('repository context: clone перед спавном движка', () 
   });
 });
 
-interface ApiHarnessLite {
-  api: AgentApi;
-  rootDir: string;
-  logs: Record<string, unknown>[];
-}
+describe('repository context: stateless API (#74)', () => {
+  // Ран не запускается: для проверки формы запроса воркер не нужен, нужен его порт.
+  const idleWorker = (): ExternalWorkerAdapter =>
+    adapterFor({ baseUrl: '', launches: [], cancels: [], options: {}, lastAuthorization: () => undefined, close: async () => undefined });
 
-const alpha: Principal = { principalId: 'p-alpha', profileId: 'profile-a', scopes: ['runs:read', 'runs:write'], engines: ['fake'] };
+  const alpha: Principal = {
+    principalId: 'p-alpha',
+    profileId: 'profile-a',
+    scopes: ['runs:read', 'runs:write'],
+    engines: ['dynamic-ip-azure-agent-run'],
+  };
 
-function createApiLite(): ApiHarnessLite {
-  const rootDir = mkdtempSync(join(tmpdir(), 'ai-agent-runner-repository-api-'));
-  const logs: Record<string, unknown>[] = [];
-  const api = new AgentApi({
-    rootDir,
-    adapters: { fake: new FakeEngine('success') },
-    host: { region: 'sandbox-eu', environment: 'sandbox' },
-    cancelGraceMs: 500,
-    logger: (entry) => logs.push(entry),
-  });
-  onTestFinished(async () => {
-    for (const runId of api.runner.listRunIds()) {
-      const snapshot = api.runner.getRun(runId);
-      if (snapshot && !isTerminalState(snapshot.state)) {
-        try {
-          await api.runner.cancel(runId, snapshot.ownerGeneration);
-        } catch {
-          // финальная уборка убивает дерево ниже
-        }
-      }
-    }
-    api.dispose();
-    await removeDirWithRetry(rootDir);
-  });
-  return { api, rootDir, logs };
-}
-
-function submitBody(over: Record<string, unknown> = {}): Record<string, unknown> {
-  return {
-    engine: { name: 'fake', adapterVersion: '1' },
+  const submitBody = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
+    engine: { name: 'dynamic-ip-azure-agent-run', adapterVersion: '1' },
     limits: { timeoutMs: 15000 },
+    envAllowlist: [],
     input: { inlinePrompt: 'repository context' },
     ...over,
-  };
-}
+  });
 
-describe('repository context: API', () => {
+
   it('кривой fullName и пустой токен → 400 INVALID_REPOSITORY', () => {
-    const { api } = createApiLite();
+    const api = new AgentApi({ worker: idleWorker() });
     for (const repository of [{ fullName: 'owner' }, { fullName: 'a/b/c' }, { fullName: '../escape' }, { fullName: 'a/b', token: '' }]) {
       let thrown: ApiError | null = null;
       try {
@@ -267,46 +245,45 @@ describe('repository context: API', () => {
     }
   });
 
-  it('токен из submit не попадает ни в receipt, status, events, result, логи, state/admissions', async () => {
-    const server = await startAuthGitServer({ repoName: 'owner/name', token: SECRET_TOKEN });
-    openServers.push(server);
-    setEnv('RUNNER_REPOSITORY_BASE_URL', server.baseUrl);
-    const { api, rootDir, logs } = createApiLite();
+  it('токен репозитория не покидает API: ни в receipt, ни в статусе, ни в воркере, ни в логах', async () => {
+    const worker = await startMockWorker();
+    onTestFinished(() => worker.close());
+    const logs: Record<string, unknown>[] = [];
+    const api = new AgentApi({ worker: adapterFor(worker), logger: (entry) => logs.push(entry) });
+    onTestFinished(() => api.dispose());
 
     const receipt = api.submit(alpha, 'idem-repository-secret', submitBody({ repository: { fullName: 'owner/name', token: SECRET_TOKEN } }));
-    const result = await api.runner.waitFor(receipt.runId, 15000);
-    const status = api.status(alpha, receipt.runId);
-    const events = api.events(alpha, receipt.runId);
+    await waitFor(() => api.status(alpha, receipt.runId).state === 'succeeded', 8000, 'run to finish');
 
-    expect(result.outcome).toBe('succeeded');
-    const admissionsOnDisk = readFileSync(join(rootDir, 'api', 'admissions.json'), 'utf8');
-    const stateOnDisk = readFileSync(join(rootDir, 'runs', receipt.runId, 'state.json'), 'utf8');
-    const dump = JSON.stringify({ receipt, status, events, result, logs, admissionsOnDisk, stateOnDisk });
+    const dump = JSON.stringify({
+      receipt,
+      status: api.status(alpha, receipt.runId),
+      events: api.events(alpha, receipt.runId),
+      result: api.result(alpha, receipt.runId),
+      artifacts: api.artifacts(alpha, receipt.runId),
+      logs,
+      // Воркеру уходит только fullName: клонирует он сам, секрет через границу не идёт.
+      launch: worker.launches,
+    });
     expect(dump).not.toContain(SECRET_TOKEN);
-    expect(admissionsOnDisk).toContain('"owner/name"');
-    expect(stateOnDisk).toContain('"owner/name"');
+    expect(worker.launches[0]!['repository']).toEqual({ fullName: 'owner/name' });
+    expect((worker.launches[0]!['repository'] as Record<string, unknown>)['token']).toBeUndefined();
   });
 
-  it('тот же Idempotency-Key с другим токеном = дедуп, а не IDEMPOTENCY_CONFLICT', async () => {
-    const server = await startAuthGitServer({ repoName: 'owner/name', token: SECRET_TOKEN });
-    openServers.push(server);
-    setEnv('RUNNER_REPOSITORY_BASE_URL', server.baseUrl);
-    const { api } = createApiLite();
-
+  it('тот же Idempotency-Key с другим токеном = дедуп, а не IDEMPOTENCY_CONFLICT', () => {
+    const api = new AgentApi({ worker: idleWorker() });
     const first = api.submit(alpha, 'idem-rotated-token', submitBody({ repository: { fullName: 'owner/name', token: SECRET_TOKEN } }));
     const second = api.submit(alpha, 'idem-rotated-token', submitBody({ repository: { fullName: 'owner/name', token: 'other-token-9999' } }));
     expect(second.deduplicated).toBe(true);
     expect(second.runId).toBe(first.runId);
-    await api.runner.waitFor(first.runId, 15000);
   });
 
-  it('пустая группа repository в submit = дефолтная репа (валидация пропускает)', async () => {
-    const fixture = createSourceRepo('api-default-marker.txt', 'api default\n');
-    setEnv('RUNNER_DEFAULT_REPO', fixture);
-    const { api } = createApiLite();
-
-    const receipt = api.submit(alpha, 'idem-empty-repository', submitBody({ repository: {} }));
-    const result = await api.runner.waitFor(receipt.runId, 15000);
-    expect(result.outcome).toBe('succeeded');
+  it('без repository клиент получает репозиторий по умолчанию, объявленный хостом', () => {
+    const api = new AgentApi({
+      worker: idleWorker(),
+      defaultRepository: 'org/default-repo',
+    });
+    const receipt = api.submit(alpha, 'idem-default-repo', submitBody({ repository: {} }));
+    expect(api.store.getByRun(receipt.runId)?.spec.repository).toEqual({ fullName: 'org/default-repo' });
   });
 });

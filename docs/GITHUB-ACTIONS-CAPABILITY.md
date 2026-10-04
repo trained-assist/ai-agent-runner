@@ -75,7 +75,7 @@ step-7-credential-scopes      563 ms
    `##[error]The runner has received a shutdown signal.`
    Внутри гостя OOM-строки нет — процесс раннера получает SIGTERM.
 6. **Таймауты**: job `timeout-minutes: 30` (capability/stress), `20` (isolation),
-   `15` (promotion/p30-fleet). Сигнатура таймаута шага:
+   `15` (проба промоушена/флота удалена в #74 — `/v1/release` больше нет). Сигнатура таймаута шага:
    `##[error]The action '… timeout-minutes=1 (спим 5 минут)' has timed out after 1 minutes.`
    → `outcome=failure`, `conclusion=success` (шаг помечен `continue-on-error`).
 7. **Passwordless sudo — норма для CI-хоста**, поэтому sudo-проба идёт в режиме
@@ -128,8 +128,7 @@ Rate-limit/429 не пойман ни разу.
 | `capability-probe` | 1m29s – 2m23s | success |
 | `stress-probe` | 50s – 3m25s | failure (memory-фаза) |
 | `CI` | 30s – 1m21s | success |
-| `promotion-probe` | 21–29s | success |
-| `p30-fleet-probe` | 29–37s | success |
+| `promotion-probe`, `p30-fleet-probe` | — | удалены в #74: оба дёргали `/v1/release`, которого нет в stateless API |
 | `isolation-probe` | 38s (skip) / 20m18–20m20s (cancel) | failure / cancelled |
 
 ## Что нужно для запуска (минимальный набор)
@@ -144,7 +143,7 @@ Rate-limit/429 не пойман ни разу.
    1.18.34 отвечает даже без конфига (exit=0, `pong`) — но для задач проекта нужен именно
    `llm-ladder`, иначе уйдёт в дефолтный провайдер.
 6. **Playwright** — `npm install --no-save playwright` + `npx playwright install --with-deps chromium`.
-7. **E2E-цикл** — `./scripts/e2e-loop.sh --sudo-policy report`.
+7. **Приёмка API** — `npx vitest run test/e2e-loop.test.ts` (драйвер `scripts/e2e-loop.sh` удалён вместе с дисковой моделью API, epic #74).
 8. **Конфиг движка для настоящих ран** — read-only шаблон в `AGENT_API_ENGINE_CONFIG_DIR`;
    хост кладёт provider/model, ключ сюда не попадает (см. `src/isolation/engine-config.ts`).
 9. **Секреты только в `secrets`**, не в логах и артефактах.

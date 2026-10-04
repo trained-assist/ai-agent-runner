@@ -8,7 +8,6 @@ import { createHarness, waitFor } from './helpers.js';
 import { RecordingLauncher, StubCleanRoomProvider, eventTypes, listDir, logMessages, type StubProviderOptions } from './isolation-helpers.js';
 import { demoRegistry, fixtureBindingResolver, logMessages as mcpLogMessages, mcpPlan, mcpServer, startFakeRemote } from './mcp-helpers.js';
 import { validateRunSpec } from '../src/contracts/run-spec.js';
-import { AgentApi } from '../src/api/service.js';
 import { FakeEngine } from '../src/adapters/engine/fake-engine.js';
 import { isProcessAlive } from '../src/adapters/engine/process-tree.js';
 import { OpenCodeAdapter } from '../src/adapters/engine/opencode-adapter.js';
@@ -54,20 +53,6 @@ function harnessWith(
     },
   });
   return { h, provider };
-}
-
-function apiFor(options: { rootDir: string; isolation?: CleanRoomProvider; artifactExport?: boolean }): AgentApi {
-  const blob = createBlobStore({ backend: 'local-fs', localRoot: join(options.rootDir, 'blobs') });
-  return new AgentApi({
-    rootDir: options.rootDir,
-    adapters: { fake: new FakeEngine('success'), opencode: new OpenCodeAdapter() },
-    host: { region: 'sandbox-eu', environment: 'sandbox' },
-    blob,
-    ...(options.artifactExport
-      ? { exports: new RunExportStore({ rootDir: options.rootDir, artifacts: new ArtifactStore({ rootDir: options.rootDir, blob }) }) }
-      : {}),
-    ...(options.isolation ? { isolation: options.isolation } : {}),
-  });
 }
 
 describe('clean room isolation (issue #51)', () => {
@@ -450,34 +435,6 @@ it('единственная копия выхода: workspace остаётся
     }
   });
 
-  it('capabilities объявляют границу честно: без провайдера, с проверенной и с отказавшей', () => {
-    const launcher = new RecordingLauncher();
-    const apiRoot = harnessRootFor('api');
-    const verified = new StubCleanRoomProvider({ rootDir: join(apiRoot, 'verified') }, launcher);
-    const refusing = new StubCleanRoomProvider({ rootDir: join(apiRoot, 'refusing'), selfTestOk: false }, launcher);
-
-    const apiWithout = apiFor({ rootDir: join(apiRoot, 'none') });
-    expect(apiWithout.capabilities().mcp.osIsolation).toBe('not_proven_service_uid_only');
-    expect(apiWithout.capabilities().isolation).toEqual({
-      mode: 'none',
-      slots: [],
-      freeSlots: [],
-      capability: 'not_proven_service_uid_only',
-      launcher: null,
-      failClosed: true,
-    });
-
-    const apiVerified = apiFor({ rootDir: join(apiRoot, 'verified'), isolation: verified });
-    expect(apiVerified.capabilities().mcp.osIsolation).toBe('per_run_unix_identity_verified');
-    expect(apiVerified.capabilities().isolation.capability).toBe('per_run_unix_identity_verified');
-    expect(apiVerified.capabilities().isolation.freeSlots).toEqual(['slot-a', 'slot-b']);
-    expect(apiVerified.capabilities().isolation.launcher).toBe('setpriv');
-
-    const apiRefusing = apiFor({ rootDir: join(apiRoot, 'refusing'), isolation: refusing });
-    expect(apiRefusing.capabilities().mcp.osIsolation).toBe('configured_but_refusing_runs');
-    expect(apiRefusing.capabilities().isolation.capability).toBe('configured_but_refusing_runs');
-  });
-
   it('spec.isolation принимает только известные режимы', () => {
     const base = {
       contractVersion: 1,
@@ -498,39 +455,6 @@ it('единственная копия выхода: workspace остаётся
     expect(validateRunSpec({ ...base, isolation: { mode: 'container' } }).ok).toBe(false);
   });
 
-  it('требование границы клиента доходит до рана: без провайдера такой ран отказывается', async () => {
-    const apiRoot = harnessRootFor('request-wiring');
-    // Хост БЕЗ провайдера границы: клиент запросил per_run_unix_identity.
-    const api = apiFor({ rootDir: apiRoot });
-    const receipt = api.submit(principal, 'idem-iso-required', {
-      userTaskId: 'task-iso',
-      engine: { name: 'fake', adapterVersion: '1' },
-      envAllowlist: [],
-      limits: { timeoutMs: 10_000 },
-      isolation: { mode: 'per_run_unix_identity' },
-    });
-    await waitFor(() => api.status(principal, receipt.runId).state === 'failed', 8000, 'run to be refused');
-    // Отказ до спавна движка: запуск под service UID был бы расширением прав.
-    expect(api.result(principal, receipt.runId).failure?.code).toBe('ISOLATION_UNAVAILABLE');
-  });
-
-  it('объявленные выходы клиента доходят до рана и сохраняются', async () => {
-    const launcher = new RecordingLauncher();
-    const rootDir = harnessRootFor('outputs-wiring');
-    const provider = new StubCleanRoomProvider({ rootDir }, launcher);
-    const api = apiFor({ rootDir, isolation: provider, artifactExport: true });
-    const receipt = api.submit(principal, 'idem-outputs', {
-      userTaskId: 'task-outputs',
-      engine: { name: 'fake', adapterVersion: '1' },
-      envAllowlist: [],
-      limits: { timeoutMs: 10_000 },
-      outputs: [{ path: 'ran.txt' }],
-    });
-    await waitFor(() => api.status(principal, receipt.runId).state === 'succeeded', 8000, 'run to succeed');
-    // spec.outputs переносится в RunSpec, иначе экспортировать нечего: манифест пуст.
-    expect(api.runner.getRun(receipt.runId)?.export?.exported).toBe(1);
-    expect(api.result(principal, receipt.runId).outputRefs).toHaveLength(1);
-  });
 });
 
 /**

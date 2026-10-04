@@ -1,3 +1,5 @@
+// ВНИМАНИЕ (epic #74): сценарий использует `/v1/artifacts/{id}` и durable store, которых
+// больше нет в обслуживающем пути. Сценарий оставлен как описание прежней приёмки.
 #!/usr/bin/env node
 // Сквозной сценарий шага 7 эпика M1 (trained-assist/trained-agent-architecture#109):
 // пять реплик одной conversation → уточнение пользователя (awaiting input) →

@@ -1,110 +1,106 @@
 import { describe, expect, it } from 'vitest';
-import { alphaKey, alphaPrincipal, authHeader, getStatus, postSubmit, startHttpHarness, submitBody, waitForAsync } from './api-http-harness.js';
+import {
+  alphaKey,
+  authHeader,
+  getResult,
+  getStatus,
+  postCancel,
+  postSubmit,
+  startHttpHarness,
+  submitBody,
+  waitForAsync,
+  waitForTerminal,
+} from './api-http-harness.js';
+import { validateRunResult } from '../src/contracts/result.js';
 
 /**
- * #54: объявленные выходы доходят до рана и переживают его через API.
- *
- * Регрессия была не в схеме запроса (её `outputs` принимал), а в сборке RunSpec:
- * `buildSpec()` терял поле, план экспорта выходил пустым, `outputRefs` в результате
- * всегда был `[]`. Проверка идёт по всей цепочке HTTP → RunSpec → экспорт → артефакт,
- * потому что каждый кусок по отдельности уже умел работать и вместе не работал.
+ * Объявленные выходы в stateless-модели (#54 → #74): клиент объявляет `outputs`, воркер
+ * складывает их в репозиторий юзера, API возвращает ссылки. Пустой список выходов не должен
+ * выглядеть как «сохранено».
  */
-describe('объявленные выходы через API (#54)', () => {
-  it('outputs запроса попадают в RunSpec, экспортируются и читаются по HTTP', async () => {
-    const harness = await startHttpHarness({ artifactExport: true });
 
-    const response = await postSubmit(harness.base, alphaKey, 'idem-outputs-e2e', submitBody({ outputs: [{ path: 'ran.txt' }] }));
-    expect(response.status).toBe(202);
-    const accepted = (await response.json()) as { runId: string };
-    const runId = accepted.runId;
+describe('объявленные выходы через внешнего воркера (#54/#74)', () => {
+  it('outputs запроса уезжают в LaunchRequest и возвращаются ссылками на GitHub', async () => {
+    const h = await startHttpHarness();
+    const submit = await postSubmit(
+      h.base,
+      alphaKey,
+      'idem-outputs',
+      submitBody({ outputs: [{ path: 'report.md', name: 'report.md', mime: 'text/markdown' }] }),
+    );
+    const receipt = (await submit.json()) as { runId: string };
+    await waitForTerminal(h.base, alphaKey, receipt.runId);
 
-    await waitForAsync(async () => (await getStatus(harness.base, alphaKey, runId)).status === 200, 8000, 'run status to be readable');
-    await waitForAsync(async () => {
-      const status = (await (await getStatus(harness.base, alphaKey, runId)).json()) as { state: string };
-      return status.state === 'succeeded';
-    }, 8000, 'run to succeed');
+    const launch = h.worker.launches[0]!;
+    expect(launch['outputs']).toEqual([{ path: 'report.md', name: 'report.md', mime: 'text/markdown' }]);
 
-    // 1. поле дошло до RunSpec: без него план экспорта пуст и сохранять нечего.
-    // План экспорта — только объявленные клиентом выходы; текст ответа агента уходит
-    // в хранилище отдельным артефактом и в план не входит.
-    const snapshot = harness.service.runner.getRun(runId);
-    expect(snapshot?.result?.outcome).toBe('succeeded');
-    expect(snapshot?.export?.planned).toBe(1);
-    expect(snapshot?.export?.exported).toBe(1);
-    expect(snapshot?.export?.cleanup).not.toBe('nothing_to_prune');
-
-    // 2. результат рана объявляет ссылку на сохранённый выход
-    const resultResponse = await fetch(`${harness.base}/v1/runs/${runId}/result`, { headers: authHeader(alphaKey) });
-    expect(resultResponse.status).toBe(200);
-    const result = (await resultResponse.json()) as { outputRefs: string[]; persistence: string };
-    expect(result.outputRefs).toHaveLength(1);
-
-    // 3. артефакт виден в списке и его байты читаются обратно из хранилища
-    const listResponse = await fetch(`${harness.base}/v1/runs/${runId}/artifacts`, { headers: authHeader(alphaKey) });
-    expect(listResponse.status).toBe(200);
-    const listing = (await listResponse.json()) as {
-      count: number;
-      artifacts: Array<{ artifactId: string; name: string; sha256: string }>;
-      export: { status: string; exported: number };
-    };
-    expect(listing.count).toBe(2);
-    const declared = listing.artifacts.find((artifact) => artifact.name === 'ran.txt');
-    const answer = listing.artifacts.find((artifact) => artifact.name === 'answer.txt');
-    expect(declared?.artifactId).toBe(result.outputRefs[0]);
-    expect(answer).toBeDefined();
-    expect(listing.export.status).toBe('complete');
-    expect(listing.export.exported).toBe(1);
-
-    const bytes = await harness.artifacts?.read(runId, declared?.artifactId as string);
-    expect(bytes?.bytes.toString('utf8')).toBe('ok');
-    expect(bytes?.manifest.profileId).toBe(alphaPrincipal.profileId);
-    // Текст ответа сохранён отдельным артефактом и переживает sweep чистой среды.
-    const answerBytes = await harness.artifacts?.read(runId, answer?.artifactId as string);
-    expect(answerBytes?.bytes.toString('utf8').length).toBeGreaterThan(0);
+    const result = (await (await getResult(h.base, alphaKey, receipt.runId)).json()) as { outputRefs: string[]; persistence: string };
+    expect(result.outputRefs).toEqual(['https://github.com/owner/name/blob/abc1234/report.md']);
+    expect(result.persistence).toBe('persisted');
   });
 
-  it('ответ без объявленных выходов не притворяется сохранённым: план пуст, ссылок нет', async () => {
-    const harness = await startHttpHarness({ artifactExport: true });
-    const response = await postSubmit(harness.base, alphaKey, 'idem-no-outputs', submitBody());
-    expect(response.status).toBe(202);
-    const runId = ((await response.json()) as { runId: string }).runId;
-    await waitForAsync(async () => {
-      const status = (await (await getStatus(harness.base, alphaKey, runId)).json()) as { state: string };
-      return status.state === 'succeeded';
-    }, 8000, 'run to succeed');
+  it('ответ без объявленных выходов не притворяется сохранённым: ссылок нет, persistence not_required', async () => {
+    const h = await startHttpHarness({ worker: { artifacts: [] } });
+    const submit = await postSubmit(h.base, alphaKey, 'idem-no-outputs', submitBody());
+    const receipt = (await submit.json()) as { runId: string };
+    await waitForTerminal(h.base, alphaKey, receipt.runId);
 
-    const result = (await (await fetch(`${harness.base}/v1/runs/${runId}/result`, { headers: authHeader(alphaKey) })).json()) as {
+    const result = (await (await getResult(h.base, alphaKey, receipt.runId)).json()) as {
       outputRefs: string[];
+      persistence: string;
+      persistenceReason: string;
     };
-    // Объявления не было — выдумывать выход нельзя: outputRefs пуст и план экспорта не
-    // открывался. Текст ответа при этом сохраняется всегда, отдельным артефактом.
     expect(result.outputRefs).toEqual([]);
-    const listing = (await (await fetch(`${harness.base}/v1/runs/${runId}/artifacts`, { headers: authHeader(alphaKey) })).json()) as {
-      artifacts: Array<{ name: string }>;
-    };
-    expect(listing.artifacts.map((artifact) => artifact.name)).toEqual(['answer.txt']);
-    expect(harness.service.runner.getRun(runId)?.export).toBeNull();
+    expect(result.persistence).toBe('not_required');
+    expect(result.persistenceReason).toContain('no artifacts');
   });
 
-  it('объявленный, но отсутствующий выход объявляется в манифесте, а не теряется молча', async () => {
-    const harness = await startHttpHarness({ artifactExport: true });
-    const response = await postSubmit(harness.base, alphaKey, 'idem-missing-output', submitBody({ outputs: [{ path: 'not-written.txt' }] }));
-    expect(response.status).toBe(202);
-    const runId = ((await response.json()) as { runId: string }).runId;
-    await waitForAsync(async () => {
-      const status = (await (await getStatus(harness.base, alphaKey, runId)).json()) as { state: string };
-      return status.state === 'succeeded';
-    }, 8000, 'run to succeed');
+  it('выход, о котором воркер не сообщил, не появляется в списке молча', async () => {
+    const h = await startHttpHarness({
+      worker: { artifacts: [{ path: 'report.md', name: 'report.md', mime: 'text/markdown', sha256: 'b'.repeat(64), size: 10 }] },
+    });
+    const submit = await postSubmit(
+      h.base,
+      alphaKey,
+      'idem-partial-outputs',
+      submitBody({ outputs: [{ path: 'report.md' }, { path: 'summary.md' }] }),
+    );
+    const receipt = (await submit.json()) as { runId: string };
+    await waitForTerminal(h.base, alphaKey, receipt.runId);
 
-    const listing = (await (await fetch(`${harness.base}/v1/runs/${runId}/artifacts`, { headers: authHeader(alphaKey) })).json()) as {
+    const page = (await (await fetch(`${h.base}/v1/runs/${receipt.runId}/artifacts`, { headers: authHeader(alphaKey) })).json()) as {
       count: number;
-      export: { status: string; planned: number; failed: number };
+      artifacts: Array<{ path: string }>;
     };
-    // Объявленный файл не записан движком: он объявлен как failed, а ответ агента
-    // сохранён рядом — ран не теряет то, что успел произвести.
-    expect(listing.count).toBe(1);
-    expect(listing.export.planned).toBe(1);
-    expect(listing.export.failed).toBe(1);
-    expect(listing.export.status).toBe('failed');
+    // `summary.md` воркер не коммитил — в ссылках его нет, и API не дорисовывает его сам.
+    expect(page.count).toBe(1);
+    expect(page.artifacts.map((entry) => entry.path)).toEqual(['report.md']);
+    expect(page.artifacts.map((entry) => entry.path)).not.toContain('summary.md');
   });
+
+  it('пока воркер не ответил, status = running, а результат не выдаётся', async () => {
+    const h = await startHttpHarness({ worker: { delayMs: 300 } });
+    const submit = await postSubmit(h.base, alphaKey, 'idem-inflight', submitBody());
+    const receipt = (await submit.json()) as { runId: string };
+
+    await waitForAsync(async () => {
+      const view = (await (await getStatus(h.base, alphaKey, receipt.runId)).json()) as { state: string };
+      return view.state === 'running';
+    }, 8000, 'run to be running');
+
+    const early = await getResult(h.base, alphaKey, receipt.runId);
+    expect(early.status).toBe(409);
+
+    await waitForTerminal(h.base, alphaKey, receipt.runId);
+    const validated = (await (await getResult(h.base, alphaKey, receipt.runId)).json()) as unknown;
+    expect(validateRunResult(validated).ok).toBe(true);
+  }, 30000);
+
+  it('отмена рана до ответа воркера финализирует его как cancelled', async () => {
+    const h = await startHttpHarness({ worker: { delayMs: 300 } });
+    const submit = await postSubmit(h.base, alphaKey, 'idem-cancel-inflight', submitBody());
+    const receipt = (await submit.json()) as { runId: string };
+    expect((await postCancel(h.base, alphaKey, receipt.runId, {})).status).toBe(202);
+    expect(await waitForTerminal(h.base, alphaKey, receipt.runId)).toBe('cancelled');
+  }, 30000);
 });

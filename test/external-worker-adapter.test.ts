@@ -1,0 +1,394 @@
+import { describe, expect, it } from 'vitest';
+import {
+  EXTERNAL_WORKER_ENGINE,
+  ExternalWorkerAdapter,
+  artifactUrl,
+  launchRequestFromSpec,
+  admissionEvents,
+  mapLaunchResult,
+  runLogRef,
+  validateLaunchResult,
+  workerTransportFailure,
+  type LaunchResult,
+} from '../src/adapters/external-worker-adapter.js';
+import { PreflightError } from '../src/contracts/validate.js';
+import { validateRunResult } from '../src/contracts/result.js';
+import { validateRunnerEvent } from '../src/contracts/events.js';
+import { adapterFor, startMockWorker } from './external-worker-harness.js';
+import { makeRunSpec } from './helpers.js';
+
+const TIMES = { startedAt: '2026-10-04T10:00:00.000Z', finishedAt: '2026-10-04T10:00:45.000Z' };
+
+function launchResult(over: Partial<LaunchResult> = {}): LaunchResult {
+  return {
+    runId: 'run-1',
+    status: 'started',
+    pid: 4242,
+    exitCode: 0,
+    exitSignal: null,
+    exitReason: 'completed',
+    stdout: 'done',
+    stderr: '',
+    answer: 'отчёт готов',
+    answerSource: 'engine_stdout',
+    durationMs: 45_000,
+    timedOut: false,
+    outputTruncated: false,
+    artifacts: [{ path: 'report.md', name: 'report.md', mime: 'text/markdown', sha256: 'a'.repeat(64), size: 1234 }],
+    logUrl: 'https://storage.googleapis.com/agent-logs/runs/run-1/session.log',
+    repo: { fullName: 'owner/name', commit: 'abc1234' },
+    ...over,
+  };
+}
+
+describe('launch request: RunSpec → LaunchRequest (issue #73)', () => {
+  it('промпт, лимиты, репозиторий и изоляция уезжают в воркер как есть', () => {
+    const spec = makeRunSpec({
+      engine: { name: EXTERNAL_WORKER_ENGINE, adapterVersion: '1', modelSettings: { model: 'free' } },
+      input: { inlinePrompt: 'сделай отчёт' },
+      envAllowlist: ['PATH', 'HOME'],
+      limits: { timeoutMs: 300_000, maxOutputBytes: 1_048_576, maxLogBytes: 1_048_576 },
+      repository: { fullName: 'owner/name' },
+      isolation: { mode: 'per_run_unix_identity' },
+      outputs: [{ path: 'report.md', name: 'report.md', mime: 'text/markdown' }],
+    });
+    const request = launchRequestFromSpec(spec, { env: { PATH: '/usr/bin', HOME: '/home/runner', SECRET: 'nope' } });
+
+    expect(request.engine).toEqual({ name: EXTERNAL_WORKER_ENGINE, adapterVersion: '1', modelSettings: { model: 'free' } });
+    expect(request.input.inlinePrompt).toBe('сделай отчёт');
+    expect(request.limits).toEqual({ timeoutMs: 300_000, maxOutputBytes: 1_048_576, maxLogBytes: 1_048_576 });
+    expect(request.repository.fullName).toBe('owner/name');
+    expect(request.isolation.mode).toBe('per_run_unix_identity');
+    expect(request.outputs).toEqual([{ path: 'report.md', name: 'report.md', mime: 'text/markdown' }]);
+    // В процесс агента уходят только переменные из envAllowlist; секрет хоста остаётся здесь.
+    expect(request.env).toEqual({ PATH: '/usr/bin', HOME: '/home/runner' });
+    expect(JSON.stringify(request)).not.toContain('nope');
+  });
+
+  it('input.refs — preflight-отказ: stateless API нечего материализовать', () => {
+    const spec = makeRunSpec({ input: { refs: [{ ref: 'snap-1', snapshotId: 'snapshot-1' }] } });
+    try {
+      launchRequestFromSpec(spec);
+      expect.unreachable('refs must be refused before the worker is called');
+    } catch (err) {
+      expect(err).toBeInstanceOf(PreflightError);
+      expect((err as PreflightError).code).toBe('INPUT_REFS_UNSUPPORTED');
+      expect((err as PreflightError).retryable).toBe(false);
+    }
+  });
+
+  it('без input.inlinePrompt — preflight-отказ INLINE_PROMPT_REQUIRED', () => {
+    const spec = makeRunSpec({ input: {} });
+    try {
+      launchRequestFromSpec(spec);
+      expect.unreachable('a run without a prompt must be refused');
+    } catch (err) {
+      expect((err as PreflightError).code).toBe('INLINE_PROMPT_REQUIRED');
+    }
+  });
+});
+
+describe('валидация LaunchResult', () => {
+  it('принимает ответ, соответствующий контракту', () => {
+    const validated = validateLaunchResult(launchResult(), 'run-1');
+    expect(validated.ok).toBe(true);
+  });
+
+  it('чужой runId, отсутствующие logUrl/repo и неизвестный exitReason — отказ', () => {
+    const validated = validateLaunchResult({ runId: 'run-other', exitReason: 'exploded' }, 'run-1');
+    expect(validated.ok).toBe(false);
+    const errors = validated.ok ? [] : validated.errors;
+    expect(errors.some((entry) => entry.includes('launch.runId'))).toBe(true);
+    expect(errors.some((entry) => entry.includes('launch.exitReason'))).toBe(true);
+    expect(errors.some((entry) => entry.includes('launch.logUrl'))).toBe(true);
+    expect(errors.some((entry) => entry.includes('launch.repo'))).toBe(true);
+  });
+});
+
+describe('маппинг LaunchResult → RunResult + RunnerEvent (epic #74, шаг 2)', () => {
+  it('успешный ран: outcome succeeded, outputRefs — ссылки на GitHub, logPath — ссылка на GCS', () => {
+    const spec = makeRunSpec({ runId: 'run-1', jobId: 'job-1' });
+    const admission = admissionEvents(spec, TIMES.startedAt);
+    const mapping = mapLaunchResult(spec, launchResult(), TIMES, { workerBaseUrl: 'https://worker.example' });
+
+    expect(validateRunResult(mapping.result).ok).toBe(true);
+    for (const event of admission) expect(validateRunnerEvent(event).ok).toBe(true);
+    expect(admission.map((event) => event.type)).toEqual(['claimed', 'inputs_materialized']);
+    expect(mapping.result.outcome).toBe('succeeded');
+    expect(mapping.result.exitReason).toBe('completed');
+    expect(mapping.result.logPath).toBe('https://storage.googleapis.com/agent-logs/runs/run-1/session.log');
+    expect(mapping.result.outputRefs).toEqual(['https://github.com/owner/name/blob/abc1234/report.md']);
+    expect(mapping.result.persistence).toBe('persisted');
+    expect(mapping.result.cleanup).toBe('completed');
+    expect(mapping.result.cleanupReason).toContain('external worker owns the workspace');
+    expect(mapping.logUrl).toBe('https://storage.googleapis.com/agent-logs/runs/run-1/session.log');
+    expect(mapping.repo).toEqual({ fullName: 'owner/name', commit: 'abc1234' });
+    for (const event of mapping.events) expect(validateRunnerEvent(event).ok).toBe(true);
+    const types = mapping.events.map((event) => event.type);
+    expect(types).toContain('started');
+    expect(types).toContain('exit');
+    expect(types).toContain('artifact_exported');
+    expect(types[types.length - 1]).toBe('succeeded');
+  });
+
+  it('ненулевой код выхода: failed + AGENT_NONZERO_EXIT, событие failed последнее', () => {
+    const spec = makeRunSpec({ runId: 'run-1' });
+    const mapping = mapLaunchResult(spec, launchResult({ exitCode: 3, exitReason: 'nonzero_exit' }), TIMES);
+    expect(mapping.result.outcome).toBe('failed');
+    expect(mapping.result.failure?.code).toBe('AGENT_NONZERO_EXIT');
+    expect(mapping.result.failure?.retryable).toBe(false);
+    expect(mapping.events[mapping.events.length - 1]!.type).toBe('failed');
+  });
+
+  it('таймаут: failed + AGENT_TIMEOUT retryable', () => {
+    const spec = makeRunSpec({ runId: 'run-1' });
+    const mapping = mapLaunchResult(spec, launchResult({ exitCode: null, exitReason: 'timeout', timedOut: true }), TIMES);
+    expect(mapping.result.failure).toEqual({
+      code: 'AGENT_TIMEOUT',
+      failureClass: 'engine',
+      safeSummary: 'agent was killed by the worker timeout',
+      retryable: true,
+    });
+  });
+
+  it('отмена воркером: outcome cancelled, exitObserved=false', () => {
+    const spec = makeRunSpec({ runId: 'run-1' });
+    const mapping = mapLaunchResult(spec, launchResult({ exitCode: null, exitReason: 'cancelled' }), TIMES);
+    expect(mapping.result.outcome).toBe('cancelled');
+    expect(mapping.result.exitObserved).toBe(false);
+    expect(mapping.result.failure).toBeUndefined();
+    expect(mapping.events[mapping.events.length - 1]!.type).toBe('cancelled');
+  });
+
+  it('код отказа воркера переносится в RunFailure без потерь', () => {
+    const spec = makeRunSpec({ runId: 'run-1' });
+    const mapping = mapLaunchResult(
+      spec,
+      launchResult({
+        status: 'failed',
+        exitCode: null,
+        exitReason: 'preflight_refused',
+        artifacts: [],
+        failure: { code: 'ISOLATION_UNSUPPORTED', failureClass: 'preflight', safeSummary: 'worker refuses per_run_unix_identity', retryable: false },
+      }),
+      TIMES,
+    );
+    expect(mapping.result.failure).toEqual({
+      code: 'ISOLATION_UNSUPPORTED',
+      failureClass: 'preflight',
+      safeSummary: 'worker refuses per_run_unix_identity',
+      retryable: false,
+    });
+  });
+
+  it('ответ воркера без артефактов = not_required, а не «сохранено»', () => {
+    const spec = makeRunSpec({ runId: 'run-1' });
+    const mapping = mapLaunchResult(spec, launchResult({ artifacts: [] }), TIMES);
+    expect(mapping.result.persistence).toBe('not_required');
+    expect(mapping.result.outputRefs).toEqual([]);
+  });
+
+  it('доступный секрет в stdout не попадает в событие рана', () => {
+    const spec = makeRunSpec({ runId: 'run-1' });
+    const mapping = mapLaunchResult(spec, launchResult({ stdout: 'using token: ghp_abcdefghijklmnopqrstuvwxyz012345' }), TIMES);
+    expect(JSON.stringify(mapping.events)).not.toContain('ghp_abcdefghijklmnopqrstuvwxyz012345');
+  });
+
+  it('многострочный вывод агента даёт событие, которое принимает общий валидатор RunnerEvent', () => {
+    const spec = makeRunSpec({ runId: 'run-1' });
+    const multiline = `${'line of agent output\n'.repeat(4000)}tail`;
+    const mapping = mapLaunchResult(spec, launchResult({ stdout: multiline, stderr: 'boom\r\nstack' }), TIMES);
+    const log = mapping.events.filter((event) => event.type === 'log');
+    expect(log.length).toBeGreaterThanOrEqual(2);
+    for (const event of mapping.events) {
+      const validated = validateRunnerEvent(event);
+      expect(validated.ok, validated.ok ? '' : validated.errors.join('; ')).toBe(true);
+    }
+    const message = (log[0]!.payload as { message: string }).message;
+    expect(message).not.toContain('\n');
+    expect(message.length).toBeLessThanOrEqual(10_000);
+    expect(message).toContain('[truncated]');
+  });
+
+  it('agent_exit_resolved соответствует объявленным полям события', () => {
+    const spec = makeRunSpec({ runId: 'run-1', outputs: [{ path: 'report.md' }] });
+    const mapping = mapLaunchResult(spec, launchResult({ answerSource: 'agent_file' }), TIMES);
+    const resolved = mapping.events.find((event) => event.type === 'agent_exit_resolved');
+    expect(resolved?.payload).toMatchObject({
+      manifest: 'ok',
+      declared: 1,
+      fromManifest: 1,
+      answerSource: 'agent_file',
+      planned: 1,
+    });
+  });
+
+  it('safeSummary воркера проходит тот же фильтр секретов, что и наши сообщения', () => {
+    const spec = makeRunSpec({ runId: 'run-1' });
+    const mapping = mapLaunchResult(
+      spec,
+      launchResult({
+        status: 'failed',
+        exitCode: null,
+        exitReason: 'startup_failure',
+        artifacts: [],
+        failure: {
+          code: 'WORKER_INTERNAL',
+          failureClass: 'runtime',
+          safeSummary: 'failed with token: ghp_abcdefghijklmnopqrstuvwxyz012345',
+          retryable: true,
+        },
+      }),
+      TIMES,
+    );
+    expect(JSON.stringify(mapping)).not.toContain('ghp_abcdefghijklmnopqrstuvwxyz012345');
+    expect(mapping.result.failure?.safeSummary).toContain('[redacted]');
+  });
+});
+
+describe('отказ воркера на уровне транспорта', () => {
+  it('ран всё равно финализируется: worker_crash + WORKER_UNREACHABLE, logPath — URL рана воркера', () => {
+    const spec = makeRunSpec({ runId: 'run-1' });
+    const mapping = workerTransportFailure(spec, new Error('connect ECONNREFUSED 10.0.0.5:8080'), TIMES, {
+      workerBaseUrl: 'https://worker.example/',
+    });
+    expect(validateRunResult(mapping.result).ok).toBe(true);
+    expect(mapping.result.outcome).toBe('failed');
+    expect(mapping.result.exitReason).toBe('worker_crash');
+    expect(mapping.result.failure?.code).toBe('WORKER_UNREACHABLE');
+    expect(mapping.result.failure?.retryable).toBe(true);
+    expect(mapping.result.logPath).toBe('https://worker.example/v1/runs/run-1');
+    expect(mapping.artifacts).toEqual([]);
+    expect(mapping.events[mapping.events.length - 1]!.type).toBe('failed');
+  });
+});
+
+describe('runLogRef и artifactUrl', () => {
+  it('logUrl воркера приоритетнее URL самого рана', () => {
+    expect(runLogRef(launchResult(), 'https://worker.example', 'run-1')).toBe(
+      'https://storage.googleapis.com/agent-logs/runs/run-1/session.log',
+    );
+    expect(runLogRef(null, 'https://worker.example/', 'run-1')).toBe('https://worker.example/v1/runs/run-1');
+    expect(runLogRef(null, null, 'run-1')).toBe('worker://unconfigured/v1/runs/run-1');
+  });
+
+  it('артефакт адресуется коммитом в репозитории юзера', () => {
+    expect(artifactUrl({ fullName: 'owner/name', commit: 'abc1234' }, 'docs/report.md')).toBe(
+      'https://github.com/owner/name/blob/abc1234/docs/report.md',
+    );
+  });
+});
+
+describe('ExternalWorkerAdapter по HTTP', () => {
+  it('launch уходит на POST /v1/launch с Bearer-токеном и возвращает LaunchResult', async () => {
+    const worker = await startMockWorker();
+    try {
+      const adapter = new ExternalWorkerAdapter({ baseUrl: worker.baseUrl, token: 'shared-secret', deadlineMs: 5000 });
+      const spec = makeRunSpec({ runId: 'run-http-1', input: { inlinePrompt: 'сделай отчёт' }, repository: { fullName: 'owner/name' } });
+      const result = await adapter.launch(spec);
+
+      expect(worker.launches).toHaveLength(1);
+      expect(worker.launches[0]!['runId']).toBe('run-http-1');
+      expect(worker.lastAuthorization()).toBe('Bearer shared-secret');
+      expect(result.exitReason).toBe('completed');
+      expect(result.repo.fullName).toBe('owner/name');
+    } finally {
+      await worker.close();
+    }
+  });
+
+  it('cancel ходит на POST /v1/runs/{runId}/cancel', async () => {
+    const worker = await startMockWorker();
+    try {
+      const adapter = adapterFor(worker);
+      await adapter.launch(makeRunSpec({ runId: 'run-http-2', input: { inlinePrompt: 'сделай отчёт' } }));
+      const receipt = await adapter.cancel('run-http-2');
+      expect(receipt.status).toBe('cancelled');
+      expect(worker.cancels).toEqual(['run-http-2']);
+    } finally {
+      await worker.close();
+    }
+  });
+
+  it('отмена неизвестного рана = unknown_run, а не молчание', async () => {
+    const worker = await startMockWorker();
+    try {
+      const receipt = await adapterFor(worker).cancel('run-never-launched');
+      expect(receipt.status).toBe('unknown_run');
+    } finally {
+      await worker.close();
+    }
+  });
+
+  it('HTTP-ошибка воркера — WORKER_HTTP_ERROR, тело не теряется молча', async () => {
+    const worker = await startMockWorker({ httpStatus: 503 });
+    try {
+      await expect(adapterFor(worker).launch(makeRunSpec({ runId: 'run-http-3', input: { inlinePrompt: 'сделай отчёт' } }))).rejects.toMatchObject({
+        code: 'WORKER_HTTP_ERROR',
+      });
+    } finally {
+      await worker.close();
+    }
+  });
+
+  it('тело вне контракта — WORKER_PROTOCOL_INVALID, а не «успешный» ран', async () => {
+    const worker = await startMockWorker({ malformed: true });
+    try {
+      await expect(adapterFor(worker).launch(makeRunSpec({ runId: 'run-http-4', input: { inlinePrompt: 'сделай отчёт' } }))).rejects.toMatchObject({
+        code: 'WORKER_PROTOCOL_INVALID',
+      });
+    } finally {
+      await worker.close();
+    }
+  });
+
+  it('таймаут launch обрывает HTTP-запрос и пытается остановить осиротевший ран', async () => {
+    const worker = await startMockWorker({ delayMs: 3000 });
+    try {
+      const adapter = adapterFor(worker, { deadlineMs: 150 });
+      await expect(adapter.launch(makeRunSpec({ runId: 'run-http-timeout', input: { inlinePrompt: 'x' } }))).rejects.toMatchObject({
+        code: 'WORKER_LAUNCH_TIMEOUT',
+        retryable: false,
+      });
+      // Отмена ушла воркеру: иначе он доработал бы ран, который уже никто не ждёт.
+      expect(worker.cancels).toContain('run-http-timeout');
+    } finally {
+      await worker.close();
+    }
+  }, 20000);
+
+  it('ответ воркера вне контракта и его тело ошибки не теряются и не текут секретами', async () => {
+    const worker = await startMockWorker({ httpStatus: 500 });
+    const logs: Record<string, unknown>[] = [];
+    try {
+      const adapter = new ExternalWorkerAdapter({ baseUrl: worker.baseUrl, deadlineMs: 5000, log: (entry) => logs.push(entry) });
+      await expect(adapter.launch(makeRunSpec({ runId: 'run-http-err', input: { inlinePrompt: 'x' } }))).rejects.toMatchObject({
+        code: 'WORKER_HTTP_ERROR',
+      });
+      const entry = logs.find((item) => item['event'] === 'worker_launch_http_error');
+      expect(entry?.['status']).toBe(500);
+      expect(entry?.['detail']).toContain('worker is unhappy');
+    } finally {
+      await worker.close();
+    }
+  });
+
+  it('хостовый env-пул доходит до воркера только через envAllowlist', async () => {
+    const worker = await startMockWorker();
+    try {
+      const adapter = adapterFor(worker, { env: { PATH: '/usr/bin', TOKEN_X: 'ghp_abcdefghijklmnopqrstuvwxyz012345' } });
+      await adapter.launch(makeRunSpec({ runId: 'run-http-env', envAllowlist: ['PATH'], input: { inlinePrompt: 'x' } }));
+      expect(worker.launches[0]!['env']).toEqual({ PATH: '/usr/bin' });
+    } finally {
+      await worker.close();
+    }
+  });
+
+  it('без адреса воркера — WORKER_NOT_CONFIGURED до сетевого вызова', async () => {
+    const adapter = new ExternalWorkerAdapter({ baseUrl: '' });
+    expect(adapter.baseUrl).toBe('');
+    await expect(adapter.launch(makeRunSpec({ runId: 'run-http-5', input: { inlinePrompt: 'сделай отчёт' } }))).rejects.toMatchObject({
+      code: 'WORKER_NOT_CONFIGURED',
+    });
+  });
+});

@@ -1,3 +1,6 @@
+> **Статус (epic #74).** Fleet/placement-политика не входит в stateless API (см. `docs/API-SERVICE.md`,
+> раздел «Ограничения»). Документ описывает доставленную функциональность библиотеки
+> `src/release/`; проба `scripts/p30-fleet-probe.mjs` и workflow `p30-fleet-probe.yml` удалены.
 # Multi-worker/region contract (P30, этап I10)
 
 Карточка [#69](https://github.com/trained-assist/trained-agent-architecture/issues/69),

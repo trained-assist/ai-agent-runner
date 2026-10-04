@@ -1,5 +1,5 @@
 [Unit]
-Description=Agent Runner Serverless Agent API (single VM)
+Description=Agent Runner Serverless Agent API (stateless orchestrator, no disk state)
 After=network-online.target
 Wants=network-online.target
 
@@ -14,19 +14,18 @@ Restart=always
 RestartSec=2
 TimeoutStopSec=20
 KillSignal=SIGTERM
-UMask=0077
-# Граница Agent clean room (#51) поднимается без root: каталоги среды создаются под
-# служебным uid и затем отдаются слоту (иначе mkdir внутри каталога слота требует
-# DAC_OVERRIDE), а переключение идентичности рана делает setpriv. Поэтому процессу
-# нужны ровно четыре capability: сменить uid/gid и передать владение каталогами.
-# В наборе НЕТ DAC_OVERRIDE, DAC_READ_SEARCH и SYS_ADMIN — Runner не должен ни читать
-# чужие файлы, ни обходить права доступа. Шире этого набора граница не расширяется.
-AmbientCapabilities=CAP_SETUID CAP_SETGID CAP_CHOWN CAP_FOWNER
-CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_CHOWN CAP_FOWNER
+
+# Stateless API (epic #74): процесс не пишет на диск и не запускает агентов, поэтому
+# capabilities, ReadWritePaths и каталог данных ему не нужны. Единственный читаемый файл —
+# реестр ключей из EnvironmentFile, а всё состояние ранов живёт в памяти процесса.
+#
+# Защиту оставляем прежней: NoNewPrivileges и ProtectSystem=full запрещают процессу
+# повышать права и писать в системные каталоги, а PrivateTmp изолирует его от /tmp хоста.
+# Никаких CAP_SETUID/CAP_SETGID: переключать идентичность рана теперь нечего — агента
+# запускает внешний воркер на своей машине.
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
-ReadWritePaths=/var/lib/agent-runner
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=agent-runner-api
