@@ -1,10 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { mkdirSync, mkdtempSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parseCleanList, cleanListRulesOf } from '../src/workspace/clean-list.js';
 import { compileCleanListRules } from '../src/workspace/policy.js';
-import { compilePolicy, matchRule } from '../src/workspace/policy.js';
+import { compilePolicy, matchRule, scanWorkspace } from '../src/workspace/policy.js';
 
 const CLEAN_LIST = `
 version: 2
@@ -126,5 +126,62 @@ describe('clean list preconditions (when: git-repo)', () => {
         rules: [{ pattern: 'x', action: 'exclude', reason: 'r', when: 'on-full-moon' as never }],
       }),
     ).toThrowError(/unsupported "when" precondition/);
+  });
+});
+
+describe('working copies nested deep inside a profile (real legacy shape)', () => {
+  const legacyRules = [
+    { pattern: '**', action: 'ARCHIVE', reason: 'git working copy', when: 'git-repo' },
+    { pattern: '*.md', action: 'KEEP', reason: 'profile text' },
+  ];
+
+  it('excludes a git clone at any depth without excluding the profile itself', () => {
+    const policy = compilePolicy({
+      policyId: 'nested',
+      version: 1,
+      textMaxBytes: 1024,
+      maxFiles: 100,
+      maxTotalBytes: 1024 * 1024,
+      rules: compileCleanListRules(legacyRules),
+    });
+    const root = mkdtempSync(join(tmpdir(), 'nested-clone-'));
+    // engineering-workspaces/repo — рабочая копия на глубине 2, как в реальных профилях.
+    mkdirSync(join(root, 'engineering-workspaces', 'repo', '.git'), { recursive: true });
+    mkdirSync(join(root, 'engineering-workspaces', 'repo', 'src'), { recursive: true });
+    mkdirSync(join(root, 'notes'), { recursive: true });
+    writeFileSync(join(root, 'engineering-workspaces', 'repo', 'src', 'index.js'), 'code\n');
+    writeFileSync(join(root, 'engineering-workspaces', 'repo', 'README.md'), 'clone readme\n');
+    writeFileSync(join(root, 'notes', 'a.md'), 'profile note\n');
+    // Файл рядом с клоном, но не внутри него, — часть образа профиля.
+    writeFileSync(join(root, 'engineering-workspaces', 'scratch.md'), 'not a clone\n');
+
+    const scan = scanWorkspace(policy, root);
+    const paths = scan.files.map((file) => file.path).sort();
+    // Содержимое клона исключено (ARCHIVE), сам профиль — нет.
+    expect(paths).toContain('notes/a.md');
+    expect(paths).toContain('engineering-workspaces/scratch.md');
+    expect(paths).not.toContain('engineering-workspaces/repo/src/index.js');
+    expect(paths).not.toContain('engineering-workspaces/repo/README.md');
+  });
+
+  it('does not mass-exclude a profile just because it sits inside the operator checkout', () => {
+    const policy = compilePolicy({
+      policyId: 'inside-checkout',
+      version: 1,
+      textMaxBytes: 1024,
+      maxFiles: 100,
+      maxTotalBytes: 1024 * 1024,
+      rules: compileCleanListRules(legacyRules),
+    });
+    // Копия профиля внутри git-чек-аута оператора: `when: git-repo` относится к клонам
+    // ВНУТРИ профиля, а не к расположению самого профиля, иначе импорт молча терял бы всё.
+    const checkout = mkdtempSync(join(tmpdir(), 'operator-checkout-'));
+    mkdirSync(join(checkout, '.git'), { recursive: true });
+    const root = join(checkout, 'profile-copy');
+    mkdirSync(join(root, 'notes'), { recursive: true });
+    writeFileSync(join(root, 'notes', 'a.md'), 'profile note\n');
+
+    const scan = scanWorkspace(policy, root);
+    expect(scan.files.map((file) => file.path)).toEqual(['notes/a.md']);
   });
 });

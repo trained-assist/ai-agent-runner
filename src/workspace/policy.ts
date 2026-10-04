@@ -265,16 +265,34 @@ export interface ScanOptions {
  */
 export function scanWorkspace(compiled: CompiledPolicy, rootDir: string, options: ScanOptions = {}): ScanResult {
   const root = resolve(rootDir);
-  const context: MatchContext = { insideGitRepo: isInsideGitRepo(root) };
+  // Стартовый контекст — НЕ рабочая копия. Учитываются только `.git` ВНУТРИ профиля:
+  // legacy понимает `when: git-repo` как «файл внутри рабочей копии на любой глубине»
+  // (engineering-workspaces/**, клоны в projects/), а не как «профиль лежит в чек-ауте
+  // оператора». Иначе импорт копии, размещённой внутри чужого репозитория, молча исключил
+  // бы весь профиль.
+  const rootContext: MatchContext = { insideGitRepo: false };
+  // Есть ли в политике правило для рабочих копий. Если нет — вложенный клон исключается
+  // целиком; если есть — содержимое классифицируют правила (`when: git-repo`).
+  const hasGitRepoRule = compiled.matchers.some((matcher) => matcher.when === 'git-repo');
   const allow = options.paths && options.paths.length > 0 ? new Set(options.paths.map((p) => p.replace(/\/+$/, ''))) : null;
   const files: ScannedFile[] = [];
   const excluded: ExcludedFile[] = [];
   let totalBytes = 0;
 
-  const walk = (absoluteDir: string, relativeDir: string): void => {
+  const walk = (absoluteDir: string, relativeDir: string, inheritedContext: MatchContext, isRoot: boolean): void => {
     const entries = readdirSync(absoluteDir, { withFileTypes: true });
     // Порядок сортируется: два одинаковых обхода дают одинаковый манифест и одинаковый hash.
     entries.sort((a, b) => a.name.localeCompare(b.name));
+    // Каталог с `.git` — начало рабочей копии: всё под ним подпадает под `when: git-repo`.
+    // Проверка бесплатна: `readdir` уже сделан, ищем среди его же записей.
+    const dirIsWorkingCopy = entries.some((entry) => entry.name === '.git');
+    const context: MatchContext = dirIsWorkingCopy ? { insideGitRepo: true } : inheritedContext;
+    if (dirIsWorkingCopy && !hasGitRepoRule && !isRoot) {
+      // Политика не описывает рабочие копии (`when: git-repo`): публиковать содержимое
+      // чужого клона целиком нельзя — это не образ профиля. Отказ, а не тихая публикация.
+      excluded.push({ path: relativeDir, reason: 'nested git repository' });
+      return;
+    }
     for (const entry of entries) {
       const relativePath = relativeDir ? `${relativeDir}/${entry.name}` : entry.name;
       const absolutePath = join(absoluteDir, entry.name);
@@ -295,11 +313,7 @@ export function scanWorkspace(compiled: CompiledPolicy, rootDir: string, options
         continue;
       }
       if (entry.isDirectory()) {
-        if (hasGitDir(absolutePath)) {
-          excluded.push({ path: relativePath, reason: 'nested git repository' });
-          continue;
-        }
-        walk(absolutePath, relativePath);
+        walk(absolutePath, relativePath, context, false);
         continue;
       }
       if (!entry.isFile()) {
@@ -331,7 +345,7 @@ export function scanWorkspace(compiled: CompiledPolicy, rootDir: string, options
     }
   };
 
-  walk(root, '');
+  walk(root, '', rootContext, true);
   files.sort((a, b) => a.path.localeCompare(b.path));
   excluded.sort((a, b) => a.path.localeCompare(b.path));
   return { files, excluded, totalBytes };
