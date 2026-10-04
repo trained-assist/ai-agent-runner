@@ -158,9 +158,14 @@ Authorization: Bearer {WORKER_TOKEN}
   "answerSource": "engine_stdout",           // engine_stdout | agent_file | null
   "durationMs": 45230,
   "timedOut": false,
-  "outputTruncated": false
+  "outputTruncated": false,
+  "logUrl": "https://storage.googleapis.com/<bucket>/runs/<runId>/session.log"
 }
 ```
+
+**Воркер НЕ возвращает артефакты и repo** — артефакты публикует наш API через
+`WorkspaceService.publishRunChanges` (модуль `src/workspace/`, уже реализован).
+Воркер только оставляет файлы в `cwd`, а наш API после завершения публикует их в GitHub.
 
 ### 6.2. Немедленный отказ (процесс не запускался)
 
@@ -212,14 +217,17 @@ Authorization: Bearer {WORKER_TOKEN}
    отказывайте с `ISOLATION_UNSUPPORTED`, `failureClass: "preflight"`.
 6. **Вывод:** stdout/stderr захватываются, ограничиваются `maxOutputBytes`, при
    превышении сохраняется хвост + флаг `outputTruncated`.
-7. **Логи:** секреты и токены не логируются в открытом виде.
+7. **Логи:** секреты и токены не логируются в открытом виде. Лог сессии загружается в GCS,
+   возвращается `logUrl`.
 8. **Stateless:** повторный запрос с тем же `runId` не ломит состояние.
+9. **Артефакты:** оставляет файлы в `cwd`, не публикует в GitHub (это делает наш API).
 
 ## 8. Артефакты
 
-Воркер **не** загружает артефакты и **не** пишет в storage — это делает наш API.
-Воркер только оставляет файлы в `cwd`. Наш API после завершения прочитает:
-`outputs` (объявленные клиентом), `.agent/final-manifest.json`, `answer.txt`.
+Воркер **не** загружает артефакты и **не** пушит в GitHub — это делает наш API через
+`WorkspaceService.publishRunChanges` (модуль `src/workspace/`, PR #131).
+Воркер только оставляет файлы в `cwd` (workspace рана). Наш API после завершения прочитает
+`outputs` (объявленные клиентом) и `.agent/final-manifest.json`, затем опубликует в GitHub.
 
 ## 9. Приёмка (чеклист)
 
