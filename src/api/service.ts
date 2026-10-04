@@ -1,27 +1,20 @@
-import { join } from 'node:path';
-import type { EngineAdapter } from '../adapters/engine/engine-adapter.js';
-import { killProcessTree } from '../adapters/engine/process-tree.js';
-import type { BlobStore } from '../storage/blob-store.js';
-import type { RunExportStore } from '../storage/export.js';
-import type { UploadSessionStore } from '../storage/upload-session.js';
-import type { WorkspaceSnapshotStore } from '../storage/workspace-snapshot.js';
-import { DEFAULT_INPUT_LIMITS, type InputMaterializer } from '../storage/input-materializer.js';
+import type { LaunchArtifact, LaunchRepo, WorkerCancelResult } from '../adapters/external-worker-adapter.js';
+import {
+  admissionEvents,
+  artifactUrl,
+  branchUrl,
+  mapLaunchResult,
+  mergeUrl,
+  workerTransportFailure,
+  type ExternalWorker,
+  type LaunchMapping,
+  type LaunchReceipt,
+  type WorkerRunStatus,
+  ResultNotReadyError,
+} from '../adapters/external-worker-adapter.js';
 import type { RunResult } from '../contracts/result.js';
-import { stripRepositoryToken, validateRunSpec, type InputSpec, type RunSpec } from '../contracts/run-spec.js';
-import type { FaultRegistry } from '../faults/registry.js';
-import type { CapabilityRegistry } from '../mcp/capabilities.js';
-import type { BindingValueResolver } from '../mcp/scope.js';
-import { claimOwnership, decideAdmission, isPlacementRefusalCode, type AdmissionRefusalCode, type PlacementContext } from '../release/admission.js';
-import type { CohortPolicy } from '../release/cohort.js';
-import type { DispatchOwnerStore } from '../release/dispatch-owner.js';
-import type { ReleaseManifest } from '../release/manifest.js';
-import { allowedEnginesForRegion, placementSummary, type PlacementPolicy } from '../release/placement.js';
-import type { PromotionJournal, ReleaseStateController } from '../release/promotion.js';
-import { retentionHealth, type RetentionHealth } from '../release/retention.js';
-import { Runner, type CancelReceipt, type RecoveryReport, type RunnerHostInfo, type RunSnapshot } from '../runner/runner.js';
-import type { LogSink } from '../runner/scoped-log.js';
-import { isTerminalState } from '../runner/state-machine.js';
-import type { Principal } from './auth.js';
+import { validateRunSpec, type InputSpec, type RunSpec } from '../contracts/run-spec.js';
+import { DEFAULT_STATELESS_LIMITS, isTerminalApiState, StatelessStore, type AdmissionRecord } from './stateless-store.js';
 import {
   API_CAPABILITIES_SCHEMA_VERSION,
   API_CONTRACT_VERSION,
@@ -37,163 +30,117 @@ import {
   type SubmitRequest,
   type SubmitResponse,
 } from './contracts.js';
-import { ApiError, type ApiErrorCode } from './errors.js';
-import { ApiStore, API_STORE_SCHEMA_VERSION, type AdmissionRecord } from './store.js';
-import type { CleanRoomProvider } from '../isolation/contract.js';
-import type { EngineConfigTemplate } from '../isolation/engine-config.js';
+import { ApiError } from './errors.js';
+import type { Principal } from './auth.js';
+
+/**
+ * Stateless-ядро API (epic #74). Принимает запрос, вызывает внешнего воркера по HTTP и держит
+ * результат в памяти. Никакого диска, никакого spawn, никакого recovery: после рестарта клиент
+ * повторяет submit с новым `Idempotency-Key`.
+ */
 
 export type ApiLogger = (entry: Record<string, unknown>) => void;
 
-/**
- * Промоушен-контур P29: закреплённый релиз/конфиг, флаг когорты, состояние отката,
- * durable-журнал переходов и (в fleet-развёртывании) общий реестр владельцев задач.
- * Отсутствие этого блока означает одиночную установку без когортного флага — как раньше.
- */
-export interface PromotionRuntime {
-  manifest: ReleaseManifest;
-  cohort: CohortPolicy;
-  state: ReleaseStateController;
-  journal: PromotionJournal;
-  owners?: DispatchOwnerStore;
-  /** Политика размещения (P30): регион × провайдер × credentials × резидентность. */
-  placement?: PlacementPolicy;
+export type RunCancelStatus = 'stopped' | 'stop_pending' | 'already_terminal' | 'too_late' | 'rejected' | 'unknown_run';
+
+export interface RunCancelReceipt {
+  runId: string;
+  status: RunCancelStatus;
+  state?: string;
+  reason?: string;
 }
 
-export interface ReleaseView {
-  schemaVersion: 1;
-  release: {
-    releaseId: string;
-    sourceCommit: string;
-    configVersion: number;
-    builtAt: string;
-    workerId: string;
-    region: string;
-    environment: string;
-    roles: { schedule: boolean; delivery: boolean };
-    engines: string[];
-    paidEngines: string[];
-    paidProfilesAllowed: boolean;
-  };
-  bindings: Array<{ name: string; required: boolean; source: string; owner: string; rotatedAt?: string }>;
-  cohort: { cohortId: string; mode: string; rolloutPercent: number; principals: number };
-  rollback: {
-    releaseId: string;
-    servingReleaseId: string;
-    previousReleaseId: string | null;
-    rolledBack: boolean;
-    reason: string | null;
-    updatedAt: string;
-    transitions: number;
-  };
-  retention: RetentionHealth;
-  fleet: ReturnType<DispatchOwnerStore['view']> | null;
-  journal: { entries: number; lastSeq: number; lastKind: string | null };
-  /** Политика размещения (P30): что этот воркер вообще имеет право запускать. */
-  placement: Record<string, unknown> | null;
+export interface RunArtifactLink {
+  path: string;
+  name: string;
+  mime: string;
+  sha256: string;
+  size: number;
+  /** Ссылка на файл в репозитории юзера — байты воркер коммитит сам, мы только адресуем. */
+  url: string;
+}
+
+export interface RunArtifactsView {
+  runId: string;
+  conversationId: string;
+  userTaskId: string;
+  repo: LaunchRepo | null;
+  /** Страница ветки рана: результат целиком, отсюда GitHub предлагает merge. */
+  branchUrl: string | null;
+  /** Куда мержить результат рана: сравнение с базой, если воркер её сообщил, иначе ветка. */
+  mergeUrl: string | null;
+  count: number;
+  artifacts: RunArtifactLink[];
+  logUrl: string | null;
+  note: string;
 }
 
 export interface AgentApiOptions {
-  rootDir: string;
-  adapters: Record<string, EngineAdapter>;
-  host?: RunnerHostInfo;
-  clock?: () => Date;
-  faults?: FaultRegistry;
-  logSink?: LogSink;
-  logger?: ApiLogger;
-  heartbeatIntervalMs?: number;
-  cancelGraceMs?: number;
-  /** Профильное хранилище для следов задач (profiles/<id>/trace.jsonl) — см. RunnerOptions.blob. */
-  blob?: BlobStore;
-  /** Манифесты экспорта артефактов — см. RunnerOptions.exports (P07). */
-  exports?: RunExportStore;
-  /** Сессии прямой загрузки артефактов — см. RunnerOptions.uploads (P08). */
-  uploads?: UploadSessionStore;
-  /** Снимки workspace — см. RunnerOptions.snapshots (P09). */
-  snapshots?: WorkspaceSnapshotStore;
-  /** Материализация входов из снимков — см. RunnerOptions.inputs (issue #52, шаг 1). */
-  inputs?: InputMaterializer;
-  /** Реестр capability handler'ов (P13) — общий для MCP-вызовов рана и этого API. */
-  capabilities?: CapabilityRegistry;
-  /** Резолвер значений credential binding'ов (P13). */
-  bindingResolver?: BindingValueResolver;
-  /** Граница Agent clean room (issue #51): per-run Unix-идентичность вместо service UID. */
-  isolation?: CleanRoomProvider;
-  /** Хостовые шаблоны конфигурации движка для run-scoped HOME — см. RunnerOptions. */
-  engineConfigTemplates?: EngineConfigTemplate | null;
   /**
-   * Оставлять рабочие каталоги ранов после финализации (диагностика/отладка). По
-   * умолчанию каталог снимается вместе с уборкой, и `cleanup: completed` означает
-   * проверенное его отсутствие (issue #52).
+   * Внешние воркеры: единственный способ запустить агента. Запрос уходит воркеру, чьё имя
+   * совпало с `engine.name`; неизвестный движок отклоняется до записи в память.
    */
-  retainWorkspaces?: boolean;
-  /** Промоушен-контур P29: pinned release, когорта, откат, журнал, реестр владельцев. */
-  promotion?: PromotionRuntime;
+  workers: ExternalWorker[];
+  logger?: ApiLogger;
+  clock?: () => Date;
+  /** Запас сверх лимита рана на persist у воркера. По умолчанию минута. */
+  resultGraceMs?: number;
+  /** Значения окружения, которые API готов передать воркеру (пересекаются с envAllowlist). */
+  env?: Record<string, string>;
+  /** Сколько незавершённых ранов API держит до отказа в приёме новых. */
+  maxActiveRuns?: number;
+  /**
+   * Репозиторий по умолчанию (`owner/name`), когда клиент его не объявил. Ставить его должен
+   * API: воркер получает готовый `repository.fullName` и сам клонирует репозиторий.
+   */
+  defaultRepository?: string;
+  store?: StatelessStore;
+  /**
+   * Журнал приёмных записей: дедупликация по `Idempotency-Key` переживает рестарт API.
+   * Без него — только память процесса (контракт эпика #74, шаг 6).
+   */
+  admissionLogPath?: string;
 }
 
-export interface ServiceRecoveryReport extends RecoveryReport {
-  healed: number;
-}
+/** Пауза между опросами статуса: растёт от базовой до потолка (экспоненциально). */
+const POLL_BASE_DELAY_MS = 500;
+const POLL_MAX_DELAY_MS = 10_000;
+/** Запас сверх лимита рана на выгрузку лога и пуш ветки до уничтожения среды. */
+const DEFAULT_RESULT_GRACE_MS = 60_000;
 
 const defaultLogger: ApiLogger = (entry) => {
   process.stdout.write(`${JSON.stringify(entry)}\n`);
 };
 
 export class AgentApi {
-  readonly runner: Runner;
-  readonly store: ApiStore;
+  readonly workers: readonly ExternalWorker[];
+  readonly store: StatelessStore;
   private readonly opts: AgentApiOptions;
   private readonly logger: ApiLogger;
   private readonly clock: () => Date;
+  /** Запас сверх лимита рана: воркер успел выгрузить лог и запушить ветку. */
+  private readonly resultGraceMs: number;
+  private disposed = false;
+  private readonly maxActiveRuns: number;
+  private readonly inFlight = new Set<string>();
 
   constructor(options: AgentApiOptions) {
     this.opts = options;
-    this.store = new ApiStore(options.rootDir);
-    this.store.init();
+    if (options.workers.length === 0) {
+      throw new Error('AgentApi requires at least one external worker: without it there is no way to launch an agent');
+    }
+    this.workers = options.workers;
+    this.store = options.store ?? new StatelessStore({}, options.admissionLogPath ?? null);
+    this.maxActiveRuns = options.maxActiveRuns ?? DEFAULT_STATELESS_LIMITS.maxActiveRuns;
     this.logger = options.logger ?? defaultLogger;
     this.clock = options.clock ?? (() => new Date());
-    const runnerOptions: ConstructorParameters<typeof Runner>[0] = {
-      rootDir: options.rootDir,
-      adapters: options.adapters,
-    };
-    if (options.host) runnerOptions.host = options.host;
-    if (options.blob) runnerOptions.blob = options.blob;
-    if (options.exports) runnerOptions.exports = options.exports;
-    if (options.uploads) runnerOptions.uploads = options.uploads;
-    if (options.snapshots) runnerOptions.snapshots = options.snapshots;
-    if (options.inputs) runnerOptions.inputs = options.inputs;
-    if (options.clock) runnerOptions.clock = options.clock;
-    if (options.faults) runnerOptions.faults = options.faults;
-    if (options.logSink) runnerOptions.logSink = options.logSink;
-    if (options.heartbeatIntervalMs !== undefined) runnerOptions.heartbeatIntervalMs = options.heartbeatIntervalMs;
-    if (options.cancelGraceMs !== undefined) runnerOptions.cancelGraceMs = options.cancelGraceMs;
-    if (options.capabilities) runnerOptions.capabilities = options.capabilities;
-    if (options.bindingResolver) runnerOptions.bindingResolver = options.bindingResolver;
-    if (options.isolation) runnerOptions.isolation = options.isolation;
-    if (options.engineConfigTemplates) runnerOptions.engineConfigTemplates = options.engineConfigTemplates;
-    if (options.retainWorkspaces !== undefined) runnerOptions.retainWorkspaces = options.retainWorkspaces;
-    this.runner = new Runner(runnerOptions);
+    this.resultGraceMs = options.resultGraceMs ?? DEFAULT_RESULT_GRACE_MS;
   }
 
-  async recover(): Promise<ServiceRecoveryReport> {
-    const report = await this.runner.recover();
-    let healed = 0;
-    for (const record of this.store.listAll()) {
-      if (this.runner.getRun(record.runId)) continue;
-      if (this.startAdmission(record)) healed += 1;
-    }
-    this.log({
-      event: 'recovered',
-      scanned: report.scanned,
-      resumedQueued: report.resumedQueued,
-      orphaned: report.orphaned,
-      lost: report.lost,
-      finalizingResumed: report.finalizingResumed,
-      terminal: report.terminal,
-      healed,
-    });
-    return { ...report, healed };
-  }
-
+  /**
+   * Идемпотентность без диска (epic #74, шаг 6): повторный submit с тем же ключом возвращает
+   * тот же receipt. При рестарте память пуста — клиент обязан повторить submit с новым ключом.
+   */
   submit(principal: Principal, rawIdempotencyKey: unknown, rawBody: unknown): SubmitResponse {
     const keyResult = validateIdempotencyKey(rawIdempotencyKey);
     if (!keyResult.ok) {
@@ -221,20 +168,25 @@ export class AgentApi {
           { requestId: existing.requestId, userTaskId: existing.userTaskId },
         );
       }
-      const current = this.store.currentAttempt(principal.principalId, existing.userTaskId) ?? existing;
-      this.heal(current);
       this.log({
         event: 'submit',
         outcome: 'duplicate',
         principalId: principal.principalId,
-        requestId: current.requestId,
-        userTaskId: current.userTaskId,
-        runId: current.runId,
-        ownerGeneration: current.ownerGeneration,
+        requestId: existing.requestId,
+        userTaskId: existing.userTaskId,
+        runId: existing.runId,
+        ownerGeneration: existing.ownerGeneration,
       });
-      return { requestId: current.requestId, userTaskId: current.userTaskId, runId: current.runId, deduplicated: true };
+      return { requestId: existing.requestId, userTaskId: existing.userTaskId, runId: existing.runId, deduplicated: true };
     }
 
+    if (!this.workerFor(request.engine.name)) {
+      throw new ApiError(
+        'ENGINE_NOT_ALLOWED',
+        `this API does not run engine "${request.engine.name}"`,
+        { engines: this.engineNames() },
+      );
+    }
     if (principal.engines && !principal.engines.includes(request.engine.name)) {
       throw new ApiError(
         'ENGINE_NOT_ALLOWED',
@@ -243,10 +195,6 @@ export class AgentApi {
       );
     }
 
-    // Откат релиза и флаг когорты проверяются ДО любой записи: отказ не должен оставить
-    // ни admission-записи, ни рана (иначе «откат» означал бы half-принятые задачи).
-    const admission = this.decideAdmission(principal, request);
-
     let requestId: string;
     let userTaskId: string;
     let jobId: string;
@@ -254,15 +202,12 @@ export class AgentApi {
     if (request.userTaskId) {
       const prior = this.store.currentAttempt(principal.principalId, request.userTaskId);
       if (prior) {
-        const priorRun = this.heal(prior);
-        if (!priorRun) {
-          throw new ApiError('INTERNAL', `previous attempt of task ${prior.userTaskId} could not be reconciled; refusing to risk a second copy`);
-        }
-        if (!isTerminalState(priorRun.state)) {
+        const priorRun = this.store.progressOf(prior.runId);
+        if (priorRun && !isTerminalApiState(priorRun.state)) {
           throw new ApiError(
             'TASK_ATTEMPT_ACTIVE',
             `task ${prior.userTaskId} already has an active attempt in state "${priorRun.state}"; cancel it before starting the next attempt`,
-            { runId: priorRun.runId, state: priorRun.state },
+            { runId: prior.runId, state: priorRun.state },
           );
         }
         requestId = prior.requestId;
@@ -283,22 +228,13 @@ export class AgentApi {
     }
 
     const spec = this.buildSpec(request, { principal, requestId, userTaskId, jobId, ownerGeneration });
-    // Реестр владельцев (fleet): решение о владении принимается один раз на задачу и
-    // определяет ownerGeneration. Отказ = «не запускай вторую копию», а не «попробуй ещё раз».
-    const ownership = this.claimOwnership(principal, userTaskId, spec.runId);
-    if (ownership) ownerGeneration = ownership;
-    if (ownership !== undefined) {
-      spec.ownerGeneration = ownership;
-      const revalidated = validateRunSpec(spec);
-      if (!revalidated.ok) {
-        throw new ApiError('INVALID_REQUEST', `assembled spec is invalid: ${revalidated.errors.join('; ')}`, { errors: revalidated.errors });
-      }
-    }
     const record: AdmissionRecord = {
-      schemaVersion: API_STORE_SCHEMA_VERSION,
+      schemaVersion: 1,
       requestId,
       userTaskId,
+      conversationId: spec.conversationId,
       principalId: principal.principalId,
+      profileId: principal.profileId,
       jobId,
       idempotencyKey,
       payloadHash,
@@ -308,10 +244,16 @@ export class AgentApi {
       spec,
       createdAt: this.nowIso(),
     };
-    this.store.put(record);
-    if (!this.startAdmission(record)) {
-      throw new ApiError('INTERNAL', 'accepted request could not be started', { requestId, runId: spec.runId });
+    // Незавершённые раны — единственное, что растёт без границы: у процесса память, и
+    // докупить её диском нельзя. Переполнение = отказ, а не тихое вытеснение живого рана.
+    if (this.store.activeRuns() >= this.maxActiveRuns) {
+      throw new ApiError('WORKER_DRAINING', `this API holds ${this.maxActiveRuns} unfinished runs; retry once one of them is terminal`, {
+        maxActiveRuns: this.maxActiveRuns,
+      });
     }
+    this.store.put(record);
+    // Ран уходит во внешнего воркера сразу: клиент получает receipt и опрашивает статус.
+    void this.execute(record);
     this.log({
       event: 'submit',
       outcome: 'accepted',
@@ -321,96 +263,15 @@ export class AgentApi {
       runId: spec.runId,
       ownerGeneration,
       engine: spec.engine.name,
-      ...(admission.admit
-        ? {
-            cohortId: admission.cohortId,
-            cohortReason: admission.cohortReason,
-            cohortBucket: admission.bucket,
-            servingReleaseId: admission.servingReleaseId,
-            ...(admission.placement
-              ? {
-                  placement: {
-                    workerId: admission.placement.workerId,
-                    region: admission.placement.region,
-                    provider: admission.placement.provider,
-                    policyId: admission.placement.policyId,
-                  },
-                }
-              : {}),
-          }
-        : {}),
+      worker: this.workerFor(spec.engine.name)?.baseUrl ?? null,
     });
     return { requestId, userTaskId, runId: spec.runId, deduplicated: false };
   }
 
-  /**
-   * Декларация развёрнутого релиза для control plane (P29): что закреплено, кто владелец,
-   * когорта, откат, retention. Значений секретов здесь нет — только имена binding'ов.
-   */
-  release(): ReleaseView | null {
-    const promotion = this.opts.promotion;
-    if (!promotion) return null;
-    const manifest = promotion.manifest;
-    const state = promotion.state.snapshot();
-    const journal = promotion.journal.list();
-    const runs = this.runner
-      .listRunIds()
-      .map((runId) => this.runner.getRun(runId))
-      .filter((snapshot): snapshot is RunSnapshot => snapshot !== null)
-      .map((snapshot) => ({ runId: snapshot.runId, state: snapshot.state, updatedAt: snapshot.updatedAt }));
-    const retention = retentionHealth({ policy: manifest.retention, runs, now: this.clock() });
-    return {
-      schemaVersion: 1,
-      release: {
-        releaseId: manifest.releaseId,
-        sourceCommit: manifest.sourceCommit,
-        configVersion: manifest.configVersion,
-        builtAt: manifest.builtAt,
-        workerId: manifest.host.workerId,
-        region: manifest.host.region,
-        environment: manifest.host.environment,
-        roles: manifest.host.roles,
-        engines: [...manifest.engines],
-        paidEngines: [...manifest.paid.engines],
-        paidProfilesAllowed: manifest.paid.allowed,
-      },
-      bindings: manifest.bindings.map((binding) => ({
-        name: binding.name,
-        required: binding.required,
-        source: binding.source,
-        owner: binding.owner,
-        ...(binding.rotatedAt !== undefined ? { rotatedAt: binding.rotatedAt } : {}),
-      })),
-      cohort: {
-        cohortId: promotion.cohort.cohortId,
-        mode: promotion.cohort.mode,
-        rolloutPercent: promotion.cohort.rolloutPercent,
-        principals: promotion.cohort.principals.length,
-      },
-      rollback: {
-        releaseId: state.releaseId,
-        servingReleaseId: state.servingReleaseId,
-        previousReleaseId: state.previousReleaseId,
-        rolledBack: state.rolledBack,
-        reason: state.reason,
-        updatedAt: state.updatedAt,
-        transitions: state.transitions,
-      },
-      retention,
-      fleet: promotion.owners ? promotion.owners.view() : null,
-      journal: {
-        entries: journal.length,
-        lastSeq: journal.length > 0 ? journal[journal.length - 1]!.seq : 0,
-        lastKind: journal.length > 0 ? journal[journal.length - 1]!.kind : null,
-      },
-      placement: promotion.placement ? placementSummary(promotion.placement) : null,
-    };
-  }
-
   status(principal: Principal, runId: string): RunStatusView {
     const record = this.requireRun(principal, runId);
-    const snapshot = this.runner.getRun(runId);
-    if (!snapshot) {
+    const run = this.store.progressOf(runId);
+    if (!run) {
       return {
         requestId: record.requestId,
         userTaskId: record.userTaskId,
@@ -423,6 +284,7 @@ export class AgentApi {
         observedAt: record.createdAt,
         sequence: 0,
         fencing: { rejected: 0 },
+        answer: null,
       };
     }
     return {
@@ -430,19 +292,141 @@ export class AgentApi {
       userTaskId: record.userTaskId,
       conversationId: record.spec.conversationId,
       runId,
-      ownerGeneration: snapshot.ownerGeneration,
-      state: snapshot.state,
-      cancelRequested: snapshot.cancelRequested !== null,
-      connectionLost: snapshot.connectionLost,
-      observedAt: snapshot.updatedAt,
-      sequence: snapshot.sequence,
-      fencing: { rejected: snapshot.fencing.rejected },
+      ownerGeneration: record.ownerGeneration,
+      state: run.state,
+      cancelRequested: run.cancelRequested !== null,
+      connectionLost: run.connectionLost,
+      observedAt: run.updatedAt,
+      sequence: run.sequence,
+      fencing: { rejected: run.fencing.rejected },
+      answer: run.answer,
+    };
+  }
+
+  result(principal: Principal, runId: string): RunResult {
+    const record = this.requireRun(principal, runId);
+    const run = this.store.progressOf(runId);
+    if (run?.result) return run.result;
+    const state = run?.state ?? 'queued';
+    throw new ApiError('RESULT_NOT_READY', `result is not available yet (state: ${state})`, {
+      runId,
+      requestId: record.requestId,
+      state,
+      connectionLost: run?.connectionLost ?? false,
+    });
+  }
+
+  events(principal: Principal, runId: string, cursor = 0, limit = 500): EventsPage {
+    this.requireRun(principal, runId);
+    if (!Number.isInteger(cursor) || cursor < 0) {
+      throw new ApiError('INVALID_REQUEST', 'cursor: expected non-negative integer');
+    }
+    if (!Number.isInteger(limit) || limit < 1 || limit > 1000) {
+      throw new ApiError('INVALID_REQUEST', 'limit: expected integer in [1, 1000]');
+    }
+    const run = this.store.progressOf(runId);
+    const available = run ? run.events.filter((event) => event.sequence > cursor) : [];
+    const events = available.slice(0, limit);
+    const hasMore = available.length > events.length;
+    const nextCursor = events.length > 0 ? events[events.length - 1]!.sequence : cursor;
+    const status = this.status(principal, runId);
+    return {
+      runId,
+      events,
+      cursor: nextCursor,
+      hasMore,
+      logUrl: run?.logUrl ?? null,
+      droppedEvents: run?.droppedEvents ?? 0,
+      snapshot: {
+        state: status.state,
+        connectionLost: status.connectionLost,
+        sequence: status.sequence,
+        ownerGeneration: status.ownerGeneration,
+      },
     };
   }
 
   /**
-   * Декларация возможностей развёрнутого Runner (см. ApiCapabilities): приёмник читает её
-   * вместо догадок о resume/awaiting_user и о правилах новой попытки.
+   * Артефакты рана — ссылки на GitHub (epic #74, шаг 4). Байты API не хранит и не отдаёт:
+   * воркер коммитит их в репозиторий юзера, мы возвращаем адрес файла в этом коммите.
+   */
+  artifacts(principal: Principal, runId: string): RunArtifactsView {
+    const record = this.requireRun(principal, runId);
+    const run = this.store.progressOf(runId);
+    const repo = run?.repo ?? null;
+    const artifacts: RunArtifactLink[] = (run?.artifacts ?? []).map((artifact: LaunchArtifact) => ({
+      path: artifact.path,
+      name: artifact.name,
+      mime: artifact.mime,
+      sha256: artifact.sha256,
+      size: artifact.size,
+      url: repo ? artifactUrl(repo, artifact.path) : artifact.path,
+    }));
+    return {
+      runId,
+      conversationId: record.spec.conversationId,
+      userTaskId: record.userTaskId,
+      repo,
+      branchUrl: repo ? branchUrl(repo) : null,
+      mergeUrl: repo ? mergeUrl(repo) : null,
+      count: artifacts.length,
+      artifacts,
+      logUrl: run?.logUrl ?? null,
+      note: 'the worker committed this run into its own branch of the user repository; the API stores no bytes and merges nothing',
+    };
+  }
+
+  async cancel(principal: Principal, runId: string, rawBody: unknown = {}): Promise<RunCancelReceipt> {
+    const record = this.requireRun(principal, runId);
+    const bodyResult = validateCancelRequest(rawBody);
+    if (!bodyResult.ok) {
+      throw new ApiError('INVALID_REQUEST', `invalid cancel body: ${bodyResult.errors.join('; ')}`, { errors: bodyResult.errors });
+    }
+    const request = bodyResult.value;
+    // Fencing: попытка отменить не то поколение рана — отказ, а не «остановлено».
+    if (request.ownerGeneration !== undefined && request.ownerGeneration !== record.ownerGeneration) {
+      this.store.bumpFencing(runId);
+      throw new ApiError('STALE_OWNER_GENERATION', `cancel for ${runId} names ownerGeneration ${request.ownerGeneration}, the current one is ${record.ownerGeneration}`, {
+        runId,
+        ownerGeneration: record.ownerGeneration,
+      });
+    }
+    const run = this.store.progressOf(runId);
+    if (!run) throw new ApiError('INTERNAL', `run ${runId} has no in-memory progress`);
+    if (isTerminalApiState(run.state)) {
+      return { runId, status: 'already_terminal', state: run.state };
+    }
+    const worker = this.workerFor(record.spec.engine.name);
+    if (!worker) {
+      throw new ApiError('INTERNAL', `run ${runId} names engine "${record.spec.engine.name}", which is not configured on this API`);
+    }
+    this.store.markCancelRequested(runId, 'cancel');
+    let receipt: WorkerCancelResult;
+    try {
+      receipt = await worker.cancel(runId);
+    } catch (err) {
+      this.log({ event: 'cancel_failed', runId, message: err instanceof Error ? err.message : String(err) });
+      return { runId, status: 'rejected', reason: 'cancel request did not reach the worker' };
+    }
+    if (receipt.status === 'unknown_run') {
+      // Ран есть в нашей памяти, но воркер его не видел — это отказ отмены, а не 404.
+      return { runId, status: 'rejected', reason: 'the worker has not registered this run; the cancellation could not be delivered' };
+    }
+    if (receipt.status === 'rejected') {
+      return { runId, status: 'rejected', reason: receipt.reason ?? 'the worker rejected the cancellation' };
+    }
+    // Ран мог финализироваться, пока отмена шла к воркеру.
+    const current = this.store.progressOf(runId);
+    if (current && isTerminalApiState(current.state)) {
+      return { runId, status: 'already_terminal', state: current.state };
+    }
+    this.log({ event: 'cancel', principalId: principal.principalId, runId, status: receipt.status, ownerGeneration: record.ownerGeneration });
+    return { runId, status: 'stop_pending', state: current?.state ?? run.state };
+  }
+
+  /**
+   * Честная декларация возможностей (epic #74, шаг 7): изоляции на хосте API нет (её
+   * обеспечивает воркер), движок один, байты артефактов и логов API не отдаёт.
    */
   capabilities(): ApiCapabilities {
     return {
@@ -468,214 +452,252 @@ export class AgentApi {
       },
       artifacts: {
         listPerRun: true,
-        download: true,
-        shareLink: true,
+        download: false,
+        shareLink: false,
         ingestEndpoint: 'absent',
-        ingestNote: 'artifacts are registered out-of-band (slice D2: POST /v1/artifacts)',
+        ingestNote: 'artifacts are committed to the user repository by the external worker; the API stores no bytes',
         export: {
-          enabled: this.opts.exports !== undefined,
-          declaredOutputs: true,
-          manifest: true,
-          partialManifestDeclared: true,
+          enabled: false,
+          declaredOutputs: false,
+          manifest: false,
+          partialManifestDeclared: false,
           engineRerunOnRecommit: false,
-          soleCopyRetainedUntilDurable: true,
+          soleCopyRetainedUntilDurable: false,
         },
         upload: {
-          enabled: this.opts.uploads !== undefined,
-          scopedSessions: true,
-          presignedUrl: true,
-          multipartResume: true,
-          abortCleanup: true,
-          maxTotalBytes: this.opts.uploads?.maxTotalBytes ?? 512 * 1024 * 1024,
-          ttlSeconds: this.opts.uploads?.ttlSeconds ?? 300,
+          enabled: false,
+          scopedSessions: false,
+          presignedUrl: false,
+          multipartResume: false,
+          abortCleanup: false,
+          maxTotalBytes: 0,
+          ttlSeconds: 0,
         },
         snapshot: {
-          enabled: this.opts.snapshots !== undefined,
-          versioning: true,
-          conflictDetection: true,
-          conflictPolicies: ['reject', 'overwrite', 'merge'] as const,
-          cleanRoomOnNewAttempt: true,
+          enabled: false,
+          versioning: false,
+          conflictDetection: false,
+          conflictPolicies: ['reject', 'overwrite', 'merge'],
+          cleanRoomOnNewAttempt: false,
           materialize: {
-            enabled: this.opts.inputs !== undefined,
-            bytesInDurableStorage: true,
-            verifyDigestOnWrite: true,
-            ownerScoped: true,
-            allOrNothing: true,
-            refusalRetryableWhenStorageUnavailable: true,
-            limits: this.opts.inputs?.limits ?? DEFAULT_INPUT_LIMITS,
+            enabled: false,
+            bytesInDurableStorage: false,
+            verifyDigestOnWrite: false,
+            ownerScoped: false,
+            allOrNothing: false,
+            refusalRetryableWhenStorageUnavailable: false,
+            limits: { refs: 0, filesPerRef: 0, fileBytes: 0, totalBytes: 0 },
           },
         },
       },
-      mcp: {
-        perRunStdioProxy: this.opts.capabilities !== undefined,
-        scopedBindings: true,
-        capabilityHandlersSharedWithMcp: this.opts.capabilities !== undefined,
-        capabilityInvokeEndpoint: this.opts.capabilities !== undefined,
-        remoteTransport: 'absent',
-        osIsolation: this.isolationCapability(),
-        osIsolationNote: this.isolationNote(),
-      },
-      isolation: this.isolationView(),
       cancel: { requestedReceipt: true, terminalConfirmation: true },
-      /**
-       * Промоушен (P29). Объявляется честно: без promotion-контура когорты и отката нет,
-       * платные профили считаются выключенными только когда это объявлено манифестом.
-       */
-      promotion: this.opts.promotion
-        ? {
-            pinnedRelease: {
-              releaseId: this.opts.promotion.manifest.releaseId,
-              sourceCommit: this.opts.promotion.manifest.sourceCommit,
-              configVersion: this.opts.promotion.manifest.configVersion,
-            },
-            cohortEnabled: this.opts.promotion.cohort.mode !== 'off',
-            cohortId: this.opts.promotion.cohort.cohortId,
-            rollbackAvailable: true,
-            rolledBack: this.opts.promotion.state.paused,
-            servingReleaseId: this.opts.promotion.state.snapshot().servingReleaseId,
-            paidProfilesAllowed: this.opts.promotion.manifest.paid.allowed,
-            sharedOwnerRegistry: this.opts.promotion.owners !== undefined,
-            takeoverRequiresExplicitSignal: true,
-            partitionIsNotFailover: true,
-            retentionPolicy: this.opts.promotion.manifest.retention,
-            releaseEndpoint: '/v1/release',
-            placement: this.opts.promotion.placement
-              ? {
-                  policyId: this.opts.promotion.placement.policyId,
-                  authority: this.opts.promotion.placement.authority,
-                  workerRegion: this.opts.promotion.manifest.host.region,
-                  allowedEngines: allowedEnginesForRegion(this.opts.promotion.placement, this.opts.promotion.manifest.host.region),
-                  dataResidencyDecided: this.opts.promotion.placement.dataResidency.decided,
-                  dataResidencyDecisionRef: this.opts.promotion.placement.dataResidency.decisionRef,
-                  checkedBefore: 'paid_profile_and_cohort',
-                  runnerRechecksEngineRegion: true,
-                }
-              : null,
-          }
-        : {
-            pinnedRelease: null,
-            cohortEnabled: false,
-            cohortId: 'none',
-            rollbackAvailable: false,
-            rolledBack: false,
-            servingReleaseId: null,
-            paidProfilesAllowed: null,
-            sharedOwnerRegistry: false,
-            takeoverRequiresExplicitSignal: true,
-            partitionIsNotFailover: true,
-            retentionPolicy: null,
-            releaseEndpoint: 'absent',
-            placement: null,
-          },
-      engines: Object.keys(this.opts.adapters).sort(),
-    };
-  }
-
-  private isolationCapability(): ApiCapabilities['isolation']['capability'] {
-    return this.opts.isolation?.capability() ?? 'not_proven_service_uid_only';
-  }
-
-  private isolationNote(): string {
-    const isolation = this.opts.isolation;
-    if (!isolation) {
-      return 'no clean room isolation provider is configured on this host: the engine runs under the service UID, which is not a proven OS isolation boundary (ARCHITECTURE §9, карточка P13)';
-    }
-    const capability = isolation.capability();
-    if (capability === 'per_run_unix_identity_verified') {
-      return `every run executes under its own leased unix identity (slots: ${isolation.policy.slots.join(', ')}), with run-scoped HOME/config/cache/tmp and a boundary probe before spawn; per-run MCP processes run under the same identity`;
-    }
-    return 'isolation provider is configured but its self-test failed: runs are refused instead of falling back to the service UID';
-  }
-
-  private isolationView(): ApiCapabilities['isolation'] {
-    const isolation = this.opts.isolation;
-    if (!isolation) {
-      return { mode: 'none', slots: [], freeSlots: [], capability: 'not_proven_service_uid_only', launcher: null, failClosed: true };
-    }
-    return {
-      mode: isolation.policy.mode,
-      slots: [...isolation.policy.slots],
-      freeSlots: isolation.freeSlots(),
-      capability: isolation.capability(),
-      launcher: isolation.launcher?.kind ?? null,
-      failClosed: true,
-    };
-  }
-
-  async cancel(principal: Principal, runId: string, rawBody: unknown = {}): Promise<CancelReceipt> {
-    const record = this.requireRun(principal, runId);
-    const bodyResult = validateCancelRequest(rawBody);
-    if (!bodyResult.ok) {
-      throw new ApiError('INVALID_REQUEST', `invalid cancel body: ${bodyResult.errors.join('; ')}`, { errors: bodyResult.errors });
-    }
-    const request = bodyResult.value;
-    const snapshot = this.heal(record);
-    if (!snapshot) throw new ApiError('INTERNAL', `run ${runId} could not be reconciled for cancel`);
-    const ownerGeneration = request.ownerGeneration ?? snapshot.ownerGeneration;
-    const receipt = await this.runner.cancel(runId, ownerGeneration);
-    if (receipt.status === 'unknown_run') throw new ApiError('NOT_FOUND', `unknown run ${runId}`);
-    this.log({
-      event: 'cancel',
-      principalId: principal.principalId,
-      runId,
-      status: receipt.status,
-      ownerGeneration,
-      state: receipt.state ?? snapshot.state,
-    });
-    return receipt;
-  }
-
-  result(principal: Principal, runId: string): RunResult {
-    const record = this.requireRun(principal, runId);
-    const snapshot = this.runner.getRun(runId);
-    if (snapshot?.finalized && snapshot.result) return snapshot.result;
-    const state = snapshot?.state ?? 'queued';
-    throw new ApiError('RESULT_NOT_READY', `result is not available yet (state: ${state})`, {
-      runId,
-      requestId: record.requestId,
-      state,
-      connectionLost: snapshot?.connectionLost ?? false,
-    });
-  }
-
-  events(principal: Principal, runId: string, cursor = 0, limit = 500): EventsPage {
-    this.requireRun(principal, runId);
-    if (!Number.isInteger(cursor) || cursor < 0) {
-      throw new ApiError('INVALID_REQUEST', 'cursor: expected non-negative integer');
-    }
-    if (!Number.isInteger(limit) || limit < 1 || limit > 1000) {
-      throw new ApiError('INVALID_REQUEST', 'limit: expected integer in [1, 1000]');
-    }
-    const available = this.runner.events(runId, cursor);
-    const events = available.slice(0, limit);
-    const hasMore = available.length > events.length;
-    const nextCursor = events.length > 0 ? events[events.length - 1]!.sequence : cursor;
-    const snapshot = this.status(principal, runId);
-    return {
-      runId,
-      events,
-      cursor: nextCursor,
-      hasMore,
-      snapshot: {
-        state: snapshot.state,
-        connectionLost: snapshot.connectionLost,
-        sequence: snapshot.sequence,
-        ownerGeneration: snapshot.ownerGeneration,
+      mcp: {
+        perRunStdioProxy: false,
+        scopedBindings: false,
+        capabilityHandlersSharedWithMcp: false,
+        capabilityInvokeEndpoint: false,
+        remoteTransport: 'absent',
+        osIsolation: 'not_proven_service_uid_only',
+        osIsolationNote: 'the API host runs no agent process: OS isolation is the external worker responsibility, and the worker declares it per run',
       },
+      isolation: {
+        mode: 'none',
+        slots: [],
+        freeSlots: [],
+        capability: 'not_proven_service_uid_only',
+        launcher: null,
+        failClosed: true,
+      },
+      promotion: {
+        pinnedRelease: null,
+        cohortEnabled: false,
+        cohortId: 'none',
+        rollbackAvailable: false,
+        rolledBack: false,
+        servingReleaseId: null,
+        paidProfilesAllowed: null,
+        sharedOwnerRegistry: false,
+        takeoverRequiresExplicitSignal: true,
+        partitionIsNotFailover: true,
+        retentionPolicy: null,
+        releaseEndpoint: 'absent',
+        placement: null,
+      },
+      engines: this.engineNames(),
     };
   }
 
-  dispose(options: { killProcesses?: boolean } = {}): void {
-    const killProcesses = options.killProcesses ?? true;
-    if (killProcesses) {
-      for (const runId of this.runner.listRunIds()) {
-        const snapshot = this.runner.getRun(runId);
-        if (snapshot && !isTerminalState(snapshot.state)) {
-          killProcessTree(snapshot.pgid, snapshot.pid, 'SIGKILL');
-        }
-      }
+  health(): {
+    status: 'ok';
+    workers: Array<{ engine: string; baseUrl: string | null }>;
+    runs: number;
+    admissions: number;
+    events: number;
+  } {
+    const counts = this.store.counts();
+    return {
+      status: 'ok',
+      workers: this.workers.map((worker) => ({ engine: worker.name, baseUrl: worker.baseUrl })),
+      ...counts,
+    };
+  }
+
+  dispose(): void {
+    this.disposed = true;
+    this.inFlight.clear();
+  }
+
+  /**
+   * Ставит ран в работу и ведёт его поллером. Соединение не держится: воркер отвечает
+   * квитанцией, дальше мы сами спрашиваем его о статусе и забираем результат.
+   *
+   * Поллер живёт в фоне и переживает запросы клиента: клиент опрашивает `status`/`events`
+   * так же, как раньше, и видит прогресс без изменений со своей стороны.
+   */
+  private async execute(record: AdmissionRecord): Promise<void> {
+    const run = this.store.open(record.runId, record.createdAt);
+    const startedAt = this.nowIso();
+    run.state = 'running';
+    run.updatedAt = startedAt;
+    // Журнал рана появляется до сетевого вызова: принятый ран виден сразу.
+    this.store.append(record.runId, admissionEvents(record.spec, startedAt));
+    const worker = this.workerFor(record.spec.engine.name);
+    if (!worker) {
+      this.finalize(record, workerTransportFailure(record.spec, new Error('worker is not configured'), { startedAt, finishedAt: this.nowIso() }));
+      return;
     }
-    this.runner.dispose();
+    this.inFlight.add(record.runId);
+    try {
+      const receipt = await worker.launch(record.spec);
+      if (this.disposed || this.store.progressOf(record.runId) === null) return;
+      this.log({
+        event: 'worker_accepted',
+        runId: record.runId,
+        engine: record.spec.engine.name,
+        worker: worker.baseUrl,
+        operationId: receipt.operationId,
+        statusUrl: receipt.statusUrl,
+      });
+      void this.pollUntilTerminal(record, worker, startedAt);
+    } catch (err) {
+      if (this.disposed) return;
+      this.log({ event: 'run_failed', runId: record.runId, message: err instanceof Error ? err.message : String(err) });
+      this.finalize(record, workerTransportFailure(record.spec, err, { startedAt, finishedAt: this.nowIso() }, { workerBaseUrl: worker.baseUrl }));
+    } finally {
+      this.inFlight.delete(record.runId);
+    }
+  }
+
+  /**
+   * Опрос воркера до терминального статуса. Таймаут ожидания не означает, что ран не
+   * состоялся: воркер мог принять задачу и даже завершить её, пока не было связи. Поэтому
+   * по истечении бюджета ран переходит в `unknown`, а поллер продолжает reconcile —
+   * спрашивать воркер о существующем запуске, не запуская заново.
+   */
+  private async pollUntilTerminal(record: AdmissionRecord, worker: ExternalWorker, startedAt: string): Promise<void> {
+    const budgetMs = record.spec.limits.timeoutMs + this.resultGraceMs;
+    const deadline = Date.now() + budgetMs;
+    let attempt = 0;
+    for (;;) {
+      if (this.disposed || this.store.progressOf(record.runId) === null) return;
+      let status: WorkerRunStatus;
+      try {
+        status = (await worker.status(record.runId)).status;
+      } catch (err) {
+        this.log({ event: 'worker_status_failed', runId: record.runId, message: err instanceof Error ? err.message : String(err) });
+        status = 'unknown';
+      }
+      this.log({ event: 'worker_status', runId: record.runId, status, attempt });
+
+      if (status === 'succeeded' || status === 'failed' || status === 'cancelled') {
+        await this.collectResult(record, worker, startedAt);
+        return;
+      }
+      if (status === 'unknown') {
+        // Исход неизвестн, но ран мог состояться. Помечаем и продолжаем спрашивать:
+        // следующий ответ воркера вернёт результат, и ран закроется нормально.
+        this.markUnknown(record, 'worker_reported_unknown');
+      }
+      if (Date.now() >= deadline) {
+        this.markUnknown(record, 'budget_exceeded');
+        if (!this.inFlight.has(record.runId)) return;
+        // Reconcile: воркер помнит operationId, поэтому мы можем спрашивать бесконечно,
+        // не рискуя вторым запуском. Клиент видит unknown и решает сам.
+        continue;
+      }
+      await this.pollBackoff(attempt);
+      attempt += 1;
+    }
+  }
+
+  /** Забрать финальный результат у воркера и закрыть ран. */
+  private async collectResult(record: AdmissionRecord, worker: ExternalWorker, startedAt: string): Promise<void> {
+    if (this.disposed || this.store.progressOf(record.runId) === null) return;
+    try {
+      const launch = await worker.result(record.runId);
+      const mapping = mapLaunchResult(record.spec, launch, { startedAt, finishedAt: this.nowIso() }, { workerBaseUrl: worker.baseUrl });
+      this.finalize(record, mapping);
+      this.log({
+        event: 'run_finished',
+        runId: record.runId,
+        outcome: mapping.result.outcome,
+        exitReason: mapping.result.exitReason,
+        exitCode: mapping.result.exitCode,
+        artifacts: mapping.artifacts.length,
+        logUrl: mapping.logUrl,
+        repo: mapping.repo?.fullName ?? null,
+      });
+    } catch (err) {
+      if (err instanceof ResultNotReadyError) {
+        // Воркер сказал «терминальный», но результата нет: честный отказ, а не успех.
+        this.log({ event: 'worker_result_missing', runId: record.runId });
+        this.markUnknown(record, 'result_missing');
+        return;
+      }
+      this.log({ event: 'run_failed', runId: record.runId, message: err instanceof Error ? err.message : String(err) });
+      this.finalize(record, workerTransportFailure(record.spec, err, { startedAt, finishedAt: this.nowIso() }, { workerBaseUrl: worker.baseUrl }));
+    }
+  }
+
+  /**
+   * Перевод рана в `unknown`. Идемпотентно: повторный вызов не затирает уже терминальное
+   * состояние и не плодит записей в журнале.
+   */
+  private markUnknown(record: AdmissionRecord, reason: string): void {
+    const run = this.store.progressOf(record.runId);
+    if (!run || isTerminalApiState(run.state) || run.state === 'unknown') return;
+    run.state = 'unknown';
+    run.updatedAt = this.nowIso();
+    this.log({ event: 'run_outcome_unknown', runId: record.runId, reason, engine: record.spec.engine.name });
+  }
+
+  /** Экспоненциальная пауза опроса с потолком, чтобы не молотить воркер в пустую. */
+  private async pollBackoff(attempt: number): Promise<void> {
+    const delayMs = Math.min(POLL_MAX_DELAY_MS, POLL_BASE_DELAY_MS * 2 ** Math.min(attempt, 5));
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+  }
+
+  /** Воркер по имени движка. Имя движка — это адрес воркера, а не его внутренняя деталь. */
+  private workerFor(engineName: string): ExternalWorker | undefined {
+    return this.workers.find((worker) => worker.name === engineName);
+  }
+
+  private engineNames(): string[] {
+    return [...this.workers.map((worker) => worker.name)].sort();
+  }
+
+  /** Единственное место, где ран становится терминальным. */
+  private finalize(record: AdmissionRecord, mapping: LaunchMapping): void {
+    this.store.append(record.runId, mapping.events);
+    this.store.complete(record.runId, {
+      state: mapping.result.outcome,
+      result: mapping.result,
+      artifacts: mapping.artifacts,
+      repo: mapping.repo,
+      logUrl: mapping.logUrl,
+      answer: mapping.answer,
+      finishedAt: mapping.result.finishedAt,
+    });
   }
 
   private buildSpec(
@@ -699,7 +721,8 @@ export class AgentApi {
       conversationId: request.conversationId ?? newApiId('conv'),
       ownerGeneration: context.ownerGeneration,
       engine: request.engine,
-      cwd: join(this.opts.rootDir, 'workspaces', runId),
+      // Каталог не создаётся: его материализует воркер на своей эфемерной машине.
+      cwd: `/workspace/${runId}`,
       envAllowlist: request.envAllowlist,
       limits: request.limits,
     };
@@ -712,9 +735,7 @@ export class AgentApi {
     if (request.outputs !== undefined) spec.outputs = request.outputs;
     if (request.traceId !== undefined) spec.traceId = request.traceId;
     if (request.repository !== undefined) spec.repository = request.repository;
-    // Требование границы доходит до рана: без него запрос `per_run_unix_identity` на хосте
-    // без провайдера не отличался бы от обычного и тихо ушёл бы под service UID, а
-    // запрос `none` всё равно получил бы чистую среду.
+    else if (this.opts.defaultRepository !== undefined) spec.repository = { fullName: this.opts.defaultRepository };
     if (request.isolation !== undefined) spec.isolation = request.isolation;
 
     const validated = validateRunSpec(spec);
@@ -722,116 +743,6 @@ export class AgentApi {
       throw new ApiError('INVALID_REQUEST', `assembled spec is invalid: ${validated.errors.join('; ')}`, { errors: validated.errors });
     }
     return validated.value;
-  }
-
-  /**
- * Приёмная политика промоушена. Без promotion-контура поведение прежнее: одиночная
- * установка принимает всё, что разрешено движком и scope. С контуром — отказ пишется и в
- * лог, и в durable-журнал: «почему задача не принята» должно читаться без request'а.
- */
-  private decideAdmission(principal: Principal, request: SubmitRequest) {
-    const promotion = this.opts.promotion;
-    if (!promotion) {
-      return {
-        admit: true as const,
-        cohortId: 'none',
-        cohortReason: 'cohort_off' as const,
-        bucket: 0,
-        releaseId: '',
-        servingReleaseId: '',
-        placement: null,
-      };
-    }
-    const placementContext: PlacementContext | undefined = promotion.placement
-      ? { policy: promotion.placement, workerId: promotion.manifest.host.workerId, region: promotion.manifest.host.region }
-      : undefined;
-    const decision = decideAdmission(
-      {
-        manifest: promotion.manifest,
-        cohort: promotion.cohort,
-        state: promotion.state.snapshot(),
-        ...(placementContext ? { placement: placementContext } : {}),
-      },
-      {
-        principalId: principal.principalId,
-        engineName: request.engine.name,
-        placement: {
-          engineName: request.engine.name,
-          ...(request.engine.modelSettings?.model !== undefined ? { model: request.engine.modelSettings.model } : {}),
-          ...(request.credentialBindings !== undefined
-            ? { credentialBindings: request.credentialBindings.map((binding) => ({ ref: binding.ref, scope: binding.scope })) }
-            : {}),
-          ...(request.regionConstraints !== undefined ? { regionConstraints: request.regionConstraints } : {}),
-        },
-      },
-    );
-    if (decision.admit) {
-      this.log({
-        event: 'placement_admitted',
-        principalId: principal.principalId,
-        engine: request.engine.name,
-        ...(decision.placement
-          ? {
-              placement: {
-                workerId: decision.placement.workerId,
-                region: decision.placement.region,
-                provider: decision.placement.provider,
-                policyId: decision.placement.policyId,
-                reasons: decision.placement.reasons,
-              },
-            }
-          : {}),
-      });
-      return decision;
-    }
-    // Отказ по размещению — отдельный вид журнала: «почему воркер не взял задачу» должно
-    // читаться без request'а и отличаться от отказов по когорте/оплате (P30, AC-175).
-    const kind = isPlacementRefusalCode(decision.code) ? 'placement_refused' : 'admission_refused';
-    this.refuseAdmission(decision, principal.principalId, kind);
-  }
-
-  private refuseAdmission(
-    refusal: { admit: false; code: AdmissionRefusalCode; reason: string; detail: Record<string, unknown> },
-    principalId: string,
-    kind: 'admission_refused' | 'placement_refused' = 'admission_refused',
-  ): never {
-    const promotion = this.opts.promotion;
-    promotion?.journal.append({
-      kind,
-      reason: refusal.reason,
-      cohortId: promotion?.cohort.cohortId,
-      detail: { code: refusal.code, principalId, ...refusal.detail },
-    });
-    this.log({
-      event: kind,
-      principalId,
-      code: refusal.code,
-      reason: refusal.reason,
-      ...refusal.detail,
-    });
-    throw new ApiError(refusal.code, refusal.reason, refusal.detail);
-  }
-
-  /**
-   * Claim владения в общем реестре флота. Возвращает поколение, если владение выдано,
-   * `undefined` — если реестр не настроен (одиночная установка).
-   */
-  private claimOwnership(principal: Principal, userTaskId: string, runId: string): number | undefined {
-    const owners = this.opts.promotion?.owners;
-    if (!owners) return undefined;
-    const claim = claimOwnership(owners, principal.principalId, userTaskId, runId);
-    if (claim.admit) {
-      this.log({
-        event: 'ownership_claimed',
-        principalId: principal.principalId,
-        userTaskId,
-        runId,
-        ownerWorkerId: owners.workerId,
-        ownerGeneration: claim.ownerGeneration,
-      });
-      return claim.ownerGeneration;
-    }
-    this.refuseAdmission(claim, principal.principalId);
   }
 
   private requireRun(principal: Principal, runId: string): AdmissionRecord {
@@ -842,30 +753,6 @@ export class AgentApi {
     return record;
   }
 
-  private heal(record: AdmissionRecord): RunSnapshot | null {
-    const existing = this.runner.getRun(record.runId);
-    if (existing) return existing;
-    return this.startAdmission(record) ? this.runner.getRun(record.runId) : null;
-  }
-
-  private startAdmission(record: AdmissionRecord): boolean {
-    try {
-      this.runner.start(record.spec, record.operationId);
-      return true;
-    } catch (err) {
-      this.log({
-        event: 'admission_start_failed',
-        runId: record.runId,
-        requestId: record.requestId,
-        message: err instanceof Error ? err.message : String(err),
-      });
-      return false;
-    } finally {
-      // токен передан в runner (там живёт только до clone) — в admission-записи он не остаётся
-      stripRepositoryToken(record.spec);
-    }
-  }
-
   private nowIso(): string {
     return this.clock().toISOString();
   }
@@ -874,3 +761,4 @@ export class AgentApi {
     this.logger({ ts: this.nowIso(), ...entry });
   }
 }
+

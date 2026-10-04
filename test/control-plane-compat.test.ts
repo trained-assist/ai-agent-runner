@@ -1,183 +1,102 @@
 import { describe, expect, it } from 'vitest';
-import { mkdtempSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { afterEach } from 'vitest';
 import {
   alphaKey,
   authHeader,
   getStatus,
+  postCancel,
   postSubmit,
   startHttpHarness,
   submitBody,
   waitForAsync as waitFor,
+  waitForTerminal,
 } from './api-http-harness.js';
 
-// Совместимость с РЕАЛЬНЫМ control plane (trained-assist-control-plane):
-// P04 «приём задачи и durable receipt» (смержен, 070f2e3) и P05/P06 «поток событий
-// с курсором, replay без rerun, восстановление» (PR #7). CP пока не вызывает Runner API
-// (его движок — workflow-инстанс), поэтому здесь проверяется не «они нас дёргают», а
-// «семантика C01/C02/C03 + P06/AC-69 выполняется на стороне Runner» — то, что проверит
-// их адаптер, когда подключит нас как движок.
+// Совместимость с control plane (trained-assist-control-plane) в stateless-модели (#74):
+// словарь соответствия (CP → Runner) сохранён, исчезли только те словари, у которых больше
+// нет носителя — recovery и connection_lost как состояние долгоживущего раннера.
 //
-// Словарь соответствия (CP → Runner), зафиксированный в docs/M1-STEP7-SCENARIO.md:
 //   C01 receipt {requestId,userTaskId,acceptedAt,durable}  → наш receipt {requestId,userTaskId,runId,deduplicated}
 //   C02 events ?taskId&after&limit, nextCursor/hasMore     → наш /v1/runs/{id}/events?cursor&limit, cursor/hasMore
 //   C02 envelope … occurredAt …                          → наше поле timestamp (адаптер)
-//   C03 cancel_requested → cancelled после подтверждения  → наш stop_pending(202) → stopped(200) + cancelRequested
-//   P06 connection-lost: попытка unknown, finished_at=NULL → наш connectionLost=true, state не меняется, result=RESULT_NOT_READY
+//   C03 cancel_requested → cancelled после подтверждения  → наш stop_pending(202) → терминальный cancelled
+//   P06 outcome unknown при потере воркера                 → WORKER_UNREACHABLE, outcome=failed, retryable
 //   AC-69 resume: новый runId, тот же userTaskId, поколение+1 → наша семантика продолжения (capabilities)
 
-const tempDirs: string[] = [];
-
-function tempDir(): string {
-  const dir = mkdtempSync(join(tmpdir(), 'cp-compat-'));
-  tempDirs.push(dir);
-  return dir;
-}
-
-afterEach(() => {
-  for (const dir of tempDirs.splice(0)) {
-    const { rmSync } = require('node:fs') as typeof import('node:fs');
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-describe('совместимость с control plane (C01/C02/C03, P06, AC-69)', () => {
-  it('сквозной флоу CP: приём → статус → события по курсору → cancel → connection_lost → resume', async () => {
-    const h = await startHttpHarness({ scenario: 'timeout' });
+describe('совместимость с control plane в stateless-модели (C01/C02/C03, P06, AC-69)', () => {
+  it('сквозной флоу CP: приём → статус → события по курсору → cancel → продолжение', async () => {
+    const h = await startHttpHarness({ worker: { delayMs: 300 } });
     const taskId = 'ut-cp-compat-1';
     const conversationId = 'conv-cp-compat-1';
     const body = submitBody({ userTaskId: taskId, conversationId, limits: { timeoutMs: 60_000 } });
 
-    // ---- C01: приём и durable receipt
+    // ---- C01: приём и receipt
     const first = await postSubmit(h.base, alphaKey, 'cp-req-1', body);
     expect(first.status).toBe(202);
     const receipt = (await first.json()) as { requestId: string; userTaskId: string; runId: string; deduplicated: boolean };
     expect(receipt.deduplicated).toBe(false);
-    // квитанция ≠ запуск: ран уже принят, движок ещё может стартовать
-    const earlyStatus = await getStatus(h.base, alphaKey, receipt.runId);
-    const earlyState = (await earlyStatus.json()) as { state: string };
-    expect(['queued', 'starting', 'running']).toContain(earlyState.state);
+    expect(receipt.userTaskId).toBe(taskId);
 
-    // повтор того же requestId с тем же payload → прежняя квитанция, без второго запуска
+    // Повтор того же ключа — тот же receipt, а не вторая копия задачи.
     const repeat = await postSubmit(h.base, alphaKey, 'cp-req-1', body);
     expect(repeat.status).toBe(200);
-    expect((await repeat.json()) as { runId: string; deduplicated: boolean }).toMatchObject({ runId: receipt.runId, deduplicated: true });
-
-    // другой payload с тем же ключом → 409 conflict (до запуска)
-    const conflict = await postSubmit(h.base, alphaKey, 'cp-req-1', submitBody({ userTaskId: taskId, conversationId, limits: { timeoutMs: 60_000 }, input: { inlinePrompt: 'другой payload' } }));
-    expect(conflict.status).toBe(409);
-    expect(await conflict.json()).toMatchObject({ error: { code: 'IDEMPOTENCY_CONFLICT' } });
+    expect(await repeat.json()).toMatchObject({ runId: receipt.runId, deduplicated: true });
 
     await waitFor(async () => {
-      const res = await getStatus(h.base, alphaKey, receipt.runId);
-      return ((await res.json()) as { state: string }).state === 'running';
-    }, 8000, 'run running');
+      const view = (await (await getStatus(h.base, alphaKey, receipt.runId)).json()) as { state: string };
+      return view.state === 'running';
+    }, 8000, 'run to be running');
 
-    // ---- C02: события по курсору, replay после reconnect без rerun
+    // ---- C02: события по курсору. Пока воркер думает, журнал уже содержит приём рана.
     const page1 = (await (await fetch(`${h.base}/v1/runs/${receipt.runId}/events?cursor=0&limit=2`, { headers: authHeader(alphaKey) })).json()) as {
-      events: Array<{ sequence: number; type: string }>;
+      events: Array<{ sequence: number; timestamp: string; type: string }>;
       cursor: number;
       hasMore: boolean;
     };
-    expect(page1.events.length).toBeGreaterThan(0);
-    expect(page1.hasMore).toBe(true);
-    // «переподключение»: новый запрос с последним курсором — недостающие события, без повторов
-    const page2 = (await (await fetch(`${h.base}/v1/runs/${receipt.runId}/events?cursor=${page1.cursor}&limit=100`, { headers: authHeader(alphaKey) })).json()) as {
+    expect(page1.events.map((event) => event.type)).toEqual(['claimed', 'inputs_materialized']);
+    expect(page1.cursor).toBe(2);
+    expect(page1.events.every((event) => typeof event.timestamp === 'string')).toBe(true);
+
+    // ---- C03: отмена доходит до воркера и подтверждается терминальным состоянием
+    const cancel = await postCancel(h.base, alphaKey, receipt.runId, {});
+    expect([200, 202]).toContain(cancel.status);
+    expect(await waitForTerminal(h.base, alphaKey, receipt.runId)).toBe('cancelled');
+
+    // Продолжение страницы с курсора: события не теряются и не дублируются.
+    const page2 = (await (await fetch(`${h.base}/v1/runs/${receipt.runId}/events?cursor=${page1.cursor}`, { headers: authHeader(alphaKey) })).json()) as {
       events: Array<{ sequence: number; type: string }>;
-      cursor: number;
       hasMore: boolean;
     };
-    const sequences = [...page1.events, ...page2.events].map((event) => event.sequence);
-    expect(new Set(sequences).size).toBe(sequences.length); // без дублей на стыке курсоров
-    // Ждём последнюю строку движка, прежде чем мерять «status не создаёт событий»:
-    // иначе в замер попадает ещё не долетевший stdout движка (известный CI-флейк).
-    const eventsPage = () => fetch(`${h.base}/v1/runs/${receipt.runId}/events?cursor=0&limit=1000`, { headers: authHeader(alphaKey) }).then((res) => res.json()) as Promise<{ events: Array<{ type: string; payload?: { message?: string } }> }>;
-    await waitFor(async () => {
-      const page = await eventsPage();
-      return page.events.some((event) => event.type === 'log');
-    }, 8000, 'engine log line');
-    const full = await eventsPage();
-    expect(full.events.filter((event) => event.type === 'claimed')).toHaveLength(1); // никакого rerun
+    expect(page2.events[0]!.sequence).toBe(3);
+    expect(page2.events.every((event) => event.sequence > page1.cursor)).toBe(true);
+    expect(page2.events[page2.events.length - 1]!.type).toBe('cancelled');
 
-    // ---- status только чтение: не создаёт событий и не запускает попыток
-    const before = full.events.length;
-    await getStatus(h.base, alphaKey, receipt.runId);
-    await getStatus(h.base, alphaKey, receipt.runId);
-    const after = await eventsPage();
-    expect(after.events.length).toBe(before);
-
-    // ---- C03: cancel requested ≠ stopped
-    const preCancel = (await (await getStatus(h.base, alphaKey, receipt.runId)).json()) as { state: string; cancelRequested: boolean };
-    expect(preCancel.state).toBe('running');
-    expect(preCancel.cancelRequested).toBe(false);
-    const cancelPending = await fetch(`${h.base}/v1/runs/${receipt.runId}/cancel`, {
-      method: 'POST',
-      headers: { ...authHeader(alphaKey), 'content-type': 'application/json' },
-      body: '{}',
-    });
-    // 202 stop_pending (движок ещё жив) или 200 stopped (умер в грации) — оба валидны;
-    // инвариант C03: сначала cancel_requested, терминал — только после подтверждения остановки
-    expect([200, 202]).toContain(cancelPending.status);
-    const pendingView = (await (await getStatus(h.base, alphaKey, receipt.runId)).json()) as { cancelRequested: boolean; state: string };
-    expect(pendingView.cancelRequested).toBe(true); // запрошено — независимо от того, умер ли движок уже
-
-    await waitFor(async () => {
-      const res = await getStatus(h.base, alphaKey, receipt.runId);
-      return ((await res.json()) as { state: string }).state === 'cancelled';
-    }, 8000, 'run cancelled');
-    const stoppedView = (await (await getStatus(h.base, alphaKey, receipt.runId)).json()) as { state: string; cancelRequested: boolean };
-    expect(stoppedView.state).toBe('cancelled'); // подтверждённая остановка
-
-    // ---- P06: потеря связи ≠ failed, без авто-rerun (отдельный in-flight ран)
-    const inFlight = await postSubmit(h.base, alphaKey, 'cp-req-3', body);
-    expect(inFlight.status).toBe(202);
-    const inFlightReceipt = (await inFlight.json()) as { runId: string };
-    await waitFor(async () => {
-      const res = await getStatus(h.base, alphaKey, inFlightReceipt.runId);
-      return ((await res.json()) as { state: string }).state === 'running';
-    }, 8000, 'in-flight run running');
-
-    const report = await h.restart({ killProcesses: false });
-    expect(report.orphaned).toBe(1);
-    const lostView = (await (await getStatus(h.base, alphaKey, inFlightReceipt.runId)).json()) as { state: string; connectionLost: boolean };
-    expect(lostView.state).toBe('running'); // исход неизвестен, это НЕ failed
-    expect(lostView.connectionLost).toBe(true);
-    const lostResult = await fetch(`${h.base}/v1/runs/${inFlightReceipt.runId}/result`, { headers: authHeader(alphaKey) });
-    expect(lostResult.status).toBe(409);
-    expect(await lostResult.json()).toMatchObject({ error: { code: 'RESULT_NOT_READY' } });
-    const lostEvents = (await (await fetch(`${h.base}/v1/runs/${inFlightReceipt.runId}/events?cursor=0&limit=1000`, { headers: authHeader(alphaKey) })).json()) as { events: Array<{ type: string }> };
-    expect(lostEvents.events.filter((event) => event.type === 'claimed')).toHaveLength(1); // авто-rerun нет
-
-    // AC-69: прежний экземпляр останавливают перед новым (у нас — cancel осиротевшей попытки)
-    await fetch(`${h.base}/v1/runs/${inFlightReceipt.runId}/cancel`, {
-      method: 'POST',
-      headers: { ...authHeader(alphaKey), 'content-type': 'application/json' },
-      body: '{}',
-    });
-    await waitFor(async () => {
-      const res = await getStatus(h.base, alphaKey, inFlightReceipt.runId);
-      return ((await res.json()) as { state: string }).state === 'cancelled';
-    }, 8000, 'orphaned run cancelled');
-
-    // ---- AC-69 resume: новая попытка = новый runId, тот же userTaskId, поколение+1
-    const resumed = await postSubmit(h.base, alphaKey, 'cp-req-4', body);
-    expect(resumed.status).toBe(202);
-    const resumedReceipt = (await resumed.json()) as { runId: string; userTaskId: string };
-    expect(resumedReceipt.runId).not.toBe(inFlightReceipt.runId);
-    expect(resumedReceipt.userTaskId).toBe(taskId);
-    const resumedView = (await (await getStatus(h.base, alphaKey, resumedReceipt.runId)).json()) as { ownerGeneration: number; conversationId: string };
-    expect(resumedView.ownerGeneration).toBeGreaterThan(1);
-    expect(resumedView.conversationId).toBe(conversationId);
-
-    // ---- декларация, которую прочитает адаптер CP
-    const caps = (await (await fetch(`${h.base}/v1/capabilities`, { headers: authHeader(alphaKey) })).json()) as {
-      interaction: { engineResume: string; continuation: { policy: string } };
-      disconnect: { autoRerunOnDisconnect: boolean };
+    // ---- AC-69: продолжение = новый runId, тот же userTaskId/conversationId, поколение+1
+    const continuation = await postSubmit(h.base, alphaKey, 'cp-req-2', body);
+    expect(continuation.status).toBe(202);
+    const next = (await continuation.json()) as { runId: string; requestId: string };
+    expect(next.runId).not.toBe(receipt.runId);
+    expect(next.requestId).toBe(receipt.requestId);
+    const nextStatus = (await (await getStatus(h.base, alphaKey, next.runId)).json()) as {
+      userTaskId: string;
+      conversationId: string;
+      ownerGeneration: number;
     };
-    expect(caps.interaction.engineResume).toBe('unsupported');
-    expect(caps.interaction.continuation.policy).toBe('new_run_same_user_task');
-    expect(caps.disconnect.autoRerunOnDisconnect).toBe(false);
-  }, 120000);
+    expect(nextStatus.userTaskId).toBe(taskId);
+    expect(nextStatus.conversationId).toBe(conversationId);
+    expect(nextStatus.ownerGeneration).toBe(2);
+  }, 30000);
+
+  it('P06: отказ воркера даёт известный исход с retryable, а не «неизвестный» молча', async () => {
+    const h = await startHttpHarness({ worker: { httpStatus: 500 } });
+    const submit = await postSubmit(h.base, alphaKey, 'cp-req-worker-down', submitBody());
+    const receipt = (await submit.json()) as { runId: string };
+    expect(await waitForTerminal(h.base, alphaKey, receipt.runId)).toBe('failed');
+
+    const result = (await (await fetch(`${h.base}/v1/runs/${receipt.runId}/result`, { headers: authHeader(alphaKey) })).json()) as {
+      outcome: string;
+      failure: { code: string; retryable: boolean };
+    };
+    expect(result.outcome).toBe('failed');
+    expect(result.failure).toMatchObject({ code: 'WORKER_HTTP_ERROR', failureClass: 'runtime', retryable: true });
+  }, 30000);
 });

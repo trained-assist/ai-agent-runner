@@ -166,10 +166,11 @@ async function buildSubmitBody(flags) {
   }
   const body = {
     engine: {
-      name: flags['engine'] ?? 'fake',
+      name: flags['engine'] ?? 'dynamic-ip-azure-agent-run',
       adapterVersion: flags['adapter-version'] ?? '1',
     },
     limits: { timeoutMs: intFlag(flags, 'timeout-ms', 30_000) },
+    envAllowlist: [],
   };
   const prompt = flags['prompt'];
   if (prompt !== undefined) body.input = { inlinePrompt: prompt };

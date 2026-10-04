@@ -16,7 +16,7 @@ import {
   validateIdempotencyKey,
   validateSubmitRequest,
 } from '../src/api/contracts.js';
-import { ApiStore, type AdmissionRecord } from '../src/api/store.js';
+import { StatelessStore, isTerminalApiState, type AdmissionRecord } from '../src/api/stateless-store.js';
 import { ApiError } from '../src/api/errors.js';
 import { makeRunSpec } from './helpers.js';
 
@@ -25,7 +25,7 @@ function tempDir(): string {
 }
 
 describe('api key registry', () => {
-  const principal: Principal = { principalId: 'p-alpha', profileId: 'profile-a', scopes: ['runs:read', 'runs:write'], engines: ['fake'] };
+  const principal: Principal = { principalId: 'p-alpha', profileId: 'profile-a', scopes: ['runs:read', 'runs:write'], engines: ['dynamic-ip-azure-agent-run'] };
 
   it('generates keys that are never the plaintext stored in records', () => {
     const key = generateApiKey();
@@ -42,7 +42,7 @@ describe('api key registry', () => {
     const registry = KeyRegistry.fromRecords([keyRecordFor(key, principal), keyRecordFor(generateApiKey(), { principalId: 'p-beta', profileId: 'profile-b', scopes: ['runs:read'] })]);
 
     const found = registry.authenticate(`Bearer ${key}`);
-    expect(found).toMatchObject({ principalId: 'p-alpha', profileId: 'profile-a', scopes: ['runs:read', 'runs:write'], engines: ['fake'] });
+    expect(found).toMatchObject({ principalId: 'p-alpha', profileId: 'profile-a', scopes: ['runs:read', 'runs:write'], engines: ['dynamic-ip-azure-agent-run'] });
     found!.scopes.push('runs:read');
     const again = registry.authenticate(`Bearer ${key}`);
     expect(again!.scopes).toEqual(['runs:read', 'runs:write']);
@@ -134,14 +134,16 @@ describe('submit contract validation', () => {
   });
 });
 
-describe('admission store durability', () => {
+describe('stateless store: приёмные записи только в памяти (#74)', () => {
   function record(over: Partial<AdmissionRecord> = {}): AdmissionRecord {
     const spec = makeRunSpec();
     return {
       schemaVersion: 1,
       requestId: 'req_1',
       userTaskId: 'task-1',
+      conversationId: spec.conversationId,
       principalId: 'p-alpha',
+      profileId: 'profile-a',
       jobId: 'job_1',
       idempotencyKey: 'idem-1',
       payloadHash: 'hash-1',
@@ -154,56 +156,73 @@ describe('admission store durability', () => {
     };
   }
 
-  it('indexes admissions by key, run and task, and survives reopen', () => {
-    const dir = tempDir();
-    try {
-      const store = new ApiStore(dir);
-      store.init();
-      const first = record();
-      store.put(first);
-      expect(store.getByAdmission('p-alpha', 'idem-1')).toMatchObject({ runId: first.runId });
-      expect(store.getByAdmission('p-beta', 'idem-1')).toBeNull();
-      expect(store.getByRun(first.runId)).toMatchObject({ requestId: 'req_1' });
-      expect(store.currentAttempt('p-alpha', 'task-1')).toMatchObject({ ownerGeneration: 1 });
+  it('индексирует приёмные записи по ключу, ран и задаче, и переживает хранение в памяти', () => {
+    const store = new StatelessStore();
+    const first = record();
+    store.put(first);
+    expect(store.getByAdmission('p-alpha', 'idem-1')).toMatchObject({ runId: first.runId });
+    expect(store.getByAdmission('p-beta', 'idem-1')).toBeNull();
+    expect(store.getByRun(first.runId)).toMatchObject({ requestId: 'req_1' });
+    expect(store.currentAttempt('p-alpha', 'task-1')).toMatchObject({ ownerGeneration: 1 });
 
-      const secondSpec = makeRunSpec();
-      const second = record({
-        idempotencyKey: 'idem-2',
-        payloadHash: 'hash-2',
-        runId: secondSpec.runId,
-        operationId: secondSpec.operationId,
-        ownerGeneration: 2,
-        spec: secondSpec,
-      });
-      store.put(second);
-      expect(store.attempts('p-alpha', 'task-1').map((entry) => entry.ownerGeneration)).toEqual([1, 2]);
-      expect(store.currentAttempt('p-alpha', 'task-1')).toMatchObject({ runId: secondSpec.runId });
-      expect(store.listAll()).toHaveLength(2);
+    const secondSpec = makeRunSpec();
+    const second = record({
+      idempotencyKey: 'idem-2',
+      payloadHash: 'hash-2',
+      runId: secondSpec.runId,
+      operationId: secondSpec.operationId,
+      ownerGeneration: 2,
+      spec: secondSpec,
+    });
+    store.put(second);
+    expect(store.attempts('p-alpha', 'task-1').map((entry) => entry.ownerGeneration)).toEqual([1, 2]);
+    expect(store.currentAttempt('p-alpha', 'task-1')).toMatchObject({ runId: secondSpec.runId });
+    expect(store.listAll()).toHaveLength(2);
 
-      const reopened = new ApiStore(dir);
-      reopened.init();
-      expect(reopened.getByAdmission('p-alpha', 'idem-1')).toMatchObject({ runId: first.runId });
-      expect(reopened.currentAttempt('p-alpha', 'task-1')).toMatchObject({ ownerGeneration: 2 });
-      expect(reopened.getByRun(secondSpec.runId)).not.toBeNull();
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
+    // Новый экземпляр — новый процесс: память пуста, и это ожидаемое поведение.
+    expect(new StatelessStore().listAll()).toHaveLength(0);
   });
 
-  it('rejects a malformed store file instead of silently losing admissions', () => {
-    const dir = tempDir();
-    try {
-      const store = new ApiStore(dir);
-      store.init();
-      store.put(record());
-      const path = join(dir, 'api', 'admissions.json');
-      writeFileSync(path, '{"schemaVersion":99,"admissions":[]}');
-      expect(() => new ApiStore(dir).init()).toThrow(/schemaVersion/);
-      writeFileSync(path, 'nope');
-      expect(() => new ApiStore(dir).init()).toThrow();
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
+  it('выбрасывает терминальные раны по TTL и уважает лимит событий на ран', () => {
+    const store = new StatelessStore({ terminalRunTtlMs: 0, maxEventsPerRun: 2 });
+    const entry = record();
+    store.put(entry);
+    const progress = store.open(entry.runId, entry.createdAt);
+    expect(progress.state).toBe('queued');
+    expect(isTerminalApiState(progress.state)).toBe(false);
+
+    const event = {
+      schemaVersion: 1,
+      eventId: 'evt_1',
+      runId: entry.runId,
+      jobId: entry.jobId,
+      userTaskId: entry.userTaskId,
+      profileId: entry.profileId,
+      ownerGeneration: 1,
+      sequence: 1,
+      timestamp: entry.createdAt,
+      type: 'claimed',
+      payload: { operationId: entry.operationId },
+    } as const;
+    store.append(entry.runId, [event, { ...event, eventId: 'evt_2', sequence: 2 }, { ...event, eventId: 'evt_3', sequence: 3 }]);
+    expect(progress.events).toHaveLength(2);
+    expect(progress.droppedEvents).toBe(1);
+    expect(progress.sequence).toBe(3);
+
+    store.complete(entry.runId, {
+      state: 'succeeded',
+      result: {} as never,
+      artifacts: [],
+      repo: null,
+      logUrl: null,
+      answer: null,
+      finishedAt: new Date().toISOString(),
+    });
+    expect(isTerminalApiState(store.progressOf(entry.runId)!.state)).toBe(true);
+    expect(store.sweep(new Date(Date.now() + 1000))).toBe(1);
+    expect(store.progressOf(entry.runId)).toBeNull();
+    expect(store.getByRun(entry.runId)).toBeNull();
+    expect(store.getByAdmission('p-alpha', 'idem-1')).toBeNull();
   });
 });
 
@@ -211,7 +230,9 @@ describe('structured api errors', () => {
   it('maps codes to http statuses and never leaks raw secrets in messages', () => {
     const err = new ApiError('UNAUTHENTICATED', 'missing key ak_supersecretvalue');
     expect(err.status).toBe(401);
-    expect(err.body()).toEqual({ error: { code: 'UNAUTHENTICATED', message: 'missing key ak_supersecretvalue' } });
+    // Сырой API-ключ в теле ошибки не остаётся: `ak_…` добавлен в фильтр секретов.
+    expect(err.body()).toEqual({ error: { code: 'UNAUTHENTICATED', message: 'missing key [redacted]' } });
+    expect(new ApiError('INTERNAL', 'ghp_abcdefghijklmnopqrstuvwxyz012345 failed').body().error.message).not.toContain('ghp_');
     expect(new ApiError('IDEMPOTENCY_CONFLICT', 'conflict').status).toBe(409);
     expect(new ApiError('RESULT_NOT_READY', 'busy').status).toBe(409);
     expect(new ApiError('SCOPE_DENIED', 'no scope').status).toBe(403);

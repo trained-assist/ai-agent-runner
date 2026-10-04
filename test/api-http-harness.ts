@@ -1,32 +1,28 @@
 import { onTestFinished } from 'vitest';
-import { mkdtempSync } from 'node:fs';
 import type { Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { FakeEngine, type FakeScenario } from '../src/adapters/engine/fake-engine.js';
-import { sleep, waitForProcessDeath } from '../src/adapters/engine/process-tree.js';
-import { OpenCodeAdapter } from '../src/adapters/engine/opencode-adapter.js';
 import { generateApiKey, KeyRegistry, keyRecordFor, type Principal } from '../src/api/auth.js';
 import { createAgentApiServer } from '../src/api/server.js';
-import { AgentApi, type AgentApiOptions, type PromotionRuntime, type ServiceRecoveryReport } from '../src/api/service.js';
-import { FaultRegistry } from '../src/faults/registry.js';
-import { isTerminalState } from '../src/runner/state-machine.js';
-import { ArtifactStore } from '../src/storage/artifact-store.js';
-import { RunExportStore } from '../src/storage/export.js';
-import { InputMaterializer } from '../src/storage/input-materializer.js';
-import { WorkspaceSnapshotStore } from '../src/storage/workspace-snapshot.js';
-import { createBlobStore } from '../src/storage/create-blob-store.js';
-import type { CapabilityRegistry } from '../src/mcp/capabilities.js';
-import type { BindingValueResolver } from '../src/mcp/scope.js';
-import { removeDirWithRetry } from './helpers.js';
+import { AgentApi } from '../src/api/service.js';
+import { StatelessStore } from '../src/api/stateless-store.js';
+import { adapterFor, startMockWorker, type MockWorker, type MockWorkerOptions } from './external-worker-harness.js';
+
+/**
+ * HTTP-харнесс stateless API (epic #74). Поднимает мок внешнего воркера, адаптер и сам API —
+ * весь путь submit → worker → result → artifacts → logUrl проходит по настоящим сокетам.
+ */
 
 export const alphaKey = generateApiKey();
 export const betaKey = generateApiKey();
 export const readerKey = generateApiKey();
 export const noScopeKey = generateApiKey();
 
-export const alphaPrincipal: Principal = { principalId: 'p-alpha', profileId: 'profile-a', scopes: ['runs:read', 'runs:write'], engines: ['fake'] };
+export const alphaPrincipal: Principal = {
+  principalId: 'p-alpha',
+  profileId: 'profile-a',
+  scopes: ['runs:read', 'runs:write'],
+  engines: ['dynamic-ip-azure-agent-run'],
+};
 export const betaPrincipal: Principal = { principalId: 'p-beta', profileId: 'profile-b', scopes: ['runs:read', 'runs:write'] };
 export const readerPrincipal: Principal = { principalId: 'p-reader', profileId: 'profile-r', scopes: ['runs:read'] };
 export const noScopePrincipal: Principal = { principalId: 'p-noscope', profileId: 'profile-a', scopes: [] };
@@ -48,177 +44,83 @@ export async function waitForAsync(condition: () => boolean | Promise<boolean>, 
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (await condition()) return;
-    await sleep(25);
+    await delay(10);
   }
   throw new Error(`timeout waiting for ${label}`);
 }
 
+export function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 export interface HttpHarnessOptions {
-  scenario?: FakeScenario;
-  heartbeatIntervalMs?: number;
+  worker?: MockWorkerOptions;
   streamPollMs?: number;
   keepaliveMs?: number;
   maxBodyBytes?: number;
-  /** Artifact store для маршрута GET /v1/runs/{id}/artifacts (общий с AgentApi rootDir). */
-  artifacts?: ArtifactStore;
-  /** Свой dataDir вместо временного — нужен, когда store создаётся снаружи на том же корне. */
-  rootDir?: string;
-  /** Реестр capability handler'ов (P13): раскрывает POST /v1/capabilities/invoke. */
-  capabilities?: CapabilityRegistry;
-  /** Резолвер значений credential binding'ов (P13). */
-  bindingResolver?: BindingValueResolver;
-  /** Регион воркера (P30): по умолчанию sandbox-eu; для симуляции двух воркеров задаётся явно. */
-  hostRegion?: string;
-  /**
-   * Стадия сохранения выходов (P07/#54): blob + манифесты экспорта, как в dist/API.
-   * Без неё `outputRefs` в результате всегда пуст — хранилища нет, сохранять некуда.
-   */
-  artifactExport?: boolean;
-  /**
-   * Снимки workspace и материализация входов (issue #52, шаг 1). Подключаются ровно как в
-   * dist/api/main.ts и требуют `artifactExport`: указатель снимка проверяется тем же
-   * хранилищем артефактов.
-   */
-  snapshotInputs?: boolean;
-  /** Оставить рабочие каталоги ранов: нужно, чтобы проверить байты ВХОДА на диске. */
-  retainWorkspaces?: boolean;
-  /**
-   * Промоушен-контур (P29). Фабрика, а не готовый объект: рестарт сервиса должен заново
-   * прочитать файл состояния релиза — иначе откат нельзя было бы проверить перезапуском.
-   */
-  promotion?: () => PromotionRuntime;
+  workerToken?: string;
+  env?: Record<string, string>;
+  store?: StatelessStore;
 }
 
 export interface HttpHarness {
-  readonly rootDir: string;
-  readonly fake: FakeEngine;
-  readonly faults: FaultRegistry;
-  readonly logs: Record<string, unknown>[];
-  readonly service: AgentApi;
   readonly base: string;
-  /** Хранилище выходов рана; создаётся только при `artifactExport: true`. */
-  readonly artifacts: ArtifactStore | null;
-  readonly exports: RunExportStore | null;
-  /** Снимки workspace; создаётся только при `snapshotInputs: true`. */
-  readonly snapshots: WorkspaceSnapshotStore | null;
-  restart(options?: { killProcesses?: boolean }): Promise<ServiceRecoveryReport>;
+  readonly worker: MockWorker;
+  readonly service: AgentApi;
+  readonly logs: Record<string, unknown>[];
   close(): Promise<void>;
 }
 
-async function listen(server: Server): Promise<number> {
-  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
-  return (server.address() as AddressInfo).port;
-}
-
-async function shutdown(server: Server): Promise<void> {
-  server.closeAllConnections();
-  await new Promise<void>((resolve) => server.close(() => resolve()));
-}
-
 export async function startHttpHarness(options: HttpHarnessOptions = {}): Promise<HttpHarness> {
-  const rootDir = options.rootDir ?? mkdtempSync(join(tmpdir(), 'ai-agent-runner-api-http-'));
-  const fake = new FakeEngine(options.scenario ?? 'success');
-  const faults = new FaultRegistry();
+  const worker = await startMockWorker(options.worker ?? {});
+  const adapter = adapterFor(worker, {
+    ...(options.workerToken !== undefined ? { token: options.workerToken } : {}),
+    env: options.env ?? {},
+  });
   const logs: Record<string, unknown>[] = [];
-  const keys = testKeyRegistry();
-  const streamPollMs = options.streamPollMs ?? 20;
-  const keepaliveMs = options.keepaliveMs ?? 10_000;
-  const maxBodyBytes = options.maxBodyBytes ?? 1_000_000;
   const logger = (entry: Record<string, unknown>): void => {
     logs.push(entry);
   };
-  // Стадия сохранения выходов подключается ровно как в dist/API (main.ts): без неё
-  // ран завершается, но сохранять выходы некуда и outputRefs всегда пуст.
-  const blob = options.artifactExport ? createBlobStore({ env: {}, localRoot: join(rootDir, 'blobs') }) : null;
-  const artifacts = blob ? new ArtifactStore({ rootDir, blob }) : (options.artifacts ?? null);
-  const exports = blob ? new RunExportStore({ rootDir, artifacts: artifacts as ArtifactStore }) : null;
-  const snapshots = options.snapshotInputs && artifacts ? new WorkspaceSnapshotStore({ rootDir }) : null;
-  const inputs = snapshots ? new InputMaterializer({ snapshots, artifacts: artifacts as ArtifactStore }) : null;
-  const serviceOptions: AgentApiOptions = {
-    rootDir,
-    adapters: { fake, opencode: new OpenCodeAdapter() },
-    host: { region: options.hostRegion ?? 'sandbox-eu', environment: 'sandbox' },
-    faults,
-    cancelGraceMs: 500,
+  const service = new AgentApi({
+    workers: [adapter],
     logger,
-    ...(options.heartbeatIntervalMs !== undefined ? { heartbeatIntervalMs: options.heartbeatIntervalMs } : {}),
-    ...(options.capabilities ? { capabilities: options.capabilities } : {}),
-    ...(options.bindingResolver ? { bindingResolver: options.bindingResolver } : {}),
-    ...(blob ? { blob } : {}),
-    ...(exports ? { exports } : {}),
-    ...(snapshots ? { snapshots } : {}),
-    ...(inputs ? { inputs } : {}),
-    ...(options.retainWorkspaces !== undefined ? { retainWorkspaces: options.retainWorkspaces } : {}),
-  };
-  const start = (): AgentApi => {
-    const service = new AgentApi(options.promotion ? { ...serviceOptions, promotion: options.promotion() } : serviceOptions);
-    return service;
-  };
-
-  let service = start();
-  await service.recover();
-  const serverOptions = {
-    keys,
+    env: options.env ?? {},
+    ...(options.store ? { store: options.store } : {}),
+  });
+  const server = createAgentApiServer(service, {
+    keys: testKeyRegistry(),
     logger,
-    streamPollMs,
-    keepaliveMs,
-    maxBodyBytes,
-    ...(artifacts ? { artifacts } : {}),
-    ...(exports ? { exports } : {}),
-    ...(snapshots ? { snapshots } : {}),
-    ...(options.capabilities ? { capabilities: options.capabilities } : {}),
-    ...(options.bindingResolver ? { bindingResolver: options.bindingResolver } : {}),
-  };
-  let server = createAgentApiServer(service, serverOptions);
-  let port = await listen(server);
+    streamPollMs: options.streamPollMs ?? 10,
+    keepaliveMs: options.keepaliveMs ?? 10_000,
+    maxBodyBytes: options.maxBodyBytes ?? 1_000_000,
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+  const port = (server.address() as AddressInfo).port;
+  // Адрес нашего API становится известен только после старта: воркер получает его в
+  // `LaunchRequest.resultUrl`, и результат приходит на реальный порт харнесса.
+  adapter.setResultBaseUrl(`http://127.0.0.1:${port}`);
 
   const harness: HttpHarness = {
-    rootDir,
-    fake,
-    faults,
+    base: `http://127.0.0.1:${port}`,
+    worker,
+    service,
     logs,
-    artifacts,
-    exports,
-    snapshots,
-    get service() {
-      return service;
-    },
-    get base() {
-      return `http://127.0.0.1:${port}`;
-    },
-    async restart(restartOptions = {}) {
-      const killProcesses = restartOptions.killProcesses ?? true;
-      const victims = killProcesses
-        ? service.runner
-            .listRunIds()
-            .map((runId) => service.runner.getRun(runId))
-            .filter((snapshot) => snapshot !== null && !isTerminalState(snapshot.state) && snapshot.pid !== null)
-            .map((snapshot) => ({ pgid: snapshot!.pgid, pid: snapshot!.pid }))
-        : [];
-      await shutdown(server);
-      service.dispose({ killProcesses });
-      for (const victim of victims) await waitForProcessDeath(victim.pgid, victim.pid, 3000);
-      service = start();
-      const report = await service.recover();
-      server = createAgentApiServer(service, serverOptions);
-      port = await listen(server);
-      return report;
-    },
     async close() {
-      await shutdown(server);
-      service.dispose({ killProcesses: true });
-      await removeDirWithRetry(rootDir);
+      service.dispose();
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await worker.close();
     },
   };
-
   onTestFinished(() => harness.close());
   return harness;
 }
 
 export function submitBody(over: Record<string, unknown> = {}): Record<string, unknown> {
   return {
-    engine: { name: 'fake', adapterVersion: '1' },
+    engine: { name: 'dynamic-ip-azure-agent-run', adapterVersion: '1' },
     limits: { timeoutMs: 15000 },
+    envAllowlist: [],
     input: { inlinePrompt: 'hello agent' },
     ...over,
   };
@@ -239,12 +141,31 @@ export async function getStatus(base: string, key: string, runId: string): Promi
   return fetch(`${base}/v1/runs/${runId}/status`, { headers: authHeader(key) });
 }
 
+export async function getResult(base: string, key: string, runId: string): Promise<Response> {
+  return fetch(`${base}/v1/runs/${runId}/result`, { headers: authHeader(key) });
+}
+
+export async function getArtifacts(base: string, key: string, runId: string): Promise<Response> {
+  return fetch(`${base}/v1/runs/${runId}/artifacts`, { headers: authHeader(key) });
+}
+
 export async function postCancel(base: string, key: string, runId: string, body: unknown = {}): Promise<Response> {
   return fetch(`${base}/v1/runs/${runId}/cancel`, {
     method: 'POST',
     headers: { ...authHeader(key), 'content-type': 'application/json' },
     body: JSON.stringify(body),
   });
+}
+
+export async function waitForTerminal(base: string, key: string, runId: string, timeoutMs = 8000): Promise<string> {
+  let state = 'queued';
+  await waitForAsync(async () => {
+    const response = await getStatus(base, key, runId);
+    const view = (await response.json()) as { state: string };
+    state = view.state;
+    return state === 'succeeded' || state === 'failed' || state === 'cancelled';
+  }, timeoutMs, `run ${runId} to reach a terminal state`);
+  return state;
 }
 
 export interface SseFrame {
@@ -331,4 +252,9 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T
   } finally {
     if (timer) clearTimeout(timer);
   }
+}
+
+export async function listen(server: Server): Promise<number> {
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+  return (server.address() as AddressInfo).port;
 }

@@ -1,7 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type { RunnerEvent } from '../contracts/events.js';
 import type { RunResult } from '../contracts/result.js';
-import type { IsolationCapability } from '../isolation/contract.js';
 import {
   canonicalJson,
   redactRepositoryToken,
@@ -19,7 +18,29 @@ import {
 } from '../contracts/run-spec.js';
 import { ErrorCollector, checkKeys, checkObject, checkString, type ValidationResult } from '../contracts/validate.js';
 
-export const API_RUN_STATES = ['queued', 'starting', 'running', 'awaiting_user', 'finalizing', 'succeeded', 'failed', 'cancelled'] as const;
+/**
+ * Способность границы изоляции. Объявлена здесь, а не импортом из `src/isolation/`: stateless-ядро
+ * API не зависит от модуля изоляции (её обеспечивает внешний воркер), но продолжает объявлять
+ * честное значение в capabilities.
+ */
+type IsolationCapability = 'not_proven_service_uid_only' | 'per_run_unix_identity_verified' | 'configured_but_refusing_runs';
+
+export const API_RUN_STATES = [
+  'queued',
+  'starting',
+  'running',
+  'awaiting_user',
+  'finalizing',
+  'succeeded',
+  'failed',
+  'cancelled',
+  /**
+   * Исход рана установить нельзя: воркер принял задачу, но результат не вернул и статус
+   * неизвестен. Это не `failed` — задача не потеряна, авто-rerun не происходит, следующий
+   * шаг — reconcile существующего запуска у воркера.
+   */
+  'unknown',
+] as const;
 
 export type ApiRunState = (typeof API_RUN_STATES)[number];
 
@@ -65,6 +86,8 @@ export interface RunStatusView {
   observedAt: string;
   sequence: number;
   fencing: { rejected: number };
+  /** Текст ответа агента, если воркер его извлёк. */
+  answer: string | null;
 }
 
 export interface EventsPage {
@@ -72,6 +95,10 @@ export interface EventsPage {
   events: RunnerEvent[];
   cursor: number;
   hasMore: boolean;
+  /** Ссылка на лог сессии в Google Storage (epic #74, шаг 5). */
+  logUrl: string | null;
+  /** Сколько событий рана отброшено по лимиту памяти процесса — молча терять их нельзя. */
+  droppedEvents: number;
   snapshot: {
     state: ApiRunState;
     connectionLost: boolean;
@@ -113,11 +140,11 @@ export interface ApiCapabilities {
     };
   };
   artifacts: {
-    listPerRun: true;
-    download: true;
-    shareLink: true;
+    listPerRun: boolean;
+    download: boolean;
+    shareLink: boolean;
     ingestEndpoint: 'absent';
-    ingestNote: 'artifacts are registered out-of-band (slice D2: POST /v1/artifacts)';
+    ingestNote: string;
     /** Экспорт объявленных выходов рана в object storage с закоммиченным манифестом. */
     export: {
       enabled: boolean;
@@ -125,24 +152,24 @@ export interface ApiCapabilities {
       manifest: boolean;
       partialManifestDeclared: boolean;
       engineRerunOnRecommit: false;
-      soleCopyRetainedUntilDurable: true;
+      soleCopyRetainedUntilDurable: boolean;
     };
     /** Прямая загрузка артефактов через скопированные сессии и presigned URL. */
     upload: {
       enabled: boolean;
-      scopedSessions: true;
+      scopedSessions: boolean;
       presignedUrl: boolean;
-      multipartResume: true;
-      abortCleanup: true;
+      multipartResume: boolean;
+      abortCleanup: boolean;
       maxTotalBytes: number;
       ttlSeconds: number;
     };
     snapshot: {
       enabled: boolean;
-      versioning: true;
-      conflictDetection: true;
+      versioning: boolean;
+      conflictDetection: boolean;
       conflictPolicies: readonly ('reject' | 'overwrite' | 'merge')[];
-      cleanRoomOnNewAttempt: true;
+      cleanRoomOnNewAttempt: boolean;
       /**
        * Снимок как указатель на байты в хранилище (issue #52, шаг 1). Объявляется честно:
        * без materializer'а запрос входа со снимком отказывается, а не материализуется
@@ -150,11 +177,11 @@ export interface ApiCapabilities {
        */
       materialize: {
         enabled: boolean;
-        bytesInDurableStorage: true;
-        verifyDigestOnWrite: true;
-        ownerScoped: true;
-        allOrNothing: true;
-        refusalRetryableWhenStorageUnavailable: true;
+        bytesInDurableStorage: boolean;
+        verifyDigestOnWrite: boolean;
+        ownerScoped: boolean;
+        allOrNothing: boolean;
+        refusalRetryableWhenStorageUnavailable: boolean;
         limits: { refs: number; filesPerRef: number; fileBytes: number; totalBytes: number };
       };
     };

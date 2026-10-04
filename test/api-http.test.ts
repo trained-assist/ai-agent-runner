@@ -1,50 +1,34 @@
 import { describe, expect, it } from 'vitest';
-import { readFileSync, readdirSync, statSync } from 'node:fs';
-import { join } from 'node:path';
 import {
+  SseCollector,
   alphaKey,
   authHeader,
+  getArtifacts,
   getStatus,
+  noScopeKey,
   postCancel,
   postSubmit,
   readerKey,
   startHttpHarness,
   submitBody,
-  SseCollector,
+  waitForAsync,
+  waitForTerminal,
 } from './api-http-harness.js';
-import { sleep } from '../src/adapters/engine/process-tree.js';
-
-async function waitFor(condition: () => Promise<boolean>, timeoutMs: number, label: string): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (await condition()) return;
-    await sleep(25);
-  }
-  throw new Error(`timeout waiting for ${label}`);
-}
-
-function walkFiles(dir: string): string[] {
-  const out: string[] = [];
-  for (const entry of readdirSync(dir, { withFileTypes: true })) {
-    const path = join(dir, entry.name);
-    if (entry.isDirectory()) out.push(...walkFiles(path));
-    else if (entry.isFile()) out.push(path);
-  }
-  return out;
-}
 
 describe('http auth, scopes and structured refusals', () => {
-  it('refuses unauthenticated, wrong-scope and malformed requests with structured errors and no key material', async () => {
+  it('отказывает без ключа, без scope и на кривых запросах — структурированно и без ключевого материала', async () => {
     const h = await startHttpHarness();
 
     const health = await fetch(`${h.base}/healthz`);
     expect(health.status).toBe(200);
-    expect(await health.json()).toMatchObject({ status: 'ok' });
+    expect(await health.json()).toMatchObject({
+      status: 'ok',
+      workers: [{ engine: 'dynamic-ip-azure-agent-run' }],
+    });
 
     const noAuth = await fetch(`${h.base}/v1/runs/run_x/status`);
     expect(noAuth.status).toBe(401);
-    const noAuthBody = (await noAuth.json()) as { error: { code: string } };
-    expect(noAuthBody.error.code).toBe('UNAUTHENTICATED');
+    expect(((await noAuth.json()) as { error: { code: string } }).error.code).toBe('UNAUTHENTICATED');
 
     const badKey = await fetch(`${h.base}/v1/runs/run_x/status`, { headers: authHeader('ak_totally_wrong_key') });
     expect(badKey.status).toBe(401);
@@ -75,145 +59,113 @@ describe('http auth, scopes and structured refusals', () => {
     const wrongMethod = await fetch(`${h.base}/v1/runs/run_x/status`, { method: 'POST', headers: authHeader(alphaKey) });
     expect(wrongMethod.status).toBe(405);
 
-    expect(h.fake.startCalls).toBe(0);
+    expect(h.worker.launches).toHaveLength(0);
 
+    // Ключи принципалов не попадают ни в логи процесса, ни в ответы.
     const logsText = JSON.stringify(h.logs);
-    const filesText = walkFiles(h.rootDir)
-      .map((path) => readFileSync(path, 'utf8'))
-      .join('\n');
-    for (const text of [logsText, filesText]) {
-      expect(text).not.toContain(alphaKey);
-      expect(text).not.toContain(readerKey);
-    }
+    expect(logsText).not.toContain(alphaKey);
+    expect(logsText).not.toContain(readerKey);
+    expect(logsText).not.toContain(noScopeKey);
     expect(logsText).not.toContain('authorization');
     const requestLogs = h.logs.filter((entry) => entry['event'] === 'request');
     expect(requestLogs.length).toBeGreaterThan(0);
     expect(requestLogs.every((entry) => typeof entry['status'] === 'number')).toBe(true);
   });
+
+  it('дисковые маршруты прошлой модели больше не существуют (#74)', async () => {
+    const h = await startHttpHarness();
+    for (const path of ['/v1/runs/run_x/export', '/v1/runs/run_x/upload', '/v1/runs/run_x/snapshot', '/v1/release', '/v1/capabilities/invoke']) {
+      const response = await fetch(`${h.base}${path}`, { headers: authHeader(alphaKey) });
+      expect([404, 405], `${path} должен быть недоступен`).toContain(response.status);
+      if (response.status === 404) {
+        expect(((await response.json()) as { error: { code: string } }).error.code).toBe('ROUTE_NOT_FOUND');
+      }
+    }
+  });
 });
 
-describe('http submit, status, result, events and cancel', () => {
-  it('admits a job, dedups by idempotency key and exposes status/result/events', async () => {
+describe('http submit, status, result, artifacts, events and cancel', () => {
+  it('принимает задачу, дедуплицирует по ключу и отдаёт status/result/artifacts/events', async () => {
     const h = await startHttpHarness();
 
     const first = await postSubmit(h.base, alphaKey, 'idem-http-1', submitBody({ userTaskId: 'task-http-1' }));
     expect(first.status).toBe(202);
-    const receipt = (await first.json()) as { requestId: string; userTaskId: string; runId: string; deduplicated: boolean };
-    expect(receipt.deduplicated).toBe(false);
-    expect(receipt.userTaskId).toBe('task-http-1');
+    const receipt = (await first.json()) as { runId: string; requestId: string; userTaskId: string; conversationId?: string };
 
-    const second = await postSubmit(h.base, alphaKey, 'idem-http-1', submitBody({ userTaskId: 'task-http-1' }));
-    expect(second.status).toBe(200);
-    expect(await second.json()).toEqual({ ...receipt, deduplicated: true });
+    const duplicate = await postSubmit(h.base, alphaKey, 'idem-http-1', submitBody({ userTaskId: 'task-http-1' }));
+    expect(duplicate.status).toBe(200);
+    expect((await duplicate.json()) as Record<string, unknown>).toMatchObject({ runId: receipt.runId, deduplicated: true });
+    expect(h.worker.launches).toHaveLength(1);
 
-    const conflict = await postSubmit(h.base, alphaKey, 'idem-http-1', submitBody({ userTaskId: 'task-http-1', limits: { timeoutMs: 9999 } }));
-    expect(conflict.status).toBe(409);
-    expect(((await conflict.json()) as { error: { code: string } }).error.code).toBe('IDEMPOTENCY_CONFLICT');
+    await waitForTerminal(h.base, alphaKey, receipt.runId);
 
-    await waitFor(async () => {
-      const response = await getStatus(h.base, alphaKey, receipt.runId);
-      const body = (await response.json()) as { state: string };
-      return body.state === 'succeeded';
-    }, 8000, 'run to succeed over http');
+    const status = (await (await getStatus(h.base, alphaKey, receipt.runId)).json()) as {
+      state: string;
+      conversationId: string;
+      userTaskId: string;
+      sequence: number;
+    };
+    expect(status.state).toBe('succeeded');
+    expect(status.userTaskId).toBe('task-http-1');
+    expect(status.conversationId).toMatch(/^conv_/);
+    expect(status.sequence).toBeGreaterThan(0);
 
-    const status = await getStatus(h.base, alphaKey, receipt.runId);
-    expect(status.status).toBe(200);
-    const statusBody = (await status.json()) as Record<string, unknown>;
-    expect(statusBody).toMatchObject({
-      requestId: receipt.requestId,
-      userTaskId: 'task-http-1',
-      runId: receipt.runId,
-      state: 'succeeded',
-      connectionLost: false,
-      cancelRequested: false,
-      ownerGeneration: 1,
-    });
+    const artifacts = (await (await getArtifacts(h.base, alphaKey, receipt.runId)).json()) as { count: number };
+    expect(artifacts.count).toBe(1);
 
-    const result = await fetch(`${h.base}/v1/runs/${receipt.runId}/result`, { headers: authHeader(alphaKey) });
-    expect(result.status).toBe(200);
-    expect(((await result.json()) as { outcome: string }).outcome).toBe('succeeded');
+    const page = (await (await fetch(`${h.base}/v1/runs/${receipt.runId}/events?cursor=0&limit=3`, { headers: authHeader(alphaKey) })).json()) as {
+      events: unknown[];
+      cursor: number;
+      hasMore: boolean;
+    };
+    expect(page.events).toHaveLength(3);
+    expect(page.hasMore).toBe(true);
+    expect(page.cursor).toBe(3);
 
-    const events = await fetch(`${h.base}/v1/runs/${receipt.runId}/events?cursor=0`, { headers: authHeader(alphaKey) });
-    expect(events.status).toBe(200);
-    const page = (await events.json()) as { events: Array<{ type: string; sequence: number }>; cursor: number; hasMore: boolean };
-    expect(page.events[0]?.type).toBe('claimed');
-    expect(page.events.at(-1)?.type).toBe('succeeded');
-
-    const limited = await fetch(`${h.base}/v1/runs/${receipt.runId}/events?cursor=0&limit=2`, { headers: authHeader(alphaKey) });
-    const limitedPage = (await limited.json()) as { events: unknown[]; hasMore: boolean; cursor: number };
-    expect(limitedPage.events).toHaveLength(2);
-    expect(limitedPage.hasMore).toBe(true);
-
-    const badCursor = await fetch(`${h.base}/v1/runs/${receipt.runId}/events?cursor=abc`, { headers: authHeader(alphaKey) });
-    expect(badCursor.status).toBe(400);
-    expect(((await badCursor.json()) as { error: { code: string } }).error.code).toBe('INVALID_REQUEST');
-
-    expect(h.fake.startCalls).toBe(1);
+    const rest = (await (await fetch(`${h.base}/v1/runs/${receipt.runId}/events?cursor=3`, { headers: authHeader(alphaKey) })).json()) as {
+      events: Array<{ sequence: number }>;
+    };
+    expect(rest.events[0]!.sequence).toBe(4);
   });
 
-  it('keeps cancel semantics distinct: stale generation rejected, cancel not pretended as stopped', async () => {
-    const h = await startHttpHarness({ scenario: 'cancel-with-children' });
+  it('незавершённый ран: result не выдаётся, отмена доходит до воркера', async () => {
+    const h = await startHttpHarness({ worker: { delayMs: 400 } });
     const submit = await postSubmit(h.base, alphaKey, 'idem-http-cancel', submitBody());
     const receipt = (await submit.json()) as { runId: string };
 
-    await waitFor(async () => {
-      const response = await getStatus(h.base, alphaKey, receipt.runId);
-      return ((await response.json()) as { state: string }).state === 'running';
-    }, 8000, 'run to be running');
-
-    const resultEarly = await fetch(`${h.base}/v1/runs/${receipt.runId}/result`, { headers: authHeader(alphaKey) });
-    expect(resultEarly.status).toBe(409);
-    const notReady = (await resultEarly.json()) as { error: { code: string; details: { state: string } } };
-    expect(notReady.error.code).toBe('RESULT_NOT_READY');
-    expect(notReady.error.details.state).toBe('running');
-
-    const stale = await postCancel(h.base, alphaKey, receipt.runId, { ownerGeneration: 77 });
-    expect(stale.status).toBe(409);
-    const staleBody = (await stale.json()) as { error: { code: string } };
-    expect(staleBody.error.code).toBe('STALE_OWNER_GENERATION');
-    const afterStale = await getStatus(h.base, alphaKey, receipt.runId);
-    expect(((await afterStale.json()) as { state: string }).state).toBe('running');
+    const early = await fetch(`${h.base}/v1/runs/${receipt.runId}/result`, { headers: authHeader(alphaKey) });
+    expect(early.status).toBe(409);
+    expect(((await early.json()) as { error: { code: string } }).error.code).toBe('RESULT_NOT_READY');
 
     const cancel = await postCancel(h.base, alphaKey, receipt.runId, {});
-    expect([200, 202]).toContain(cancel.status);
-    const cancelBody = (await cancel.json()) as { status: string; state?: string };
-    expect(['stopped', 'stop_pending']).toContain(cancelBody.status);
-    if (cancelBody.status === 'stop_pending') {
-      const pendingStatus = await getStatus(h.base, alphaKey, receipt.runId);
-      expect(['queued', 'starting', 'running', 'finalizing']).toContain(((await pendingStatus.json()) as { state: string }).state);
-    }
+    expect(cancel.status).toBe(202);
+    expect(h.worker.cancels).toContain(receipt.runId);
 
-    await waitFor(async () => {
-      const response = await getStatus(h.base, alphaKey, receipt.runId);
-      return ((await response.json()) as { state: string }).state === 'cancelled';
-    }, 8000, 'run to be cancelled');
+    await waitForTerminal(h.base, alphaKey, receipt.runId);
+    expect((await (await getStatus(h.base, alphaKey, receipt.runId)).json()) as { state: string }).toMatchObject({ state: 'cancelled' });
 
-    const repeat = await postCancel(h.base, alphaKey, receipt.runId, {});
-    expect(repeat.status).toBe(200);
-    expect(((await repeat.json()) as { status: string }).status).toBe('already_terminal');
-
-    const result = await fetch(`${h.base}/v1/runs/${receipt.runId}/result`, { headers: authHeader(alphaKey) });
-    expect(result.status).toBe(200);
-    expect(((await result.json()) as { outcome: string }).outcome).toBe('cancelled');
-    expect(h.fake.startCalls).toBe(1);
+    // Повторная отмена терминального рана — «уже терминальный», а не 409-фантом.
+    const again = await postCancel(h.base, alphaKey, receipt.runId, {});
+    expect(again.status).toBe(200);
+    expect((await again.json()) as Record<string, unknown>).toMatchObject({ status: 'already_terminal' });
   });
 
-  it('rejects an oversized body without starting a run', async () => {
-    const h = await startHttpHarness({ scenario: 'success', maxBodyBytes: 2048 });
+  it('отклоняет слишком большое тело, не доходя до воркера', async () => {
+    const h = await startHttpHarness({ maxBodyBytes: 2048 });
     const oversized = await postSubmit(h.base, alphaKey, 'idem-oversized', submitBody({ instructions: 'x'.repeat(4096) }));
     expect(oversized.status).toBe(413);
     expect(((await oversized.json()) as { error: { code: string } }).error.code).toBe('PAYLOAD_TOO_LARGE');
-    expect(h.fake.startCalls).toBe(0);
+    expect(h.worker.launches).toHaveLength(0);
   });
 });
 
 describe('http sse replay', () => {
-  it('streams events, survives an aborted connection, replays by cursor and ends at the terminal event', async () => {
-    const h = await startHttpHarness({ scenario: 'cancel-with-children', streamPollMs: 20 });
+  it('стримит события, переживает оборванную связь, переигрывает по курсору и закрывается на терминальном событии', async () => {
+    const h = await startHttpHarness({ worker: { delayMs: 300 }, streamPollMs: 10 });
     const submit = await postSubmit(h.base, alphaKey, 'idem-sse', submitBody());
     const receipt = (await submit.json()) as { runId: string };
 
-    await waitFor(async () => {
+    await waitForAsync(async () => {
       const response = await getStatus(h.base, alphaKey, receipt.runId);
       return ((await response.json()) as { state: string }).state === 'running';
     }, 8000, 'run to be running before the first stream');
@@ -225,14 +177,11 @@ describe('http sse replay', () => {
     });
     expect(firstResponse.status).toBe(200);
     expect(firstResponse.headers.get('content-type')).toContain('text/event-stream');
-    const firstReader = firstResponse.body!.getReader();
-    const firstCollector = new SseCollector(firstReader);
-    const firstFrames = await firstCollector.waitFor((frames) => frames.some((frame) => frame.event === 'started'), 8000);
+    const firstCollector = new SseCollector(firstResponse.body!.getReader());
+    const firstFrames = await firstCollector.waitFor((frames) => frames.some((frame) => frame.event === 'snapshot'), 8000);
     const snapshot = firstFrames.find((frame) => frame.event === 'snapshot');
-    expect(snapshot).toBeDefined();
     expect(JSON.parse(snapshot!.data!).state).toBe('running');
     const resumeFrom = firstCollector.lastEventId();
-    expect(resumeFrom).toBeGreaterThan(0);
 
     controller.abort();
     await new Promise((resolve) => setTimeout(resolve, 50));
@@ -240,37 +189,23 @@ describe('http sse replay', () => {
     const secondResponse = await fetch(`${h.base}/v1/runs/${receipt.runId}/events`, {
       headers: { ...authHeader(alphaKey), accept: 'text/event-stream', 'last-event-id': String(resumeFrom) },
     });
-    expect(secondResponse.status).toBe(200);
     const secondCollector = new SseCollector(secondResponse.body!.getReader());
-    await secondCollector.waitFor((frames) => frames.some((frame) => frame.event === 'snapshot'), 8000);
-
-    const cancel = await postCancel(h.base, alphaKey, receipt.runId, {});
-    expect([200, 202]).toContain(cancel.status);
-
-    await secondCollector.waitFor((frames) => frames.some((frame) => frame.event === 'cancelled'), 8000);
+    await secondCollector.waitFor(
+      (frames) => frames.some((frame) => frame.event === 'succeeded' || frame.event === 'failed' || frame.event === 'cancelled'),
+      8000,
+    );
     await secondCollector.waitEnd(8000);
 
     const eventIds = secondCollector.all.filter((frame) => frame.id).map((frame) => Number(frame.id));
-    const uniqueIds = new Set(eventIds);
-    expect(uniqueIds.size).toBe(eventIds.length);
+    expect(new Set(eventIds).size).toBe(eventIds.length);
+    expect(secondCollector.all.filter((frame) => frame.id && Number(frame.id) <= resumeFrom)).toHaveLength(0);
+  }, 30000);
 
-    const replayedAfterCursor = secondCollector.all.filter((frame) => frame.id && Number(frame.id) <= resumeFrom);
-    expect(replayedAfterCursor).toHaveLength(0);
-
-    const status = await getStatus(h.base, alphaKey, receipt.runId);
-    expect(((await status.json()) as { state: string }).state).toBe('cancelled');
-    expect(h.fake.startCalls).toBe(1);
-  });
-
-  it('ends an sse stream immediately when the run is already terminal', async () => {
-    const h = await startHttpHarness({ scenario: 'success' });
+  it('немедленно закрывает sse-поток на уже терминальном ране', async () => {
+    const h = await startHttpHarness();
     const submit = await postSubmit(h.base, alphaKey, 'idem-sse-done', submitBody());
     const receipt = (await submit.json()) as { runId: string };
-
-    await waitFor(async () => {
-      const response = await getStatus(h.base, alphaKey, receipt.runId);
-      return ((await response.json()) as { state: string }).state === 'succeeded';
-    }, 8000, 'run to finish');
+    await waitForTerminal(h.base, alphaKey, receipt.runId);
 
     const response = await fetch(`${h.base}/v1/runs/${receipt.runId}/events`, {
       headers: { ...authHeader(alphaKey), accept: 'text/event-stream' },

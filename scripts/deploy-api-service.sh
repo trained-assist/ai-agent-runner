@@ -6,7 +6,6 @@ SERVICE_USER="${SERVICE_USER:-sandbox}"
 SERVICE_GROUP="${SERVICE_GROUP:-$SERVICE_USER}"
 UNIT_NAME="agent-runner-api.service"
 PORT="${AGENT_API_PORT:-8787}"
-DATA_DIR="${AGENT_API_DATA_DIR:-/var/lib/agent-runner}"
 CONF_DIR="${CONF_DIR:-/etc/agent-runner}"
 KEY_FILE="$CONF_DIR/api-key"
 REGISTRY_FILE="$CONF_DIR/key-registry.json"
@@ -15,6 +14,8 @@ UNIT_PATH="/etc/systemd/system/$UNIT_NAME"
 HEALTH_URL="http://127.0.0.1:$PORT/healthz"
 ROTATE_KEY=0
 SKIP_UFW=0
+WORKER_URL="${EXTERNAL_WORKER_URL:-}"
+WORKER_TOKEN="${EXTERNAL_WORKER_TOKEN:-}"
 
 log() { printf '[deploy-api] %s\n' "$*"; }
 die() { printf '[deploy-api] ERROR: %s\n' "$*" >&2; exit 1; }
@@ -23,17 +24,21 @@ usage() {
   cat <<USAGE
 Usage: sudo scripts/deploy-api-service.sh [options]
 
-Runs on the VM from the repo checkout: build -> data/config dirs -> API key ->
+Runs on the VM from the repo checkout: build -> config dir -> API key -> worker URL/token ->
 systemd unit -> enable+start -> health-check -> auth-check -> ufw (only after auth).
 
-Options:
-  --port <n>       listen port (default 8787, same as AGENT_API_PORT)
-  --rotate-key     generate a fresh API key even if one is installed
-  --no-ufw         never touch the firewall
-  -h, --help       this text
+There is no data directory: the API is stateless (epic #74) and keeps nothing on disk.
 
-Environment overrides: REPO_DIR, SERVICE_USER, AGENT_API_PORT, AGENT_API_DATA_DIR,
-CONF_DIR, ARTIFACT_SHARE_SECRET, ARTIFACT_BASE_URL.
+Options:
+  --port <n>                 listen port (default 8787, same as AGENT_API_PORT)
+  --worker-url <url>         external worker base URL (default $EXTERNAL_WORKER_URL)
+  --worker-token <token>     shared secret for the worker (default $EXTERNAL_WORKER_TOKEN)
+  --rotate-key               generate a fresh API key even if one is installed
+  --no-ufw                   never touch the firewall
+  -h, --help                 this text
+
+Environment overrides: REPO_DIR, SERVICE_USER, AGENT_API_PORT, CONF_DIR,
+EXTERNAL_WORKER_URL, EXTERNAL_WORKER_TOKEN, RUNNER_DEFAULT_REPO, AGENT_API_ENV.
 Extra KEY=value lines already present in the service env file are kept as they are.
 USAGE
 }
@@ -41,6 +46,8 @@ USAGE
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --port) PORT="${2:-}"; shift 2 ;;
+  --worker-url) WORKER_URL="${2:-}"; shift 2 ;;
+  --worker-token) WORKER_TOKEN="${2:-}"; shift 2 ;;
     --rotate-key) ROTATE_KEY=1; shift ;;
     --no-ufw) SKIP_UFW=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -72,10 +79,8 @@ log "2/7 build → $REPO_DIR/dist"
 sudo -u "$SERVICE_USER" -H npm run build
 [[ -f "$REPO_DIR/dist/api/main.js" ]] || die "build did not produce dist/api/main.js"
 
-log "3/7 durable store $DATA_DIR (0700) and config $CONF_DIR"
-install -d -m 0700 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$DATA_DIR"
+log "3/7 config $CONF_DIR (no data dir: the API is stateless)"
 install -d -m 0755 -o root -g root "$CONF_DIR"
-[[ "$(stat -c '%a' "$DATA_DIR")" == "700" ]] || die "$DATA_DIR is not mode 0700"
 
 log "4/7 API key"
 KEY_STATE=existing
@@ -111,33 +116,25 @@ mv "$CONF_DIR/.key-registry.tmp" "$REGISTRY_FILE"
 log "key state: $KEY_STATE (raw key only in $KEY_FILE, mode 0600; registry holds the sha256 only)"
 
 log "5/7 service environment $ENV_FILE"
-SHARE_SECRET="${ARTIFACT_SHARE_SECRET:-}"
-BASE_URL="${ARTIFACT_BASE_URL:-}"
 if [[ -f "$ENV_FILE" ]]; then
-  [[ -n "$SHARE_SECRET" ]] || SHARE_SECRET="$(sed -n 's/^ARTIFACT_SHARE_SECRET=//p' "$ENV_FILE" | head -n1)"
-  [[ -n "$BASE_URL" ]] || BASE_URL="$(sed -n 's/^ARTIFACT_BASE_URL=//p' "$ENV_FILE" | head -n1)"
+  [[ -n "$WORKER_URL" ]] || WORKER_URL="$(sed -n 's/^EXTERNAL_WORKER_URL=//p' "$ENV_FILE" | head -n1)"
+  [[ -n "$WORKER_TOKEN" ]] || WORKER_TOKEN="$(sed -n 's/^EXTERNAL_WORKER_TOKEN=//p' "$ENV_FILE" | head -n1)"
 fi
-[[ -n "$SHARE_SECRET" ]] || SHARE_SECRET="$(openssl rand -hex 32)"
-if [[ -z "$BASE_URL" ]]; then
-  SRC_IP="$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -n1)"
-  BASE_URL="http://${SRC_IP:-127.0.0.1}:$PORT"
-fi
+[[ -n "$WORKER_URL" ]] || die "external worker URL is required: pass --worker-url or set EXTERNAL_WORKER_URL"
+[[ "$WORKER_URL" =~ ^https?:// ]] || die "--worker-url: expected an http(s) URL, got \"$WORKER_URL\""
 EXTRA_ENV=""
 if [[ -f "$ENV_FILE" ]]; then
   EXTRA_ENV="$(grep -E '^[A-Za-z_][A-Za-z0-9_]*=' "$ENV_FILE" \
-    | grep -vE '^(AGENT_API_HOST|AGENT_API_PORT|AGENT_API_DATA_DIR|AGENT_API_KEY_REGISTRY|AGENT_API_REGION|AGENT_API_ENVIRONMENT|ARTIFACT_SHARE_SECRET|ARTIFACT_BASE_URL)=' \
+    | grep -vE '^(AGENT_API_HOST|AGENT_API_PORT|AGENT_API_KEY_REGISTRY|EXTERNAL_WORKER_URL|EXTERNAL_WORKER_TOKEN)=' \
     || true)"
 fi
 {
   cat <<ENV
 AGENT_API_HOST=0.0.0.0
 AGENT_API_PORT=$PORT
-AGENT_API_DATA_DIR=$DATA_DIR
 AGENT_API_KEY_REGISTRY=$REGISTRY_FILE
-AGENT_API_REGION=sandbox
-AGENT_API_ENVIRONMENT=sandbox
-ARTIFACT_SHARE_SECRET=$SHARE_SECRET
-ARTIFACT_BASE_URL=$BASE_URL
+EXTERNAL_WORKER_URL=$WORKER_URL
+EXTERNAL_WORKER_TOKEN=$WORKER_TOKEN
 ENV
   if [[ -n "$EXTRA_ENV" ]]; then printf '%s\n' "$EXTRA_ENV"; fi
 } > "$CONF_DIR/.env.tmp"
@@ -191,8 +188,8 @@ fi
 
 log "--- summary"
 log "unit:    $UNIT_NAME (enabled, $(systemctl is-active "$UNIT_NAME"))"
-log "port:    $PORT   health: $HEALTH_URL   base url: $BASE_URL"
-log "data:    $DATA_DIR mode $(stat -c '%a' "$DATA_DIR") owner $(stat -c '%U' "$DATA_DIR")"
+log "port:    $PORT   health: $HEALTH_URL   worker: $WORKER_URL"
+log "state:   stateless — receipts and run progress live in process memory, nothing on disk"
 log "key:     $KEY_FILE mode $(stat -c '%a' "$KEY_FILE") owner $(stat -c '%U' "$KEY_FILE")"
 if [[ "$KEY_STATE" == "new" ]]; then
   log "NEW API KEY (printed once here, stored in $KEY_FILE):"

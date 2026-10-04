@@ -303,4 +303,4 @@ chmod 0640 "$NS_ROOT/provisioning.json"
 
 log "namespace: $NS_ROOT"
 log "provisioning manifest: $NS_ROOT/provisioning.json"
-log "next: node scripts/promotion-probe.mjs --fleet-root $FLEET_ROOT --namespace $NAMESPACE"
+log "next: npx vitest run test/e2e-loop.test.ts   # проба промоушена удалена вместе с /v1/release (epic #74)"

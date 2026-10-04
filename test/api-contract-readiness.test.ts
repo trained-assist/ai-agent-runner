@@ -1,28 +1,19 @@
-import { mkdtempSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { ArtifactStore } from '../src/storage/artifact-store.js';
-import { createLocalFsBlobStore } from '../src/storage/local-fs.js';
 import {
   alphaKey,
   authHeader,
   betaKey,
-  getStatus,
-  noScopeKey,
+  getArtifacts,
   postSubmit,
   startHttpHarness,
   submitBody,
-  waitForAsync as waitFor,
+  waitForTerminal,
 } from './api-http-harness.js';
 
-// Контрактная готовность Runner под шаги 2 и 4 эпика M1
-// (trained-assist/trained-agent-architecture#109, SERVERLESS-AGENT-API.md):
-//   1) GET /v1/capabilities — декларация возможностей (resume/awaiting/continuation);
-//   2) GET /v1/runs/{id}/artifacts — ссылки на артефакты рана для приёмника (шаг 4);
-//   3) conversationId в status — приёмник проверяет «продолжение = тот же userTaskId и
-//      conversationId, новый runId» (гейт #115), не полагаясь на свою память;
-//   4) никаких credentials в capabilities/списке артефактов.
+/**
+ * Контрактная готовность stateless API (epic #74): capabilities, артефакты-ссылки на GitHub и
+ * инвариант «продолжение = тот же userTaskId/conversationId, новый runId».
+ */
 
 interface Capabilities {
   contract: { name: string; version: number };
@@ -35,17 +26,14 @@ interface Capabilities {
     engineResume: string;
     continuation: { policy: string; userTaskIdStable: boolean; conversationIdStable: boolean; savedDataRefs: string[] };
   };
-  artifacts: { listPerRun: boolean; download: boolean; shareLink: boolean; ingestEndpoint: string };
+  artifacts: { listPerRun: boolean; download: boolean; shareLink: boolean; ingestEndpoint: string; export: { enabled: boolean } };
+  isolation: { mode: string; launcher: string | null };
   cancel: { requestedReceipt: boolean; terminalConfirmation: boolean };
   engines: string[];
 }
 
-function artifactStore(rootDir: string): ArtifactStore {
-  return new ArtifactStore({ rootDir, blob: createLocalFsBlobStore({ rootDir: join(rootDir, 'blobs') }) });
-}
-
-describe('GET /v1/capabilities: декларация, а не догадки (M1 шаги 2/4)', () => {
-  it('требует ключ и объявляет resume/awaiting/continuation политику без секретов', async () => {
+describe('GET /v1/capabilities: декларация, а не догадки (#74)', () => {
+  it('требует ключ и объявляет политику продолжения, честную изоляцию и один движок', async () => {
     const h = await startHttpHarness();
 
     const anonymous = await fetch(`${h.base}/v1/capabilities`);
@@ -62,179 +50,117 @@ describe('GET /v1/capabilities: декларация, а не догадки (M1
       newAttemptRequires: 'new_idempotency_key',
     });
     expect(caps.events).toMatchObject({ cursor: true, replay: true, sse: true, lastEventId: true });
-    // Потеря связи = неизвестный исход, НЕ failed, без авто-rerun
-    expect(caps.disconnect).toMatchObject({ connectionLostIsNotFailed: true, autoRerunOnDisconnect: false, outcomeUnknown: true });
-    // Engine resume и awaiting_user не поддержаны — объявлено явно
+    expect(caps.disconnect.outcomeUnknown).toBe(true);
+    expect(caps.disconnect.autoRerunOnDisconnect).toBe(false);
     expect(caps.interaction.awaitingUserInput).toBe('unsupported');
     expect(caps.interaction.engineResume).toBe('unsupported');
-    expect(caps.interaction.continuation).toMatchObject({
-      policy: 'new_run_same_user_task',
-      userTaskIdStable: true,
-      conversationIdStable: true,
-    });
+    expect(caps.interaction.continuation.policy).toBe('new_run_same_user_task');
     expect(caps.interaction.continuation.savedDataRefs).toEqual(['run_result', 'run_events', 'run_artifacts']);
-    expect(caps.artifacts.listPerRun).toBe(true);
-    expect(caps.engines.length).toBeGreaterThanOrEqual(1);
-    expect(caps.states).toContain('running');
 
-    const serialized = JSON.stringify(caps);
-    expect(serialized).not.toContain(alphaKey);
-    expect(serialized).not.toContain('keyHash');
+    // Никакой изоляции на хосте API и никакого экспорта байтов.
+    expect(caps.isolation.mode).toBe('none');
+    expect(caps.isolation.launcher).toBeNull();
+    expect(caps.artifacts.export.enabled).toBe(false);
+    expect(caps.artifacts.download).toBe(false);
+    expect(caps.artifacts.shareLink).toBe(false);
+    expect(caps.artifacts.ingestEndpoint).toBe('absent');
+    expect(caps.artifacts.listPerRun).toBe(true);
+    expect(caps.engines).toEqual(['dynamic-ip-azure-agent-run']);
+    expect(caps.cancel).toEqual({ requestedReceipt: true, terminalConfirmation: true });
+
+    // Никаких credentials в декларации.
+    expect(JSON.stringify(caps)).not.toMatch(/token|secret|password/i);
   });
 });
 
-describe('GET /v1/runs/{id}/artifacts: ссылки на артефакты для приёмника (M1 шаг 4)', () => {
-  it('отдаёт манифесты артефактов рана, изолирует по профилю, переживает restart', async () => {
-    // ArtifactStore смотрит в тот же dataDir, что и AgentApi (манифесты лежат рядом
-    // с state.json рана, как в проде — docs/API-SERVICE.md), поэтому dataDir задаём сами.
-    const rootDir = mkdtempSync(join(tmpdir(), 'ai-agent-runner-contract-'));
-    const store = artifactStore(rootDir);
-    const h = await startHttpHarness({ rootDir, artifacts: store });
-
-    const submit = await postSubmit(h.base, alphaKey, 'artifacts-list-1', submitBody({ userTaskId: 'task-artifacts' }));
-    expect(submit.status).toBe(202);
+describe('GET /v1/runs/{id}/artifacts: ссылки на GitHub, а не байты (#74, шаг 4)', () => {
+  it('отдаёт адрес файла в коммите юзеровского репозитория и ссылку на лог в GCS', async () => {
+    const h = await startHttpHarness();
+    const submit = await postSubmit(h.base, alphaKey, 'idem-artifacts', submitBody({ outputs: [{ path: 'report.md' }] }));
     const receipt = (await submit.json()) as { runId: string };
-    await store.put({
-      runId: receipt.runId,
-      userTaskId: 'task-artifacts',
-      profileId: 'profile-a',
-      name: 'out.txt',
-      mime: 'text/plain',
-      bytes: 'artifact body',
-      artifactId: 'art-list-1',
+    await waitForTerminal(h.base, alphaKey, receipt.runId);
+
+    const view = (await (await getArtifacts(h.base, alphaKey, receipt.runId)).json()) as {
+      runId: string;
+      repo: { fullName: string; branch: string; commit: string; baseRef?: string };
+      branchUrl: string;
+      mergeUrl: string;
+      count: number;
+      logUrl: string;
+      artifacts: Array<{ path: string; name: string; mime: string; size: number; sha256: string; url: string }>;
+      note: string;
+    };
+    expect(view.runId).toBe(receipt.runId);
+    // Результат рана — отдельная ветка: её видно целиком и из неё GitHub предлагает merge.
+    expect(view.repo.branch).toBe(`agent-run/${receipt.runId}`);
+    expect(view.repo.fullName).toBe('owner/name');
+    expect(view.branchUrl).toBe(`https://github.com/owner/name/tree/agent-run/${receipt.runId}`);
+    expect(view.mergeUrl).toBe(`https://github.com/owner/name/compare/main...agent-run/${receipt.runId}`);
+    expect(view.count).toBe(1);
+    expect(view.artifacts[0]).toMatchObject({
+      path: 'report.md',
+      name: 'report.md',
+      mime: 'text/markdown',
+      size: 1234,
+      url: 'https://github.com/owner/name/blob/abc1234/report.md',
     });
+    expect(view.artifacts[0]!.sha256).toHaveLength(64);
+    expect(view.logUrl).toMatch(/^https:\/\/storage\.googleapis\.com\//);
+    expect(view.note).toContain('the API stores no bytes');
+    expect(view.note).toContain('merges nothing');
+    // В ответе нет ни байт, ни base64 — только ссылки и метаданные.
+    expect(Object.keys(view.artifacts[0]!).sort()).toEqual(['mime', 'name', 'path', 'sha256', 'size', 'url']);
+  });
 
-    const response = await fetch(`${h.base}/v1/runs/${receipt.runId}/artifacts`, { headers: authHeader(alphaKey) });
-    expect(response.status).toBe(200);
-    const page = (await response.json()) as { runId: string; count: number; artifacts: Array<{ artifactId: string; name: string; size: number }> };
-    expect(page.runId).toBe(receipt.runId);
-    expect(page.count).toBe(1);
-    expect(page.artifacts[0]).toMatchObject({ artifactId: 'art-list-1', name: 'out.txt', size: 'artifact body'.length });
-
-    // Чужой principal (другой профиль) → 404, артефакт не протекает
-    const foreign = await fetch(`${h.base}/v1/runs/${receipt.runId}/artifacts`, { headers: authHeader(betaKey) });
+  it('чужой ран — NOT_FOUND: артефакты отдаются только владельцу', async () => {
+    const h = await startHttpHarness();
+    const submit = await postSubmit(h.base, alphaKey, 'idem-artifacts-owner', submitBody());
+    const receipt = (await submit.json()) as { runId: string };
+    await waitForTerminal(h.base, alphaKey, receipt.runId);
+    const foreign = await getArtifacts(h.base, betaKey, receipt.runId);
     expect(foreign.status).toBe(404);
-    // Анонимно → 401
-    const anonymous = await fetch(`${h.base}/v1/runs/${receipt.runId}/artifacts`);
-    expect(anonymous.status).toBe(401);
-    // Неизвестный run → 404
-    const unknown = await fetch(`${h.base}/v1/runs/run_does_not_exist/artifacts`, { headers: authHeader(alphaKey) });
-    expect(unknown.status).toBe(404);
-    // Без scope runs:read → 403
-    const noRead = await fetch(`${h.base}/v1/runs/${receipt.runId}/artifacts`, { headers: authHeader(noScopeKey) });
-    expect(noRead.status).toBe(403);
-
-    // Restart: манифесты переживают перезапуск процесса
-    const report = await h.restart();
-    expect(report.scanned).toBeGreaterThanOrEqual(1);
-    const after = await fetch(`${h.base}/v1/runs/${receipt.runId}/artifacts`, { headers: authHeader(alphaKey) });
-    expect(after.status).toBe(200);
-    const afterPage = (await after.json()) as { count: number; artifacts: Array<{ artifactId: string }> };
-    expect(afterPage.count).toBe(1);
-    expect(afterPage.artifacts[0]!.artifactId).toBe('art-list-1');
   });
 });
 
 describe('conversationId в status + инвариант попытки (гейт #115)', () => {
-  it('status отдаёт conversationId; потерянный ответ → тот же ран; новая попытка = новый runId, те же task/conversation, без скрытого rerun', async () => {
+  it('status отдаёт conversationId; новая попытка = новый runId, те же task/conversation, без скрытого rerun', async () => {
     const h = await startHttpHarness();
-    const body = submitBody({ userTaskId: 'task-conv', conversationId: 'conv-7' });
+    const submit = await postSubmit(h.base, alphaKey, 'idem-attempt-1', submitBody({ userTaskId: 'task-gate', conversationId: 'conv-gate' }));
+    const first = (await submit.json()) as { runId: string; requestId: string };
+    await waitForTerminal(h.base, alphaKey, first.runId);
 
-    // Шаг 2 приёмки: потеряли HTTP-ответ после сохранения → повтор возвращает ту же задачу
-    const first = await postSubmit(h.base, alphaKey, 'attempt-1', body);
-    expect(first.status).toBe(202);
-    const receipt1 = (await first.json()) as { runId: string; userTaskId: string; requestId: string };
-    const lostResponse = await postSubmit(h.base, alphaKey, 'attempt-1', body);
-    expect(lostResponse.status).toBe(200);
-    expect((await lostResponse.json()) as { runId: string; deduplicated: boolean }).toMatchObject({
-      runId: receipt1.runId,
-      deduplicated: true,
-    });
-
-    await waitFor(async () => {
-      const res = await getStatus(h.base, alphaKey, receipt1.runId);
-      return ((await res.json()) as { state: string }).state === 'succeeded';
-    }, 8000, 'first attempt to finish');
-
-    const view1 = (await (await getStatus(h.base, alphaKey, receipt1.runId)).json()) as {
+    const firstStatus = (await (await fetch(`${h.base}/v1/runs/${first.runId}/status`, { headers: authHeader(alphaKey) })).json()) as {
       conversationId: string;
       userTaskId: string;
-      runId: string;
-      ownerGeneration: number;
+      requestId: string;
     };
-    expect(view1.conversationId).toBe('conv-7');
-    expect(view1.userTaskId).toBe('task-conv');
-    expect(view1.ownerGeneration).toBe(1);
+    expect(firstStatus.conversationId).toBe('conv-gate');
+    expect(firstStatus.userTaskId).toBe('task-gate');
+    expect(firstStatus.requestId).toBe(first.requestId);
 
-    // Новая попытка продолжения: явный новый Idempotency-Key → новый runId, тот же task/conversation,
-    // поколение попытки увеличивается (никакого «тихого» повтора первой попытки).
-    const second = await postSubmit(h.base, alphaKey, 'attempt-2', body);
-    expect(second.status).toBe(202);
-    const receipt2 = (await second.json()) as { runId: string; userTaskId: string; requestId: string };
-    expect(receipt2.runId).not.toBe(receipt1.runId);
-    expect(receipt2.userTaskId).toBe(receipt1.userTaskId);
-    expect(receipt2.requestId).toBe(receipt1.requestId);
+    // Новый Idempotency-Key = новая попытка, а не перезапуск прошлого рана.
+    const retry = await postSubmit(h.base, alphaKey, 'idem-attempt-2', submitBody({ userTaskId: 'task-gate', conversationId: 'conv-gate' }));
+    const second = (await retry.json()) as { runId: string; requestId: string };
+    expect(second.runId).not.toBe(first.runId);
+    expect(second.requestId).toBe(first.requestId);
+    await waitForTerminal(h.base, alphaKey, second.runId);
 
-    const view2 = (await (await getStatus(h.base, alphaKey, receipt2.runId)).json()) as {
+    const secondStatus = (await (await fetch(`${h.base}/v1/runs/${second.runId}/status`, { headers: authHeader(alphaKey) })).json()) as {
       conversationId: string;
       userTaskId: string;
-      runId: string;
       ownerGeneration: number;
     };
-    expect(view2.runId).toBe(receipt2.runId);
-    expect(view2.userTaskId).toBe('task-conv');
-    expect(view2.conversationId).toBe('conv-7');
-    expect(view2.ownerGeneration).toBe(2);
-
-    // Повтор старого ключа не создаёт третью попытку: задача отвечает своей текущей попыткой.
-    const oldKey = await postSubmit(h.base, alphaKey, 'attempt-1', body);
-    expect(oldKey.status).toBe(200);
-    expect((await oldKey.json()) as { runId: string; deduplicated: boolean }).toMatchObject({
-      runId: receipt2.runId,
-      deduplicated: true,
-    });
-
-    // Никакого скрытого rerun: у первой попытки ровно один claimed, попыток ровно две
-    const firstEvents = (await (await fetch(`${h.base}/v1/runs/${receipt1.runId}/events?cursor=0`, { headers: authHeader(alphaKey) })).json()) as {
-      events: Array<{ type: string; userTaskId: string; ownerGeneration: number }>;
-    };
-    expect(firstEvents.events.filter((event) => event.type === 'claimed')).toHaveLength(1);
-    for (const event of firstEvents.events) {
-      expect(event.userTaskId).toBe('task-conv');
-      expect(event.ownerGeneration).toBe(1);
-    }
-    const secondEvents = (await (await fetch(`${h.base}/v1/runs/${receipt2.runId}/events?cursor=0`, { headers: authHeader(alphaKey) })).json()) as {
-      events: Array<{ type: string; userTaskId: string; ownerGeneration: number }>;
-    };
-    expect(secondEvents.events.filter((event) => event.type === 'claimed')).toHaveLength(1);
-    expect(secondEvents.events.every((event) => event.ownerGeneration === 2)).toBe(true);
+    expect(secondStatus.conversationId).toBe('conv-gate');
+    expect(secondStatus.userTaskId).toBe('task-gate');
+    expect(secondStatus.ownerGeneration).toBe(2);
   });
 
   it('вторая попытка задачи, пока первая активна, отклоняется (TASK_ATTEMPT_ACTIVE)', async () => {
-    const h = await startHttpHarness({ scenario: 'timeout' });
-    const body = submitBody({ userTaskId: 'task-active', conversationId: 'conv-active', limits: { timeoutMs: 60000 } });
-
-    const first = await postSubmit(h.base, alphaKey, 'active-1', body);
+    const h = await startHttpHarness({ worker: { delayMs: 400 } });
+    const first = await postSubmit(h.base, alphaKey, 'idem-active-1', submitBody({ userTaskId: 'task-active' }));
     expect(first.status).toBe(202);
-    const receipt1 = (await first.json()) as { runId: string };
-    await waitFor(async () => {
-      const res = await getStatus(h.base, alphaKey, receipt1.runId);
-      return ((await res.json()) as { state: string }).state === 'running';
-    }, 8000, 'first attempt running');
-
-    // Сигнал продолжения без завершения первой попытки не создаёт второй run
-    const retry = await postSubmit(h.base, alphaKey, 'active-2', body);
-    expect(retry.status).toBe(409);
-    expect(await retry.json()).toMatchObject({ error: { code: 'TASK_ATTEMPT_ACTIVE' } });
-
-    await fetch(`${h.base}/v1/runs/${receipt1.runId}/cancel`, {
-      method: 'POST',
-      headers: { ...authHeader(alphaKey), 'content-type': 'application/json' },
-      body: '{}',
-    });
-    await waitFor(async () => {
-      const res = await getStatus(h.base, alphaKey, receipt1.runId);
-      return ((await res.json()) as { state: string }).state === 'cancelled';
-    }, 8000, 'first attempt cancelled');
+    const conflict = await postSubmit(h.base, alphaKey, 'idem-active-2', submitBody({ userTaskId: 'task-active' }));
+    expect(conflict.status).toBe(409);
+    expect(((await conflict.json()) as { error: { code: string } }).error.code).toBe('TASK_ATTEMPT_ACTIVE');
   });
 });

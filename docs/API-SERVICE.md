@@ -1,314 +1,196 @@
-# Serverless Agent API на песочной VM — деплой, безопасность, смоук
+# Serverless Agent API — деплой, конфигурация, смоук
 
-Деплой постоянного сервиса + CLI для runner#7 (dogfooding, шаг 1).
-Факты ниже собраны на живой VM `vm2` (Hostland, `169.58.15.230`, Ubuntu 24.04, node v20.20.2)
-**2026-10-01**, ветка `feat/api-service-on-sandbox-vm`.
+Статус документа: **04.10.2026, модель epic #74.** API — stateless-оркестратор: он не пишет
+на диск, не запускает процессов и не восстанавливается после рестарта. Единственное, что он
+делает, — ходит по HTTP во внешнего воркера и отдаёт клиенту то, что тот вернул.
 
-## Что в репо
+Предыдущая версия документа описывала API с durable store `/var/lib/agent-runner`,
+локальным `spawn` движков и recovery после `kill -9`. Этих вещей в сервисе больше нет.
 
-| Файл | Роль |
-|---|---|
-| `src/api/main.ts` | Точка входа сервиса (новый файл; существующие `src/api/**` не менялись). Env-конфиг, обязательный key registry, data dir `0700` и запрет `/tmp`, один HTTP-порт для `/healthz` + `/v1/runs/*` + `/v1/artifacts/*`, graceful shutdown на SIGTERM |
-| `tsconfig.build.json`, `npm run build` / `npm start` | Сборка `tsc → dist/`, запуск `node dist/api/main.js` |
-| `infra/agent-runner-api.service` | systemd-юнит (`@NODE@` подставляет deploy-скрипт) |
-| `scripts/deploy-api-service.sh` | Деплой на VM: build → dirs → ключ → юнит → enable+start → health → auth-check → ufw |
-| `scripts/runner-cli.mjs` | CLI: `submit/status/events/follow/result/cancel` против URL + ключа |
+---
 
-## Деплой
+## 1. Что в репо
 
-На VM из чекаута репо (git-операции — от пользователя `sandbox`, у root git ругается на dubious ownership):
-
-```bash
-runuser -u sandbox -- git -C /opt/sb/ai-agent-runner fetch origin
-runuser -u sandbox -- git -C /opt/sb/ai-agent-runner checkout <ветка>
-bash /opt/sb/ai-agent-runner/scripts/deploy-api-service.sh
-```
-
-Скрипт идемпотентен: при повторном запуске `npm ci` пропускается (если `node_modules` полный),
-существующий API-ключ переиспользуется (**не печатается снова**), правило ufw не дублируется,
-`ARTIFACT_SHARE_SECRET`/`ARTIFACT_BASE_URL` сохраняются, посторонние `KEY=value` в env-файле не затираются.
-Опции: `--port`, `--rotate-key`, `--no-ufw`, `--help`.
-
-## Конфигурация сервиса
-
-`/etc/agent-runner/agent-runner-api.env` (mode `0600`, владелец `sandbox`):
-
-| Переменная | Назначение |
-|---|---|
-| `AGENT_API_HOST` | слушать `0.0.0.0` |
-| `AGENT_API_PORT` | `8787` (по умолчанию в коде — `DEFAULT_API_PORT`) |
-| `AGENT_API_DATA_DIR` | durable store: `/var/lib/agent-runner` (создаётся deploy-скриптом, `0700`) |
-| `AGENT_API_KEY_REGISTRY` | путь к key registry (`{principals:[{keyHash,principalId,profileId,scopes}]}`) |
-| `AGENT_API_REGION`, `AGENT_API_ENVIRONMENT` | host-info в runner |
-| `ARTIFACT_SHARE_SECRET` | HMAC-секрет share-токенов (генерируется при первом деплое) |
-| `ARTIFACT_BASE_URL` | база для ссылок на артефакты: `http://169.58.15.230:8787` |
-| `AGENT_API_ISOLATION_SLOTS`, `AGENT_API_ISOLATION_TOOL_PATHS` | граница Agent clean room (#51): пул Unix-слотов ран'а (`ta-agent-1,ta-agent-2`) и общие read-only каталоги бинарей. Пустой слот — движок под service UID, и capabilities объявляют это честно |
-| `AGENT_API_ENGINE_CONFIG_DIR` | каталог хостовых шаблонов конфигурации движка: один read-only файл `<engine>.json` на движок. Копия кладётся в корень workspace рана (владелец — слот, `0600`) и уезжает со sweep. Нужен потому, что своя HOME рана убирает у движка конфиг пользователя сервиса: без provider/model `opencode` уходит на платный профиль по умолчанию. Секретов в шаблонах нет — ключи приходят в env рана по `envAllowlist` |
-| `AGENT_API_COHORT_ID`, `AGENT_API_COHORT_MODE`, `AGENT_API_COHORT_PRINCIPALS` | когорта P29: по умолчанию (`off`) **не обслуживает никого** — каждый `POST /v1/runs` получает `COHORT_NOT_ENABLED`. Одиночная установка обязана объявить allowlist с principal'ами, иначе она принимает ноль задач |
-| `AGENT_API_FAKE_SCENARIO` | опционально: сценарий fake-движка (`success` по умолчанию, `timeout`, `nonzero-exit`, …) — для проверки аварийных путей; правится вручную в env-файле + `systemctl restart` |
-| `AGENT_API_FAULTS` | опционально: управляемые точки сбоя для приёмки lifecycle (#52) — `cleanup` (сбой в момент уборки), `export`, `finalization`, … через запятую, `точка:count` задаёт число срабатываний (без `count` — один раз). Неизвестная точка валит старт: молча проигнорированная точка означала бы пробу, которая «прошла», ни разу не упав. В обычном сервисе переменная пуста |
-
-Старт падает сразу и явно, если: не задан `AGENT_API_KEY_REGISTRY`, файла ключей нет или в нём 0 ключей,
-data dir попал во временный каталог или имеет права шире `0700`.
-
-### Capability юнита и граница clean room
-
-Юнит даёт процессу ровно четыре capability: `CAP_SETUID`, `CAP_SETGID` (переключение
-идентичности рана лаунчером) и `CAP_CHOWN`, `CAP_FOWNER` (каталоги среды создаются под
-служебным uid и затем отдаются слоту). `CAP_DAC_OVERRIDE` в наборе нет намеренно: без него
-создание каталога внутри уже отданного слота каталога было бы единственным способом
-поднять границу, то есть цей границы стал бы обходом прав доступа. Если capability не
-выданы, `capabilities.osIsolation` сообщает `configured_but_refusing_runs` → ран
-отказывается, а не идёт под service UID.
-
-## Безопасность
-
-- **API без ключа не работает.** Анонимный запрос → `401 UNAUTHENTICATED` на всех маршрутах, кроме `GET /healthz`.
-  `src/api/server.ts` аутентифицирует до разбора маршрута и тела.
-- **Ключ генерируется при деплое** (`ak_` + 48 hex, тот же формат, что `generateApiKey()`), живёт только в
-  `/etc/agent-runner/api-key` (mode `0600`, владелец `sandbox`) и **один раз** печатается в лог первого деплоя.
-  В репо/доки/коммит ключ не попадает. Key registry (`/etc/agent-runner/key-registry.json`, `0600`) содержит
-  только sha256. Отпечатать ключ заново: `sudo scripts/deploy-api-service.sh --rotate-key`.
-- **Файлы:** `/etc/agent-runner` — `0755` (dir), `api-key`/`key-registry.json`/`agent-runner-api.env` — `0600 sandbox`;
-  `/var/lib/agent-runner` — `0700 sandbox`; workspace рана — `0700`, артефакты рана — `0600` (`UMask=0077` в юните).
-- **ufw:** правило `8787/tcp ALLOW Anywhere # agent-runner-api` ставится deploy-скриптом **только после**
-  успешной проверки auth (аноним `401` + с ключом `404`); иначе скрипт падает и порт закрыт.
-  `22/tcp` не трогается. Порт открыт миру — это осознанный выбор песочницы, внешний доступ даёт только ключ;
-  **TLS на песочнице нет** (HTTP), для продакшена нужен терминирующий прокси/HTTPS.
-- `GET /healthz` без auth отдаёт только `{status, ready, droppedLogCount, activeRuns, runs}` — без путей и секретов.
-- Лог в journald — JSON-строки: method/path/status/durationMs/principalId, путь **без query-string** (share-токен в логи не попадает).
-
-## CLI — `scripts/runner-cli.mjs`
-
-```bash
-export RUNNER_API_URL=http://127.0.0.1:8787
-export RUNNER_API_KEY_FILE=/etc/agent-runner/api-key   # или RUNNER_API_KEY / --key
-
-node scripts/runner-cli.mjs submit  --prompt "hi" --engine fake --timeout-ms 30000
-node scripts/runner-cli.mjs submit  --file spec.json --idempotency-key <key>
-node scripts/runner-cli.mjs status  <runId>
-node scripts/runner-cli.mjs events  <runId> [--cursor N] [--limit N]
-node scripts/runner-cli.mjs follow  <runId> [--timeout-ms N]   # SSE до терминального состояния, resume по cursor
-node scripts/runner-cli.mjs result  <runId>
-node scripts/runner-cli.mjs cancel  <runId> [--owner-generation N] [--reason text]
-```
-
-Подключение: `--url/--key/--key-file` либо env `RUNNER_API_URL/RUNNER_API_KEY/RUNNER_API_KEY_FILE`
-(флаги важнее env). На stdout — JSON (у `follow` — NDJSON по событию), диагностика на stderr.
-Exit codes: `0` успех · `1` ошибка API/сети · `2` ошибка использования · `3` `RESULT_NOT_READY`.
-
-## Эндпоинты
-
-| Метод | Путь | Auth |
+| Модуль | Файл | Роль |
 |---|---|---|
-| GET | `/healthz` | не нужен |
-| GET | `/v1/capabilities` | Bearer (любой валидный ключ) — декларация возможностей |
-| POST | `/v1/runs` (нужен `Idempotency-Key`) | Bearer + `runs:write` |
-| GET | `/v1/runs/{id}/status`, `/events` (SSE при `Accept: text/event-stream`), `/result` | Bearer + `runs:read` |
-| GET | `/v1/runs/{id}/artifacts` | Bearer + `runs:read` (манифесты только своего `profileId`) |
-| POST | `/v1/runs/{id}/cancel` | Bearer + `runs:write` |
-| GET | `/v1/artifacts/{id}[?t=share-token]`, `…/meta`, алиас `/artifact/{id}` | share-токен **или** Bearer + `runs:read` + совпадение `profileId` |
+| HTTP-сервис | `dist/api/main.js` | читает env, поднимает `node:http`, всё состояние — в памяти |
+| Ядро | `src/api/service.ts` | приём запроса, идемпотентность, запуск во внешний воркер, маппинг результата |
+| Память процесса | `src/api/stateless-store.ts` | приёмные записи, прогресс ранов, события, лимиты и TTL |
+| Адаптер воркера | `src/adapters/external-worker-adapter.ts` | `POST {worker}/v1/launch` → `LaunchResult`, отмена через `POST {worker}/v1/runs/{id}/cancel` |
+| Маршруты | `src/api/server.ts` | `/healthz`, `/v1/capabilities`, `/v1/runs…` |
+| Юнит | `infra/agent-runner-api.service` | systemd, `User=sandbox`, **без `ReadWritePaths` и без capabilities** |
+| Деплой | `scripts/deploy-api-service.sh` | build → config dir → API-ключ → адрес воркера → юнит → health → auth → ufw |
+| CLI | `scripts/runner-cli.mjs` | `submit/status/events/follow/result/cancel` против живого API |
 
-### Декларация возможностей (`GET /v1/capabilities`)
+Библиотечный код (`src/runner/`, `src/isolation/`, `src/storage/`, `src/workspace/`,
+`src/release/`) остался в репозитории как модули самого Runner'а, но **обслуживающим путём
+API больше не используется** и удаляется отдельной задачей.
 
-Приёмник (control plane) читает её вместо догадок о том, что умеет Runner — требование
-`SERVERLESS-AGENT-API.md` («resume/checkpoint возможности не объявляются универсальными»):
+---
 
-```jsonc
-{
-  "schemaVersion": 1,
-  "contract": { "name": "ai-agent-runner/serverless-agent-api", "version": 1 },
-  "idempotency": { "header": "Idempotency-Key", "repeatWithSameKey": "same_receipt", "newAttemptRequires": "new_idempotency_key" },
-  "states": ["queued", "starting", "running", "awaiting_user", "finalizing", "succeeded", "failed", "cancelled"],
-  "events": { "cursor": true, "replay": true, "sse": true, "lastEventId": true },
-  "disconnect": { "connectionLostIsNotFailed": true, "autoRerunOnDisconnect": false, "outcomeUnknown": true },
-  "interaction": {
-    "awaitingUserInput": "unsupported",     // ожидание ведёт control plane, не Runner
-    "engineResume": "unsupported",          // --resume движка не поддержан
-    "continuation": {                        // продолжение = НОВАЯ ПОПЫТКА, не повтор всей задачи
-      "policy": "new_run_same_user_task",
-      "userTaskIdStable": true,
-      "conversationIdStable": true,
-      "savedDataRefs": ["run_result", "run_events", "run_artifacts"]
-    }
-  },
-  "artifacts": { "listPerRun": true, "download": true, "shareLink": true, "ingestEndpoint": "absent", "ingestNote": "…" },
-  "cancel": { "requestedReceipt": true, "terminalConfirmation": true },
-  "engines": ["fake", "opencode"]
-}
-```
+## 2. Конфигурация
 
-Дополнительно, что видно из ответов и важно для приёмника:
+Обязательное:
 
-- `status` возвращает `conversationId` — приёмник проверяет инвариант продолжения
-  «новая попытка = новый `runId`, тот же `userTaskId` и тот же `conversationId`, `ownerGeneration` +1»
-  (`test/api-contract-readiness.test.ts`);
-- одна активная попытка на задачу: `submit` с новым ключом при активной попытке → `409 TASK_ATTEMPT_ACTIVE`
-  (никаких параллельных ран одной задачи);
-- `GET /v1/runs/{id}/artifacts` — ссылки на артефакты рана для шага 4 «результат и ссылки на артефакты»;
-  манифесты фильтруются по `profileId` принципала, переживают restart процесса.
+| Переменная | Смысл |
+|---|---|
+| `AGENT_API_KEY_REGISTRY` | путь к JSON с `principals` (только sha256 ключей), режим `0600` |
+| `EXTERNAL_WORKER_URL` | базовый URL внешнего воркера (`http(s)://…`) |
+| `EXTERNAL_WORKER_TOKEN` | общий секрет; уходит в `Authorization: Bearer …` |
 
-### Что считается выходом рана (issue #52, шаг 2)
+Принимаются также имена из ТЗ воркера — `DYNAMIC_IP_AZURE_URL` / `DYNAMIC_IP_AZURE_TOKEN`,
+но `EXTERNAL_WORKER_*` приоритетнее.
 
-Источников ровно два, третьего нет:
+Необязательное:
 
-1. **Объявленные клиентом выходы** — `outputs` в `POST /v1/runs` (`spec.outputs`).
-   Путь проверяется на выход из workspace в момент экспорта.
-2. **Финальный манифест агента** — файл `.agent/final-manifest.json` в workspace рана:
+| Переменная | По умолчанию | Смысл |
+|---|---|---|
+| `AGENT_API_HOST` / `AGENT_API_PORT` | `0.0.0.0` / `8787` | адрес прослушивания |
+| `AGENT_API_ENV` | `{}` | JSON-пул значений окружения; в воркер уходят только те, что перечислил клиент в `envAllowlist` |
+| `RUNNER_DEFAULT_REPO` | — | `owner/name` для клиентов, не объявивших `repository` |
+| `EXTERNAL_WORKER_LAUNCH_DEADLINE_MS` | `600000` | таймаут ожидания `LaunchResult` |
+| `EXTERNAL_WORKER_CANCEL_DEADLINE_MS` | `30000` | таймаут ожидания подтверждения отмены |
 
-   ```jsonc
-   { "outputs": [{ "path": "report.md", "mime": "text/markdown" }], "answerFile": "answer.md" }
-   ```
+Переменных данных больше нет: `AGENT_API_DATA_DIR`, `ARTIFACT_SHARE_SECRET`,
+`ARTIFACT_BASE_URL`, `AGENT_API_RELEASE_MANIFEST`, `AGENT_API_FAULTS` сервис не читает.
 
-   Манифест читается после выхода движка. Дефект (не JSON, путь с `..`, дубль пути,
-   больше 64 КБ) — это отказ манифеста **с причиной в журнале рана**, а не падение рана:
-   объявленные клиентом выходы при этом сохраняются. При конфликте по пути выигрывает
-   объявление клиента.
+---
 
-**Сканирование «вслепую» запрещено**: файлы, которые агент не объявил ни в манифесте, ни
-клиент в `outputs`, в хранилище не попадают — ни из workspace, ни из HOME, ни из
-конфигов и секретов.
+## 3. Эндпоинты
 
-**Текст ответа** сохраняется всегда, отдельным артефактом `answer.txt`
-(`GET /v1/runs/{id}/artifacts`): источник — `answerFile` из манифеста, а если его нет —
-хвост stdout движка. Текст продублирован в обязательном `checkpoint.json` рана
-(`runs/<runId>/checkpoint.json`), поэтому он переживает sweep чистой среды даже на хосте
-без object storage. В журнал рана попадают только источник и размер, не содержимое.
+| Метод и путь | Что делает |
+|---|---|
+| `GET /healthz` | единственный маршрут без ключа: `{status, worker, engine, runs, admissions, events}` |
+| `GET /v1/capabilities` | декларация возможностей (см. §5) |
+| `POST /v1/runs` | приём: `Idempotency-Key` обязателен; `202` — новый receipt, `200` — дедуп |
+| `GET /v1/runs/{id}/status` | состояние рана, курсор событий, `answer` агента |
+| `GET /v1/runs/{id}/result` | `RunResult` после терминального состояния, иначе `409 RESULT_NOT_READY` |
+| `GET /v1/runs/{id}/events` | страница событий (`?cursor=&limit=`) либо SSE на `Accept: text/event-stream` |
+| `GET /v1/runs/{id}/artifacts` | ветка рана, ссылка на merge, ссылки на файлы по коммиту и `logUrl` |
+| `GET /v1/runs/{id}/log` | `302` на ссылку лога в Google Storage |
+| `POST /v1/runs/{id}/cancel` | пробрасывает отмену воркеру; `202` — принята, `200` — уже терминальный |
 
-## Смоук на живой VM — факты прогона
+Маршрутов ниже больше нет: `/v1/runs/{id}/export`, `/v1/runs/{id}/upload`,
+`/v1/runs/{id}/upload-session/{sid}`, `/v1/runs/{id}/snapshot`,
+`/v1/runs/{id}/snapshot-file/{sid}`, `/v1/artifacts/{id}`, `/v1/release`,
+`/v1/capabilities/invoke`. Они либо писали на диск, либо отдавали байты.
 
-### 1. Юнит и порт
+---
+
+## 4. Жизненный цикл рана
 
 ```
-$ systemctl is-enabled agent-runner-api   → enabled
-$ systemctl is-active  agent-runner-api   → active
-$ ps -o user,pid,args -p <MainPID>        → sandbox … /usr/local/bin/node /opt/sb/ai-agent-runner/dist/api/main.js
-$ ss -lntp | grep 8787                    → LISTEN 0.0.0.0:8787  users:(("node",pid=…))
-$ ufw status | grep 8787                  → 8787/tcp ALLOW Anywhere # agent-runner-api  (+ v6)
+POST /v1/runs  →  202 receipt           память: AdmissionRecord + события claimed/inputs_materialized
+                →  POST {worker}/v1/launch   (воркер сам клонирует репозиторий и запускает агента)
+                →  LaunchResult         маппинг в RunResult + RunnerEvent[]
+                →  память: state terminal, logUrl, artifacts[], repo
 ```
 
-Стартовая строка журнала после финального рестарта (одним JSON, дословно):
+События появляются двумя волнами: `claimed` и `inputs_materialized` пишутся сразу при приёме,
+остальные — когда воркер ответил. Поэтому журнал не пуст, пока воркер думает, и клиент
+отличает «принято» от «потеряно».
 
-```json
-{"ts":"2026-10-01T07:31:10.614Z","event":"api_listening","host":"0.0.0.0","port":8787,"dataDir":"/var/lib/agent-runner","keyRegistry":"/etc/agent-runner/key-registry.json","keys":1,"engines":["fake","opencode"],"fakeScenario":"success","health":"/healthz","recovery":{"scanned":4,"resumedQueued":0,"orphaned":0,"lost":0,"terminal":4,"healed":0},"startedAt":"2026-10-01T07:31:10.614Z"}
+**Отмена.** Контракт воркера синхронный: `launch` — это весь ран. Если отмена приходит раньше,
+чем воркер зарегистрировал ран, его `cancel` отвечает `unknown_run`; API повторяет запрос,
+пока ран в полёте (`CANCEL_UNKNOWN_RUN_RETRIES` × `CANCEL_UNKNOWN_RUN_BACKOFF_MS`). Если ран
+так и не появился — отказ (`409`), а не «остановлено».
+
+**Отказ воркера.** Транспортный обрыв, HTTP-ошибка или тело вне контракта дают терминальный
+`failed` с `exitReason: worker_crash` и кодом причины (`WORKER_UNREACHABLE`, `WORKER_HTTP_ERROR`,
+`WORKER_PROTOCOL_INVALID`, `WORKER_LAUNCH_TIMEOUT`). Пре-флайт-отказ клиента (`input.refs`,
+нет промпта) сохраняет свой код и `retryable: false`. Ран никогда не остаётся в `running`
+навсегда.
+
+## 4.1 Результат рана — ветка
+
+Каждый ран получает **свою ветку** `agent-run/<runId>` в репозитории юзера: имя задаёт API,
+воркер клонирует репозиторий, создаёт ветку, коммитит в неё объявленные `outputs` и пушит.
+`GET /v1/runs/{id}/artifacts` отдаёт три уровня адреса:
+
+| Поле | Пример | Что это |
+|---|---|---|
+| `artifacts[].url` | `https://github.com/owner/name/blob/abc1234/report.md` | конкретный файл на коммите |
+| `branchUrl` | `https://github.com/owner/name/tree/agent-run/run_…` | весь результат рана |
+| `mergeUrl` | `https://github.com/owner/name/compare/main...agent-run/run_…` | куда его смержить |
+
+Наше API **не мержит** — у него нет кредов на push и merge чужой работы без спроса. Решение
+о слиянии принимает человек или control plane, получив `mergeUrl`. Подробности — ТЗ воркера §8.1.
+
+---
+
+## 5. Декларация возможностей
+
+`GET /v1/capabilities` отчитывается о том, что есть на самом деле:
+
+- `engines: ["dynamic-ip-azure-agent-run"]` — единственный движок, и он внешний;
+- `isolation.mode: "none"`, `launcher: null` — на хосте API нечего изолировать, агента
+  запускает воркер на своей машине и объявляет границу в ответе;
+- `artifacts.export.enabled: false`, `download: false`, `shareLink: false`,
+  `upload.enabled: false`, `snapshot.enabled: false` — байт в API нет;
+- `promotion.releaseEndpoint: "absent"` — контура промоушена в stateless-сервисе нет;
+- `events: {cursor, replay, sse, lastEventId}` — работают, журнал в памяти.
+
+---
+
+## 6. Безопасность
+
+- **Ключи.** В реестре только sha256; сверка `timingSafeEqual`. Сырой ключ лежит в
+  `/etc/agent-runner/api-key` (`0600`) и печатается один раз при первом деплое.
+- **Журнал.** Заголовок `Authorization` не логируется; `redactSecrets` вырезает
+  `ghp_…`/`github_pat_…`/`token=…` из сообщений об ошибках и из stdout/stderr рана,
+  попавшего в события.
+- **Токен репозитория.** В `LaunchRequest` уходит только `repository.fullName`; клонирует
+  воркер, поэтому клиентский токен не пересекает границу процесса.
+- **Юнит.** `NoNewPrivileges`, `PrivateTmp`, `ProtectSystem=full`. Capabilities не выдаются:
+  переключать Unix-идентичность больше нечего, писать некуда.
+- **Firewall.** `deploy-api-service.sh` открывает порт только после успешной auth-пробы
+  (анонимный `POST /v1/runs` → 401, с ключом `GET /v1/runs/<unknown>/status` → 404).
+
+---
+
+## 7. Деплой
+
+```bash
+sudo scripts/deploy-api-service.sh --worker-url https://worker.example --worker-token "$TOKEN"
+# или с переменными окружения:
+sudo EXTERNAL_WORKER_URL=https://worker.example EXTERNAL_WORKER_TOKEN="$TOKEN" scripts/deploy-api-service.sh
 ```
 
-### 2. Health
+Скрипт: `npm ci` → `npm run build` → `/etc/agent-runner` → API-ключ `0600` → env-файл с
+адресом и токеном воркера → юнит → `systemctl enable --restart` → `GET /healthz` →
+auth-проба → ufw. Каталога данных не создаётся.
 
-```
-$ curl -s http://127.0.0.1:8787/healthz            # health-check первого деплоя, ранов ещё нет
-{"status":"ok","ready":true,"droppedLogCount":0,"activeRuns":0,"runs":0}
-$ curl -s -o /dev/null -w '%{http_code}' http://169.58.15.230:8787/healthz   # с машины оператора, через ufw
-200
-```
+---
 
-### 3. Auth-пробы (до и после открытия порта)
+## 8. Смоук на живой VM
 
-```
-POST /v1/runs анонимно                        → 401
-GET  /v1/runs/{id}/status анонимно            → 401
-GET  /v1/runs/{id}/status с неверным ключом   → 401
-GET  /v1/runs/run_deploy_probe/status с ключом → 404 (аутентифицирован, ран не найден — эта проверка стоит до ufw)
-GET  /v1/artifacts/{id}/meta анонимно (снаружи)→ 401
-```
+```bash
+export RUNNER_API_URL=http://127.0.0.1:8787 RUNNER_API_KEY_FILE=/etc/agent-runner/api-key
 
-### 4. Полный цикл рана через CLI
-
-```
-$ node scripts/runner-cli.mjs submit --prompt "sandbox smoke run" --idempotency-key smoke-vm-1
-{"requestId":"req_bb7d712a-…","userTaskId":"task_24b97ec4-…","runId":"run_0fdd061d-14c3-42ea-b182-9393ff3564fa","deduplicated":false}
-
-$ node scripts/runner-cli.mjs events run_0fdd061d… --limit 20 | jq
-{"count":8,"hasMore":false,"cursor":8,"state":"succeeded",
- "types":["claimed","materialized","started","log","log","exit","finalizing","succeeded"]}
-
-$ node scripts/runner-cli.mjs result run_0fdd061d…
-{"outcome":"succeeded","exitReason":"completed","exitCode":0,"persistence":"persisted",
- "logPath":"runs/run_0fdd061d-14c3-42ea-b182-9393ff3564fa/events.jsonl"}
+curl -s $RUNNER_API_URL/healthz | jq .                # status, worker, engine
+node scripts/runner-cli.mjs submit --prompt "напиши отчёт в report.md"   # 202 + receipt
+node scripts/runner-cli.mjs follow <runId>            # SSE до терминального события
+node scripts/runner-cli.mjs result <runId> | jq .     # outcome, outputRefs (ссылки на GitHub), logPath (GCS)
+curl -s -H "Authorization: Bearer $KEY" $RUNNER_API_URL/v1/runs/<runId>/artifacts | jq .
 ```
 
-Повтор того же `--idempotency-key` → `{"runId":"…","deduplicated":true}` — второй ран не создаётся.
+Приёмка приёма воркера на dev-стенде описана в `test/e2e-loop.test.ts`: поднимается мок
+воркера, и проверяется полный путь submit → launch → result → артефакты → logUrl.
 
-### 5. Перезапуск = данные живут
+---
 
-```
-$ systemctl restart agent-runner-api
-journalctl -u agent-runner-api -o cat:
-{"ts":"2026-10-01T07:28:30.160Z","event":"recovered","scanned":1,"resumedQueued":0,"orphaned":0,"lost":0,"finalizingResumed":0,"terminal":1,"healed":0}
-$ node scripts/runner-cli.mjs status  run_0fdd061d… → {"state":"succeeded","sequence":8}
-$ node scripts/runner-cli.mjs result  run_0fdd061d… → {"outcome":"succeeded",…}
-$ node scripts/runner-cli.mjs submit … --idempotency-key smoke-vm-2   → run_47656b48-… → succeeded
-```
+## 9. Ограничения (честно)
 
-То есть admissions/result/events переживают рестарт за счёт `/var/lib/agent-runner`.
-
-### 6. Артефакт: local-fs storage → ссылка → скачивание
-
-Fake-движок положил `ran.txt` в workspace рана; артефакт положен в store той же storage-кодой,
-которой пользуется сервис (ingest-эндпоинта в P04–P06 нет — это slice D2, поэтому put выполняется
-операторским кодом из `dist/`). Команды ниже сокращены (`…`), вывод и суммы — дословно:
-
-```
-$ sha256sum /var/lib/agent-runner/workspaces/run_0fdd061d…/ran.txt
-2689367b205c16ce32ed4200942b8b8b1e262dfc70d9bc9fbc77c49699a4f1df   (mode 0600)
-
-$ node --input-type=module -e "…ArtifactStore.put({runId, userTaskId, profileId:'profile-sandbox', name:'ran.txt', mime:'text/plain', bytes})"
-{"artifactId":"art-535ece258f5024655f7b4bd5","runId":"run_0fdd061d-…","size":2,
- "sha256":"2689367b…","storageKey":"runs/run_0fdd061d-…/artifacts/art-535ece258f5024655f7b4bd5"}
-
-$ curl -H "Authorization: Bearer $KEY" …/v1/artifacts/art-535ece258f5024655f7b4bd5/meta   → 200 manifest
-$ curl -H "Authorization: Bearer $KEY" …/v1/artifacts/art-535ece258f5024655f7b4bd5       → 200
-  x-artifact-sha256: 2689367b…, content-disposition: attachment; filename="ran.txt"
-  sha256 скачанного файла == sha256 workspace, cmp — byte-for-byte OK
-
-$ node --input-type=module -e "…ShareTokenIssuer({secret: ARTIFACT_SHARE_SECRET}).issue(id) → artifactSharePath(ARTIFACT_BASE_URL,…)"
-http://169.58.15.230:8787/v1/artifacts/art-535ece258f5024655f7b4bd5?t=<token>
-$ curl "$LINK"            → 200, x-artifact-sha256: 2689367b…, byte-for-byte OK (без ключа, только токен)
-
-пробники: аноним meta → 401 · аноним download → 401 · неверный ключ → 401 · мусорный share-токен → 401
-```
-
-Дерево данных после смоука:
-
-```
-/var/lib/agent-runner/                 700 sandbox
-├── api/admissions.json                600 sandbox
-├── blobs/runs/<runId>/artifacts/<artId>          700 dirs / 600 file
-├── runs/<runId>/                                700 sandbox
-│   ├── state.json, result.json, events.jsonl    600 sandbox (пишет сервис, UMask=0077)
-│   └── artifacts/<artId>.json                   600 sandbox
-└── workspaces/<runId>/                          700 sandbox
-```
-
-Put артефакта в смоуке делался out-of-band-процессом (umask `022`) — права на файлы/каталоги blobs
-после прогона выровнены под политику `0600/0700`. При записи из сервиса `UMask=0077` даёт `0600` сам;
-вне `/var/lib/agent-runner` (`0700`) эти файлы всё равно недоступны третьим лицам.
-
-### 7. Живой `follow` (SSE) + `cancel`
-
-С `AGENT_API_FAKE_SCENARIO=timeout` (после прогона строка удалена и сервис перезапущен —
-в логе снова `"fakeScenario":"success"`):
-
-```
-$ node scripts/runner-cli.mjs follow run_b2a63098-2e14-4e6d-a6d0-cf5c3c5bff3f > /tmp/f.ndjson &
-$ node scripts/runner-cli.mjs cancel run_b2a63098… --reason "live follow demo"
-{"runId":"run_b2a63098…","status":"stopped","state":"cancelled"}
-
-$ wc -l < /tmp/f.ndjson   → 8
-snapshot state=running seq=4 → claimed → materialized → started → log → exit → finalizing → cancelled
-$ node scripts/runner-cli.mjs result run_b2a63098…
-{"outcome":"cancelled","exitReason":"cancelled"}
-```
-
-`follow` переподключается с `last-event-id` при обрыве и завершается на терминальном событии/снапшоте;
-на уже завершённом ране печатает один снапшот и выходит с кодом 0.
-
-## Ограничения (честно)
-
-- **TLS нет** — трафик HTTP, порт открыт миру; на песочнице это допустимо, на проде нужен прокси.
-- **Ingest артефактов вне API**: `POST /v1/artifacts` нет (slice D2), поэтому put в смоуке выполняется
-  операторским кодом; выдача share-ссылки — тоже на стороне оператора (`ShareTokenIssuer` + `ARTIFACT_BASE_URL`),
-  эндпоинта выдачи ссылки в API нет.
-- Смоук идёт на `fake`-движке; `opencode` в сервисе зарегистрирован и бинарь на VM есть
-  (`/usr/local/bin/opencode`), но opencode-ран в этом прогоне не запускался.
-- Смоук закрывает transport (runner#7): admission → события → результат → артефакт → ссылка/скачивание.
+- **Состояние в памяти.** Рестарт процесса = потеря ранов. Клиент обязан повторять submit с
+  новым `Idempotency-Key`. Это задокументированный контракт, а не авария, но он означает, что
+  retry с тем же ключом после рестарта создаст новый ран.
+- **Лимиты памяти.** `maxRuns` (500), `maxEventsPerRun` (2000), TTL терминальных ранов (1 час);
+  при переполнении самые старые терминальные раны выбрасываются. События сверх лимита
+  учитываются в `droppedEvents`, а не молча теряются.
+- **Живой прогон длиннее `AGENT_API`-процесса.** Пока воркер думает, запрос `launch` висит;
+  это ограничение платформы, а не API.
+- **TLS нет.** На песочнице допустимо, на проде нужен прокси или Cloudflare Worker.
+- **Open question ТЗ §13.1** (CF Worker или тонкий VM) не решена: до решения API разворачивается
+  как stateless-процесс на VM, и `infra/agent-runner-api.service` — временная обвязка.
+- **`RUNNER_DEFAULT_REPO`** обязателен для клиентов без `repository`, иначе воркер не сможет
+  клонировать репозиторий.

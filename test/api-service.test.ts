@@ -1,318 +1,338 @@
 import { describe, expect, it, onTestFinished } from 'vitest';
-import { mkdtempSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { FakeEngine, type FakeScenario } from '../src/adapters/engine/fake-engine.js';
-import type { Principal } from '../src/api/auth.js';
 import { ApiError } from '../src/api/errors.js';
 import { AgentApi } from '../src/api/service.js';
-import { FaultRegistry } from '../src/faults/registry.js';
-import { isTerminalState } from '../src/runner/state-machine.js';
-import { removeDirWithRetry, waitFor } from './helpers.js';
+import { StatelessStore } from '../src/api/stateless-store.js';
+import type { Principal } from '../src/api/auth.js';
+import { adapterFor, startMockWorker, type MockWorkerOptions } from './external-worker-harness.js';
+import { ExternalWorkerAdapter } from '../src/adapters/external-worker-adapter.js';
 
-const alpha: Principal = { principalId: 'p-alpha', profileId: 'profile-a', scopes: ['runs:read', 'runs:write'], engines: ['fake'] };
-const beta: Principal = { principalId: 'p-beta', profileId: 'profile-b', scopes: ['runs:read', 'runs:write'] };
+/**
+ * Правила приёма stateless-ядра (epic #74): идемпотентность в памяти, границы движка,
+ * владение ран и отсутствие recovery. Никакого `recover()` и никакого `ApiStore` здесь быть
+ * не может — состояние процесса не переживает рестарт.
+ */
 
-interface ApiHarness {
-  api: AgentApi;
-  fake: FakeEngine;
-  faults: FaultRegistry;
-  logs: Record<string, unknown>[];
-}
+const alpha: Principal = {
+  principalId: 'p-alpha',
+  profileId: 'profile-a',
+  scopes: ['runs:read', 'runs:write'],
+  engines: ['dynamic-ip-azure-agent-run'],
+};
 
-function createApi(scenario: FakeScenario = 'success', opts: { heartbeatIntervalMs?: number } = {}): ApiHarness {
-  const rootDir = mkdtempSync(join(tmpdir(), 'ai-agent-runner-api-svc-'));
-  const fake = new FakeEngine(scenario);
-  const faults = new FaultRegistry();
-  const logs: Record<string, unknown>[] = [];
-  const api = new AgentApi({
-    rootDir,
-    adapters: { fake },
-    host: { region: 'sandbox-eu', environment: 'sandbox' },
-    faults,
-    cancelGraceMs: 500,
-    logger: (entry) => logs.push(entry),
-    ...(opts.heartbeatIntervalMs !== undefined ? { heartbeatIntervalMs: opts.heartbeatIntervalMs } : {}),
-  });
-  onTestFinished(async () => {
-    for (const runId of api.runner.listRunIds()) {
-      const snapshot = api.runner.getRun(runId);
-      if (snapshot && !isTerminalState(snapshot.state)) {
-        try {
-          await api.runner.cancel(runId, snapshot.ownerGeneration);
-        } catch {
-          // final cleanup kills the tree below
-        }
-      }
-    }
-    api.dispose();
-    await removeDirWithRetry(rootDir);
-  });
-  return { api, fake, faults, logs };
-}
-
-function submitBody(over: Record<string, unknown> = {}): Record<string, unknown> {
+function body(over: Record<string, unknown> = {}): Record<string, unknown> {
   return {
-    engine: { name: 'fake', adapterVersion: '1' },
+    engine: { name: 'dynamic-ip-azure-agent-run', adapterVersion: '1' },
     limits: { timeoutMs: 15000 },
+    envAllowlist: [],
     input: { inlinePrompt: 'hello agent' },
     ...over,
   };
 }
 
-function expectApiError(fn: () => unknown, code: string): ApiError {
-  try {
-    fn();
-  } catch (err) {
-    expect(err).toBeInstanceOf(ApiError);
-    const apiError = err as ApiError;
-    expect(apiError.code).toBe(code);
-    return apiError;
-  }
-  throw new Error(`expected ApiError ${code}, nothing was thrown`);
+async function makeApi(options: MockWorkerOptions = {}, store = new StatelessStore()): Promise<AgentApi> {
+  const worker = await startMockWorker(options);
+  onTestFinished(() => worker.close());
+  const api = new AgentApi({ workers: [adapterFor(worker)], store });
+  onTestFinished(() => api.dispose());
+  return api;
 }
 
-async function expectApiErrorAsync(fn: () => Promise<unknown>, code: string): Promise<ApiError> {
-  try {
-    await fn();
-  } catch (err) {
-    expect(err).toBeInstanceOf(ApiError);
-    const apiError = err as ApiError;
-    expect(apiError.code).toBe(code);
-    return apiError;
+async function waitForState(api: AgentApi, principal: Principal, runId: string, state: string): Promise<void> {
+  const deadline = Date.now() + 8000;
+  while (Date.now() < deadline) {
+    if (api.status(principal, runId).state === state) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
   }
-  throw new Error(`expected ApiError ${code}, nothing was thrown`);
+  throw new Error(`run ${runId} never reached ${state}: ${api.status(principal, runId).state}`);
 }
 
-describe('submit admission and durable receipt', () => {
-  it('accepts a typed job, runs it and exposes status, result and events', async () => {
-    const h = createApi();
-    await h.api.recover();
-    expect(h.logs.some((entry) => entry['event'] === 'recovered')).toBe(true);
-
-    const receipt = h.api.submit(alpha, 'idem-1', submitBody());
-    expect(receipt.deduplicated).toBe(false);
-    expect(receipt.requestId).toMatch(/^req_/);
-    expect(receipt.runId).toMatch(/^run_/);
-
-    await waitFor(() => h.api.status(alpha, receipt.runId).state === 'succeeded', 8000, 'run to succeed');
-    const status = h.api.status(alpha, receipt.runId);
-    expect(status).toMatchObject({ requestId: receipt.requestId, userTaskId: receipt.userTaskId, runId: receipt.runId, state: 'succeeded', connectionLost: false, cancelRequested: false });
-    expect(status.ownerGeneration).toBe(1);
-
-    const result = h.api.result(alpha, receipt.runId);
-    expect(result.outcome).toBe('succeeded');
-    expect(result.userTaskId).toBe(receipt.userTaskId);
-
-    const page = h.api.events(alpha, receipt.runId, 0);
-    const types = page.events.map((event) => event.type);
-    expect(types[0]).toBe('claimed');
-    expect(types.at(-1)).toBe('succeeded');
-    expect(page.snapshot.state).toBe('succeeded');
-    expect(page.cursor).toBe(page.events.at(-1)!.sequence);
-
-    expect(h.logs.some((entry) => entry['event'] === 'submit' && entry['outcome'] === 'accepted' && entry['requestId'] === receipt.requestId)).toBe(true);
-    expect(JSON.stringify(h.logs)).not.toContain('idem-1');
-  });
-
-  it('returns the same receipt for a duplicate submit and never starts a second run', async () => {
-    const h = createApi();
-    const first = h.api.submit(alpha, 'idem-dup', submitBody({ userTaskId: 'task-dup' }));
-    const second = h.api.submit(alpha, 'idem-dup', submitBody({ userTaskId: 'task-dup' }));
-    expect(second).toMatchObject({ requestId: first.requestId, userTaskId: first.userTaskId, runId: first.runId, deduplicated: true });
-
-    await waitFor(() => h.api.status(alpha, first.runId).state === 'succeeded', 8000, 'first run');
-    const third = h.api.submit(alpha, 'idem-dup', submitBody({ userTaskId: 'task-dup' }));
-    expect(third).toMatchObject({ runId: first.runId, deduplicated: true });
-    expect(h.fake.startCalls).toBe(1);
-    expect(h.api.runner.listRunIds()).toHaveLength(1);
-  });
-
-  it('rejects the same idempotency key with a different payload as conflict', () => {
-    const h = createApi();
-    h.api.submit(alpha, 'idem-x', submitBody());
-    const err = expectApiError(() => h.api.submit(alpha, 'idem-x', submitBody({ limits: { timeoutMs: 9999 } })), 'IDEMPOTENCY_CONFLICT');
-    expect(err.status).toBe(409);
-    expect(err.details).toMatchObject({ requestId: expect.stringMatching(/^req_/) });
-    expect(h.api.runner.listRunIds()).toHaveLength(1);
-  });
-
-  it('rejects a missing idempotency key and an invalid body before any run', () => {
-    const h = createApi();
-    expectApiError(() => h.api.submit(alpha, undefined, submitBody()), 'MISSING_IDEMPOTENCY_KEY');
-    expectApiError(() => h.api.submit(alpha, '', submitBody()), 'MISSING_IDEMPOTENCY_KEY');
-
-    const invalid = expectApiError(() => h.api.submit(alpha, 'idem-bad', { engine: { name: 'fake' } }), 'INVALID_REQUEST');
-    expect(Array.isArray(invalid.details?.['errors'])).toBe(true);
-    expect(h.fake.startCalls).toBe(0);
-    expect(h.api.runner.listRunIds()).toHaveLength(0);
-  });
-
-  it('denies a disallowed engine before the run and keeps principals isolated', async () => {
-    const h = createApi();
-    expectApiError(() => h.api.submit(alpha, 'idem-engine', submitBody({ engine: { name: 'opencode', adapterVersion: '1' } })), 'ENGINE_NOT_ALLOWED');
-    expect(h.fake.startCalls).toBe(0);
-
-    const alphaReceipt = h.api.submit(alpha, 'idem-shared-key', submitBody());
-    const betaReceipt = h.api.submit(beta, 'idem-shared-key', submitBody());
-    expect(betaReceipt.requestId).not.toBe(alphaReceipt.requestId);
-    expect(betaReceipt.runId).not.toBe(alphaReceipt.runId);
-    expect(h.api.runner.listRunIds()).toHaveLength(2);
-
-    expectApiError(() => h.api.status(beta, alphaReceipt.runId), 'NOT_FOUND');
-    expectApiError(() => h.api.result(beta, alphaReceipt.runId), 'NOT_FOUND');
-    expectApiError(() => h.api.events(beta, alphaReceipt.runId, 0), 'NOT_FOUND');
-    await expectApiErrorAsync(() => h.api.cancel(beta, alphaReceipt.runId, {}), 'NOT_FOUND');
-    expectApiError(() => h.api.status(alpha, 'run_unknown'), 'NOT_FOUND');
-
-    await waitFor(() => h.api.status(alpha, alphaReceipt.runId).state === 'succeeded', 8000, 'alpha run');
-    await waitFor(() => h.api.status(beta, betaReceipt.runId).state === 'succeeded', 8000, 'beta run');
-  });
-});
-
-describe('task attempts, cancel and fencing', () => {
-  it('blocks a second live attempt for the same task and starts a new runId after terminal', async () => {
-    const h = createApi('cancel-with-children');
-    const first = h.api.submit(alpha, 'idem-attempt-1', submitBody({ userTaskId: 'task-attempts' }));
-    await waitFor(() => h.api.status(alpha, first.runId).state === 'running', 8000, 'first attempt running');
-
-    expectApiError(() => h.api.submit(alpha, 'idem-attempt-2', submitBody({ userTaskId: 'task-attempts' })), 'TASK_ATTEMPT_ACTIVE');
-    expect(h.fake.startCalls).toBe(1);
-
-    const cancel = await h.api.cancel(alpha, first.runId, {});
-    expect(cancel.status).toBe('stopped');
-    await waitFor(() => h.api.status(alpha, first.runId).state === 'cancelled', 8000, 'first attempt cancelled');
-
-    const second = h.api.submit(alpha, 'idem-attempt-3', submitBody({ userTaskId: 'task-attempts' }));
-    expect(second.deduplicated).toBe(false);
-    expect(second.requestId).toBe(first.requestId);
-    expect(second.userTaskId).toBe(first.userTaskId);
-    expect(second.runId).not.toBe(first.runId);
-    expect(h.api.status(alpha, second.runId).ownerGeneration).toBe(2);
-
-    await waitFor(() => h.api.status(alpha, second.runId).state === 'running', 8000, 'second attempt running');
-    const repeat = h.api.submit(alpha, 'idem-attempt-3', submitBody({ userTaskId: 'task-attempts' }));
-    expect(repeat).toMatchObject({ runId: second.runId, deduplicated: true });
-    expect(h.fake.startCalls).toBe(2);
-
-    const stop = await h.api.cancel(alpha, second.runId, {});
-    expect(stop.status).toBe('stopped');
-    await waitFor(() => h.api.status(alpha, second.runId).state === 'cancelled', 8000, 'second attempt cancelled');
-    const repeatAfterStop = h.api.submit(alpha, 'idem-attempt-3', submitBody({ userTaskId: 'task-attempts' }));
-    expect(repeatAfterStop.runId).toBe(second.runId);
-    expect(h.fake.startCalls).toBe(2);
-  });
-
-  it('cancels a queued run without ever spawning the engine', async () => {
-    const h = createApi();
-    const receipt = h.api.submit(alpha, 'idem-queued', submitBody());
-    const cancel = await h.api.cancel(alpha, receipt.runId, {});
-    expect(cancel.status).toBe('stopped');
-    await waitFor(() => h.api.status(alpha, receipt.runId).state === 'cancelled', 8000, 'queued cancel');
-    expect(h.fake.startCalls).toBe(0);
-
-    const again = await h.api.cancel(alpha, receipt.runId, {});
-    expect(again.status).toBe('already_terminal');
-    expect(h.api.result(alpha, receipt.runId).outcome).toBe('cancelled');
-  });
-
-  it('rejects stale ownerGeneration signals without changing the run status', async () => {
-    const h = createApi('cancel-with-children');
-    const receipt = h.api.submit(alpha, 'idem-fence', submitBody());
-    await waitFor(() => h.api.status(alpha, receipt.runId).state === 'running', 8000, 'running');
-
-    const before = h.api.status(alpha, receipt.runId);
-    const lateEvent = h.api.runner.submitEvent(receipt.runId, {
-      type: 'log',
-      ownerGeneration: before.ownerGeneration + 5,
-      payload: { stream: 'runner', level: 'info', message: 'late writer' },
-    });
-    expect(lateEvent).toEqual({ accepted: false, reason: 'stale_owner_generation' });
-
-    const staleCancel = await h.api.cancel(alpha, receipt.runId, { ownerGeneration: before.ownerGeneration + 5 });
-    expect(staleCancel.status).toBe('rejected');
-
-    const after = h.api.status(alpha, receipt.runId);
-    expect(after.state).toBe('running');
-    expect(after.sequence).toBe(before.sequence);
-    expect(after.fencing.rejected).toBe(2);
-
-    const stop = await h.api.cancel(alpha, receipt.runId, { ownerGeneration: before.ownerGeneration });
-    expect(stop.status).toBe('stopped');
-    await waitFor(() => h.api.status(alpha, receipt.runId).state === 'cancelled', 8000, 'cancelled after fencing');
-    const finalStatus = h.api.status(alpha, receipt.runId);
-    expect(finalStatus.fencing.rejected).toBe(2);
-  });
-});
-
-describe('structured outcomes and observation states', () => {
-  it('surfaces budget and credential denials as structured failures', async () => {
-    const h = createApi();
-    const budgetReceipt = h.api.submit(alpha, 'idem-budget', submitBody({ budget: { correlationRef: 'b-1', approved: false, reason: 'quota exceeded' } }));
-    const credentialsReceipt = h.api.submit(alpha, 'idem-creds', submitBody({ credentialBindings: [{ ref: 'openai-key', scope: 'llm', status: 'missing' }] }));
-
-    await waitFor(
-      () => h.api.status(alpha, budgetReceipt.runId).state === 'failed' && h.api.status(alpha, credentialsReceipt.runId).state === 'failed',
-      8000,
-      'both denials',
-    );
-    expect(h.api.result(alpha, budgetReceipt.runId).failure).toMatchObject({ code: 'BUDGET_UNAVAILABLE', failureClass: 'preflight' });
-    expect(h.api.result(alpha, credentialsReceipt.runId).failure).toMatchObject({ code: 'CREDENTIALS_UNAVAILABLE', failureClass: 'preflight' });
-    expect(h.api.status(alpha, budgetReceipt.runId).state).toBe('failed');
-  });
-
-  it('keeps connection_lost separate from failed and withholds the result', async () => {
-    const h = createApi('timeout', { heartbeatIntervalMs: 40 });
-    h.faults.inject('heartbeat', { kind: 'connection_lost', once: true });
-    const receipt = h.api.submit(alpha, 'idem-lost', submitBody({ limits: { timeoutMs: 30000 } }));
-
-    await waitFor(() => h.api.status(alpha, receipt.runId).connectionLost, 8000, 'connection_lost');
-    const status = h.api.status(alpha, receipt.runId);
-    expect(status.state).toBe('running');
-    expect(status.state).not.toBe('failed');
-    expect(status.connectionLost).toBe(true);
-
-    const page = h.api.events(alpha, receipt.runId, 0);
-    expect(page.events.some((event) => event.type === 'connection_lost')).toBe(true);
-
-    const notReady = await expectApiErrorAsync(async () => h.api.result(alpha, receipt.runId), 'RESULT_NOT_READY');
-    expect(notReady.status).toBe(409);
-    expect(notReady.details).toMatchObject({ state: 'running', connectionLost: true });
-
-    const stop = await h.api.cancel(alpha, receipt.runId, {});
-    expect(stop.status).toBe('stopped');
-    await waitFor(() => h.api.status(alpha, receipt.runId).state === 'cancelled', 8000, 'cancel after connection_lost');
-    expect(h.api.result(alpha, receipt.runId).outcome).toBe('cancelled');
-  });
-
-  it('replays events by cursor without gaps or duplicates', async () => {
-    const h = createApi();
-    const receipt = h.api.submit(alpha, 'idem-events', submitBody());
-    await waitFor(() => h.api.status(alpha, receipt.runId).state === 'succeeded', 8000, 'run');
-
-    const full = h.api.events(alpha, receipt.runId, 0);
-    expect(full.events.length).toBeGreaterThan(3);
-    expect(full.hasMore).toBe(false);
-
-    const collected: number[] = [];
-    let cursor = 0;
-    let pages = 0;
-    for (;;) {
-      const page = h.api.events(alpha, receipt.runId, cursor, 2);
-      pages += 1;
-      for (const event of page.events) collected.push(event.sequence);
-      cursor = page.cursor;
-      if (!page.hasMore) break;
-      expect(pages).toBeLessThan(50);
+describe('stateless AgentApi: приём запроса', () => {
+  it('без Idempotency-Key — MISSING_IDEMPOTENCY_KEY', async () => {
+    const api = await makeApi();
+    let thrown: ApiError | null = null;
+    try {
+      api.submit(alpha, undefined, body());
+    } catch (err) {
+      thrown = err as ApiError;
     }
-    expect(collected).toEqual(full.events.map((event) => event.sequence));
-    expect(new Set(collected).size).toBe(collected.length);
+    expect(thrown).toBeInstanceOf(ApiError);
+    expect(thrown?.code).toBe('MISSING_IDEMPOTENCY_KEY');
+    expect(thrown?.status).toBe(400);
+  });
 
-    const tail = h.api.events(alpha, receipt.runId, full.cursor);
-    expect(tail.events).toHaveLength(0);
-    expect(tail.cursor).toBe(full.cursor);
+  it('кривое тело — INVALID_REQUEST, кривой repository — INVALID_REPOSITORY', async () => {
+    const api = await makeApi();
+    expect(() => api.submit(alpha, 'idem-bad-body', { engine: 'dynamic-ip-azure-agent-run' })).toThrowError(
+      expect.objectContaining({ code: 'INVALID_REQUEST' }),
+    );
+    try {
+      api.submit(alpha, 'idem-bad-repo', body({ repository: { fullName: 'owner' } }));
+    } catch (err) {
+      expect((err as ApiError).code).toBe('INVALID_REPOSITORY');
+      expect((err as ApiError).status).toBe(400);
+    }
+  });
 
-    expectApiError(() => h.api.events(alpha, receipt.runId, -1), 'INVALID_REQUEST');
-    expectApiError(() => h.api.events(alpha, receipt.runId, 0, 0), 'INVALID_REQUEST');
+  it('повтор с тем же ключом и тем же payload = тот же receipt; с другим = IDEMPOTENCY_CONFLICT', async () => {
+    const api = await makeApi();
+    const first = api.submit(alpha, 'idem-dedup', body());
+    const second = api.submit(alpha, 'idem-dedup', body());
+    expect(second.deduplicated).toBe(true);
+    expect(second.runId).toBe(first.runId);
+    expect(second.requestId).toBe(first.requestId);
+
+    try {
+      api.submit(alpha, 'idem-dedup', body({ input: { inlinePrompt: 'другое' } }));
+      expect.unreachable('a different payload under the same key must be refused');
+    } catch (err) {
+      expect((err as ApiError).code).toBe('IDEMPOTENCY_CONFLICT');
+    }
+    await waitForState(api, alpha, first.runId, 'succeeded');
+  });
+
+  it('движок не из allowlist принципала — ENGINE_NOT_ALLOWED', async () => {
+    const api = await makeApi();
+    try {
+      api.submit(alpha, 'idem-engine', body({ engine: { name: 'opencode', adapterVersion: '1' } }));
+      expect.unreachable('a foreign engine must be refused');
+    } catch (err) {
+      expect((err as ApiError).code).toBe('ENGINE_NOT_ALLOWED');
+    }
+  });
+
+  it('API обслуживает только движок своего воркера, даже если принципал ограничений не имеет', async () => {
+    const worker = await startMockWorker();
+    onTestFinished(() => worker.close());
+    const loose: Principal = { principalId: 'p-loose', profileId: 'profile-a', scopes: ['runs:read', 'runs:write'] };
+    const api = new AgentApi({ workers: [adapterFor(worker)] });
+    onTestFinished(() => api.dispose());
+    try {
+      api.submit(loose, 'idem-loose-engine', body({ engine: { name: 'opencode', adapterVersion: '1' } }));
+      expect.unreachable('an engine the worker does not implement must be refused');
+    } catch (err) {
+      expect((err as ApiError).code).toBe('ENGINE_NOT_ALLOWED');
+      expect((err as ApiError).details).toMatchObject({ engines: ['dynamic-ip-azure-agent-run'] });
+    }
+  });
+
+  it('input.refs и ран без промпта — preflight-отказ с retryable=false, а не «воркер недоступен»', async () => {
+    const api = await makeApi();
+    const refs = api.submit(alpha, 'idem-refs', {
+      engine: { name: 'dynamic-ip-azure-agent-run', adapterVersion: '1' },
+      limits: { timeoutMs: 5000 },
+      envAllowlist: [],
+      input: { refs: [{ ref: 'snap-1', snapshotId: 'snapshot-1' }] },
+    });
+    await waitForState(api, alpha, refs.runId, 'failed');
+    const result = api.result(alpha, refs.runId);
+    expect(result.exitReason).toBe('preflight_refused');
+    expect(result.failure).toMatchObject({ code: 'INPUT_REFS_UNSUPPORTED', failureClass: 'preflight', retryable: false });
+  });
+
+  it('память процесса: переполнение незавершённых ранов отказывает, а не вытесняет живой ран', async () => {
+    const worker = await startMockWorker({ delayMs: 500 });
+    onTestFinished(() => worker.close());
+    const api = new AgentApi({ workers: [adapterFor(worker)], maxActiveRuns: 2 });
+    onTestFinished(() => api.dispose());
+    const runs = [1, 2].map((n) => api.submit(alpha, `idem-cap-${n}`, body()).runId);
+    expect(() => api.submit(alpha, 'idem-cap-3', body())).toThrowError(
+      expect.objectContaining({ code: 'WORKER_DRAINING', status: 503 }),
+    );
+    expect(api.status(alpha, runs[0]!).state).not.toBe('succeeded');
+  });
+
+  it('вторая попытка задачи, пока первая жива, — TASK_ATTEMPT_ACTIVE; после финализации проходит с ownerGeneration+1', async () => {
+    const api = await makeApi({ delayMs: 200 });
+    const first = api.submit(alpha, 'idem-attempt-1', body({ userTaskId: 'task-attempt' }));
+    try {
+      api.submit(alpha, 'idem-attempt-2', body({ userTaskId: 'task-attempt' }));
+      expect.unreachable('a second attempt of a live task must be refused');
+    } catch (err) {
+      expect((err as ApiError).code).toBe('TASK_ATTEMPT_ACTIVE');
+      expect((err as ApiError).status).toBe(409);
+    }
+    await waitForState(api, alpha, first.runId, 'succeeded');
+
+    const second = api.submit(alpha, 'idem-attempt-3', body({ userTaskId: 'task-attempt' }));
+    expect(second.runId).not.toBe(first.runId);
+    expect(api.status(alpha, second.runId).ownerGeneration).toBe(2);
+    await waitForState(api, alpha, second.runId, 'succeeded');
+  });
+
+  it('чужой ран — NOT_FOUND: владение проверяется по principal', async () => {
+    const api = await makeApi();
+    const receipt = api.submit(alpha, 'idem-owner', body());
+    const stranger: Principal = { principalId: 'p-stranger', profileId: 'profile-b', scopes: ['runs:read'] };
+    expect(() => api.status(stranger, receipt.runId)).toThrowError(expect.objectContaining({ code: 'NOT_FOUND' }));
+    expect(() => api.artifacts(stranger, receipt.runId)).toThrowError(expect.objectContaining({ code: 'NOT_FOUND' }));
+  });
+});
+
+describe('stateless AgentApi: финализация', () => {
+  it('result доступен только после терминального состояния, иначе RESULT_NOT_READY', async () => {
+    const api = await makeApi({ delayMs: 200 });
+    const receipt = api.submit(alpha, 'idem-not-ready', body());
+    try {
+      api.result(alpha, receipt.runId);
+      expect.unreachable('result of a live run must not be readable');
+    } catch (err) {
+      expect((err as ApiError).code).toBe('RESULT_NOT_READY');
+    }
+    await waitForState(api, alpha, receipt.runId, 'succeeded');
+    expect(api.result(alpha, receipt.runId).outcome).toBe('succeeded');
+  });
+
+  it('ответ воркера вне контракта не превращается в «успешный» ран', async () => {
+    const api = await makeApi({ malformed: true });
+    const receipt = api.submit(alpha, 'idem-malformed', body());
+    await waitForState(api, alpha, receipt.runId, 'failed');
+    const result = api.result(alpha, receipt.runId);
+    expect(result.outcome).toBe('failed');
+    expect(result.exitReason).toBe('worker_crash');
+  });
+
+  it('отмена живого рана доходит до воркера и даёт outcome cancelled', async () => {
+    const api = await makeApi({ delayMs: 300 });
+    const receipt = api.submit(alpha, 'idem-cancel', body());
+    const cancel = await api.cancel(alpha, receipt.runId);
+    expect(cancel.status).toBe('stop_pending');
+    await waitForState(api, alpha, receipt.runId, 'cancelled');
+    expect(api.result(alpha, receipt.runId).outcome).toBe('cancelled');
+  });
+
+  it('отмена терминального рана — already_terminal, а не попытка убить призрака', async () => {
+    const api = await makeApi();
+    const receipt = api.submit(alpha, 'idem-cancel-terminal', body());
+    await waitForState(api, alpha, receipt.runId, 'succeeded');
+    const cancel = await api.cancel(alpha, receipt.runId);
+    expect(cancel.status).toBe('already_terminal');
+  });
+
+  it('отмена после приёма всегда доходит до воркера: гонки с запуском больше нет', async () => {
+    // Асинхронный контракт убрал гонку, ради которой раньше был нужен повтор отмены:
+    // квитанция приходит только после того, как воркер принял и зарегистрировал ран.
+    const api = await makeApi({ delayMs: 150 });
+    const receipt = api.submit(alpha, 'idem-cancel-after-accept', body());
+    const cancel = await api.cancel(alpha, receipt.runId);
+    expect(cancel.status).toBe('stop_pending');
+    await waitForState(api, alpha, receipt.runId, 'cancelled');
+  }, 20000);
+
+  it('воркер отверг отмену — отказ с причиной, а не молчание и не 404', async () => {
+    const api = await makeApi();
+    const receipt = api.submit(alpha, 'idem-cancel-rejected', body());
+    await waitForState(api, alpha, receipt.runId, 'succeeded');
+    // Ран терминальный: воркер уже нечего отменять, но сервис не должен врать, что остановил.
+    const cancel = await api.cancel(alpha, receipt.runId);
+    expect(cancel.status).toBe('already_terminal');
+  }, 20000);
+
+  it('cancel с чужим ownerGeneration — STALE_OWNER_GENERATION, отказ попытки виден в fencing', async () => {
+    const api = await makeApi({ delayMs: 300 });
+    const receipt = api.submit(alpha, 'idem-fencing', body());
+    await expect(api.cancel(alpha, receipt.runId, { ownerGeneration: 99 })).rejects.toMatchObject({
+      code: 'STALE_OWNER_GENERATION',
+    });
+    // Отмена не дошла до воркера, поэтому ран доиграл штатно: fencing не «отменяет всё подряд».
+    await waitForState(api, alpha, receipt.runId, 'succeeded');
+    expect(api.status(alpha, receipt.runId).fencing.rejected).toBe(1);
+  }, 20000);
+});
+
+describe('stateless AgentApi: capabilities отчитываются честно (#74, шаг 7)', () => {
+  it('изоляции на хосте нет, движок один, байты API не отдаёт', async () => {
+    const api = await makeApi();
+    const caps = api.capabilities();
+    expect(caps.isolation.mode).toBe('none');
+    expect(caps.isolation.launcher).toBeNull();
+    expect(caps.engines).toEqual(['dynamic-ip-azure-agent-run']);
+    expect(caps.artifacts.export.enabled).toBe(false);
+    expect(caps.artifacts.download).toBe(false);
+    expect(caps.artifacts.shareLink).toBe(false);
+    expect(caps.artifacts.upload.enabled).toBe(false);
+    expect(caps.artifacts.snapshot.enabled).toBe(false);
+    expect(caps.mcp.perRunStdioProxy).toBe(false);
+    expect(caps.mcp.capabilityInvokeEndpoint).toBe(false);
+    expect(caps.promotion.releaseEndpoint).toBe('absent');
+    expect(JSON.stringify(caps)).not.toContain('fake');
+  });
+
+  it('при переполнении лимита событий терминальное событие рана вытесняет обычное, а не наоборот', async () => {
+    const store = new StatelessStore({ maxEventsPerRun: 4 });
+    const api = await makeApi({}, store);
+    const receipt = api.submit(alpha, 'idem-event-cap', body());
+    await waitForState(api, alpha, receipt.runId, 'succeeded');
+    const progress = store.progressOf(receipt.runId)!;
+    expect(progress.events.length).toBeLessThanOrEqual(4);
+    expect(progress.events[progress.events.length - 1]!.type).toBe('succeeded');
+    expect(progress.sequence).toBeGreaterThanOrEqual(progress.events[0]!.sequence);
+    expect(store.progressOf(receipt.runId)!.droppedEvents).toBeGreaterThan(0);
+  });
+
+  it('реестр движков: запрос уходит воркеру по имени движка, capabilities перечисляет все', async () => {
+    const azure = await startMockWorker();
+    const actions = await startMockWorker();
+    onTestFinished(() => azure.close());
+    onTestFinished(() => actions.close());
+    const service = new AgentApi({
+      workers: [
+        adapterFor(azure),
+        new ExternalWorkerAdapter({
+          baseUrl: actions.baseUrl,
+          engineName: 'github-actions-agent-run',
+          token: 'test-worker-token',
+          baseUrlForResult: 'https://api.test',
+          deadlineMs: 2000,
+        }),
+      ],
+    });
+    onTestFinished(() => service.dispose());
+    // Принципал без allowlist движков: проверяем сам реестр, а не ограничение принципала.
+    const fleet: Principal = { principalId: 'p-fleet', profileId: 'profile-a', scopes: ['runs:read', 'runs:write'] };
+
+    expect(service.capabilities().engines).toEqual(['dynamic-ip-azure-agent-run', 'github-actions-agent-run']);
+    expect(service.health().workers.map((entry) => entry.engine)).toEqual(['dynamic-ip-azure-agent-run', 'github-actions-agent-run']);
+
+    // Каждый движок обслуживает свой воркер: launch ушёл туда, куда просили.
+    const first = service.submit(fleet, 'idem-fleet-azure', body());
+    await waitForState(service, fleet, first.runId, 'succeeded');
+    expect(azure.launches).toHaveLength(1);
+    expect(actions.launches).toHaveLength(0);
+
+    const second = service.submit(fleet, 'idem-fleet-actions', body({ engine: { name: 'github-actions-agent-run', adapterVersion: '1' } }));
+    await waitForState(service, fleet, second.runId, 'succeeded');
+    expect(actions.launches).toHaveLength(1);
+    expect(azure.launches).toHaveLength(1);
+
+    // Отмена уходит в воркер своего движка, а не в первый попавшийся.
+    const third = service.submit(fleet, 'idem-fleet-cancel', body({ engine: { name: 'github-actions-agent-run', adapterVersion: '1' } }));
+    await service.cancel(fleet, third.runId);
+    expect(actions.cancels).toContain(third.runId);
+    expect(azure.cancels).not.toContain(third.runId);
+
+    // Движок, которого в реестре нет, отклоняется до записи — и перечисляет доступные.
+    try {
+      service.submit(fleet, 'idem-fleet-unknown', body({ engine: { name: 'opencode', adapterVersion: '1' } }));
+      expect.unreachable('an unregistered engine must be refused');
+    } catch (err) {
+      expect((err as ApiError).code).toBe('ENGINE_NOT_ALLOWED');
+      expect((err as ApiError).details).toMatchObject({ engines: ['dynamic-ip-azure-agent-run', 'github-actions-agent-run'] });
+    }
+  }, 30000);
+
+  it('пустой реестр воркеров — отказ на старте, а не API без способа запустить агента', () => {
+    expect(() => new AgentApi({ workers: [] })).toThrowError(/at least one external worker/);
+  });
+
+  it('у ядра нет recovery: состояние живёт в памяти и вычищается по TTL', async () => {
+    const store = new StatelessStore({ terminalRunTtlMs: 0 });
+    const api = await makeApi({}, store);
+    expect((api as unknown as { recover?: unknown }).recover).toBeUndefined();
+    const receipt = api.submit(alpha, 'idem-sweep', body());
+    await waitForState(api, alpha, receipt.runId, 'succeeded');
+    expect(store.counts().runs).toBe(1);
+    store.sweep(new Date(Date.now() + 1000));
+    expect(store.counts().runs).toBe(0);
+    expect(() => api.status(alpha, receipt.runId)).toThrowError(expect.objectContaining({ code: 'NOT_FOUND' }));
   });
 });

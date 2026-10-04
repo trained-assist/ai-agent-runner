@@ -1,4 +1,4 @@
-import { redactSecrets } from '../runner/util.js';
+import { redactSecrets } from '../redact.js';
 
 export type ApiErrorCode =
   | 'UNAUTHENTICATED'
@@ -15,6 +15,7 @@ export type ApiErrorCode =
   | 'METHOD_NOT_ALLOWED'
   | 'RESULT_NOT_READY'
   | 'STALE_OWNER_GENERATION'
+  | 'CANCEL_REJECTED'
   | 'PAYLOAD_TOO_LARGE'
   | 'INTERNAL'
   | 'UPLOAD_SESSION_INVALID'
@@ -59,6 +60,7 @@ const HTTP_STATUS: Record<ApiErrorCode, number> = {
   METHOD_NOT_ALLOWED: 405,
   RESULT_NOT_READY: 409,
   STALE_OWNER_GENERATION: 409,
+  CANCEL_REJECTED: 409,
   PAYLOAD_TOO_LARGE: 413,
   INTERNAL: 500,
   UPLOAD_SESSION_INVALID: 400,
