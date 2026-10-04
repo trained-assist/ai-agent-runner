@@ -172,6 +172,20 @@ node scripts/runner-cli.mjs follow <runId>         # SSE до терминаль
 
 Факты прогона на живой VM (юнит, порт, health, auth-пробы, смоук рана и артефакта, restart-персистентность): **[docs/API-SERVICE.md](docs/API-SERVICE.md)**.
 
+## Запуск в GitHub Actions — что можно, чего нельзя (эксперимент 01–04.10.2026)
+
+Замеры ограничений GitHub-hosted runner'а для задач проекта: тесты, Playwright, opencode
+headless и e2e-цикл гоняются в CI; reboot, входящие порты и привилегированная OS-проба —
+нет. Полная сводка с замерами времени и требованиями к запуску —
+[docs/GITHUB-ACTIONS-CAPABILITY.md](docs/GITHUB-ACTIONS-CAPABILITY.md).
+
+Ключевое: `ubuntu-latest` (4 CPU / 15 GiB), Node 20, секрет `LLM_LADDER_TOKEN`,
+`--sudo-policy report` (passwordless sudo в CI — норма). Запуск Runner в CI занимает
+**~8.7 s** от старта джобы до готового результата (npm ci 6.7 s + dist 1.9 s + сам ран
+42 ms). Потолок памяти ~15 GiB, аллокация до ~18 GB убивает джобу (exit 143). Для
+reboot-валидации и доказательства OS-границы — только песочная VM. План «джоба сама
+опрашивает очередь задач» — issue [#10](https://github.com/trained-assist/ai-agent-runner/issues/10).
+
 ## Repository context — репозиторий в контексте run (01.10.2026)
 
 RunSpec получил необязательную группу `repository`: ран клонирует репозиторий **до** спавна движка, и cwd движка = этот клон. Движок работает *в чужой репе* — это основа будущего pr-fixer.
