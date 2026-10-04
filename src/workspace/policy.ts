@@ -128,6 +128,7 @@ export const MIGRATION_BINARY_EXCLUDES: readonly ExportRule[] = [
   { pattern: '*.dmg', action: 'heavy', reason: 'образ диска — ref в object storage' },
   { pattern: '*.iso', action: 'heavy', reason: 'образ диска — ref в object storage' },
   { pattern: '*.pdf', action: 'heavy', reason: 'документ — ref в object storage' },
+  { pattern: '*.bundle', action: 'heavy', reason: 'git bundle с локальными коммитами — бинарный, ref в object storage' },
   { pattern: '*.sqlite', action: 'heavy', reason: 'база данных — ref в object storage' },
   { pattern: '*.db', action: 'heavy', reason: 'база данных — ref в object storage' },
 ];

@@ -73,9 +73,18 @@ if (!OWNER || !TOKEN_REF || !TOKEN) {
   process.exit(1);
 }
 
-const { WorkspaceService, WorkspaceJournal, createLocalGitPort, createGitHubRepositoryAdmin, parseCleanList, cleanListRulesOf, compileCleanListRules } = await import(
-  `file://${DIST}/index.js`
-);
+const {
+  WorkspaceService,
+  WorkspaceJournal,
+  createLocalGitPort,
+  createGitHubRepositoryAdmin,
+  parseCleanList,
+  cleanListRulesOf,
+  compileCleanListRules,
+  buildMigrationPolicy,
+  compilePolicy,
+  prepareProfileTree,
+} = await import(`file://${DIST}/index.js`);
 const { createLocalFsBlobStore } = await import(`file://${REPO_ROOT}/dist/storage/local-fs.js`);
 
 const stateDir = options.state ?? mkdtempSync(join(tmpdir(), 'workspace-rehearsal-state-'));
@@ -134,6 +143,16 @@ const service = new WorkspaceService({
   }),
 });
 
+// Политика нужна и для шага подготовки дерева (архивация рабочих копий) — компилируем ту же.
+const compiledPolicy = compilePolicy(
+  buildMigrationPolicy({
+    policyId: `rehearsal-clean-list-v${cleanListVersion ?? 'default'}`,
+    cleanListRules: policyRules,
+    compress: true,
+    maxTotalBytes: 512 * 1024 * 1024,
+  }),
+);
+
 // ── копии профилей ────────────────────────────────────────────────────────────
 
 const SOURCE_ROOT = process.env.REHEARSAL_SOURCE_ROOT ?? join(REPO_ROOT, '..', '..', 'users');
@@ -170,6 +189,18 @@ function inventory(root) {
 process.stdout.write(`репетиция миграции: owner=${OWNER} cleanList=v${cleanListVersion ?? 'default'} state=${stateDir}\n`);
 process.stdout.write(`токен: ${TOKEN.slice(0, 8)}…\n`);
 process.stdout.write(`профили: ${requested.join(', ')} (копии, исходные не трогаются)\n\n`);
+
+// M3: архивируем изменения git-рабочих копий в .profile-changes копии профиля. Чистые
+// клоны не архивируются; сами копии не изменяются, кроме этого каталога.
+for (const [name, copy] of copies) {
+  const prepared = prepareProfileTree(copy, { policy: compiledPolicy });
+  const dirty = prepared.workingCopies.filter((item) => item.archivePath);
+  process.stdout.write(`  ${name}: рабочих копий ${prepared.workingCopies.length}, архивировано ${prepared.archived} (${(prepared.bytes / 1024 / 1024).toFixed(1)} МБ)\n`);
+  for (const item of dirty.slice(0, 5)) {
+    process.stdout.write(`      ${item.path}: dirty=${item.state.modified} untracked=${item.state.untracked} unpushed=${item.state.unpushedCommits} branches=${item.state.branches.length}\n`);
+  }
+}
+process.stdout.write('\n');
 
 const inventoryReport = new Map();
 for (const [name, copy] of copies) {

@@ -129,6 +129,8 @@ export interface GitRepositoryPort {
   hasCommit(mirror: GitMirror, commit: string): Promise<boolean>;
   /** Является ли `ancestor` предком `commit` (публикация уже применена иначе). */
   isAncestor(mirror: GitMirror, ancestor: string, commit: string): Promise<boolean>;
+  /** Общий предок двух коммитов — база слияния для уже запушенной ветки рана. */
+  mergeBase(mirror: GitMirror, a: string, b: string): Promise<string | null>;
   /** Ref, в котором лежит кандидат публикации; null — ref нет (или локальный путь). */
   candidateRefCommit(mirror: GitMirror, ref: string): Promise<string | null>;
 }

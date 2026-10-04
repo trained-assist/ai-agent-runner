@@ -439,6 +439,13 @@ export function createLocalGitPort(options: LocalGitPortOptions): GitRepositoryP
       return (await inMirror(mirror, ['cat-file', '-e', `${commit}^{commit}`])).code === 0;
     },
 
+    async mergeBase(mirror, a, b) {
+      const result = await inMirror(mirror, ['merge-base', a, b]);
+      if (result.code !== 0) return null;
+      const sha = result.stdout.trim();
+      return /^[0-9a-f]{40,64}$/.test(sha) ? sha : null;
+    },
+
     async isAncestor(mirror, ancestor, commit) {
       const result = await inMirror(mirror, ['merge-base', '--is-ancestor', ancestor, commit]);
       if (result.code === 0) return true;
