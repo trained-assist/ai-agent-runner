@@ -25,7 +25,7 @@ function tempDir(): string {
 }
 
 describe('api key registry', () => {
-  const principal: Principal = { principalId: 'p-alpha', profileId: 'profile-a', scopes: ['runs:read', 'runs:write'], engines: ['dynamic-ip-azure-agent-run'] };
+  const principal: Principal = { principalId: 'p-alpha', profileId: 'profile-a', scopes: ['runs:read', 'runs:write'], engines: ['azure-dynamic-ip-agent-run'] };
 
   it('generates keys that are never the plaintext stored in records', () => {
     const key = generateApiKey();
@@ -42,7 +42,7 @@ describe('api key registry', () => {
     const registry = KeyRegistry.fromRecords([keyRecordFor(key, principal), keyRecordFor(generateApiKey(), { principalId: 'p-beta', profileId: 'profile-b', scopes: ['runs:read'] })]);
 
     const found = registry.authenticate(`Bearer ${key}`);
-    expect(found).toMatchObject({ principalId: 'p-alpha', profileId: 'profile-a', scopes: ['runs:read', 'runs:write'], engines: ['dynamic-ip-azure-agent-run'] });
+    expect(found).toMatchObject({ principalId: 'p-alpha', profileId: 'profile-a', scopes: ['runs:read', 'runs:write'], engines: ['azure-dynamic-ip-agent-run'] });
     found!.scopes.push('runs:read');
     const again = registry.authenticate(`Bearer ${key}`);
     expect(again!.scopes).toEqual(['runs:read', 'runs:write']);

@@ -25,7 +25,7 @@ import { redactSecrets, truncateLine } from '../redact.js';
  * юзера, сам складывает артефакты в него и сам грузит лог сессии в Google Storage.
  */
 
-export const EXTERNAL_WORKER_ENGINE = 'dynamic-ip-azure-agent-run';
+export const EXTERNAL_WORKER_ENGINE = 'azure-dynamic-ip-agent-run';
 export const EXTERNAL_WORKER_ADAPTER_VERSION = '1';
 
 /** Сколько событий рана API пишет до сетевого вызова: `claimed` + `inputs_materialized`. */
@@ -66,10 +66,28 @@ export interface LaunchRepo {
   fullName: string;
   /** Ветка рана: воркер создал её, закоммитил в неё `outputs` и запушил. */
   branch: string;
-  /** HEAD этой ветки на момент ответа. */
-  commit: string;
+  /**
+   * HEAD ветки на момент ответа. `null` (или null-SHA) означает «в ветку ничего не
+   * запушено»: ран без выходов заканчивается законно, и это не отказ.
+   */
+  commit: string | null;
   /** Ветка, от которой ответвлялся ран (если воркер её сообщил). */
   baseRef?: string;
+}
+
+const NULL_SHA = /^0{7,64}$/;
+
+/**
+ * Можно ли отдать клиенту лог по этой ссылке. Воркер без бакета держит лог у себя и
+ * возвращает `local://…`: это честный ответ, но не URL, и редиректить на него нельзя.
+ */
+export function isRetrievableLogUrl(logUrl: string | null): boolean {
+  return typeof logUrl === 'string' && /^https?:\/\//.test(logUrl);
+}
+
+/** Есть ли в ветке рана хоть один коммит: null-SHA и пустая строка означают «ничего нет». */
+export function repoHasCommit(repo: LaunchRepo): boolean {
+  return typeof repo.commit === 'string' && repo.commit.length > 0 && !NULL_SHA.test(repo.commit);
 }
 
 /**
@@ -209,9 +227,10 @@ export interface ExternalWorkerOptions {
   /** Публичный адрес нашего API: воркер шлёт результат на callback resultUrl. */
   baseUrlForResult?: string;
   /**
-   * Имя движка, которым этот воркер отвечает. По умолчанию — `dynamic-ip-azure-agent-run`
-   * (Azure VM). Второй воркер (например, получатель раннеров на GitHub Actions) объявляет
-   * своё: имя движка — это адрес воркера, а не его внутренняя деталь.
+   * Имя движка, которым этот воркер отвечает. По умолчанию — `azure-dynamic-ip-agent-run`:
+   * агент запускается раннером GitHub Actions на Azure-машине с динамическим IP — это
+   * основной путь и первый в цепочке движков. Наши собственные машины (EU VM, RF VM)
+   * объявляют свои имена: движок — это адрес исполнителя, а не его внутренняя деталь.
    */
   engineName?: string;
   token?: string;
@@ -292,7 +311,11 @@ export function runLogRef(launch: LaunchResult | null, workerBaseUrl: string | n
 
 /** Ссылка на файл в репозитории юзера: воркер коммитит артефакты, мы только адресуем их. */
 export function artifactUrl(repo: LaunchRepo, path: string): string {
-  return `https://github.com/${repo.fullName}/blob/${repo.commit}/${path}`;
+  // Файл адресуем коммитом, но если в ветку ничего не запушено — ссылка на ветку:
+  // `/blob/null/...` был бы битой ссылкой, а не «артефакт без коммита».
+  return repoHasCommit(repo)
+    ? `https://github.com/${repo.fullName}/blob/${repo.commit}/${path}`
+    : `https://github.com/${repo.fullName}/tree/${repo.branch}/${path}`;
 }
 
 /** Страница ветки рана: отсюда видно весь результат и отсюда GitHub предлагает merge/PR. */
@@ -305,7 +328,8 @@ export function branchUrl(repo: LaunchRepo): string {
  * известной базы честнее отдать страницу ветки: GitHub сам предложит merge.
  */
 export function mergeUrl(repo: LaunchRepo): string {
-  return repo.baseRef
+  // Сравнивать нечего, если в ветке нет коммитов: отдаём страницу ветки.
+  return repo.baseRef && repoHasCommit(repo)
     ? `https://github.com/${repo.fullName}/compare/${repo.baseRef}...${repo.branch}`
     : branchUrl(repo);
 }
@@ -405,7 +429,15 @@ export function validateLaunchResult(input: unknown, expectedRunId: string): Val
   const collector = new ErrorCollector();
   if (!checkObject(input, 'launch', collector)) return collector.finish(undefined as never);
   // `failure` появляется только на отказе воркера (issue #73) — остальное обяза��тельно.
-  checkKeys(input, LAUNCH_RESULT_KEYS, LAUNCH_RESULT_KEYS.filter((key) => key !== 'failure'), 'launch', collector);
+  // `failure` — только на отказе, `pid` — необязателен: агент в GitHub Actions запущен на
+  // другой машине, и локального PID у нашего API нет. Оба поля отклика на этой машине.
+  checkKeys(
+    input,
+    LAUNCH_RESULT_KEYS,
+    LAUNCH_RESULT_KEYS.filter((key) => key !== 'failure' && key !== 'pid'),
+    'launch',
+    collector,
+  );
 
   if (input['runId'] !== expectedRunId) collector.push(`launch.runId: expected echo of ${expectedRunId}`);
   if (input['status'] !== 'started' && input['status'] !== 'failed') collector.push('launch.status: expected started | failed');
@@ -451,10 +483,17 @@ export function validateLaunchResult(input: unknown, expectedRunId: string): Val
   if (!checkObject(input['repo'], 'launch.repo', collector)) {
     // уже сообщено
   } else {
-    checkKeys(input['repo'], ['fullName', 'branch', 'commit', 'baseRef'], ['fullName', 'branch', 'commit'], 'launch.repo', collector);
+    checkKeys(input['repo'], ['fullName', 'branch', 'commit', 'baseRef'], ['fullName', 'branch'], 'launch.repo', collector);
     checkString(input['repo']['fullName'], 'launch.repo.fullName', collector, 200);
     checkString(input['repo']['branch'], 'launch.repo.branch', collector, 200);
-    checkString(input['repo']['commit'], 'launch.repo.commit', collector, 64);
+    // `commit` может быть null или null-SHA: это «в ветку ничего не запушено», а не отказ.
+    // Требовать непустой SHA нельзя — ран без выходов заканчивается законно.
+    const commit = input['repo']['commit'];
+    if (commit !== null && commit !== undefined) {
+      if (typeof commit !== 'string' || commit.length === 0 || commit.length > 64) {
+        collector.push('launch.repo.commit: expected a sha string, null, or omitted');
+      }
+    }
     if (input['repo']['baseRef'] !== undefined) checkString(input['repo']['baseRef'], 'launch.repo.baseRef', collector, 200);
   }
 
@@ -843,7 +882,9 @@ export class ExternalWorkerAdapter implements ExternalWorker {
       this.log({ event: 'worker_launch_http_error', runId: spec.runId, status: response.status, detail });
       throw new PreflightError('WORKER_HTTP_ERROR', `the external worker answered ${response.status} on launch`, {
         failureClass: 'runtime',
-        retryable: true,
+        // 4xx — про запрос: тот же запрос получит тот же отказ (битый токен, не тот payload),
+        // и повтор станет штормом. 5xx — про состояние воркера, повтор оправдан.
+        retryable: response.status >= 500,
       });
     }
     const validated = validateLaunchReceipt(await readJson(response), spec.runId);
@@ -852,7 +893,9 @@ export class ExternalWorkerAdapter implements ExternalWorker {
       throw new PreflightError(
         'WORKER_PROTOCOL_INVALID',
         `the external worker answered launch outside the contract: ${validated.errors.join('; ')}`,
-        { failureClass: 'runtime', retryable: true },
+        // Расхождение контракта детерминировано: тот же запрос получит тот же ответ.
+        // Повтор его не исправит и превращается в шторм — это отказ, а не «попробуй ещё».
+        { failureClass: 'runtime', retryable: false },
       );
     }
     this.log({ event: 'worker_launch_accepted', runId: spec.runId, engine: spec.engine.name, statusUrl: validated.value.statusUrl });
@@ -879,7 +922,7 @@ export class ExternalWorkerAdapter implements ExternalWorker {
       throw new PreflightError(
         'WORKER_PROTOCOL_INVALID',
         `the external worker answered status outside the contract: ${validated.errors.join('; ')}`,
-        { failureClass: 'runtime', retryable: true },
+        { failureClass: 'runtime', retryable: false },
       );
     }
     return validated.value;
@@ -909,7 +952,7 @@ export class ExternalWorkerAdapter implements ExternalWorker {
       throw new PreflightError(
         'WORKER_PROTOCOL_INVALID',
         `the external worker answered result outside the contract: ${validated.errors.join('; ')}`,
-        { failureClass: 'runtime', retryable: true },
+        { failureClass: 'runtime', retryable: false },
       );
     }
     return validated.value;

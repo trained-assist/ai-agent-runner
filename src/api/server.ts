@@ -1,4 +1,5 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { isRetrievableLogUrl } from '../adapters/external-worker-adapter.js';
 import { TERMINAL_EVENT_TYPES } from '../contracts/events.js';
 import type { KeyRegistry, Principal, Scope } from './auth.js';
 import { ApiError } from './errors.js';
@@ -130,6 +131,13 @@ export function createAgentApiServer(service: AgentApi, options: AgentApiServerO
         requireScope(principal, 'runs:read');
         const view = service.artifacts(principal, runId);
         if (!view.logUrl) throw new ApiError('RESULT_NOT_READY', 'the worker has not published a session log for this run yet');
+        // Редиректим только на настоящий URL. Воркер может вернуть `local://…` (лог остался
+        // на его машине, бакета ещё нет) — редирект на такую схему клиент не откроет, и врать
+        // «перейдите по ссылке» хуже, чем честно отдать её в теле.
+        if (!isRetrievableLogUrl(view.logUrl)) {
+          sendJson(res, 200, { runId, logUrl: view.logUrl, retrievable: false, note: 'the log is not served over HTTP yet; the worker kept it locally' });
+          return 200;
+        }
         res.writeHead(302, { location: view.logUrl });
         res.end();
         return 302;

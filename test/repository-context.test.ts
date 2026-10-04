@@ -229,11 +229,11 @@ describe('repository context: stateless API (#74)', () => {
     principalId: 'p-alpha',
     profileId: 'profile-a',
     scopes: ['runs:read', 'runs:write'],
-    engines: ['dynamic-ip-azure-agent-run'],
+    engines: ['azure-dynamic-ip-agent-run'],
   };
 
   const submitBody = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
-    engine: { name: 'dynamic-ip-azure-agent-run', adapterVersion: '1' },
+    engine: { name: 'azure-dynamic-ip-agent-run', adapterVersion: '1' },
     limits: { timeoutMs: 15000 },
     envAllowlist: [],
     input: { inlinePrompt: 'repository context' },

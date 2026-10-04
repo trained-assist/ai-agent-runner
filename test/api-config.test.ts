@@ -17,7 +17,7 @@ describe('конфигурация воркеров', () => {
     const config = loadAgentApiConfig({ ...base, EXTERNAL_WORKER_URL: 'https://worker.example', EXTERNAL_WORKER_TOKEN: 'secret' });
     expect(config.workers).toEqual([
       {
-        engine: 'dynamic-ip-azure-agent-run',
+        engine: 'azure-dynamic-ip-agent-run',
         baseUrl: 'https://worker.example',
         token: 'secret',
         launchDeadlineMs: 600000,
@@ -30,21 +30,21 @@ describe('конфигурация воркеров', () => {
     const config = loadAgentApiConfig({
       ...base,
       AGENT_API_WORKERS: JSON.stringify([
-        { engine: 'dynamic-ip-azure-agent-run', baseUrl: 'https://azure.example', token: 'a' },
-        { engine: 'github-actions-agent-run', baseUrl: 'https://receiver.example', token: 'b' },
+        { engine: 'azure-dynamic-ip-agent-run', baseUrl: 'https://gha.example', token: 'a' },
+        { engine: 'eu-vm-agent-run', baseUrl: 'https://eu.example', token: 'b' },
       ]),
     });
-    expect(config.workers.map((worker) => worker.engine)).toEqual(['dynamic-ip-azure-agent-run', 'github-actions-agent-run']);
-    expect(config.workers.map((worker) => worker.baseUrl)).toEqual(['https://azure.example', 'https://receiver.example']);
+    expect(config.workers.map((worker) => worker.engine)).toEqual(['azure-dynamic-ip-agent-run', 'eu-vm-agent-run']);
+    expect(config.workers.map((worker) => worker.baseUrl)).toEqual(['https://gha.example', 'https://eu.example']);
   });
 
   it('имя движка можно переопределить и в одиночном формате', () => {
     const config = loadAgentApiConfig({
       ...base,
       EXTERNAL_WORKER_URL: 'https://receiver.example',
-      EXTERNAL_WORKER_ENGINE: 'github-actions-agent-run',
+      EXTERNAL_WORKER_ENGINE: 'eu-vm-agent-run',
     });
-    expect(config.workers[0]!.engine).toBe('github-actions-agent-run');
+    expect(config.workers[0]!.engine).toBe('eu-vm-agent-run');
   });
 
   it('без воркера — отказ на старте: API без способа запустить агента не поднимается', () => {
@@ -56,8 +56,8 @@ describe('конфигурация воркеров', () => {
       loadAgentApiConfig({
         ...base,
         AGENT_API_WORKERS: JSON.stringify([
-          { engine: 'github-actions-agent-run', baseUrl: 'https://a.example' },
-          { engine: 'github-actions-agent-run', baseUrl: 'https://b.example' },
+          { engine: 'azure-dynamic-ip-agent-run', baseUrl: 'https://a.example' },
+          { engine: 'azure-dynamic-ip-agent-run', baseUrl: 'https://b.example' },
         ]),
       }),
     ).toThrowError(/declared twice/);
