@@ -188,7 +188,12 @@ export interface WorkspacePublication {
   artifacts: WorkspaceArtifactRef[];
   conflictId: string | null;
   candidateId: string | null;
-  /** Коммит кандидата в remote ref `refs/workspace/publications/<publicationId>`. */
+  /**
+   * Ветка рана (`agent-run/<runId>`) или синхронизации: единица результата. В ней лежит
+   * коммит кандидата; основная ветка обновляется только CAS-merge'ом из неё.
+   */
+  branch: string;
+  /** Коммит кандидата (вершина ветки рана). */
   candidateCommit: string | null;
   candidatePushed: boolean;
   /** Исход push неизвестен: сверять с git/binding-журналом, не повторять движок. */
@@ -470,6 +475,7 @@ const PUBLICATION_KEYS = [
   'artifacts',
   'conflictId',
   'candidateId',
+  'branch',
   'candidateCommit',
   'candidatePushed',
   'outcomeUnknown',
@@ -533,6 +539,7 @@ export function validatePublication(input: unknown): ValidationResult<WorkspaceP
   }
   if (input['conflictId'] !== null) checkString(input['conflictId'], 'publication.conflictId', collector, 300);
   if (input['candidateId'] !== null) checkString(input['candidateId'], 'publication.candidateId', collector, 300);
+  checkString(input['branch'], 'publication.branch', collector, 300);
   if (input['candidateCommit'] !== null && !isCommitSha(input['candidateCommit'])) {
     collector.push('publication.candidateCommit: expected a commit sha or null');
   }

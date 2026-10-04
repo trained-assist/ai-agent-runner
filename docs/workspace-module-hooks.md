@@ -108,6 +108,30 @@ const workspace = new WorkspaceService({
 > контура его нужно заменить на fine-grained PAT с `Contents:R/W` на `profiles-artifacts`
 > (и на право удаления репозитория, если понадобится откат) — имя секрета менять не нужно.
 
+
+### Ветка рана и адреса (согласовано с внешним воркером)
+
+Каждый ран публикует свою ветку `agent-run/<runId>` (host-синхронизация — `profile-sync/<id>`).
+В публикации (`WorkspacePublication`) ветка лежит в поле `branch`; коммит ветки — в
+`candidateCommit`, коммит основной ветки после merge — в `committedRevision`.
+
+Три уровня адреса считаются хелперами `src/workspace/branches.ts` (без знания внутренностей):
+
+```ts
+import { branchUrl, mergeUrl, artifactUrl } from './workspace/index.js';
+
+branchUrl(binding.repository, publication.branch);                       // весь результат рана
+mergeUrl(binding.repository, publication.branch, binding.branch);        // куда мержить
+artifactUrl(binding.repository, publication.committedRevision, path);    // конкретный файл
+```
+
+Основная ветка профиля обновляется **из ветки рана**: fast-forward, если она не двигалась,
+иначе merge-коммит с двумя родителями. Внешний воркер (PR #75) в чужой репозиторий не мержит
+— отдаёт клиенту merge-URL; здесь публикуется наше состояние профиля, поэтому merge остаётся.
+
+Уборка веток рана после merge — отдельным явным вызовом (`deleteRef`); по умолчанию ветки
+остаются как история того, что сделал каждый ран.
+
 ### H2. Политика экспорта
 
 По умолчанию включён deny-list (`DEFAULT_EXPORT_POLICY`): credentials, git, входы рана,

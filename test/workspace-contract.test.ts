@@ -64,6 +64,7 @@ function publication(overrides: Partial<WorkspacePublication> = {}): WorkspacePu
     artifacts: [],
     conflictId: null,
     candidateId: null,
+    branch: 'agent-run/run-1',
     candidateCommit: null,
     candidatePushed: false,
     outcomeUnknown: false,

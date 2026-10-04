@@ -14,6 +14,7 @@
 
 import { WorkspaceError } from '../contract.js';
 import type { CredentialResolver, RepositoryAdminPort } from '../ports.js';
+import { isTransientFailure, sleep, RETRY_DELAYS_MS } from './transient.js';
 
 export const GITHUB_API_BASE = 'https://api.github.com';
 export const GITHUB_API_VERSION = '2022-11-28';
@@ -41,6 +42,11 @@ export function createGitHubRepositoryAdmin(options: GitHubRepositoryAdminOption
   const timeoutMs = options.timeoutMs ?? 15_000;
   let ownerKind: 'org' | 'user' | null = null;
 
+  /**
+   * Запрос с повторами для транзиентных сбоев. Сетевой обрыв («fetch failed»,
+   * «Connection reset», 5xx) повторяется с backoff; 401/403 и «not found» — нет: повтор
+   * не поможет, а только задержит честную ошибку.
+   */
   const request = async (pathname: string, init: { method?: string; body?: unknown } = {}): Promise<{ status: number; json: () => Promise<unknown> }> => {
     if (typeof fetchImpl !== 'function') {
       throw new WorkspaceError('WORKSPACE_INVALID', 'GitHub admin port requires fetch (Node ≥ 18)', { retryable: false });
@@ -55,20 +61,34 @@ export function createGitHubRepositoryAdmin(options: GitHubRepositoryAdminOption
       'X-GitHub-Api-Version': GITHUB_API_VERSION,
     };
     if (init.body !== undefined) headers['Content-Type'] = 'application/json';
-    let response: Response;
-    try {
-      response = await fetchImpl(`${baseUrl}${pathname}`, {
-        method: init.method ?? 'GET',
-        headers,
-        ...(init.body !== undefined ? { body: JSON.stringify(init.body) } : {}),
-        signal: AbortSignal.timeout(timeoutMs),
-      });
-    } catch (err) {
-      throw new WorkspaceError('WORKSPACE_GIT_FAILED', `GitHub API is unreachable for ${init.method ?? 'GET'} ${pathname}: ${err instanceof Error ? err.message : String(err)}`, {
-        retryable: true,
-      });
+    let lastError: string | null = null;
+    for (let attempt = 0; attempt <= RETRY_DELAYS_MS.length; attempt += 1) {
+      let response: Response;
+      try {
+        response = await fetchImpl(`${baseUrl}${pathname}`, {
+          method: init.method ?? 'GET',
+          headers,
+          ...(init.body !== undefined ? { body: JSON.stringify(init.body) } : {}),
+          signal: AbortSignal.timeout(timeoutMs),
+        });
+      } catch (err) {
+        lastError = err instanceof Error ? err.message : String(err);
+        if (!isTransientFailure(lastError, false) || attempt === RETRY_DELAYS_MS.length) break;
+        await sleep(RETRY_DELAYS_MS[attempt] as number);
+        continue;
+      }
+      // Транзиентный HTTP-статус тоже повторяем: 502/503/504 и обрыв соединения.
+      const transientStatus = response.status === 429 || response.status === 502 || response.status === 503 || response.status === 504;
+      if (!transientStatus) return { status: response.status, json: () => response.json().catch(() => ({})) };
+      lastError = `HTTP ${response.status}`;
+      if (attempt === RETRY_DELAYS_MS.length) break;
+      await sleep(RETRY_DELAYS_MS[attempt] as number);
     }
-    return { status: response.status, json: () => response.json().catch(() => ({})) };
+    throw new WorkspaceError(
+      'WORKSPACE_GIT_FAILED',
+      `GitHub API is unreachable for ${init.method ?? 'GET'} ${pathname}: ${lastError ?? 'no response'}`,
+      { retryable: true },
+    );
   };
 
   const readRepo = async (owner: string, name: string): Promise<RepoInfo | null> => {
