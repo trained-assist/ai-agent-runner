@@ -25,7 +25,22 @@ import { ErrorCollector, checkKeys, checkObject, checkString, type ValidationRes
  */
 type IsolationCapability = 'not_proven_service_uid_only' | 'per_run_unix_identity_verified' | 'configured_but_refusing_runs';
 
-export const API_RUN_STATES = ['queued', 'starting', 'running', 'awaiting_user', 'finalizing', 'succeeded', 'failed', 'cancelled'] as const;
+export const API_RUN_STATES = [
+  'queued',
+  'starting',
+  'running',
+  'awaiting_user',
+  'finalizing',
+  'succeeded',
+  'failed',
+  'cancelled',
+  /**
+   * Исход рана установить нельзя: воркер принял задачу, но результат не вернул и статус
+   * неизвестен. Это не `failed` — задача не потеряна, авто-rerun не происходит, следующий
+   * шаг — reconcile существующего запуска у воркера.
+   */
+  'unknown',
+] as const;
 
 export type ApiRunState = (typeof API_RUN_STATES)[number];
 
