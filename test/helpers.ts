@@ -15,6 +15,8 @@ import type { BlobStore } from '../src/storage/blob-store.js';
 import { createBlobStore } from '../src/storage/create-blob-store.js';
 import { ArtifactStore } from '../src/storage/artifact-store.js';
 import { RunExportStore } from '../src/storage/export.js';
+import { InputMaterializer } from '../src/storage/input-materializer.js';
+import { WorkspaceSnapshotStore } from '../src/storage/workspace-snapshot.js';
 import type { CapabilityRegistry } from '../src/mcp/capabilities.js';
 import type { BindingValueResolver } from '../src/mcp/scope.js';
 import type { CleanRoomProvider } from '../src/isolation/contract.js';
@@ -94,16 +96,27 @@ export interface HarnessOptions {
   isolation?: CleanRoomProvider | ((rootDir: string) => CleanRoomProvider);
   /** Хостовые шаблоны конфигурации движка для run-scoped HOME (issue #51). */
   engineConfigTemplates?: EngineConfigTemplate | null;
+  /**
+   * Снимки workspace + материализация входов из них (issue #52, шаг 1). Ставится так же,
+   * как в dist/api/main.ts: снимки и артефакты поверх ОДНОГО хранилища, иначе указатель
+   * снимка нечего проверять.
+   */
+  snapshotInputs?: boolean;
 }
 
 export interface Harness {
   rootDir: string;
   fake: FakeEngine;
-  /** Каталог с чистыми средами (identity/leases, cleanrooms/<runId>) — граница issue #51. */
+  /** Каталог чистых сред (identity/leases, cleanrooms/<runId>) — граница issue #51. */
   isolationRoot(): string;
   faults: FaultRegistry;
   readonly runner: Runner;
   exports: RunExportStore | null;
+  /** Хранилище байт ранов (общий для экспорта и снимков); null без `artifactExport`. */
+  blob: BlobStore | null;
+  artifacts: ArtifactStore | null;
+  snapshots: WorkspaceSnapshotStore | null;
+  inputs: InputMaterializer | null;
   makeSpec: (over?: Partial<RunSpec>) => RunSpec;
   start: (over?: Partial<RunSpec>) => { receipt: StartReceipt; spec: RunSpec };
   reopen: () => Runner;
@@ -134,15 +147,30 @@ export function createHarness(options: HarnessOptions = {}): Harness {
   if (options.isolation) base.isolation = typeof options.isolation === 'function' ? options.isolation(rootDir) : options.isolation;
   if (options.engineConfigTemplates) base.engineConfigTemplates = options.engineConfigTemplates;
   let exports: RunExportStore | null = null;
+  let artifacts: ArtifactStore | null = null;
+  let blob: BlobStore | null = options.blob ?? null;
   if (options.artifactExport) {
-    const blob = options.blob ?? createBlobStore({ backend: 'local-fs', localRoot: join(rootDir, 'blobs') });
-    if (!options.blob) base.blob = blob;
+    blob = options.blob ?? createBlobStore({ backend: 'local-fs', localRoot: join(rootDir, 'blobs') });
+    base.blob = blob;
+    artifacts = new ArtifactStore({ rootDir, blob });
     exports = new RunExportStore({
       rootDir,
-      artifacts: new ArtifactStore({ rootDir, blob }),
+      artifacts,
       ...(options.pruneLocalCopies !== undefined ? { pruneLocalCopies: options.pruneLocalCopies } : {}),
     });
     base.exports = exports;
+  }
+  let snapshots: WorkspaceSnapshotStore | null = null;
+  let inputs: InputMaterializer | null = null;
+  if (options.snapshotInputs) {
+    // Снимок указывает на байты ArtifactStore, поэтому без хранилища артефактов указатель
+    // проверять нечем: тогда материализация и не подключается.
+    snapshots = new WorkspaceSnapshotStore({ rootDir });
+    base.snapshots = snapshots;
+    if (artifacts) {
+      inputs = new InputMaterializer({ snapshots, artifacts });
+      base.inputs = inputs;
+    }
   }
 
   let runner = new Runner(base);
@@ -153,6 +181,10 @@ export function createHarness(options: HarnessOptions = {}): Harness {
     faults,
     isolationRoot: () => rootDir,
     exports,
+    blob,
+    artifacts,
+    snapshots,
+    inputs,
     get runner() {
       return runner;
     },

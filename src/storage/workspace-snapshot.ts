@@ -3,6 +3,8 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 
 import { dirname, join } from 'node:path';
 import { isSafeId } from '../contracts/validate.js';
 import { StorageError } from './errors.js';
+import { isSafeRelativePath } from './local-paths.js';
+import { isSha256 } from './manifest.js';
 
 export const WORKSPACE_SNAPSHOT_SCHEMA_VERSION = 1 as const;
 
@@ -16,6 +18,22 @@ export interface WorkspaceFileEntry {
   createdAt: string;
 }
 
+/**
+ * Указатель снимка на байты в долговечном хранилище (issue #52, шаг 1). Снимок хранит
+ * НЕ файл, а ссылку на артефакт рана: байты лежат в object storage, а `sha256`/`size`
+ * позволяют проверить их перед записью в workspace нового рана. Путь — относительный
+ * путь файла внутри снимка.
+ */
+export interface WorkspaceSnapshotArtifact {
+  path: string;
+  artifactId: string;
+  sha256: string;
+  size: number;
+  name: string;
+  mime: string;
+  linkedAt: string;
+}
+
 export interface WorkspaceSnapshot {
   schemaVersion: typeof WORKSPACE_SNAPSHOT_SCHEMA_VERSION;
   snapshotId: string;
@@ -26,6 +44,8 @@ export interface WorkspaceSnapshot {
   status: 'active' | 'committed' | 'conflict' | 'abandoned';
   conflictPolicy: SnapshotConflictPolicy;
   files: WorkspaceFileEntry[];
+  /** Указатели на байты в хранилище; именно они материализуются в новый ран. */
+  artifacts: WorkspaceSnapshotArtifact[];
   totalBytes: number;
   createdAt: string;
   committedAt: string | null;
@@ -37,6 +57,16 @@ export interface CreateSnapshotInput {
   userTaskId: string;
   profileId: string;
   conflictPolicy?: SnapshotConflictPolicy;
+}
+
+/** Параметр указателя, который проверяет сам store (владельца артефакта проверяет вызывающий). */
+export interface RecordArtifactInput {
+  path: string;
+  artifactId: string;
+  sha256: string;
+  size: number;
+  name: string;
+  mime: string;
 }
 
 export interface SnapshotStoreOptions {
@@ -83,6 +113,7 @@ export class WorkspaceSnapshotStore {
       status: 'active',
       conflictPolicy: input.conflictPolicy ?? 'reject',
       files: [],
+      artifacts: [],
       totalBytes: 0,
       createdAt: at,
       committedAt: null,
@@ -164,6 +195,61 @@ export class WorkspaceSnapshotStore {
     return updated;
   }
 
+  /**
+   * Запись указателя на байты в хранилище. Проверяется формат пути и дайджеста: снимок,
+   * который потом материализуется в чужой ран, не должен содержать ни пути наружу, ни
+   * digest, которого нет в хранилище.
+   */
+  recordArtifact(snapshotId: string, input: RecordArtifactInput): WorkspaceSnapshot {
+    const snapshot = this.requireActive(snapshotId);
+    if (!isSafeRelativePath(input.path)) {
+      throw new StorageError(
+        'SNAPSHOT_ARTIFACT_INVALID',
+        `invalid artifact path "${input.path}": expected a relative path inside the workspace without "..", "." or a leading "/"`,
+      );
+    }
+    this.assertId(input.artifactId, 'artifactId');
+    if (!isSha256(input.sha256)) {
+      throw new StorageError('SNAPSHOT_ARTIFACT_INVALID', `invalid artifact sha256 for "${input.path}": expected 64 lowercase hex chars`);
+    }
+    if (!Number.isInteger(input.size) || input.size < 0) {
+      throw new StorageError('SNAPSHOT_ARTIFACT_INVALID', `invalid artifact size for "${input.path}": expected non-negative integer`);
+    }
+    const entry: WorkspaceSnapshotArtifact = {
+      path: input.path,
+      artifactId: input.artifactId,
+      sha256: input.sha256,
+      size: input.size,
+      name: input.name,
+      mime: input.mime,
+      linkedAt: new Date().toISOString(),
+    };
+
+    const existing = snapshot.artifacts.find((item) => item.path === input.path);
+    if (existing && existing.sha256 !== entry.sha256 && snapshot.conflictPolicy === 'reject') {
+      const updated: WorkspaceSnapshot = {
+        ...snapshot,
+        status: 'conflict',
+        abandonedAt: new Date().toISOString(),
+      };
+      this.writeSnapshot(updated);
+      throw new StorageError(
+        'SNAPSHOT_CONFLICT',
+        `artifact "${input.path}" is already linked to different bytes (sha256 mismatch)`,
+      );
+    }
+
+    const artifacts = snapshot.artifacts.map((item) => (item.path === entry.path ? entry : item));
+    if (!artifacts.some((item) => item.path === entry.path)) artifacts.push(entry);
+    const updated: WorkspaceSnapshot = {
+      ...snapshot,
+      artifacts,
+      totalBytes: artifacts.reduce((sum, item) => sum + item.size, 0),
+    };
+    this.writeSnapshot(updated);
+    return updated;
+  }
+
   commit(snapshotId: string): WorkspaceSnapshot {
     const snapshot = this.requireActive(snapshotId);
     const committed: WorkspaceSnapshot = {
@@ -211,6 +297,9 @@ export class WorkspaceSnapshotStore {
     if (snapshot.schemaVersion !== WORKSPACE_SNAPSHOT_SCHEMA_VERSION) {
       throw new StorageError('SNAPSHOT_INVALID', `unsupported schema version ${snapshot.schemaVersion}`);
     }
+    // Снимки, записанные до появления указателей на артефакты, остаются читаемыми: у них
+    // просто нет материализуемых байтов, и это не поломка записи, а её отсутствие.
+    if (!Array.isArray(snapshot.artifacts)) snapshot.artifacts = [];
     return snapshot;
   }
 

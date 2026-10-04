@@ -21,6 +21,8 @@ export interface SnapshotView {
   status: WorkspaceSnapshot['status'];
   conflictPolicy: WorkspaceSnapshot['conflictPolicy'];
   files: WorkspaceSnapshot['files'];
+  /** Указатели на байты в долговечном хранилище (issue #52, шаг 1). */
+  artifacts: WorkspaceSnapshot['artifacts'];
   totalBytes: number;
   createdAt: string;
   committedAt: string | null;
@@ -37,6 +39,7 @@ export function buildSnapshotView(snapshot: WorkspaceSnapshot): SnapshotView {
     status: snapshot.status,
     conflictPolicy: snapshot.conflictPolicy,
     files: snapshot.files,
+    artifacts: snapshot.artifacts,
     totalBytes: snapshot.totalBytes,
     createdAt: snapshot.createdAt,
     committedAt: snapshot.committedAt,
@@ -122,6 +125,48 @@ export async function handleSnapshotFileAction(
         const updated = deps.snapshots.recordFile(snapshotId, filePath, size, sha256, mime);
         return { status: 200, view: buildSnapshotView(updated) };
       }
+      /**
+       * Снимок — указатель на байты в хранилище (issue #52, шаг 1). Артефакт обязан
+       * принадлежать ЭТОМУ рану и этому principal'у, а его манифест — совпадать с
+       * объявленными клиентом `sha256`/`size`: иначе в снимок попала бы ссылка на чужие
+       * или подменённые байты, а проверить их потом нечем.
+       */
+      case 'link': {
+        const filePath = readString(body, 'path', 512);
+        if (!filePath) throw new ApiError('INVALID_REQUEST', 'path is required for action "link"');
+        const artifactId = readString(body, 'artifactId', 200);
+        if (!artifactId) throw new ApiError('INVALID_REQUEST', 'artifactId is required for action "link"');
+        const manifest = deps.artifacts.getManifest(runId, artifactId);
+        if (!manifest) {
+          throw new ApiError('NOT_FOUND', `artifact ${artifactId} is not registered for run ${runId}`);
+        }
+        if (manifest.profileId !== principal.profileId) {
+          throw new ApiError('FORBIDDEN', `artifact ${artifactId} belongs to a different principal`);
+        }
+        const claimedSha = readString(body, 'sha256', 64);
+        if (claimedSha && claimedSha !== manifest.sha256) {
+          throw new ApiError('INVALID_REQUEST', `sha256 does not match the stored artifact ${artifactId}`, {
+            artifactId,
+            sha256: manifest.sha256,
+          });
+        }
+        const claimedSize = readOptionalInt(body, 'size');
+        if (claimedSize !== null && claimedSize !== manifest.size) {
+          throw new ApiError('INVALID_REQUEST', `size does not match the stored artifact ${artifactId}`, {
+            artifactId,
+            size: manifest.size,
+          });
+        }
+        const updated = deps.snapshots.recordArtifact(snapshotId, {
+          path: filePath,
+          artifactId,
+          sha256: manifest.sha256,
+          size: manifest.size,
+          name: manifest.name,
+          mime: manifest.mime,
+        });
+        return { status: 200, view: buildSnapshotView(updated) };
+      }
       default:
         throw new ApiError('INVALID_REQUEST', `unknown action "${action}"`);
     }
@@ -144,6 +189,17 @@ function readPositiveInt(body: unknown, field: string): number {
   const value = (body as Record<string, unknown>)[field];
   if (typeof value !== 'number' || !Number.isInteger(value) || value <= 0) {
     throw new ApiError('INVALID_REQUEST', `${field}: expected a positive integer`);
+  }
+  return value;
+}
+
+/** Необязательное целое: отсутствие — не ошибка, но несоответствие объявленному — да. */
+function readOptionalInt(body: unknown, field: string): number | null {
+  if (typeof body !== 'object' || body === null) return null;
+  const value = (body as Record<string, unknown>)[field];
+  if (value === undefined || value === null) return null;
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
+    throw new ApiError('INVALID_REQUEST', `${field}: expected a non-negative integer`);
   }
   return value;
 }

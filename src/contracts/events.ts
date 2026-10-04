@@ -1,5 +1,6 @@
 import {
   ErrorCollector,
+  checkArray,
   checkKeys,
   checkObject,
   checkPositiveInt,
@@ -15,6 +16,7 @@ export const RUNNER_EVENT_SCHEMA_VERSION = 1 as const;
 export const RUNNER_EVENT_TYPES = [
   'claimed',
   'materialized',
+  'inputs_materialized',
   'started',
   'log',
   'exit',
@@ -61,6 +63,32 @@ export interface MaterializedEvent extends EventEnvelope {
 export interface StartedEvent extends EventEnvelope {
   type: 'started';
   payload: { pid: number };
+}
+
+/**
+ * Входы рана материализованы (issue #52, шаг 1): что запрашивал ран, что легло в его
+ * workspace и чем закончилось. Содержимое файлов и их текст в событие не попадают — только
+ * идентификаторы снимков, относительные пути, размеры и код отказа.
+ */
+export interface InputsMaterializedEvent extends EventEnvelope {
+  type: 'inputs_materialized';
+  payload: {
+    status: 'materialized' | 'refused' | 'unavailable' | 'nothing_to_materialize';
+    declared: number;
+    requested: number;
+    files: number;
+    bytes: number;
+    entries: Array<{
+      ref: string;
+      snapshotId: string;
+      status: 'materialized' | 'refused' | 'unavailable';
+      code: string | null;
+      files: number;
+      bytes: number;
+      reason: string | null;
+    }>;
+    reason: string | null;
+  };
 }
 
 export interface LogEvent extends EventEnvelope {
@@ -187,6 +215,7 @@ export interface ConnectionLostEvent extends EventEnvelope {
 export type RunnerEvent =
   | ClaimedEvent
   | MaterializedEvent
+  | InputsMaterializedEvent
   | StartedEvent
   | LogEvent
   | ExitEvent
@@ -229,6 +258,7 @@ const ENVELOPE_KEYS = [
 const PAYLOAD_KEYS: Record<RunnerEventType, readonly string[]> = {
   claimed: ['operationId'],
   materialized: ['inputs'],
+  inputs_materialized: ['status', 'declared', 'requested', 'files', 'bytes', 'entries', 'reason'],
   started: ['pid'],
   log: ['stream', 'level', 'message'],
   exit: ['code', 'signal'],
@@ -260,6 +290,50 @@ function validatePayload(type: RunnerEventType, value: unknown, path: string, co
         collector.push(`${path}.inputs: expected non-negative integer`);
       }
       break;
+    case 'inputs_materialized': {
+      const status = value['status'];
+      if (
+        status !== 'materialized' &&
+        status !== 'refused' &&
+        status !== 'unavailable' &&
+        status !== 'nothing_to_materialize'
+      ) {
+        collector.push(`${path}.status: expected materialized | refused | unavailable | nothing_to_materialize`);
+      }
+      for (const key of ['declared', 'requested', 'files', 'bytes'] as const) {
+        if (typeof value[key] !== 'number' || !Number.isInteger(value[key]) || (value[key] as number) < 0) {
+          collector.push(`${path}.${key}: expected non-negative integer`);
+        }
+      }
+      if (value['reason'] !== null) checkString(value['reason'], `${path}.reason`, collector, 500);
+      const entries = value['entries'];
+      if (!checkArray(entries, `${path}.entries`, collector)) break;
+      if (entries.length > 100) collector.push(`${path}.entries: too many entries`);
+      entries.slice(0, 100).forEach((entry, index) => {
+        const entryPath = `${path}.entries[${index}]`;
+        if (!checkObject(entry, entryPath, collector)) return;
+        checkKeys(
+          entry,
+          ['ref', 'snapshotId', 'status', 'code', 'files', 'bytes', 'reason'],
+          ['ref', 'snapshotId', 'status'],
+          entryPath,
+          collector,
+        );
+        checkString(entry['ref'], `${entryPath}.ref`, collector, 500);
+        checkString(entry['snapshotId'], `${entryPath}.snapshotId`, collector, 200);
+        if (entry['status'] !== 'materialized' && entry['status'] !== 'refused' && entry['status'] !== 'unavailable') {
+          collector.push(`${entryPath}.status: expected materialized | refused | unavailable`);
+        }
+        if (entry['code'] !== null) checkString(entry['code'], `${entryPath}.code`, collector, 100);
+        for (const key of ['files', 'bytes'] as const) {
+          if (typeof entry[key] !== 'number' || !Number.isInteger(entry[key]) || (entry[key] as number) < 0) {
+            collector.push(`${entryPath}.${key}: expected non-negative integer`);
+          }
+        }
+        if (entry['reason'] !== null) checkString(entry['reason'], `${entryPath}.reason`, collector, 500);
+      });
+      break;
+    }
     case 'started':
       if (typeof value['pid'] !== 'number' || !Number.isInteger(value['pid']) || value['pid'] <= 0) {
         collector.push(`${path}.pid: expected positive integer`);

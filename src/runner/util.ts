@@ -9,10 +9,14 @@ export function specHash(value: unknown): string {
   return createHash('sha256').update(canonicalJson(redactRepositoryToken(value))).digest('hex');
 }
 
-export function writeFileAtomic(path: string, content: string): void {
+/**
+ * Запись «всё или ничего»: временный файл рядом и rename. Принимает байты, а не только
+ * текст, — материализация входа переносит артефакты побайтно (issue #52).
+ */
+export function writeFileAtomic(path: string, content: string | Uint8Array): void {
   mkdirSync(dirname(path), { recursive: true });
   const tmp = `${path}.tmp`;
-  writeFileSync(tmp, content, 'utf8');
+  writeFileSync(tmp, content);
   renameSync(tmp, path);
 }
 

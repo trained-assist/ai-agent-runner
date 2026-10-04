@@ -143,6 +143,20 @@ export interface ApiCapabilities {
       conflictDetection: true;
       conflictPolicies: readonly ('reject' | 'overwrite' | 'merge')[];
       cleanRoomOnNewAttempt: true;
+      /**
+       * Снимок как указатель на байты в хранилище (issue #52, шаг 1). Объявляется честно:
+       * без materializer'а запрос входа со снимком отказывается, а не материализуется
+       * «как-нибудь».
+       */
+      materialize: {
+        enabled: boolean;
+        bytesInDurableStorage: true;
+        verifyDigestOnWrite: true;
+        ownerScoped: true;
+        allOrNothing: true;
+        refusalRetryableWhenStorageUnavailable: true;
+        limits: { refs: number; filesPerRef: number; fileBytes: number; totalBytes: number };
+      };
     };
   };
   cancel: { requestedReceipt: true; terminalConfirmation: true };

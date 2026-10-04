@@ -23,6 +23,7 @@ import type { BlobStore } from '../storage/blob-store.js';
 import { RunExportStore, type PlannedOutput } from '../storage/export.js';
 import type { UploadSessionStore } from '../storage/upload-session.js';
 import type { WorkspaceSnapshotStore } from '../storage/workspace-snapshot.js';
+import { InputMaterializer, type MaterializeReceipt } from '../storage/input-materializer.js';
 import { artifactNameFor, mimeForName } from '../storage/export-manifest.js';
 import type { RunExportManifest } from '../storage/export-manifest.js';
 import { isRegularFile, resolveExistingInsideRoot } from '../storage/local-paths.js';
@@ -101,6 +102,14 @@ export interface RunnerOptions {
    * для следующей попытки.
    */
   snapshots?: WorkspaceSnapshotStore;
+  /**
+   * Материализация входов из снимков workspace (issue #52, шаг 1). Байты берутся из
+   * долговечного хранилища по указателю снимка и кладутся в workspace нового рана с
+   * проверкой владельца (profileId рана) и дайджеста при записи. Отказ любого ref'а
+   * останавливает материализацию целиком: в workspace не остаётся ни одного байта входа,
+   * а ран получает отказ с причиной и признаком повторяемости.
+   */
+  inputs?: InputMaterializer;
   /**
    * Реестр capability handler'ов хоста (P13). Один и тот же реестр обслуживает вызовы MCP
    * ран'а и внутренний API control plane — бизнес-логика домена не дублируется в транспортах.
@@ -267,6 +276,40 @@ interface ExitResolution {
 /** Потолок накопителя ответа: хвост, а не архив вывода движка. */
 const ANSWER_TAIL_MAX_LINES = 200;
 const ANSWER_TAIL_MAX_LINE = 2000;
+
+/** Receipt входа без материализации: ран объявляет ноль, а не молчит о ref'ах без снимка. */
+function emptyInputReceipt(st: PersistedRunState, declared: number) {
+  return {
+    status: 'nothing_to_materialize' as const,
+    declared,
+    requested: 0,
+    files: 0,
+    bytes: 0,
+    entries: [],
+    reason: null,
+  };
+}
+
+/** Receipt входа в форму события: пути и размеры остаются, содержимое и имена файлов — нет. */
+function inputReceiptPayload(receipt: MaterializeReceipt) {
+  return {
+    status: receipt.status,
+    declared: receipt.declared,
+    requested: receipt.requested,
+    files: receipt.files,
+    bytes: receipt.bytes,
+    entries: receipt.entries.map((entry) => ({
+      ref: entry.ref,
+      snapshotId: entry.snapshotId,
+      status: entry.status,
+      code: entry.code,
+      files: entry.files,
+      bytes: entry.bytes,
+      reason: entry.reason === null ? null : truncateLine(redactSecrets(entry.reason), 500),
+    })),
+    reason: receipt.reason === null ? null : truncateLine(redactSecrets(receipt.reason), 500),
+  };
+}
 
 
 const DEFAULT_CANCEL_GRACE_MS = 1000;
@@ -1085,7 +1128,81 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
       // токен живёт только до попытки clone: в движок, env и журналы он не уходит
       stripRepositoryToken(st.spec);
     }
+    await this.materializeInputs(st);
     this.emit(st, 'materialized', { inputs: st.spec.input?.refs?.length ?? 0 });
+  }
+
+  /**
+   * Входы рана из снимков предыдущих ранов (issue #52, шаг 1). Проверки идут ДО движка:
+   * подтверждённого входа, чужого снимка или битых байт рану быть нельзя.
+   *
+   * Отказ не роняет воркер: `refused`/`unavailable` превращаются в отказ старта с кодом и
+   * признаком повторяемости, а причина идёт и в журнал рана, и в событие входов. Без
+   * настроенного materializer'а (нет хранилища снимков) refs со снимком отказаны честно,
+   * а не пропущены молча.
+   */
+  private async materializeInputs(st: PersistedRunState): Promise<void> {
+    const refs = st.spec.input?.refs ?? [];
+    const materializer = this.opts.inputs;
+    if (refs.every((ref) => ref.snapshotId === undefined)) {
+      if (materializer) {
+        this.emit(st, 'inputs_materialized', emptyInputReceipt(st, refs.length));
+      }
+      return;
+    }
+    if (!materializer) {
+      const wanted = refs.filter((ref) => ref.snapshotId !== undefined);
+      const reason = `run ${st.runId} requests snapshot inputs [${wanted.map((ref) => ref.snapshotId).join(', ')}], but this worker has no snapshot materializer configured`;
+      this.emit(st, 'inputs_materialized', {
+        status: 'refused',
+        declared: refs.length,
+        requested: wanted.length,
+        files: 0,
+        bytes: 0,
+        entries: wanted.map((ref) => ({
+          ref: ref.ref,
+          snapshotId: ref.snapshotId as string,
+          status: 'refused',
+          code: 'MATERIALIZE_REF_INVALID',
+          files: 0,
+          bytes: 0,
+          reason,
+        })),
+        reason,
+      });
+      this.emit(st, 'log', {
+        stream: 'runner',
+        level: 'error',
+        message: `inputs.materialize_refused runId=${st.runId} status=refused retryable=false reason=${truncateLine(redactSecrets(reason), 300)}`,
+      });
+      throw new PreflightError('MATERIALIZE_REF_INVALID', reason, { retryable: false });
+    }
+
+    const receipt = await materializer.materialize(refs, {
+      runId: st.runId,
+      profileId: st.profileId,
+      cwd: st.spec.cwd,
+    });
+    this.emit(st, 'inputs_materialized', inputReceiptPayload(receipt));
+    if (receipt.status === 'materialized' || receipt.status === 'nothing_to_materialize') {
+      if (receipt.status === 'materialized') {
+        this.emit(st, 'log', {
+          stream: 'runner',
+          level: 'info',
+          message: `inputs.materialized runId=${st.runId} refs=${receipt.requested} files=${receipt.files} bytes=${receipt.bytes}`,
+        });
+      }
+      return;
+    }
+    const code = receipt.entries.find((entry) => entry.code !== null)?.code ?? 'MATERIALIZE_REF_INVALID';
+    const retryable = InputMaterializer.isRetryable(code);
+    const reason = receipt.reason ?? `snapshot inputs of run ${st.runId} were not materialized`;
+    this.emit(st, 'log', {
+      stream: 'runner',
+      level: 'error',
+      message: `inputs.materialize_${receipt.status} runId=${st.runId} code=${code} retryable=${retryable} reason=${truncateLine(redactSecrets(reason), 300)}`,
+    });
+    throw new PreflightError(code, reason, { retryable });
   }
 
   /**

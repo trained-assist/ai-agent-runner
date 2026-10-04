@@ -8,6 +8,7 @@ import {
   checkString,
   isEnvName,
   isRecord,
+  isSafeId,
   isUtcTimestamp,
   type ValidationResult,
 } from './validate.js';
@@ -28,9 +29,17 @@ export interface EngineSpec {
   modelSettings?: EngineModelSettings;
 }
 
+/**
+ * Входной ref рана. `snapshotId` — указатель на закоммиченный снимок workspace
+ * предыдущего рана (issue #52, шаг 1): байты лежат в долговечном хранилище, а ран
+ * получает их в свой workspace с проверкой владельца и дайджеста. `path` сужает ref до
+ * одного файла снимка; без него материализуется весь снимок.
+ */
 export interface InputRef {
   ref: string;
   version?: string;
+  snapshotId?: string;
+  path?: string;
 }
 
 export interface InputSpec {
@@ -262,13 +271,30 @@ function validateInput(value: unknown, path: string, collector: ErrorCollector):
       input.refs = refs.map((entry, i) => {
         const refPath = `${path}.refs[${i}]`;
         if (!checkObject(entry, refPath, collector)) return { ref: '' };
-        checkKeys(entry, ['ref', 'version'], ['ref'], refPath, collector);
+        checkKeys(entry, ['ref', 'version', 'snapshotId', 'path'], ['ref'], refPath, collector);
         const ref: InputRef = { ref: '' };
         checkString(entry['ref'], `${refPath}.ref`, collector, 500);
         if (typeof entry['ref'] === 'string') ref.ref = entry['ref'];
         if (entry['version'] !== undefined) {
           checkString(entry['version'], `${refPath}.version`, collector, 200);
           if (typeof entry['version'] === 'string') ref.version = entry['version'];
+        }
+        if (entry['snapshotId'] !== undefined) {
+          if (!isSafeId(entry['snapshotId'])) {
+            collector.push(`${refPath}.snapshotId: expected a snapshot id matching [A-Za-z0-9][A-Za-z0-9._:-]*`);
+          } else {
+            ref.snapshotId = entry['snapshotId'];
+          }
+        }
+        if (entry['path'] !== undefined) {
+          if (typeof entry['path'] !== 'string' || !isSafeRelativePath(entry['path'])) {
+            collector.push(`${refPath}.path: expected a relative path inside the run workspace without "..", "." or a leading "/"`);
+          } else {
+            ref.path = entry['path'];
+          }
+        }
+        if (ref.path !== undefined && ref.snapshotId === undefined) {
+          collector.push(`${refPath}.path: a file of a snapshot requires snapshotId`);
         }
         return ref;
       });

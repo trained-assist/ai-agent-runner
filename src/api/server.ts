@@ -153,7 +153,12 @@ export function createAgentApiServer(service: AgentApi, options: AgentApiServerO
 
     const runId = segments[2];
     const action = segments[3];
-    if (!runId || !action || segments.length > 4) {
+    // Два маршрута адресуют объект ВНУТРИ рана (`upload-session/{id}`, `snapshot-file/{id}`),
+    // остальные живут ровно на `/v1/runs/{id}/{action}`. Раньше лимит в 4 сегмента отсекал
+    // и их: ветки с `segments[4]` были недостижимы, и link в снимок отвечал 404.
+    const addressesRunObject = action === 'upload-session' || action === 'snapshot-file';
+    const maxSegments = addressesRunObject ? 5 : 4;
+    if (!runId || !action || segments.length > maxSegments) {
       throw new ApiError('ROUTE_NOT_FOUND', `no route for ${path}`);
     }
 
@@ -264,7 +269,11 @@ export function createAgentApiServer(service: AgentApi, options: AgentApiServerO
       requireScope(principal, 'runs:write');
       const snapshotId = segments[4];
       if (!snapshotId) throw new ApiError('ROUTE_NOT_FOUND', `no route for ${path}`);
-      const deps: SnapshotRouteDeps = { service, snapshots: store, artifacts: options.artifacts!, keys: options.keys };
+      // Link в снимок ссылается на артефакт рана: без хранилища артефактов действие
+      // недоступно, а не «успешно» без указателей.
+      const artifactStore = options.artifacts;
+      if (!artifactStore) throw new ApiError('ROUTE_NOT_FOUND', 'artifact store is not enabled in this deployment');
+      const deps: SnapshotRouteDeps = { service, snapshots: store, artifacts: artifactStore, keys: options.keys };
       const body = await readJsonBody(req, maxBodyBytes);
       const { status, view } = await handleSnapshotFileAction(deps, principal, runId, snapshotId, req.method, body);
       logger({
