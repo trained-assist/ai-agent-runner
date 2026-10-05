@@ -1,7 +1,7 @@
 import { appendFileSync, readFileSync, renameSync } from 'node:fs';
 import { TERMINAL_EVENT_TYPES, type RunnerEvent } from '../contracts/events.js';
 import type { RunResult } from '../contracts/result.js';
-import type { RunSpec } from '../contracts/run-spec.js';
+import { redactRepositoryToken, type RunSpec } from '../contracts/run-spec.js';
 import type { LaunchArtifact, LaunchRepo } from '../adapters/external-worker-adapter.js';
 import type { ApiRunState } from './contracts.js';
 
@@ -120,9 +120,13 @@ export class StatelessStore {
   /**
    * Дописать приёмную запись в долговечный журнал. Одна строка = одна запись, поэтому
    * запись переживает падение процесса целиком (строка либо есть, либо нет).
+   *
+   * `repository.token` из строки вычищается: журнал — это файл на диске, и секрет,
+   * который туда попал, переживает ротацию ключей. В памяти процесса токен остаётся —
+   * оттуда его берёт адаптер, который передаёт токен воркеру.
    */
   appendAdmission(record: AdmissionRecord): void {
-    this.write({ kind: 'admission', record });
+    this.write({ kind: 'admission', record: { ...record, spec: redactRepositoryToken(record.spec) } });
   }
 
   /** Ран принят воркером: помечаем, чтобы поллер пережил рестарт API. */

@@ -132,6 +132,17 @@ export interface LaunchRequest {
   limits: { timeoutMs: number; maxOutputBytes: number; maxLogBytes: number };
   repository: { fullName: string; branch: string };
   /**
+   * Токен публикации: клон `repository.fullName` и коммит выходов в его ветку.
+   *
+   * Воркер запускается в чужом репозитории (кольцо), и токен того репозитория не имеет
+   * прав на репозиторий задачи — публикация падала, а рапорт уходил успешным. Не
+   * прислать токен — значит knowingly отдать клиенту ран без выходов, поэтому поле
+   * необязательное только для совместимости, а не «на всякий случай».
+   *
+   * В `workflow_dispatch` не попадает: воркер забирает его по одноразовому claim-токену.
+   */
+  publicationToken?: string;
+  /**
    * Куда воркер вернёт `LaunchResult` для этого рана: `POST {resultUrl}` с общим секретом
    * в `Authorization`. Адрес приходит в запросе, поэтому воркеру не нужно знать, где мы.
    */
@@ -405,6 +416,18 @@ export function launchRequestFromSpec(
       maxLogBytes: spec.limits.maxLogBytes ?? 0,
     },
     repository: { fullName: spec.repository?.fullName ?? '', branch: runBranchName(spec.runId) },
+    // Токен публикации: без него джоба клонирует репозиторий задачи и коммитит выходы
+    // токеном репозитория кольца, у которого нет прав на чужой репозиторий. На живом
+    // замере 05.10.2026 так ушли 15 запусков из 16 как `completed artifacts=0`.
+    //
+    // Раньше токен не пересылался намеренно («клиентский токен не покидает API»), и это
+    // было верно, пока публиковать было нечем: выходы всегда шли в репозиторий кольца.
+    // Теперь публикация идёт в `repository.fullName` задачи, поэтому токен нужен воркеру.
+    //
+    // Он не попадает в `workflow_dispatch` воркера: воркер получает его по одноразовому
+    // claim-токену, а claim-ответ помечен `no-store`. В диспатч уезжают только runId и
+    // claimToken.
+    ...(spec.repository?.token !== undefined ? { publicationToken: spec.repository.token } : {}),
     resultUrl: options.resultUrl,
     isolation: { mode: spec.isolation?.mode ?? 'none' },
     ...(outputs.length > 0 ? { outputs } : {}),
