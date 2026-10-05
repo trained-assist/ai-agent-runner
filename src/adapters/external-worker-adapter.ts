@@ -210,6 +210,16 @@ export interface ExternalWorker {
   cancel(runId: string): Promise<WorkerCancelResult>;
 }
 
+/**
+ * Чистый текст из вывода агента: ANSI-последовательности вырезаются, прочие управляющие
+ * символы (кроме перевода строки и табуляции) заменяются пробелом. Реальный opencode печатает
+ * цветом и курсивом — раньше такой `stderr` отвергал весь результат рана.
+ */
+export function stripControlCharacters(value: string): string {
+  // eslint-disable-next-line no-control-regex
+  return value.replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, '').replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, ' ');
+}
+
 /** Проверка текста, который в норме может быть пустым (stderr, stdout без вывода). */
 function checkText(value: unknown, path: string, collector: ErrorCollector, maxLen: number): void {
   if (typeof value !== 'string') {
@@ -437,13 +447,24 @@ export function validateLaunchResult(input: unknown, expectedRunId: string): Val
   // `failure` появляется только на отказе воркера (issue #73) — остальное обяза��тельно.
   // `failure` — только на отказе, `pid` — необязателен: агент в GitHub Actions запущен на
   // другой машине, и локального PID у нашего API нет. Оба поля отклика на этой машине.
+  // Необязательны три поля: `failure` — только на отказе, `pid` — агент в GitHub Actions
+  // запущен на другой машине и локального PID у нас нет, `answer` — извлекает воркер, и
+  // настоящий opencode-шлюз его не присылает вовсе. Отсутствие этих полей — не повод
+  // выбросить результат целого рана: живая проба #100 показала, что реальный ответ
+  // отвергался как WORKER_PROTOCOL_INVALID, и рана с артефактами у клиента не было.
+  const OPTIONAL_RESULT_KEYS = ['failure', 'pid', 'answer'] as const;
   checkKeys(
     input,
     LAUNCH_RESULT_KEYS,
-    LAUNCH_RESULT_KEYS.filter((key) => key !== 'failure' && key !== 'pid'),
+    LAUNCH_RESULT_KEYS.filter((key) => !(OPTIONAL_RESULT_KEYS as readonly string[]).includes(key)),
     'launch',
     collector,
   );
+  // Управляющие символы и ANSI в выводе агента — норма для реального CLI: вычищаем их
+  // на входе, чтобы в RunResult и в события рана не попал мусор из терминала.
+  for (const key of ['stdout', 'stderr', 'answer'] as const) {
+    if (typeof input[key] === 'string') input[key] = stripControlCharacters(input[key] as string);
+  }
 
   if (input['runId'] !== expectedRunId) collector.push(`launch.runId: expected echo of ${expectedRunId}`);
   if (input['status'] !== 'started' && input['status'] !== 'failed') collector.push('launch.status: expected started | failed');

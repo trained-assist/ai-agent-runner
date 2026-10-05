@@ -1,16 +1,12 @@
 import { mkdirSync, statSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { dirname } from 'node:path';
-import {
-  DEFAULT_CANCEL_DEADLINE_MS,
-  DEFAULT_LAUNCH_DEADLINE_MS,
-  EXTERNAL_WORKER_ENGINE,
-  ExternalWorkerAdapter,
-} from '../adapters/external-worker-adapter.js';
+import { EXTERNAL_WORKER_ENGINE } from '../adapters/external-worker-adapter.js';
 import { KeyRegistry } from './auth.js';
 import { createAgentApiServer } from './server.js';
 import { AgentApi, type ApiLogger } from './service.js';
 import { loadAgentApiConfig, requireKeyRegistry } from './config.js';
+import { createExternalWorkers } from './workers.js';
 
 /** Путь журнала приёмных записей: явный env, без значения — дедупликация только в памяти. */
 function admissionLogFile(raw: string | undefined): string | null {
@@ -24,20 +20,7 @@ async function main(): Promise<void> {
     process.stdout.write(`${JSON.stringify({ ts: new Date().toISOString(), ...entry })}\n`);
   };
   const keys = requireKeyRegistry(config.keyRegistryPath);
-  const workers = config.workers.map(
-    (worker) =>
-      new ExternalWorkerAdapter({
-        engineName: worker.engine,
-        baseUrl: worker.baseUrl,
-        ...(worker.token ? { token: worker.token } : {}),
-        deadlineMs: worker.launchDeadlineMs,
-        // Бюджет приёма рана — свой у каждого движка (issue #100): не ответил за него,
-        // цепочка берёт следующий исполнитель.
-        acceptDeadlineMs: worker.acceptDeadlineMs,
-        cancelDeadlineMs: worker.cancelDeadlineMs,
-        log,
-      }),
-  );
+  const workers = createExternalWorkers(config, log);
   // Журнал приёмных записей: дедупликация по `Idempotency-Key` переживает рестарт API.
   // Без него повторный submit с тем же ключом после рестарта запустил бы второй ран.
   //
