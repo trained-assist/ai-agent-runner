@@ -104,6 +104,26 @@ describe('валидация LaunchResult', () => {
     expect(validated.ok).toBe(true);
   });
 
+  it('ответ без answer принимается: настоящий opencode-шлюз его не присылает', () => {
+    // Живая проба #100: реальный результат воркера отвергался как WORKER_PROTOCOL_INVALID
+    // только из-за отсутствующего answer — рана с артефактами у клиента не было.
+    const { answer: _answer, ...withoutAnswer } = launchResult();
+    const validated = validateLaunchResult(withoutAnswer, 'run-1');
+    expect(validated.ok).toBe(true);
+  });
+
+  it('ANSI и управляющие символы в stderr вычищаются, а не роняют результат', () => {
+    // Реальный opencode печатает цветом: раньше такой stderr отвергал весь результат.
+    const validated = validateLaunchResult(
+      launchResult({ stderr: '\u001b[0m> build · free\u001b[0m\n\u001b[91m\u001b[1mError:\u001b[0m unauthorized\u001b[0m' }),
+      'run-1',
+    );
+    expect(validated.ok).toBe(true);
+    if (!validated.ok) return;
+    expect(validated.value.stderr).not.toContain('\u001b');
+    expect(validated.value.stderr).toContain('Error:');
+  });
+
   it('чужой runId, отсутствующие logUrl/repo и неизвестный exitReason — отказ', () => {
     const validated = validateLaunchResult({ runId: 'run-other', exitReason: 'exploded' }, 'run-1');
     expect(validated.ok).toBe(false);
