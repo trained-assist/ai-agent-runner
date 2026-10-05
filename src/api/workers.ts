@@ -1,8 +1,4 @@
-import {
-  EXTERNAL_WORKER_ADAPTER_VERSION,
-  ExternalWorkerAdapter,
-  type ExternalWorker,
-} from '../adapters/external-worker-adapter.js';
+import { EXTERNAL_WORKER_ADAPTER_VERSION, ExternalWorkerAdapter } from '../adapters/external-worker-adapter.js';
 import type { AgentApiProcessConfig } from './config.js';
 
 /**
@@ -13,7 +9,7 @@ import type { AgentApiProcessConfig } from './config.js';
  * создавался без `env`, поэтому `LaunchRequest.env` уезжал пустым, ключ LLM не покидал API,
  * а агент в GitHub Actions падал с `unauthorized` — при зелёных тестах и живом шлюзе.
  */
-export function createExternalWorkers(config: AgentApiProcessConfig, log: (entry: Record<string, unknown>) => void): ExternalWorker[] {
+export function createExternalWorkers(config: AgentApiProcessConfig, log: (entry: Record<string, unknown>) => void): ExternalWorkerAdapter[] {
   return config.workers.map(
     (worker) =>
       new ExternalWorkerAdapter({
