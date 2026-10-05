@@ -55,13 +55,16 @@ const codeText = [...apiSources, adapterSource].join('\n');
  */
 const CONFIG_ENV_PREFIXES = ['AGENT_API_', 'EXTERNAL_WORKER_', 'RUNNER_DEFAULT_REPO', 'DYNAMIC_IP_AZURE_'];
 
-/** Переменные, которые читает код: `env['X']`, `process.env['X']`, `process.env.X`. */
+/** Переменные, которые читает код: `env['X']`, `process.env['X']`, `process.env.X`, `intEnv(env, 'X'`. */
 function readEnvNames(text: string): string[] {
   const names = new Set<string>();
   for (const match of text.matchAll(/(?:env|process\.env)\[\s*['"]([A-Za-z_][A-Za-z0-9_]*)['"]\s*\]/g)) {
     names.add(match[1]!);
   }
   for (const match of text.matchAll(/process\.env\.([A-Za-z_][A-Za-z0-9_]*)/g)) {
+    names.add(match[1]!);
+  }
+  for (const match of text.matchAll(/intEnv\(\s*env\s*,\s*['"]([A-Za-z_][A-Za-z0-9_]*)['"]/g)) {
     names.add(match[1]!);
   }
   return [...names];
