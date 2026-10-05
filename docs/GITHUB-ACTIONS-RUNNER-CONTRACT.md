@@ -196,7 +196,9 @@ AGENT_API_ENGINE_CHAIN=azure-dynamic-ip-agent-run,eu-vm-agent-run,rf-vm-agent-ru
    процесс и отдельный checkout. Для чувствительных задач остаётся Azure.
 4. **Нужна ещё одна машина** под receiver (или он живёт на той же VM, что и API).
 5. **Креды на push** у воркера — свои (deploy key / GitHub App), как и для Azure-воркера.
-   Клиентский `repository.token` по-прежнему наружу не уходит.
+   Клиентский `repository.token` по-прежнему наружу не уходит: воркер берёт токен публикации
+   из `LaunchRequest.publicationToken`, который приходит в claim-ответе, а не в `inputs`
+   диспатча (см. [ai-agent-runner#6](https://github.com/vovalikessmoothy-png/opencode-gha-runner/pull/6)).
 
 ---
 
