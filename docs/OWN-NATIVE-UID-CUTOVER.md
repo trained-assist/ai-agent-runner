@@ -151,6 +151,12 @@ bytes in root-private 0600 files. An inert transient systemd service evaluates
 the actual `EnvironmentFile` syntax using `/usr/bin/env -0`, not a shell or a
 hand-written dotenv parser. It runs as root (never the shared sandbox UID) with no new privileges, a private
 network and read-only system filesystem; it does not launch Runner or a job.
+The original environment must itself be root-owned 0600, without symlinks or
+non-root/writable ancestors. Before evaluation, the running environment must not
+define nonempty loader-control variables. A deliberately conservative byte scan
+rejects loader names anywhere in the staged file (including comments/values);
+systemd also unsets the enumerated loader variables before executing the parser.
+Do not relax this guard to accommodate a token or comment containing a loader name.
 Runner/worker/callback/child environment settings must match the checked running
 process, except the explicit own journal/registry path changes. Nonempty unit
 `Environment`, `PassEnvironment` or `UnsetEnvironment` settings refuse this narrow

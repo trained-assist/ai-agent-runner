@@ -26,6 +26,10 @@ const environment = join(paths.config, 'service.env');
 const stateFile = join(paths.backup, 'state.json');
 const digest = bytes => createHash('sha256').update(bytes).digest('hex');
 const canonicalRun = /^run_[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
+export const loaderVariables = Object.freeze(['LD_PRELOAD', 'LD_LIBRARY_PATH', 'LD_AUDIT', 'LD_DEBUG',
+  'LD_DEBUG_OUTPUT', 'LD_PROFILE', 'LD_ORIGIN_PATH', 'LD_ASSUME_KERNEL', 'LD_HWCAP_MASK',
+  'LD_BIND_NOT', 'LD_BIND_NOW', 'LD_SHOW_AUXV', 'GCONV_PATH', 'GLIBC_TUNABLES',
+  'LOCPATH', 'NLSPATH', 'MALLOC_TRACE', 'GETCONF_DIR', 'HOSTALIASES', 'LOCALDOMAIN', 'RES_OPTIONS']);
 
 export function releasePath(commit) {
   assert.ok(typeof commit === 'string' && /^[a-f0-9]{40}$/.test(commit));
@@ -223,12 +227,25 @@ export function validateEnvironmentPin(bytes, expected) {
   assert.equal(digest(bytes), expected);
 }
 
+export function rejectLoaderEnvironment(env, bytes) {
+  for (const name of loaderVariables) {
+    assert.ok(!env[name]);
+    assert.ok(!bytes.toString('utf8').includes(name));
+  }
+  assert.ok(!Object.keys(env).some(name => name.startsWith('LD_') && env[name]));
+  assert.ok(!bytes.toString('utf8').includes('LD_'));
+}
+
 function parseSystemdEnvironment(file, expected) {
-  validateEnvironmentPin(privateBytes(file), expected);
+  verifyRootAncestors(file);
+  const bytes = privateBytes(file);
+  validateEnvironmentPin(bytes, expected);
+  rejectLoaderEnvironment({}, bytes);
   const output = command('systemd-run', ['--quiet', '--wait', '--pipe', '--collect',
     '--property=Type=exec', '--property=User=root', '--property=Group=root',
     '--property=NoNewPrivileges=yes', '--property=ProtectSystem=strict', '--property=ProtectHome=yes',
     '--property=PrivateNetwork=yes', '--property=PrivateTmp=yes', '--property=RuntimeMaxSec=10',
+    `--property=UnsetEnvironment=${loaderVariables.join(' ')}`,
     `--property=EnvironmentFile=${file}`, '/usr/bin/env', '-0']);
   const parsed = Object.fromEntries(output.split('\0').filter(Boolean).map(entry => {
     const index = entry.indexOf('=');
@@ -271,6 +288,7 @@ function performCutover(action, gateFile) {
   const currentCode = action === 'apply' ? paths.code : release;
   const properties = serviceProperties();
   const baseline = assertProcess(properties, gate, action === 'apply' ? 'sandbox' : paths.user, journal, action === 'apply' ? paths.oldRegistry : registry, currentCode);
+  rejectLoaderEnvironment(baseline, Buffer.alloc(0));
   for (const key of ['Environment', 'UnsetEnvironment', 'PassEnvironment']) assert.equal(properties[key], '');
   let state;
   let env;
@@ -293,7 +311,9 @@ function performCutover(action, gateFile) {
     assert.equal(optionalCommand('getent', ['passwd', String(uid)]), '');
     assert.equal(optionalCommand('getent', ['group', paths.user]), '');
     assert.equal(optionalCommand('getent', ['group', String(uid)]), '');
-    env = privateBytes(paths.oldEnv, [0, 1002]);
+    verifyRootAncestors(paths.oldEnv);
+    env = privateBytes(paths.oldEnv);
+    rejectLoaderEnvironment(baseline, env);
     keys = privateBytes(paths.oldRegistry, [0, 1002]);
     state = { schemaVersion: 'own-native-uid-cutover-v1', targetUid: uid, releaseCommit: gate.releaseCommit, originalJournalSha256: digest(bytes),
       originalEnvironmentSha256: digest(env), originalRegistrySha256: digest(keys) };
@@ -309,7 +329,8 @@ function performCutover(action, gateFile) {
     assert.equal(state.targetUid, uid);
     assert.equal(state.releaseCommit, gate.releaseCommit);
     validateEnvironmentPin(privateBytes(environment), state.stagedEnvironmentSha256);
-    assert.equal(digest(privateBytes(paths.oldEnv, [0, 1002])), state.originalEnvironmentSha256);
+    verifyRootAncestors(paths.oldEnv);
+    assert.equal(digest(privateBytes(paths.oldEnv)), state.originalEnvironmentSha256);
     assert.equal(digest(privateBytes(paths.oldRegistry, [0, 1002])), state.originalRegistrySha256);
     assert.equal(digest(privateBytes(paths.oldJournal, [1002])), state.originalJournalSha256);
     assert.equal(command('id', ['-u', paths.user]), String(uid));

@@ -3,10 +3,29 @@ import { createHash } from 'node:crypto';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
-import { cutoverPlan, paths, releasePath, validateEnvironmentPin, validateQuiescence, validateRunnerArgv, validateStagedEnvironment } from './own-native-uid-cutover.mjs';
+import { cutoverPlan, loaderVariables, paths, rejectLoaderEnvironment, releasePath, validateEnvironmentPin, validateQuiescence, validateRunnerArgv, validateStagedEnvironment } from './own-native-uid-cutover.mjs';
 import { stagePlan, validateSourceTar } from './stage-own-native-release.mjs';
 
 const now = Date.parse('2026-10-05T07:00:00Z');
+test('loader guards refuse baseline values and any staged declaration before evaluation', () => {
+  rejectLoaderEnvironment({}, Buffer.from('EXTERNAL_WORKER_TOKEN=fixture\n'));
+  for (const name of loaderVariables) {
+    assert.throws(() => rejectLoaderEnvironment({ [name]: '/fixture' }, Buffer.alloc(0)));
+    for (const declaration of [`${name}=/fixture\n`, ` ${name} = '/fixture'\n`, `# ${name}\n`]) {
+      assert.throws(() => rejectLoaderEnvironment({}, Buffer.from(declaration)));
+    }
+  }
+  assert.throws(() => rejectLoaderEnvironment({ LD_FUTURE_VARIABLE: 'fixture' }, Buffer.alloc(0)));
+  assert.throws(() => rejectLoaderEnvironment({}, Buffer.from('LD_FUTURE_VARIABLE=fixture\n')));
+});
+
+test('root-owned source and loader guard precede transient evaluation', () => {
+  const source = readFileSync(new URL('./own-native-uid-cutover.mjs', import.meta.url), 'utf8');
+  assert.match(source, /verifyRootAncestors\(paths.oldEnv\);\s+env = privateBytes\(paths.oldEnv\);/);
+  assert.doesNotMatch(source, /privateBytes\(paths.oldEnv, \[0, 1002\]\)/);
+  assert.ok(source.indexOf('rejectLoaderEnvironment({}, bytes)') < source.indexOf("command('systemd-run'"));
+  assert.match(source, /--property=UnsetEnvironment=\$\{loaderVariables.join/);
+});
 test('Runner accepts only exact relative or absolute entrypoint with exact working directory', () => {
   for (const code of [paths.code, releasePath('a'.repeat(40))]) {
     validateRunnerArgv(['/usr/local/bin/node', 'dist/api/main.js'], code, code);
