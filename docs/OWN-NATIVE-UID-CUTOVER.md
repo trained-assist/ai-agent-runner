@@ -202,6 +202,33 @@ Private backups, dedicated account and new journal remain for review; no shared
 ownership changes or account deletion occur. Parent repeats post-cutover checks
 before reopening ingress. A second cutover requires a separately reviewed plan.
 
+## Deployment evidence — 2026-10-05
+
+Parent reports successful actual cutover using operational source
+`c877ea112d8d88d353afec8d16090f8c47ecdf0e` (PR132), independently reviewed with
+51 offline tests. The deployed Runner application is the separately staged
+root-owned release `97956c5bca4a9d6c87d71b826354ab05ab48811d`, not the operational
+script commit. Its source archive SHA256 is
+`e83d83864714907174e196cc44ed08edbb52e7dd282d53bdb552423527999a78`;
+package-lock SHA256 is
+`b1fe9e8edaf181f2dd6e78e28344d957bac5950c64e9dcebe29ce6a39ab64c93`.
+
+Reported live checks passed: dedicated UID12079, independent Unix boundary,
+all four existing CP/native/Runner runs and journal/artifact identities,
+callback and unchanged legacy units. Parent removed only the exact own ingress
+seal; non-root health returned 200. External Runner health and bot restoration
+were still pending at this checkpoint. These are parent-reported live results,
+not a live run performed by this source author. Evidence is tracked in
+[architecture issue141](https://github.com/trained-assist/trained-agent-architecture/issues/141).
+
+Actual rollback was **not performed**. Current rollback requires an active
+isolated Runner with its expected PID and environment. It cannot recover an
+inactive partial apply (including a failed post-start check that stops the unit).
+Such recovery requires a separately reviewed inactive recovery gate and explicit
+operator authorization; do not restart, rerun jobs, or claim rollback acceptance.
+This cutover proves neither Google/vault access nor external GHA/model sandbox
+isolation. No Google vault transfer or Google activation is part of this evidence.
+
 ## Later Google vault boundary
 
 Only after independent UID cutover verification may parent authorize a **new**
