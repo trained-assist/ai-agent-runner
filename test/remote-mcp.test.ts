@@ -25,10 +25,13 @@ function setup() {
 function documentsSetup() {
   const { spec, host } = setup();
   spec.profileId = 'integration-v1';
-  spec.runId = '01234567-89ab-cdef-0123-456789abcdef';
-  host.servers = { documents: { ...policies.documents, transportProfileId: 'sandbox-integrator-google' } };
-  const registration: DocumentsHttpRegistration = { runtime: '/private/documents-runtime', serverId: descriptor.serverId, url: descriptor.url, scope: 'documents:approved', allowedTools: descriptor.allowedTools, userTaskId: spec.userTaskId, actorProfileId: 'integration-v1', transportProfileId: 'sandbox-integrator-google', mintOnResolve: true };
+  spec.runId = 'run_01234567-89ab-cdef-0123-456789abcdef';
+  const registration: DocumentsHttpRegistration = { runtime: '/private/documents-runtime', serverId: descriptor.serverId, url: descriptor.url, scope: 'documents:approved', allowedTools: descriptor.allowedTools, userTaskId: spec.userTaskId, expectedActorProfile: 'integration-v1', credentialProfile: 'sandbox-integrator-google', mintOnResolve: true, startOnResolve: true, port: 8791 };
   return { spec, host, registrations: { [descriptor.bindingRef]: registration } };
+}
+
+function fakeStartup() {
+  return vi.fn(async () => ({ server: { listening: true }, close: vi.fn(async () => undefined) }));
 }
 
 describe('remote MCP public contract', () => {
@@ -46,6 +49,59 @@ describe('remote MCP public contract', () => {
 });
 
 describe('trusted host attachment', () => {
+  it('refuses mint-only configuration without a registered startup hook', async () => {
+    const { spec, host, registrations } = documentsSetup();
+    const readBinding = vi.fn();
+    const mintBinding = vi.fn();
+    host.resolveBinding = localDocumentsBindingResolver(registrations, { readBinding, mintBinding });
+    await expect(resolveRemoteMcpAttachment(spec, host, now)).rejects.toMatchObject({ code: 'MCP_BINDING_UNAVAILABLE' });
+    expect(readBinding).not.toHaveBeenCalled();
+    expect(mintBinding).not.toHaveBeenCalled();
+  });
+
+  it('fails closed on startup failure and does not automatically restart the domain', async () => {
+    const { spec, host, registrations } = documentsSetup();
+    const native = { runId: spec.runId, userTaskId: spec.userTaskId, profile: 'integration-v1', credentialProfile: 'sandbox-integrator-google', expiresAt: '2026-10-05T01:00:00.000Z', authToken: 'a'.repeat(43) };
+    const createHttpHost = vi.fn(async () => { throw new Error('DOMAIN_NOT_READY'); });
+    host.resolveBinding = localDocumentsBindingResolver(registrations, { readBinding: () => native, mintBinding: vi.fn(), createHttpHost });
+    const fetchImpl = vi.fn();
+    const adapter = new ExternalWorkerAdapter({ baseUrl: 'https://worker.example.test', baseUrlForResult: 'https://api.example.test', remoteMcp: host, now: () => now, fetchImpl });
+    await expect(adapter.launch(spec)).rejects.toMatchObject({ code: 'MCP_BINDING_UNAVAILABLE' });
+    await expect(adapter.launch(spec)).rejects.toMatchObject({ code: 'MCP_BINDING_UNAVAILABLE' });
+    expect(createHttpHost).toHaveBeenCalledTimes(1);
+    expect(fetchImpl).not.toHaveBeenCalled();
+    await adapter.dispose();
+  });
+
+  it('closes a late-starting domain after deadline and disposes it only once', async () => {
+    const { spec, host, registrations } = documentsSetup();
+    const native = { runId: spec.runId, userTaskId: spec.userTaskId, profile: 'integration-v1', credentialProfile: 'sandbox-integrator-google', expiresAt: '2026-10-05T01:00:00.000Z', authToken: 'a'.repeat(43) };
+    const close = vi.fn(async () => undefined);
+    host.resolveBinding = localDocumentsBindingResolver(registrations, { readBinding: () => native, mintBinding: vi.fn(), createHttpHost: async () => { await new Promise(resolve => setTimeout(resolve, 40)); return { server: { listening: true }, close }; } });
+    const fetchImpl = vi.fn();
+    const adapter = new ExternalWorkerAdapter({ baseUrl: 'https://worker.example.test', baseUrlForResult: 'https://api.example.test', deadlineMs: 10, remoteMcp: host, now: () => now, fetchImpl });
+    await expect(adapter.launch(spec)).rejects.toMatchObject({ code: 'MCP_BINDING_UNAVAILABLE' });
+    await new Promise(resolve => setTimeout(resolve, 60));
+    expect(close).toHaveBeenCalledTimes(1);
+    expect(fetchImpl).not.toHaveBeenCalled();
+    await adapter.dispose();
+    await adapter.dispose();
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects bare UUIDs before native binding access or mint', async () => {
+    const { spec, host, registrations } = documentsSetup();
+    spec.runId = spec.runId.slice(4);
+    const readBinding = vi.fn();
+    const mintBinding = vi.fn();
+    const createHttpHost = fakeStartup();
+    host.resolveBinding = localDocumentsBindingResolver(registrations, { readBinding, mintBinding, createHttpHost });
+    await expect(resolveRemoteMcpAttachment(spec, host, now)).rejects.toMatchObject({ code: 'MCP_BINDING_UNAVAILABLE' });
+    expect(readBinding).not.toHaveBeenCalled();
+    expect(mintBinding).not.toHaveBeenCalled();
+    expect(createHttpHost).not.toHaveBeenCalled();
+  });
+
   it('uses host scope metadata without CP credential declarations', async () => {
     const { spec, host } = setup();
     delete spec.credentialBindings;
@@ -70,13 +126,16 @@ describe('trusted host attachment', () => {
       if (!native) throw Object.assign(new Error('missing'), { code: 'ENOENT' });
       return native;
     });
-    const mintBinding = vi.fn(request => { native = { ...request, authToken: 'a'.repeat(43) }; });
-    host.resolveBinding = localDocumentsBindingResolver(registrations, { readBinding, mintBinding });
+    const mintBinding = vi.fn(request => { native = { ...request, profile: request.expectedActorProfile, authToken: 'a'.repeat(43) }; });
+    const createHttpHost = fakeStartup();
+    host.resolveBinding = localDocumentsBindingResolver(registrations, { readBinding, mintBinding, createHttpHost });
     const first = await resolveRemoteMcpAttachment(spec, host, now);
     expect(await resolveRemoteMcpAttachment(spec, host, now)).toEqual(first);
     expect(mintBinding).toHaveBeenCalledTimes(1);
-    expect(mintBinding).toHaveBeenCalledWith(expect.objectContaining({ runId: spec.runId, userTaskId: spec.userTaskId, profile: 'sandbox-integrator-google' }));
-    expect(first?.mcp.servers.documents?.headers).toMatchObject({ 'X-MCP-Profile': 'sandbox-integrator-google', 'X-MCP-Run-Id': spec.runId });
+    expect(mintBinding).toHaveBeenCalledWith(expect.objectContaining({ runId: spec.runId, userTaskId: spec.userTaskId, expectedActorProfile: 'integration-v1', credentialProfile: 'sandbox-integrator-google' }));
+    expect(first?.mcp.servers.documents?.headers).toMatchObject({ 'X-MCP-Profile': 'integration-v1', 'X-MCP-Run-Id': spec.runId });
+    expect(createHttpHost).toHaveBeenCalledTimes(1);
+    await host.resolveBinding.dispose?.();
     readBinding.mockClear();
     spec.profileId = 'other-actor';
     await expect(resolveRemoteMcpAttachment(spec, host, now)).rejects.toMatchObject({ code: 'MCP_BINDING_UNAVAILABLE' });
@@ -87,19 +146,19 @@ describe('trusted host attachment', () => {
   it('does not mint invalid existing records or when opt-in is disabled', async () => {
     const { spec, host, registrations } = documentsSetup();
     const mintBinding = vi.fn();
-    host.resolveBinding = localDocumentsBindingResolver(registrations, { readBinding: () => { throw new Error('unsafe'); }, mintBinding });
+    host.resolveBinding = localDocumentsBindingResolver(registrations, { readBinding: () => { throw new Error('unsafe'); }, mintBinding, createHttpHost: fakeStartup() });
     await expect(resolveRemoteMcpAttachment(spec, host, now)).rejects.toMatchObject({ code: 'MCP_BINDING_UNAVAILABLE' });
     registrations[descriptor.bindingRef]!.mintOnResolve = false;
-    host.resolveBinding = localDocumentsBindingResolver(registrations, { readBinding: () => { throw Object.assign(new Error('missing'), { code: 'ENOENT' }); }, mintBinding });
+    host.resolveBinding = localDocumentsBindingResolver(registrations, { readBinding: () => { throw Object.assign(new Error('missing'), { code: 'ENOENT' }); }, mintBinding, createHttpHost: fakeStartup() });
     await expect(resolveRemoteMcpAttachment(spec, host, now)).rejects.toMatchObject({ code: 'MCP_BINDING_UNAVAILABLE' });
     expect(mintBinding).not.toHaveBeenCalled();
   });
 
   it('verifies exclusive-create races rather than replacing another registration', async () => {
     const { spec, host, registrations } = documentsSetup();
-    const readBinding = vi.fn().mockImplementationOnce(() => { throw Object.assign(new Error('missing'), { code: 'ENOENT' }); }).mockReturnValue({ runId: 'another-run', userTaskId: spec.userTaskId, profile: 'sandbox-integrator-google', expiresAt: new Date(Date.now() + 60000).toISOString(), authToken: 'a'.repeat(43) });
+    const readBinding = vi.fn().mockImplementationOnce(() => { throw Object.assign(new Error('missing'), { code: 'ENOENT' }); }).mockReturnValue({ runId: 'another-run', userTaskId: spec.userTaskId, profile: 'integration-v1', credentialProfile: 'sandbox-integrator-google', expiresAt: new Date(Date.now() + 60000).toISOString(), authToken: 'a'.repeat(43) });
     const mintBinding = vi.fn(() => { throw Object.assign(new Error('exists'), { code: 'EEXIST' }); });
-    host.resolveBinding = localDocumentsBindingResolver(registrations, { readBinding, mintBinding });
+    host.resolveBinding = localDocumentsBindingResolver(registrations, { readBinding, mintBinding, createHttpHost: fakeStartup() });
     await expect(resolveRemoteMcpAttachment(spec, host, now)).rejects.toMatchObject({ code: 'MCP_BINDING_UNAVAILABLE' });
     expect(mintBinding).toHaveBeenCalledTimes(1);
     expect(readBinding).toHaveBeenCalledTimes(2);
@@ -108,7 +167,7 @@ describe('trusted host attachment', () => {
   it('prevents late local mint after the bounded resolver deadline', async () => {
     const { spec, host, registrations } = documentsSetup();
     const mintBinding = vi.fn();
-    host.resolveBinding = localDocumentsBindingResolver(registrations, { readBinding: async () => { await new Promise(resolve => setTimeout(resolve, 40)); throw Object.assign(new Error('missing'), { code: 'ENOENT' }); }, mintBinding });
+    host.resolveBinding = localDocumentsBindingResolver(registrations, { readBinding: async () => { await new Promise(resolve => setTimeout(resolve, 40)); throw Object.assign(new Error('missing'), { code: 'ENOENT' }); }, mintBinding, createHttpHost: fakeStartup() });
     const fetchImpl = vi.fn();
     const adapter = new ExternalWorkerAdapter({ baseUrl: 'https://worker.example.test', baseUrlForResult: 'https://api.example.test', deadlineMs: 10, remoteMcp: host, now: () => now, fetchImpl });
     await expect(adapter.launch(spec)).rejects.toMatchObject({ code: 'MCP_BINDING_UNAVAILABLE' });
@@ -132,30 +191,29 @@ describe('trusted host attachment', () => {
   it('reads the native registered wrapper binding without mint or SA access', async () => {
     const { spec, host } = setup();
     spec.profileId = 'integration-v1';
-    host.servers = { documents: { ...policies.documents, transportProfileId: 'sandbox-integrator-google' } };
     spec.runId = 'run_01234567-89ab-cdef-0123-456789abcdef';
     const opaque = 'a'.repeat(43);
-    const native = { runId: spec.runId, userTaskId: spec.userTaskId, profile: 'sandbox-integrator-google', expiresAt: '2026-10-05T01:00:00.000Z', authToken: opaque };
+    const native = { runId: spec.runId, userTaskId: spec.userTaskId, profile: 'integration-v1', credentialProfile: 'sandbox-integrator-google', expiresAt: '2026-10-05T01:00:00.000Z', authToken: opaque };
     const readBinding = vi.fn(() => native);
-    host.resolveBinding = registeredDocumentsBindingResolver({ [descriptor.bindingRef]: { runtime: '/private/documents-runtime', serverId: descriptor.serverId, url: descriptor.url, scope: 'documents:approved', allowedTools: descriptor.allowedTools, userTaskId: spec.userTaskId, actorProfileId: 'integration-v1', transportProfileId: 'sandbox-integrator-google' } }, readBinding);
+    host.resolveBinding = registeredDocumentsBindingResolver({ [descriptor.bindingRef]: { runtime: '/private/documents-runtime', serverId: descriptor.serverId, url: descriptor.url, scope: 'documents:approved', allowedTools: descriptor.allowedTools, userTaskId: spec.userTaskId, expectedActorProfile: 'integration-v1', credentialProfile: 'sandbox-integrator-google' } }, readBinding);
     const first = await resolveRemoteMcpAttachment(spec, host, now);
     const repeat = await resolveRemoteMcpAttachment(spec, host, now);
     expect(first).toEqual(repeat);
     expect(first?.mcpSecrets.RUNNER_MCP_DOCS_TOKEN).toBe(opaque);
-    expect(first?.mcp.servers.documents?.headers['X-MCP-Profile']).toBe('sandbox-integrator-google');
+    expect(first?.mcp.servers.documents?.headers['X-MCP-Profile']).toBe('integration-v1');
     expect(readBinding).toHaveBeenCalledWith('/private/documents-runtime');
     expect(JSON.stringify(first)).not.toContain('/private/documents-runtime');
     spec.runId = spec.runId.slice(4);
     await expect(resolveRemoteMcpAttachment(spec, host, now)).rejects.toMatchObject({ code: 'MCP_BINDING_UNAVAILABLE' });
   });
 
-  it.each(['profile', 'userTaskId', 'runId'] as const)('rejects native registered wrapper mismatched %s', async field => {
+  it.each(['profile', 'credentialProfile', 'userTaskId', 'runId'] as const)('rejects native registered wrapper mismatched %s', async field => {
     const { spec, host } = setup();
     spec.profileId = 'integration-v1';
-    host.servers = { documents: { ...policies.documents, transportProfileId: 'sandbox-integrator-google' } };
-    const native = { runId: spec.runId, userTaskId: spec.userTaskId, profile: 'sandbox-integrator-google', expiresAt: '2026-10-05T01:00:00.000Z', authToken: 'a'.repeat(43) };
+    spec.runId = 'run_01234567-89ab-cdef-0123-456789abcdef';
+    const native = { runId: spec.runId, userTaskId: spec.userTaskId, profile: 'integration-v1', credentialProfile: 'sandbox-integrator-google', expiresAt: '2026-10-05T01:00:00.000Z', authToken: 'a'.repeat(43) };
     native[field] = 'other';
-    host.resolveBinding = registeredDocumentsBindingResolver({ [descriptor.bindingRef]: { runtime: '/private/documents-runtime', serverId: descriptor.serverId, url: descriptor.url, scope: 'documents:approved', allowedTools: descriptor.allowedTools, userTaskId: spec.userTaskId, actorProfileId: 'integration-v1', transportProfileId: 'sandbox-integrator-google' } }, () => native);
+    host.resolveBinding = registeredDocumentsBindingResolver({ [descriptor.bindingRef]: { runtime: '/private/documents-runtime', serverId: descriptor.serverId, url: descriptor.url, scope: 'documents:approved', allowedTools: descriptor.allowedTools, userTaskId: spec.userTaskId, expectedActorProfile: 'integration-v1', credentialProfile: 'sandbox-integrator-google' } }, () => native);
     await expect(resolveRemoteMcpAttachment(spec, host, now)).rejects.toMatchObject({ code: 'MCP_BINDING_UNAVAILABLE' });
   });
 
@@ -179,7 +237,7 @@ describe('trusted host attachment', () => {
     const receipt = api.submit(principal, 'remote-mcp-test', { engine: { name: 'dynamic-ip-azure-agent-run', adapterVersion: '1' }, input: { inlinePrompt: 'read approved sheet' }, limits: { timeoutMs: 5000 }, userTaskId: 'owner-task', mcp: { servers: [descriptor] } });
     await vi.waitFor(() => expect(api.status(principal, receipt.runId).state).toBe('succeeded'));
     expect(resolved).toEqual([receipt.runId]);
-    expect(receipt.runId).toMatch(/^[a-f0-9-]{36}$/);
+    expect(receipt.runId).toMatch(/^run_[a-f0-9-]{36}$/);
     expect(api.capabilities().mcp.remoteTransport).toBe('worker_remote');
     expect(JSON.stringify(api.result(principal, receipt.runId))).not.toContain(token);
   });

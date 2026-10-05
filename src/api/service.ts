@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import type { LaunchArtifact, LaunchRepo, WorkerCancelResult } from '../adapters/external-worker-adapter.js';
 import {
   admissionEvents,
@@ -553,9 +553,10 @@ export class AgentApi {
     };
   }
 
-  dispose(): void {
+  async dispose(): Promise<void> {
     this.disposed = true;
     this.inFlight.clear();
+    await Promise.all(this.workers.map(worker => worker.dispose?.()));
   }
 
   /**
@@ -753,7 +754,7 @@ export class AgentApi {
     request: SubmitRequest,
     context: { principal: Principal; requestId: string; userTaskId: string; jobId: string; ownerGeneration: number },
   ): RunSpec {
-    const runId = request.mcp?.servers.some(server => server.transport === 'remote') ? randomUUID() : newApiId('run');
+    const runId = newApiId('run');
     const input: InputSpec = { ...(request.input ?? {}) };
     if (request.instructions !== undefined) {
       input.inlinePrompt = input.inlinePrompt

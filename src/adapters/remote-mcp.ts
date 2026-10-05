@@ -5,7 +5,6 @@ import { isRemoteMcpUrl, MCP_TOOL_NAME, type McpRemoteServerSpec, type RunSpec }
 import { PreflightError, isRecord } from '../contracts/validate.js';
 
 export interface RemoteMcpServerPolicy {
-  transportProfileId?: string;
   url: string;
   tokenEnvName: string;
   headers: Record<string, string>;
@@ -14,7 +13,6 @@ export interface RemoteMcpServerPolicy {
 }
 
 export interface RemoteMcpBinding {
-  transportProfileId?: string;
   runId: string;
   profileId: string;
   userTaskId: string;
@@ -50,6 +48,8 @@ export type RemoteMcpBindingResolver = (
   context: Readonly<RemoteMcpBindingContext>,
 ) => RemoteMcpBinding | null | Promise<RemoteMcpBinding | null>;
 
+export type ManagedRemoteMcpBindingResolver = RemoteMcpBindingResolver & { dispose?: () => Promise<void> };
+
 export interface RemoteMcpAttachment {
   mcp: { servers: Record<string, { type: 'remote'; url: string; headers: Record<string, string>; enabled: true }> };
   mcpSecrets: Record<string, string>;
@@ -57,7 +57,7 @@ export interface RemoteMcpAttachment {
 
 export interface RemoteMcpHostOptions {
   servers: Readonly<Record<string, RemoteMcpServerPolicy>>;
-  resolveBinding: RemoteMcpBindingResolver;
+  resolveBinding: ManagedRemoteMcpBindingResolver;
 }
 
 export interface DocumentsHttpRegistration {
@@ -67,31 +67,82 @@ export interface DocumentsHttpRegistration {
   scope: string;
   allowedTools: string[];
   userTaskId: string;
-  actorProfileId: 'integration-v1';
-  transportProfileId: 'sandbox-integrator-google';
+  expectedActorProfile: 'integration-v1';
+  credentialProfile: 'sandbox-integrator-google';
   mintOnResolve?: boolean;
+  startOnResolve?: boolean;
+  port?: number;
+}
+
+export interface DocumentsHttpStartedHost {
+  server: { listening: boolean };
+  close: () => Promise<void>;
 }
 
 export interface DocumentsHttpHost {
   readBinding: (runtime: string) => unknown | Promise<unknown>;
-  mintBinding: (request: { runtime: string; userTaskId: string; profile: string; runId: string; expiresAt: string }) => unknown | Promise<unknown>;
+  mintBinding: (request: { runtime: string; userTaskId: string; expectedActorProfile: string; credentialProfile: string; runId: string; expiresAt: string }) => unknown | Promise<unknown>;
+  createHttpHost?: (request: { runtime: string; port: number }) => Promise<DocumentsHttpStartedHost>;
 }
 
 export function localDocumentsBindingResolver(
   registrations: Readonly<Record<string, DocumentsHttpRegistration>>,
   host: DocumentsHttpHost,
-): RemoteMcpBindingResolver {
-  return registeredDocumentsBindingResolver(registrations, async runtime => host.readBinding(runtime), async (registered, context) => {
+): ManagedRemoteMcpBindingResolver {
+  const resolveRegistered = registeredDocumentsBindingResolver(registrations, async runtime => host.readBinding(runtime), async (registered, context) => {
     if (!registered.mintOnResolve || context.signal?.aborted ||
-        !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(context.runId) ||
+        !/^run_[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(context.runId) ||
         context.timeoutMs + 60000 > 86400000) return;
     await host.mintBinding({ runtime: registered.runtime, userTaskId: context.userTaskId,
-      profile: registered.transportProfileId, runId: context.runId,
+      expectedActorProfile: registered.expectedActorProfile, credentialProfile: registered.credentialProfile, runId: context.runId,
       expiresAt: new Date(Date.now() + context.timeoutMs + 60000).toISOString() });
   });
+  const started = new Map<string, { runId: string; userTaskId: string; promise: Promise<DocumentsHttpStartedHost>; closing?: Promise<void> }>();
+  let disposed = false;
+  let closing: Promise<void> | undefined;
+  const resolver: ManagedRemoteMcpBindingResolver = async (ref, context) => {
+    const registration = Object.hasOwn(registrations, ref) ? registrations[ref] : undefined;
+    if (disposed || !registration?.startOnResolve || !host.createHttpHost ||
+        !Number.isInteger(registration.port) || registration.port! < 1 || registration.port! > 65535 || context.signal?.aborted) return null;
+    const binding = await resolveRegistered(ref, context);
+    if (!binding || disposed || context.signal?.aborted) return null;
+    let instance = started.get(registration.runtime);
+    if (instance && (instance.closing || instance.runId !== context.runId || instance.userTaskId !== context.userTaskId)) return null;
+    if (!instance) {
+      instance = { runId: context.runId, userTaskId: context.userTaskId,
+        promise: host.createHttpHost({ runtime: registration.runtime, port: registration.port! }) };
+      started.set(registration.runtime, instance);
+    }
+    const current = instance;
+    const promise = instance.promise;
+    const abort = (): void => {
+      current.closing ??= promise.then(running => running.close());
+      void current.closing.catch(() => undefined);
+    };
+    context.signal?.addEventListener('abort', abort, { once: true });
+    if (context.signal?.aborted) abort();
+    try {
+      const running = await promise;
+      if (disposed || context.signal?.aborted || !running.server.listening) return null;
+      return binding;
+    } finally {
+      context.signal?.removeEventListener('abort', abort);
+    }
+  };
+  resolver.dispose = () => {
+    disposed = true;
+    closing ??= Promise.all([...started.values()].map(async instance => {
+      let running: DocumentsHttpStartedHost;
+      try { running = await instance.promise; } catch { return; }
+      instance.closing ??= running.close();
+      await instance.closing;
+    })).then(() => undefined);
+    return closing;
+  };
+  return resolver;
 }
 
-export function configuredDocumentsBindingResolver(modulePath: string | undefined, raw: string | undefined): RemoteMcpBindingResolver | undefined {
+export function configuredDocumentsBindingResolver(modulePath: string | undefined, raw: string | undefined): ManagedRemoteMcpBindingResolver | undefined {
   if (!modulePath && !raw) return undefined;
   try {
     if (!modulePath || !isAbsolute(modulePath) || !raw) throw new Error();
@@ -99,18 +150,20 @@ export function configuredDocumentsBindingResolver(modulePath: string | undefine
     if (!isRecord(registrations) || Object.keys(registrations).length === 0 || Object.keys(registrations).length > 8) throw new Error();
     for (const [ref, registration] of Object.entries(registrations)) {
       if (!ref || ref.length > 300 || !isRecord(registration) ||
-          Object.keys(registration).some(key => !['runtime', 'serverId', 'url', 'scope', 'allowedTools', 'userTaskId', 'actorProfileId', 'transportProfileId', 'mintOnResolve'].includes(key)) ||
+          Object.keys(registration).some(key => !['runtime', 'serverId', 'url', 'scope', 'allowedTools', 'userTaskId', 'expectedActorProfile', 'credentialProfile', 'mintOnResolve', 'startOnResolve', 'port'].includes(key)) ||
           typeof registration.runtime !== 'string' || !isAbsolute(registration.runtime) ||
           typeof registration.serverId !== 'string' || !isRemoteMcpUrl(registration.url) ||
           typeof registration.scope !== 'string' || !registration.scope ||
-          registration.actorProfileId !== 'integration-v1' || registration.transportProfileId !== 'sandbox-integrator-google' ||
+          registration.expectedActorProfile !== 'integration-v1' || registration.credentialProfile !== 'sandbox-integrator-google' ||
           typeof registration.userTaskId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(registration.userTaskId) ||
           !Array.isArray(registration.allowedTools) || !registration.allowedTools.length ||
           !registration.allowedTools.every(tool => ['gdrive_create_spreadsheet', 'gdrive_read_sheet', 'gdrive_write_sheet'].includes(tool)) ||
-          (registration.mintOnResolve !== undefined && typeof registration.mintOnResolve !== 'boolean')) throw new Error();
+          (registration.mintOnResolve !== undefined && typeof registration.mintOnResolve !== 'boolean') ||
+          (registration.startOnResolve !== undefined && typeof registration.startOnResolve !== 'boolean') ||
+          (registration.port !== undefined && (typeof registration.port !== 'number' || !Number.isInteger(registration.port) || registration.port < 1 || registration.port > 65535))) throw new Error();
     }
     const host: unknown = createRequire(import.meta.url)(modulePath);
-    if (!isRecord(host) || typeof host.readBinding !== 'function' || typeof host.mintBinding !== 'function') throw new Error();
+    if (!isRecord(host) || typeof host.readBinding !== 'function' || typeof host.mintBinding !== 'function' || typeof host.createHttpHost !== 'function') throw new Error();
     return localDocumentsBindingResolver(registrations as unknown as Record<string, DocumentsHttpRegistration>, host as unknown as DocumentsHttpHost);
   } catch {
     throw new Error('documents MCP host configuration requires a trusted local module and pinned private registrations');
@@ -125,8 +178,9 @@ export function registeredDocumentsBindingResolver(
   return async (bindingRef, context) => {
     const registered = Object.hasOwn(registrations, bindingRef) ? registrations[bindingRef] : undefined;
     if (!registered || registered.serverId !== context.serverId || registered.url !== context.url || registered.scope !== context.scope ||
-        registered.actorProfileId !== 'integration-v1' || registered.transportProfileId !== 'sandbox-integrator-google' ||
-        context.profileId !== registered.actorProfileId || context.userTaskId !== registered.userTaskId || context.signal?.aborted ||
+        registered.expectedActorProfile !== 'integration-v1' || registered.credentialProfile !== 'sandbox-integrator-google' ||
+        context.profileId !== registered.expectedActorProfile || context.userTaskId !== registered.userTaskId || context.signal?.aborted ||
+        !/^run_[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(context.runId) ||
         !context.allowedTools.every(tool => registered.allowedTools.includes(tool))) return null;
     let native: unknown;
     try {
@@ -142,14 +196,13 @@ export function registeredDocumentsBindingResolver(
       native = await readBinding(registered.runtime);
     }
     if (!isRecord(native) || native.runId !== context.runId || native.userTaskId !== context.userTaskId ||
-        native.profile !== registered.transportProfileId || typeof native.expiresAt !== 'string' ||
+        native.profile !== registered.expectedActorProfile || native.credentialProfile !== registered.credentialProfile || typeof native.expiresAt !== 'string' ||
         typeof native.authToken !== 'string' || !/^[A-Za-z0-9_-]{43,128}$/.test(native.authToken)) return null;
     return {
       runId: context.runId, profileId: context.profileId, userTaskId: context.userTaskId,
       conversationId: context.conversationId, ownerGeneration: context.ownerGeneration,
       engine: context.engine, serverId: context.serverId, url: context.url,
       scope: registered.scope, allowedTools: [...registered.allowedTools],
-      transportProfileId: registered.transportProfileId,
       expiresAt: native.expiresAt, token: native.authToken,
     };
   };
@@ -168,8 +221,8 @@ export function parseRemoteMcpServerPolicies(raw: string | undefined): Record<st
     const tokenNames = new Set<string>();
     for (const [serverId, policy] of Object.entries(input)) {
       if (!/^[A-Za-z0-9._-]{1,64}$/.test(serverId) || !isRecord(policy) ||
-          Object.keys(policy).some(key => !['url', 'tokenEnvName', 'headers', 'allowedTools', 'bindingScopes', 'transportProfileId'].includes(key)) ||
-          !isRemoteMcpUrl(policy.url) || (policy.transportProfileId !== undefined && (typeof policy.transportProfileId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(policy.transportProfileId))) || typeof policy.tokenEnvName !== 'string' ||
+          Object.keys(policy).some(key => !['url', 'tokenEnvName', 'headers', 'allowedTools', 'bindingScopes'].includes(key)) ||
+          !isRemoteMcpUrl(policy.url) || typeof policy.tokenEnvName !== 'string' ||
           !/^RUNNER_MCP_[A-Z0-9_]{1,48}$/.test(policy.tokenEnvName) || tokenNames.has(policy.tokenEnvName) ||
           !isRecord(policy.headers) || !isRecord(policy.bindingScopes) || Object.keys(policy.bindingScopes).length === 0 ||
           !Object.entries(policy.bindingScopes).every(([ref, scope]) => ref.length > 0 && ref.length <= 300 && typeof scope === 'string' && scope.length > 0 && scope.length <= 300) || !Array.isArray(policy.allowedTools) ||
@@ -186,7 +239,7 @@ export function parseRemoteMcpServerPolicies(raw: string | undefined): Record<st
         headers[name] = template;
       }
       tokenNames.add(policy.tokenEnvName);
-      servers[serverId] = { url: policy.url, tokenEnvName: policy.tokenEnvName, headers, allowedTools: [...policy.allowedTools], bindingScopes: { ...policy.bindingScopes } as Record<string, string>, ...(policy.transportProfileId ? { transportProfileId: policy.transportProfileId as string } : {}) };
+      servers[serverId] = { url: policy.url, tokenEnvName: policy.tokenEnvName, headers, allowedTools: [...policy.allowedTools], bindingScopes: { ...policy.bindingScopes } as Record<string, string> };
     }
     return servers;
   } catch {
@@ -253,7 +306,6 @@ export async function resolveRemoteMcpAttachment(
     }
     if (signal?.aborted || binding.scope !== scope || !Array.isArray(binding.allowedTools) ||
         !server.allowedTools.every(tool => binding.allowedTools.includes(tool))) refuse('MCP_BINDING_SCOPE_MISMATCH');
-    if (binding.transportProfileId !== policy.transportProfileId) refuse('MCP_BINDING_SCOPE_MISMATCH');
     if (!(Date.parse(binding.expiresAt) >= now.getTime() + spec.limits.timeoutMs)) refuse('MCP_BINDING_EXPIRED');
     if (typeof binding.token !== 'string' || !/^[A-Za-z0-9._~-]{16,2048}$/.test(binding.token)) refuse('MCP_BINDING_INVALID');
     if (Object.hasOwn(attachment.mcpSecrets, policy.tokenEnvName)) refuse('MCP_TOKEN_NAME_CONFLICT');
@@ -262,7 +314,7 @@ export async function resolveRemoteMcpAttachment(
       headers[name] = template;
     }
     headers['X-MCP-User-Task-Id'] = context.userTaskId;
-    headers['X-MCP-Profile'] = binding.transportProfileId ?? context.profileId;
+    headers['X-MCP-Profile'] = context.profileId;
     headers['X-MCP-Run-Id'] = context.runId;
     if (Object.values(headers).some(value => /[\r\n]/.test(value))) refuse('MCP_BINDING_SCOPE_MISMATCH');
     attachment.mcp.servers[server.serverId] = { type: 'remote', url: policy.url, headers, enabled: true };
