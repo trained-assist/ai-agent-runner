@@ -2,7 +2,7 @@ import { describe, expect, it, vi, onTestFinished } from 'vitest';
 import { ExternalWorkerAdapter } from '../src/adapters/external-worker-adapter.js';
 import { configuredDocumentsBindingResolver, localDocumentsBindingResolver, parseRemoteMcpServerPolicies, registeredDocumentsBindingResolver, resolveRemoteMcpAttachment, type DocumentsHttpRegistration, type RemoteMcpBinding, type RemoteMcpHostOptions } from '../src/adapters/remote-mcp.js';
 import { validateSubmitRequest } from '../src/api/contracts.js';
-import { validateRunSpec } from '../src/contracts/run-spec.js';
+import { validateRunSpec, type RunSpec } from '../src/contracts/run-spec.js';
 import { makeRunSpec } from './helpers.js';
 import { AgentApi } from '../src/api/service.js';
 import type { Principal } from '../src/api/auth.js';
@@ -39,6 +39,16 @@ function fakeStartup() {
   return vi.fn(async () => ({ server: { listening: true }, isReady: () => true, close: vi.fn(async () => undefined) }));
 }
 
+function journaledRun(spec: RunSpec, admittedAt: string): StatelessStore {
+  const directory = mkdtempSync(join(tmpdir(), 'runner-mcp-replay-'));
+  onTestFinished(() => rmSync(directory, { recursive: true, force: true }));
+  const journal = join(directory, 'admissions.jsonl');
+  const original = new StatelessStore({}, journal);
+  original.put({ schemaVersion: 2, requestId: 'request-replay', principalId: 'principal-replay', profileId: spec.profileId, userTaskId: spec.userTaskId, conversationId: spec.conversationId, jobId: spec.jobId, idempotencyKey: 'replay-key', payloadHash: 'replay-hash', runId: spec.runId, operationId: spec.operationId, ownerGeneration: spec.ownerGeneration, spec, createdAt: admittedAt });
+  original.appendDispatched(spec.runId, spec.engine.name, admittedAt);
+  return new StatelessStore({}, journal);
+}
+
 describe('remote MCP public contract', () => {
   it('preserves descriptor through Submit normalization', () => {
     const { spec } = setup();
@@ -61,16 +71,10 @@ describe('trusted host attachment', () => {
     expect(resolveBinding).not.toHaveBeenCalled();
   });
 
-  it.each([false, true])('restores a journaled MCP run before polling without launch; refused=%s', async refused => {
+  it.each([false, true])('checks native status then restores a nonterminal journaled run without launch; refused=%s', async refused => {
     const { spec } = documentsSetup();
     spec.engine.name = 'dynamic-ip-azure-agent-run';
-    const directory = mkdtempSync(join(tmpdir(), 'runner-mcp-replay-'));
-    onTestFinished(() => rmSync(directory, { recursive: true, force: true }));
-    const journal = join(directory, 'admissions.jsonl');
-    const original = new StatelessStore({}, journal);
     const admittedAt = new Date().toISOString();
-    original.put({ schemaVersion: 2, requestId: 'request-replay', principalId: 'principal-replay', profileId: spec.profileId, userTaskId: spec.userTaskId, conversationId: spec.conversationId, jobId: spec.jobId, idempotencyKey: 'replay-key', payloadHash: 'replay-hash', runId: spec.runId, operationId: spec.operationId, ownerGeneration: spec.ownerGeneration, spec, createdAt: admittedAt });
-    original.appendDispatched(spec.runId, spec.engine.name, admittedAt);
     let release: (() => void) | undefined;
     const pending = new Promise<void>(resolve => { release = resolve; });
     const order: string[] = [];
@@ -82,23 +86,73 @@ describe('trusted host attachment', () => {
     const status = vi.fn(async () => { order.push('poll'); return { runId: spec.runId, status: 'running' as const }; });
     const launch = vi.fn();
     const worker: ExternalWorker = { name: spec.engine.name, baseUrl: null, restoreMcp, status, launch, result: vi.fn(), cancel: vi.fn() };
-    const restored = new StatelessStore({}, journal);
+    const restored = journaledRun(spec, admittedAt);
     const api = new AgentApi({ workers: [worker], store: restored });
     onTestFinished(() => api.dispose());
     expect(api.resumeDispatched()).toBe(1);
     expect(api.resumeDispatched()).toBe(0);
-    expect(status).not.toHaveBeenCalled();
+    await vi.waitFor(() => expect(restoreMcp).toHaveBeenCalledTimes(1));
+    expect(status).toHaveBeenCalledTimes(1);
     expect(restoreMcp).toHaveBeenCalledWith(expect.objectContaining({ runId: spec.runId, userTaskId: spec.userTaskId, conversationId: spec.conversationId, ownerGeneration: spec.ownerGeneration, engine: spec.engine }), admittedAt);
     release?.();
     if (refused) {
       await vi.waitFor(() => expect(restored.progressOf(spec.runId)?.state).toBe('unknown'));
-      expect(status).not.toHaveBeenCalled();
+      expect(status).toHaveBeenCalledTimes(1);
     } else {
-      await vi.waitFor(() => expect(status).toHaveBeenCalledWith(spec.runId));
-      expect(order.slice(0, 2)).toEqual(['restore', 'poll']);
+      await vi.waitFor(() => expect(status).toHaveBeenCalledTimes(2));
+      expect(order.slice(0, 3)).toEqual(['poll', 'restore', 'poll']);
     }
     expect(launch).not.toHaveBeenCalled();
     await api.dispose();
+  });
+
+  it.each((['missing', 'expired'] as const).flatMap(bindingState => (['succeeded', 'failed', 'cancelled'] as const).map(terminalStatus => ({ bindingState, terminalStatus }))))('retrieves $terminalStatus native result with $bindingState binding; nonterminal stays fail closed', async ({ bindingState, terminalStatus }) => {
+    const { spec, host, registrations } = documentsSetup();
+    spec.engine.name = 'dynamic-ip-azure-agent-run';
+    registrations[descriptor.bindingRef]!.engine = spec.engine.name;
+    const readBinding = vi.fn(() => {
+      if (bindingState === 'missing') throw Object.assign(new Error('missing'), { code: 'ENOENT' });
+      return { runId: spec.runId, userTaskId: spec.userTaskId, profile: 'integration-v1', credentialProfile: 'sandbox-integrator-google', expiresAt: '2026-10-04T00:00:00.000Z', authToken: 'a'.repeat(43) };
+    });
+    const mintBinding = vi.fn();
+    const createHttpHost = fakeStartup();
+    host.resolveBinding = localDocumentsBindingResolver(registrations, { readBinding, mintBinding, createHttpHost });
+    const fetchImpl = vi.fn(async (url: string | URL | Request) => {
+      if (String(url).endsWith('/status')) return Response.json({ runId: spec.runId, status: terminalStatus });
+      if (String(url).endsWith('/result')) return Response.json({ runId: spec.runId, status: 'started', pid: 4242, exitCode: terminalStatus === 'cancelled' ? null : terminalStatus === 'failed' ? 1 : 0, exitSignal: null, exitReason: terminalStatus === 'cancelled' ? 'cancelled' : terminalStatus === 'failed' ? 'nonzero_exit' : 'completed', stdout: 'fixture result', stderr: '', answer: 'fixture answer', answerSource: 'engine_stdout', durationMs: 1000, timedOut: false, outputTruncated: false, artifacts: [], logUrl: 'https://logs.example.test/run.log', repo: { fullName: 'owner/name', branch: `agent-run/${spec.runId}`, commit: 'abc1234' } });
+      throw new Error('unexpected worker request');
+    });
+    const adapter = new ExternalWorkerAdapter({ baseUrl: 'https://worker.example.test', baseUrlForResult: 'https://api.example.test', remoteMcp: host, now: () => now, fetchImpl });
+    const restore = vi.spyOn(adapter, 'restoreMcp');
+    const launch = vi.spyOn(adapter, 'launch');
+    const restored = journaledRun(spec, now.toISOString());
+    const api = new AgentApi({ workers: [adapter], store: restored });
+    onTestFinished(() => api.dispose());
+    expect(api.resumeDispatched()).toBe(1);
+    await vi.waitFor(() => expect(restored.progressOf(spec.runId)?.state).toBe(terminalStatus));
+    expect(restored.progressOf(spec.runId)?.result).toMatchObject({ runId: spec.runId, userTaskId: spec.userTaskId, ownerGeneration: spec.ownerGeneration, exitReason: terminalStatus === 'cancelled' ? 'cancelled' : terminalStatus === 'failed' ? 'nonzero_exit' : 'completed' });
+    expect(restored.progressOf(spec.runId)?.answer).toBe('fixture answer');
+    expect(fetchImpl.mock.calls.map(([url]) => String(url).split('/').pop())).toEqual(['status', 'result']);
+    expect(readBinding).not.toHaveBeenCalled();
+    expect(restore).not.toHaveBeenCalled();
+    expect(launch).not.toHaveBeenCalled();
+    expect(api.resumeDispatched()).toBe(0);
+    await api.dispose();
+
+    const runningFetch = vi.fn(async () => Response.json({ runId: spec.runId, status: 'running' }));
+    const runningAdapter = new ExternalWorkerAdapter({ baseUrl: 'https://worker.example.test', baseUrlForResult: 'https://api.example.test', remoteMcp: { ...host, resolveBinding: localDocumentsBindingResolver(registrations, { readBinding, mintBinding, createHttpHost }) }, now: () => now, fetchImpl: runningFetch });
+    const runningLaunch = vi.spyOn(runningAdapter, 'launch');
+    const runningStore = journaledRun(spec, now.toISOString());
+    const runningApi = new AgentApi({ workers: [runningAdapter], store: runningStore });
+    onTestFinished(() => runningApi.dispose());
+    expect(runningApi.resumeDispatched()).toBe(1);
+    await vi.waitFor(() => expect(runningStore.progressOf(spec.runId)?.state).toBe('unknown'));
+    expect(runningFetch).toHaveBeenCalledTimes(1);
+    expect(readBinding).toHaveBeenCalledTimes(1);
+    expect(mintBinding).not.toHaveBeenCalled();
+    expect(createHttpHost).not.toHaveBeenCalled();
+    expect(runningLaunch).not.toHaveBeenCalled();
+    await runningApi.dispose();
   });
 
   it.each(['conversationId', 'ownerGeneration', 'engine'] as const)('checks registered %s before reading or minting', async field => {
