@@ -7,6 +7,12 @@ import { cutoverPlan, paths, releasePath, validateQuiescence } from './own-nativ
 import { stagePlan, validateSourceTar } from './stage-own-native-release.mjs';
 
 const now = Date.parse('2026-10-05T07:00:00Z');
+test('release base excludes sandbox-owned ancestor', () => {
+  assert.equal(paths.releases, '/opt/ta-integrator-runner-native-releases');
+  for (const file of ['stage-own-native-release.mjs', 'own-native-uid-cutover.mjs']) {
+    assert.match(readFileSync(new URL(file, import.meta.url), 'utf8'), /verifyRootAncestors\(/);
+  }
+});
 const runId = 'run_00000000-0000-0000-0000-000000000001';
 const record = { schemaVersion: 2, runId, principalId: 'integration-v1', profileId: 'integration-v1',
   userTaskId: 'task-1', ownerGeneration: 1,

@@ -4,7 +4,7 @@ import { execFileSync } from 'node:child_process';
 import { chmodSync, closeSync, constants, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { paths, releasePath, verifyRootRelease, verifyReleaseTree } from './own-native-uid-cutover.mjs';
+import { paths, releasePath, verifyRootAncestors, verifyRootRelease, verifyReleaseTree } from './own-native-uid-cutover.mjs';
 
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 
@@ -80,6 +80,7 @@ export function stageRelease(archive, commit, archiveSha256, packageLockSha256) 
   } finally { closeSync(descriptor); }
   assert.equal(hash(bytes), archiveSha256);
   validateSourceTar(bytes, commit);
+  verifyRootAncestors(paths.releases);
   const base = lstatSync(dirname(paths.releases));
   assert.ok(base.isDirectory() && !base.isSymbolicLink() && base.uid === 0 && (base.mode & 0o022) === 0);
   try { mkdirSync(paths.releases, { mode: 0o755 }); }

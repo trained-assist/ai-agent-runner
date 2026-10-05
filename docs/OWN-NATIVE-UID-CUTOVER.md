@@ -46,7 +46,9 @@ unit remained active under sandbox, PID205775. This is inventory, not a quiescen
 or cutover proof; refresh it before any operational approval.
 
 Remediation creates a separate release at
-`/opt/sb/ta-integrator-runner-native-releases/<40-character-source-commit>`.
+`/opt/ta-integrator-runner-native-releases/<40-character-source-commit>`.
+Every ancestor must be root-owned, non-symlink and not group/world writable.
+The shared sandbox-owned `/opt/sb` is never changed or used as a release ancestor.
 It never changes the current tree, follows that dependency symlink, or chowns
 shared code. Source, compiled build and production dependencies are rebuilt from
 the exact reviewed commit and its unchanged package-lock, not copied from the

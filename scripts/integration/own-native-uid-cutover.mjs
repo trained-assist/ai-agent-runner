@@ -9,7 +9,7 @@ export const paths = Object.freeze({
   unit: 'ta-integrator-runner-native-v1.service',
   user: 'ta-integrator-native-v1',
   code: '/opt/sb/ta-integrator-runner-native-v1',
-  releases: '/opt/sb/ta-integrator-runner-native-releases',
+  releases: '/opt/ta-integrator-runner-native-releases',
   oldJournal: '/var/lib/ta-integrator-runner-native-v1/admission.jsonl',
   oldRegistry: '/etc/agent-runner/integrator-native-v1-key-registry.json',
   oldEnv: '/etc/agent-runner/integrator-native-v1-combined.env',
@@ -128,8 +128,19 @@ export function verifyReleaseTree(root, file = root) {
   if (stat.isDirectory()) for (const name of readdirSync(file)) verifyReleaseTree(root, join(file, name));
 }
 
+export function verifyRootAncestors(file) {
+  let ancestor = dirname(file);
+  for (;;) {
+    const stat = lstatSync(ancestor);
+    assert.ok(stat.isDirectory() && !stat.isSymbolicLink() && stat.uid === 0 && (stat.mode & 0o022) === 0);
+    if (ancestor === '/') break;
+    ancestor = dirname(ancestor);
+  }
+}
+
 export function verifyRootRelease(commit) {
   const root = releasePath(commit);
+  verifyRootAncestors(root);
   const parent = lstatSync(paths.releases);
   assert.ok(parent.isDirectory() && !parent.isSymbolicLink() && parent.uid === 0 && (parent.mode & 0o022) === 0);
   verifyReleaseTree(root);
