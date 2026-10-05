@@ -179,6 +179,7 @@ export interface WorkerCancelResult {
 
 /** Порт, который использует stateless-ядро API. Реализация — `ExternalWorkerAdapter`. */
 export interface ExternalWorker {
+  dispose?(): Promise<void>;
   readonly remoteMcpEnabled?: boolean;
   readonly name: string;
   readonly baseUrl: string | null;
@@ -799,6 +800,9 @@ export function workerTransportFailure(
 }
 
 export class ExternalWorkerAdapter implements ExternalWorker {
+  async dispose(): Promise<void> {
+    await this.remoteMcp?.resolveBinding.dispose?.();
+  }
   readonly remoteMcpEnabled: boolean;
   private readonly remoteMcp: RemoteMcpHostOptions | undefined;
   readonly name: string;

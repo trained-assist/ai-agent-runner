@@ -28,25 +28,24 @@ Set `AGENT_API_REMOTE_MCP_SERVERS` to a host-owned JSON map (example values only
     "tokenEnvName":"RUNNER_MCP_DOCUMENTS_TOKEN",
     "headers":{"Authorization":"Bearer {env:RUNNER_MCP_DOCUMENTS_TOKEN}"},
     "bindingScopes":{"documents-approved":"documents:owner-target"},
-    "transportProfileId":"sandbox-integrator-google",
     "allowedTools":["gdrive_create_spreadsheet","gdrive_read_sheet","gdrive_write_sheet"]
   }
 }
 ```
 
-Each descriptor must match the host's exact server ID, URL, binding reference and tool policy. Configured headers accept only opaque-token environment placeholders, optionally prefixed with `Bearer `. Runner generates `X-MCP-User-Task-Id`, `X-MCP-Profile` and `X-MCP-Run-Id` automatically after trusted resolution; neither caller nor policy can override these headers. `X-MCP-Profile` is the explicitly approved transport profile, or the actor profile when no alias is configured. Root keys and SA credentials are never header values.
+Each descriptor must match the host's exact server ID, URL, binding reference and tool policy. Configured headers accept only opaque-token environment placeholders, optionally prefixed with `Bearer `. Runner generates all three scope headers from validated context: task, actor profile (`integration-v1` for documents), and unchanged `run_<UUID>`. Neither caller nor policy can override them. Vault identity is never a scope-header alias. Root keys and SA credentials are never header values.
 
 The trusted host hook `RemoteMcpBindingResolver(bindingRef, context)` receives generated run ID, actor profile, task, conversation, owner generation, operation, engine, server ID, expected URL, tools, timeout and an abort signal. Supply it through `createExternalWorkers(config, log, resolveBinding)` or the local process configuration below. Resolution has the bounded launch deadline and must stop before minting if aborted. Readiness is established from the real host binding, not a caller-provided verified flag. No new mint endpoint, broker or controller is introduced.
 
-The resolver returns `RemoteMcpBinding`: exact context identities except operation ID, plus host-declared `scope`, permitted tools, expiry, opaque token and optionally host-approved `transportProfileId`. `profileId` remains the admission actor, never a vault alias. Missing, mismatched or insufficiently long-lived bindings are refused before worker contact. Expiry must cover the run timeout. Wrapper targets still require separate owner approval.
+The resolver returns `RemoteMcpBinding`: exact context identities except operation ID, plus host-declared scope, permitted tools, expiry and opaque token. `profileId` remains the admission actor. Missing, mismatched or insufficiently long-lived bindings are refused before worker contact. Expiry must cover the run timeout. Wrapper targets still require separate owner approval.
 
 For pre-registered bindings, the default process resolver reads `AGENT_API_REMOTE_MCP_BINDINGS_FILE`, a private mode-0600 JSON map keyed by binding reference. Each value has the above binding shape, including the **actual generated** `runId`. A guessed or generic run ID fails closed. This file fallback does not mint tokens and cannot pre-authorize unknown future run IDs; fresh Submit flows require the trusted host hook or an existing host registration integration. Keep private runtime files outside the repository. Missing configuration or binding never silently launches without MCP.
 
 ## Existing documents HTTP host integration
 
-Documents PR #20, source `8b14251`, exports `mintBinding({runtime,userTaskId,profile,runId,expiresAt})` and `readBinding(runtime)` from `scripts/sandbox/google-mcp-http.cjs`. Mint is a **host-only function/operator CLI**, not an HTTP endpoint. It exclusively creates a random opaque token in private `http-binding.json`; an existing registration must be inspected and read, never overwritten or minted twice. Expiry must be future and no more than 24 hours away. Profile is pinned to `sandbox-integrator-google`.
+Documents PR #20, source `217a8b4`, exports `mintBinding({runtime,userTaskId,expectedActorProfile,credentialProfile,runId,expiresAt})`, `readBinding(runtime)` and `createHttpHost({runtime,port})` from `scripts/sandbox/google-mcp-http.cjs`. Mint is host-local, not an HTTP endpoint. Actor is `integration-v1`, credential profile is `sandbox-integrator-google`, and run ID must preserve `run_<UUID>`. Mint exclusively creates a random opaque token; existing registrations are never overwritten. Expiry must be future and at most 24 hours away.
 
-Use `registeredDocumentsBindingResolver(registrations, readBinding)` for read-only registration. For opt-in local minting use `localDocumentsBindingResolver(registrations, {readBinding,mintBinding})`, reusing the actual exported functions on the documents domain host with the same private registry. No remote mint service is called. Process wiring accepts `AGENT_API_DOCUMENTS_MCP_MODULE`, the trusted absolute path to `scripts/sandbox/google-mcp-http.cjs`, and `AGENT_API_DOCUMENTS_MCP_REGISTRATIONS`, a host-owned JSON map:
+Use `registeredDocumentsBindingResolver(registrations, readBinding)` for metadata-only reading; this alone does not establish HTTP readiness. The configured local resolver reuses `{readBinding,mintBinding,createHttpHost}` on the same domain host/private registry. It refuses before mint/read if startup is not explicitly enabled with a fixed local port and the actual startup export. After exact registration, it awaits real domain startup (including the wrapper's three-tool discovery) and a listening socket before returning attachment. No remote mint service is called. Process wiring accepts `AGENT_API_DOCUMENTS_MCP_MODULE`, the trusted absolute path to the existing module, and `AGENT_API_DOCUMENTS_MCP_REGISTRATIONS`, a host-owned JSON map:
 
 ```json
 {
@@ -57,22 +56,24 @@ Use `registeredDocumentsBindingResolver(registrations, readBinding)` for read-on
     "scope":"documents:owner-target",
     "allowedTools":["gdrive_create_spreadsheet","gdrive_read_sheet","gdrive_write_sheet"],
     "userTaskId":"OPERATOR_APPROVED_TASK",
-    "actorProfileId":"integration-v1",
-    "transportProfileId":"sandbox-integrator-google",
-    "mintOnResolve":false
+    "expectedActorProfile":"integration-v1",
+    "credentialProfile":"sandbox-integrator-google",
+    "mintOnResolve":false,
+    "startOnResolve":false,
+    "port":8791
   }
 }
 ```
 
-The map must be explicitly provisioned for the operator-approved task and exact actor. The only v1 actor-to-vault mapping supported here is `integration-v1` to `sandbox-integrator-google`; all other actors refuse before binding access. The physical credential folder/child `USER_ID` stays `sandbox-integrator-google`. It is not the admission owner. Wrapper `profile`/`X-MCP-Profile` describes its transport/vault profile; actual actor ownership remains checked by Runner's explicit host registration. No old tasks are moved or admission ownership changed.
+Provision registrations after CP intake has supplied the task ID, before routing/submitting its agent attempt. The only v1 actor-to-vault mapping supported is explicit `expectedActorProfile: integration-v1` to `credentialProfile: sandbox-integrator-google`; all other actors refuse. Native `binding.profile`, scope headers and owner-target profile are the actor. Native `binding.credentialProfile` and the physical folder/child `USER_ID` are the vault. No admission ownership changes, old task migration or caller-controlled vault selection occurs.
 
-`mintOnResolve` is disabled by default. After separate owner authorization, the operator may enable it: on a genuinely missing binding (`ENOENT`) Runner calls the existing local `mintBinding` once with the generated UUID, pinned task, transport profile and bounded expiry (run timeout plus one minute, at most 24 hours). No SA is read by mint, no Google operation is performed and no host is started. Invalid/expired/mismatched records are never replaced. An exclusive-create race (`EEXIST`) is followed by exact tuple verification. Repeat resolution for the same run reads the same opaque token; a new run needs its own isolated registry/host and owner target approval. An aborted resolver cannot start a late mint.
+Mint and startup opt-ins default off. After owner authorization, enabling both permits missing-file (`ENOENT`) local mint followed by `createHttpHost`. Mint receives the exact actor/vault pair, pinned task, unchanged canonical run ID and bounded expiry (timeout plus one minute, at most 24 hours). Invalid/expired/mismatched records are never replaced; `EEXIST` triggers exact verification. Same-run repeats reuse token and started host; changed scope requires a new isolated runtime/host. Startup errors are cached, not automatically retried. Deadline abort closes late-starting hosts; Runner disposal closes started hosts. Startup uses the existing SA on its host, but no mint/startup function calls Google artifact tools.
 
-The native `{runId,userTaskId,profile,expiresAt,authToken}` record is converted to the full scoped binding only after exact run/task/transport-profile checks. Runtime paths never enter the worker wire. Do not enable mint or start the listener before owner authorization/target input. The code and tests are not a live-ready claim.
+Native `{runId,userTaskId,profile,credentialProfile,expiresAt,authToken}` is converted only after exact run/task/actor/vault checks. Runtime paths and vault identity never enter engine headers. Do not enable mint/startup before owner authorization/target input. Fixtures are not live-ready proof.
 
 The wrapper requires `Authorization` and all three scope headers on every RPC. Its exact tool names are `gdrive_create_spreadsheet`, `gdrive_read_sheet`, `gdrive_write_sheet`. Its loopback listener needs separately approved TLS forwarding that preserves local Host and scope/auth headers.
 
-For remote-MCP Submit only, Runner generates a fresh bare canonical UUID and forwards that identical ID to the worker, binding and headers. Non-MCP ID generation is unchanged. No prefix is stripped from an existing run and CP's input run ID is never substituted. This matches documents source `8b14251` without relaxing its UUID checks. Cross-host deployment without a shared private registry is unsupported here; no broker or transport is invented to bridge it.
+Runner retains `newApiId('run')`: canonical `run_<UUID>` is identical in its receipt, worker request, private binding, owner-target metadata and scope headers. There is no bare-UUID normalization or prefix stripping. Deploy the existing documents host module and Runner resolver on the same VM with a shared private registry; no cross-host mint broker is needed or implemented. Remaining composition requires approved runtime/targets and a TLS route preserving the wrapper's local Host header, followed by live verification. Startup success alone is not proof that the external engine can reach that TLS route or access owner-approved Sheets targets.
 
 ## Existing worker wire contract
 
