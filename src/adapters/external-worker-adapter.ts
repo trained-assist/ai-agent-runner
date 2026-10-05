@@ -519,6 +519,13 @@ export interface LaunchMapping {
 export interface LaunchMappingOptions {
   /** Базовый URL воркера: источник ссылки на лог, когда воркер её не вернул. */
   workerBaseUrl?: string | null;
+  /**
+   * Номер события, с которого продолжается нумерация журнала рана. По умолчанию — сразу
+   * после событий приёма. API передавает тут уже занятый номер, если до финализации в
+   * журнал писалось что-то ещё (например, отметка «исход неизвестен»): иначе события
+   * финализации переиспользовали бы занятые номера и сломали бы cursor-переигрывание.
+   */
+  startSequence?: number;
 }
 
 /**
@@ -543,6 +550,39 @@ export function admissionEvents(spec: RunSpec, startedAt: string): RunnerEvent[]
       reason: 'stateless API passes the prompt inline; there is no durable workspace to materialize into',
     },
     startedAt,
+  );
+  return events;
+}
+
+/**
+ * Событие рана «исход неизвестен». Отдельного типа для него в контракте нет, и это
+ * правильно: `unknown` — не отказ и не успех, а отсутствие ответа. Поэтому это честная
+ * запись журнала уровня `warn` с причиной: клиент читает события рана, и без записи он
+ * не отличил бы «связь потеряна» от «ран просто идёт».
+ *
+ * Текст проходит через `safeSummary`: событие уходит клиенту, секреты в нём недопустимы.
+ */
+export function outcomeUnknownEvent(
+  spec: RunSpec,
+  sequence: number,
+  at: string,
+  reason: string,
+  detail?: string,
+): RunnerEvent[] {
+  const events: RunnerEvent[] = [];
+  pushRunnerEvent(
+    events,
+    spec,
+    sequence,
+    'log',
+    {
+      stream: 'runner',
+      level: 'warn',
+      message: `outcome unknown (${reason}): ${
+        detail ? `${safeSummary(detail)}; ` : ''
+      }the worker may still be running this run, and its result is not lost yet`,
+    },
+    at,
   );
   return events;
 }
@@ -625,7 +665,7 @@ export function mapLaunchResult(
   }
   return {
     result: validated.value,
-    events: runnerEventsFromLaunch(spec, launch, times, artifacts, repo, logUrl),
+    events: runnerEventsFromLaunch(spec, launch, times, artifacts, repo, logUrl, options.startSequence ?? ADMISSION_EVENT_COUNT),
     artifacts,
     repo,
     logUrl,
@@ -674,10 +714,12 @@ function runnerEventsFromLaunch(
   artifacts: LaunchArtifact[],
   repo: LaunchRepo | null,
   logUrl: string | null,
+  startSequence: number = ADMISSION_EVENT_COUNT,
 ): RunnerEvent[] {
-  // Два события приёма уже записаны до вызова воркера, поэтому нумерация продолжается с трёх.
+  // Нумерация продолжается с того, чем закончился журнал рана: по умолчанию — с двух
+  // событий приёма, записанных до вызова воркера.
   const events: RunnerEvent[] = [];
-  let sequence = ADMISSION_EVENT_COUNT;
+  let sequence = startSequence;
   const push = (type: RunnerEvent['type'], payload: Record<string, unknown>, timestamp: string): void => {
     sequence += 1;
     pushRunnerEvent(events, spec, sequence, type, payload, timestamp);
@@ -794,7 +836,7 @@ export function workerTransportFailure(
     logPath: runLogRef(null, options.workerBaseUrl ?? null, spec.runId),
   };
   const events: RunnerEvent[] = [];
-  let sequence = ADMISSION_EVENT_COUNT;
+  let sequence = options.startSequence ?? ADMISSION_EVENT_COUNT;
   sequence += 1;
   pushRunnerEvent(
     events,
@@ -863,10 +905,15 @@ export class ExternalWorkerAdapter implements ExternalWorker {
       // которое мы ещё не прочитали.
       if (controller.signal.aborted) controller.abort();
       this.log({ event: 'worker_launch_failed', runId: spec.runId, message: err instanceof Error ? err.message : String(err) });
-      throw new PreflightError('WORKER_LAUNCH_UNREACHABLE', 'the external worker did not accept the run', {
+      throw new PreflightError('WORKER_LAUNCH_UNREACHABLE', 'the external worker did not answer the launch request', {
         failureClass: 'runtime',
-        // Ран не принят — никто его не выполняет, поэтому повтор не создаст второй.
         retryable: true,
+        // Транспорт не доказывает, что ран не запущен: запрос мог дойти, воркер мог
+        // зарегистрировать ран и запустить агента, а ответ потеряться по дороге. Поэтому
+        // исход неизвестен — API обязан спросить `status` существующего запуска, прежде чем
+        // считать ран несостоявшимся (контракт внешнего worker, п. 4). `retryable` здесь
+        // означает лишь «транспорт можно повторить», а не «повтор безопасен».
+        outcomeUnknown: true,
       });
     }
     if (!response.ok) {
@@ -877,6 +924,9 @@ export class ExternalWorkerAdapter implements ExternalWorker {
         // 4xx — про запрос: тот же запрос получит тот же отказ (битый токен, не тот payload),
         // и повтор станет штормом. 5xx — про состояние воркера, повтор оправдан.
         retryable: response.status >= 500,
+        // 5xx — состояние воркера: он мог принять ран и упасть уже на ответе, поэтому
+        // запуска мы не знаем. 4xx — отказ по самому запросу: ран не зарегистрирован.
+        outcomeUnknown: response.status >= 500,
       });
     }
     const validated = validateLaunchReceipt(await readJson(response), spec.runId);

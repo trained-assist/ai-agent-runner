@@ -1,11 +1,13 @@
 import { createHash } from 'node:crypto';
 import type { LaunchArtifact, LaunchRepo, WorkerCancelResult } from '../adapters/external-worker-adapter.js';
 import {
+  ADMISSION_EVENT_COUNT,
   admissionEvents,
   artifactUrl,
   branchUrl,
   mapLaunchResult,
   mergeUrl,
+  outcomeUnknownEvent,
   workerTransportFailure,
   type ExternalWorker,
   type LaunchMapping,
@@ -14,6 +16,7 @@ import {
   ResultNotReadyError,
 } from '../adapters/external-worker-adapter.js';
 import type { RunResult } from '../contracts/result.js';
+import { PreflightError } from '../contracts/validate.js';
 import { validateRunSpec, type InputSpec, type RunSpec } from '../contracts/run-spec.js';
 import { DEFAULT_STATELESS_LIMITS, isTerminalApiState, STATELESS_STORE_SCHEMA_VERSION, StatelessStore, type AdmissionRecord } from './stateless-store.js';
 import {
@@ -621,11 +624,77 @@ export class AgentApi {
       void this.pollUntilTerminal(record, worker, startedAt);
     } catch (err) {
       if (this.disposed) return;
-      this.log({ event: 'run_failed', runId: record.runId, message: err instanceof Error ? err.message : String(err) });
-      this.finalize(record, workerTransportFailure(record.spec, err, { startedAt, finishedAt: this.nowIso() }, { workerBaseUrl: worker.baseUrl }));
+      await this.reconcileLaunch(record, worker, err, startedAt);
     } finally {
       this.inFlight.delete(record.runId);
     }
+  }
+
+  /**
+   * Отказ на launch, после которого исход рана неизвестен (контракт внешнего worker, п. 4).
+   *
+   * Таймаут ожидания квитанции не доказывает, что ран не запущен: запрос мог дойти,
+   * воркер мог зарегистрировать ран и даже завершить его, пока не было связи. Поэтому
+   * ран нельзя финализировать здесь — иначе клиент получит терминальный отказ с
+   * `retryable` и повторит запрос, заведя второй ран там, где первый ещё идёт.
+   *
+   * Порядок: (1) пометить попытку `unknown` с причиной `worker_unreachable`; (2) один раз
+   * спросить `status` уже отправленного `runId` — воркер помнит запуски по `operationId`,
+   * поэтому опрос не создаёт нового запуска; (3) только если воркер не видит ран, считать
+   * запуск не состоявшимся.
+   */
+  private async reconcileLaunch(record: AdmissionRecord, worker: ExternalWorker, err: unknown, startedAt: string): Promise<void> {
+    const message = err instanceof Error ? err.message : String(err);
+    const code = err instanceof PreflightError ? err.code : 'WORKER_UNREACHABLE';
+    if (!(err instanceof PreflightError) || !err.outcomeUnknown) {
+      // Отказ известен: запрос не дошёл до воркера (preflight) или воркер ответил отказом
+      // по самому запросу. Запуска нет, проверять нечего.
+      this.log({ event: 'run_failed', runId: record.runId, message });
+      this.finalize(record, workerTransportFailure(record.spec, err, { startedAt, finishedAt: this.nowIso() }, { workerBaseUrl: worker.baseUrl }));
+      return;
+    }
+    this.log({ event: 'worker_launch_undetermined', runId: record.runId, code, message });
+    // 1. Исход неизвестен — это не `failed`. Отказ остаётся видимым и в логе, и в журнале рана.
+    this.markUnknown(record, 'worker_unreachable', message);
+    // 2. Один запрос по уже отправленному runId. Новый launch не отправляется никогда.
+    let status: WorkerRunStatus | null = null;
+    try {
+      status = (await worker.status(record.runId)).status;
+    } catch (probeErr) {
+      this.log({ event: 'worker_status_failed', runId: record.runId, message: probeErr instanceof Error ? probeErr.message : String(probeErr) });
+    }
+    if (this.disposed || this.store.progressOf(record.runId) === null) return;
+    const run = this.store.progressOf(record.runId);
+    if (!run || isTerminalApiState(run.state)) return;
+    this.log({ event: 'worker_launch_reconciled', runId: record.runId, code, status: status ?? 'unreachable' });
+    // 3. Воркер видит ран: поллер доводит его до терминала штатно. Помечаем до старта
+    //    поллера, чтобы ран пережил рестарт API (§8.2 ревью).
+    if (status === 'accepted' || status === 'running') {
+      this.store.appendDispatched(record.runId, record.spec.engine.name, this.nowIso());
+      void this.pollUntilTerminal(record, worker, startedAt);
+      return;
+    }
+    if (status === 'succeeded' || status === 'failed' || status === 'cancelled') {
+      // Ран успел завершиться, пока ответ на launch терялся: результат забираем штатно.
+      await this.collectResult(record, worker, startedAt);
+      return;
+    }
+    // 4. Воркер не видит запуска: ран не состоялся. Терминальный failed — но с исходным
+    //    кодом отказа (он называет причину) и с честным итогом в описании.
+    this.log({ event: 'worker_run_absent', runId: record.runId, code });
+    this.finalize(
+      record,
+      workerTransportFailure(
+        record.spec,
+        new PreflightError(
+          code,
+          `the worker has no record of run ${record.runId} after the launch answer was lost: ${message}`,
+          { failureClass: 'runtime', retryable: true },
+        ),
+        { startedAt, finishedAt: this.nowIso() },
+        { workerBaseUrl: worker.baseUrl, startSequence: this.journalSequence(record.runId) },
+      ),
+    );
   }
 
   /**
@@ -675,7 +744,12 @@ export class AgentApi {
     if (this.disposed || this.store.progressOf(record.runId) === null) return;
     try {
       const launch = await worker.result(record.runId);
-      const mapping = mapLaunchResult(record.spec, launch, { startedAt, finishedAt: this.nowIso() }, { workerBaseUrl: worker.baseUrl });
+      const mapping = mapLaunchResult(
+        record.spec,
+        launch,
+        { startedAt, finishedAt: this.nowIso() },
+        { workerBaseUrl: worker.baseUrl, startSequence: this.journalSequence(record.runId) },
+      );
       this.finalize(record, mapping);
       this.log({
         event: 'run_finished',
@@ -702,13 +776,24 @@ export class AgentApi {
   /**
    * Перевод рана в `unknown`. Идемпотентно: повторный вызов не затирает уже терминальное
    * состояние и не плодит записей в журнале.
+   *
+   * Отказ обязан остаться видимым в журнале рана, а не только в логе API: клиент читает
+   * события рана, и «исход неизвестен» без причины для него неотличимо от тишины.
    */
-  private markUnknown(record: AdmissionRecord, reason: string): void {
+  private markUnknown(record: AdmissionRecord, reason: string, detail?: string): void {
     const run = this.store.progressOf(record.runId);
     if (!run || isTerminalApiState(run.state) || run.state === 'unknown') return;
+    const at = this.nowIso();
     run.state = 'unknown';
-    run.updatedAt = this.nowIso();
-    this.log({ event: 'run_outcome_unknown', runId: record.runId, reason, engine: record.spec.engine.name });
+    run.connectionLost = true;
+    run.updatedAt = at;
+    this.store.append(record.runId, outcomeUnknownEvent(record.spec, run.sequence + 1, at, reason, detail));
+    this.log({ event: 'run_outcome_unknown', runId: record.runId, reason, engine: record.spec.engine.name, detail: detail ?? null });
+  }
+
+  /** Номер события, с которого продолжается нумерация журнала рана. */
+  private journalSequence(runId: string): number {
+    return this.store.progressOf(runId)?.sequence ?? ADMISSION_EVENT_COUNT;
   }
 
   /** Экспоненциальная пауза опроса с потолком, чтобы не молотить воркер в пустую. */

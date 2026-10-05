@@ -26,13 +26,27 @@ export class PreflightError extends Error {
   readonly code: string;
   readonly failureClass: 'preflight' | 'runtime';
   readonly retryable: boolean;
+  /**
+   * Исход операции неизвестен: запрос исполнителя мог дойти, а ответ потеряться.
+   *
+   * Такой отказ нельзя считать «операция не состоялась»: единственный честный порядок —
+   * пометить попытку `unknown` и спросить исполнителя о запуске, который он, возможно,
+   * уже зарегистрировал (контракт внешнего worker, п. 4). Иначе клиент, увидевший
+   * терминальный отказ с `retryable`, повторит запрос и заведёт второй запуск.
+   */
+  readonly outcomeUnknown: boolean;
 
-  constructor(code: string, message: string, opts?: { failureClass?: 'preflight' | 'runtime'; retryable?: boolean }) {
+  constructor(
+    code: string,
+    message: string,
+    opts?: { failureClass?: 'preflight' | 'runtime'; retryable?: boolean; outcomeUnknown?: boolean },
+  ) {
     super(message);
     this.name = 'PreflightError';
     this.code = code;
     this.failureClass = opts?.failureClass ?? 'preflight';
     this.retryable = opts?.retryable ?? false;
+    this.outcomeUnknown = opts?.outcomeUnknown ?? false;
   }
 }
 
