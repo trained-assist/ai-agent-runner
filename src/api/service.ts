@@ -504,10 +504,10 @@ export class AgentApi {
       cancel: { requestedReceipt: true, terminalConfirmation: true },
       mcp: {
         perRunStdioProxy: false,
-        scopedBindings: false,
+        scopedBindings: this.workers.some(worker => worker.remoteMcpEnabled),
         capabilityHandlersSharedWithMcp: false,
         capabilityInvokeEndpoint: false,
-        remoteTransport: 'absent',
+        remoteTransport: this.workers.some(worker => worker.remoteMcpEnabled) ? 'worker_remote' : 'absent',
         osIsolation: 'not_proven_service_uid_only',
         osIsolationNote: 'the API host runs no agent process: OS isolation is the external worker responsibility, and the worker declares it per run',
       },
@@ -779,6 +779,7 @@ export class AgentApi {
     if (request.deadline !== undefined) spec.deadline = request.deadline;
     if (request.regionConstraints !== undefined) spec.regionConstraints = request.regionConstraints;
     if (request.credentialBindings !== undefined) spec.credentialBindings = request.credentialBindings;
+    if (request.mcp !== undefined) spec.mcp = request.mcp;
     if (request.budget !== undefined) spec.budget = request.budget;
     if (request.result !== undefined) spec.result = request.result;
     if (request.outputs !== undefined) spec.outputs = request.outputs;
@@ -810,4 +811,3 @@ export class AgentApi {
     this.logger({ ts: this.nowIso(), ...entry });
   }
 }
-

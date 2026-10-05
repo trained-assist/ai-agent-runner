@@ -152,11 +152,13 @@ export class McpServerSession {
     this.process = spawned;
     this.serverId = deps.scoped.serverId;
     this.pid = spawned.child.pid ?? null;
+    if (deps.scoped.spec.transport !== 'stdio') throw new McpStartupError(this.serverId, 'spawn_failed', 'remote MCP requires the external worker transport');
     this.commandRef = commandRef(deps.scoped.spec.command, deps.scoped.spec.args ?? []);
   }
 
   static async start(deps: McpServerSessionDeps): Promise<McpServerSession> {
     const spec = deps.scoped.spec;
+    if (spec.transport !== 'stdio') throw new McpStartupError(deps.scoped.serverId, 'spawn_failed', 'remote MCP requires the external worker transport');
     deps.log('info', 'mcp.server_starting', {
       serverId: deps.scoped.serverId,
       transport: spec.transport,
@@ -562,6 +564,7 @@ export class McpRunSession {
     const killGraceMs = deps.killGraceMs ?? DEFAULT_MCP_KILL_GRACE_MS;
     try {
       for (const scoped of deps.scope.servers) {
+        if (scoped.spec.transport !== 'stdio') throw new McpStartupError(scoped.serverId, 'spawn_failed', 'remote MCP requires external worker transport');
         const env: Record<string, string> = { ...(deps.runEnv ?? {}) };
         for (const name of scoped.spec.envAllowlist ?? []) {
           const value = process.env[name];
