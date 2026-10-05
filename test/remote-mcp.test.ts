@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, onTestFinished } from 'vitest';
-import { ExternalWorkerAdapter } from '../src/adapters/external-worker-adapter.js';
+import { ExternalWorkerAdapter, ResultNotReadyError } from '../src/adapters/external-worker-adapter.js';
 import { configuredDocumentsBindingResolver, localDocumentsBindingResolver, parseRemoteMcpServerPolicies, registeredDocumentsBindingResolver, resolveRemoteMcpAttachment, type DocumentsHttpRegistration, type RemoteMcpBinding, type RemoteMcpHostOptions } from '../src/adapters/remote-mcp.js';
 import { validateSubmitRequest } from '../src/api/contracts.js';
 import { validateRunSpec, type RunSpec } from '../src/contracts/run-spec.js';
@@ -64,6 +64,47 @@ describe('remote MCP public contract', () => {
 });
 
 describe('trusted host attachment', () => {
+  it.each(['not_ready', 'transport'] as const)('reconciles restored terminal MCP result %s without remint or launch', async failure => {
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    const { spec } = documentsSetup();
+    spec.engine.name = 'dynamic-ip-azure-agent-run';
+    const restored = journaledRun(spec, now.toISOString());
+    const worker: ExternalWorker = {
+      name: spec.engine.name, baseUrl: 'https://worker.example.test', launch: vi.fn(),
+      status: vi.fn<ExternalWorker['status']>(async runId => ({ runId, status: 'succeeded' })),
+      result: vi.fn<ExternalWorker['result']>(async runId => ({ runId, status: 'started', exitCode: 0, exitSignal: null,
+        exitReason: 'completed', stdout: 'recovered result', stderr: '', durationMs: 100,
+        timedOut: false, outputTruncated: false, artifacts: [],
+        logUrl: 'https://logs.example.test/run.log', repo: { fullName: 'owner/name', branch: 'fixture', commit: 'abc1234' } })),
+      restoreMcp: vi.fn(), cancel: vi.fn(),
+    };
+    vi.mocked(worker.result).mockRejectedValueOnce(failure === 'not_ready'
+      ? new ResultNotReadyError(spec.runId) : new TypeError('fetch failed'));
+    const api = new AgentApi({ workers: [worker], store: restored });
+    onTestFinished(async () => {
+      await api.dispose();
+      await vi.advanceTimersByTimeAsync(10000);
+      vi.useRealTimers();
+    });
+    expect(api.resumeDispatched()).toBe(1);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(restored.progressOf(spec.runId)?.state).toBe('unknown');
+    expect(restored.progressOf(spec.runId)?.result).toBeNull();
+    expect(api.resumeDispatched()).toBe(0);
+    await vi.advanceTimersByTimeAsync(10000);
+    expect(restored.progressOf(spec.runId)?.result).toMatchObject({ runId: spec.runId,
+      userTaskId: spec.userTaskId, profileId: spec.profileId, ownerGeneration: spec.ownerGeneration,
+      outcome: 'succeeded', exitObserved: true });
+    expect(worker.result).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(worker.result).mock.calls.every(([runId]) => runId === spec.runId)).toBe(true);
+    expect(worker.launch).not.toHaveBeenCalled();
+    expect(worker.restoreMcp).not.toHaveBeenCalled();
+    expect(worker.cancel).not.toHaveBeenCalled();
+    expect(restored.dispatchedRuns()).toHaveLength(1);
+    expect(api.resumeDispatched()).toBe(0);
+  });
+
   it('refuses budgets over 24 hours before resolving a credential', async () => {
     const { spec, host, resolveBinding } = setup();
     host.servers = { documents: { ...policies.documents, startupTimeoutMs: 86400000 } };

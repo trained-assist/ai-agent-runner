@@ -15,6 +15,7 @@ import {
 } from '../adapters/external-worker-adapter.js';
 import type { RunResult } from '../contracts/result.js';
 import { validateRunSpec, type InputSpec, type RunSpec } from '../contracts/run-spec.js';
+import { PreflightError } from '../contracts/validate.js';
 import { DEFAULT_STATELESS_LIMITS, isTerminalApiState, STATELESS_STORE_SCHEMA_VERSION, StatelessStore, type AdmissionRecord } from './stateless-store.js';
 import {
   API_CAPABILITIES_SCHEMA_VERSION,
@@ -600,7 +601,10 @@ export class AgentApi {
         const status = (await worker.status(record.runId)).status;
         if (this.disposed) return;
         if (status === 'succeeded' || status === 'failed' || status === 'cancelled') {
-          await this.collectResult(record, worker, record.createdAt);
+          if (!await this.collectResult(record, worker, record.createdAt)) {
+            await this.pollBackoff(0);
+            await this.pollUntilTerminal(record, worker, record.createdAt);
+          }
           return;
         }
         if (!worker.restoreMcp) throw new Error('MCP_RESTORE_UNSUPPORTED');
@@ -677,8 +681,7 @@ export class AgentApi {
       this.log({ event: 'worker_status', runId: record.runId, status, attempt });
 
       if (status === 'succeeded' || status === 'failed' || status === 'cancelled') {
-        await this.collectResult(record, worker, startedAt);
-        return;
+        if (await this.collectResult(record, worker, startedAt)) return;
       }
       if (status === 'unknown') {
         // Исход неизвестн, но ран мог состояться. Помечаем и продолжаем спрашивать:
@@ -696,8 +699,8 @@ export class AgentApi {
   }
 
   /** Забрать финальный результат у воркера и закрыть ран. */
-  private async collectResult(record: AdmissionRecord, worker: ExternalWorker, startedAt: string): Promise<void> {
-    if (this.disposed || this.store.progressOf(record.runId) === null) return;
+  private async collectResult(record: AdmissionRecord, worker: ExternalWorker, startedAt: string): Promise<boolean> {
+    if (this.disposed || this.store.progressOf(record.runId) === null) return true;
     try {
       const launch = await worker.result(record.runId);
       const mapping = mapLaunchResult(record.spec, launch, { startedAt, finishedAt: this.nowIso() }, { workerBaseUrl: worker.baseUrl });
@@ -712,15 +715,22 @@ export class AgentApi {
         logUrl: mapping.logUrl,
         repo: mapping.repo?.fullName ?? null,
       });
+      return true;
     } catch (err) {
       if (err instanceof ResultNotReadyError) {
         // Воркер сказал «терминальный», но результата нет: честный отказ, а не успех.
         this.log({ event: 'worker_result_missing', runId: record.runId });
         this.markUnknown(record, 'result_missing');
-        return;
+        return false;
+      }
+      if (!(err instanceof PreflightError && ['WORKER_PROTOCOL_INVALID', 'LAUNCH_RESULT_INVALID'].includes(err.code))) {
+        this.log({ event: 'worker_result_failed', runId: record.runId, reason: 'result_transport_unknown' });
+        this.markUnknown(record, 'result_transport_unknown');
+        return false;
       }
       this.log({ event: 'run_failed', runId: record.runId, message: err instanceof Error ? err.message : String(err) });
       this.finalize(record, workerTransportFailure(record.spec, err, { startedAt, finishedAt: this.nowIso() }, { workerBaseUrl: worker.baseUrl }));
+      return true;
     }
   }
 
