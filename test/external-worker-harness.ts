@@ -38,6 +38,8 @@ export interface MockWorkerOptions {
   runningStatus?: 'running';
   /** Ответить HTTP-ошибкой на запрос статуса: воркер недоступен для reconcile (#73, п. 4). */
   statusHttpStatus?: number;
+  /** Задержать ответ на статус: воркер жив, но отвечает дольше бюджета reconcile. */
+  statusDelayMs?: number;
 }
 
 export interface MockWorker {
@@ -150,6 +152,7 @@ export async function startMockWorker(options: MockWorkerOptions = {}): Promise<
           return;
         }
         const runId = statusMatch[1]!;
+        if (settings.statusDelayMs) await new Promise((resolve) => setTimeout(resolve, settings.statusDelayMs));
         const record = [...live].find((entry) => entry.runId === runId);
         if (!record || record.pending) {
           res.writeHead(200, { 'content-type': 'application/json' });

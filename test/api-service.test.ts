@@ -196,6 +196,20 @@ describe('stateless AgentApi: финализация', () => {
     expect(api.result(alpha, receipt.runId).outcome).toBe('succeeded');
   });
 
+  it('reconcile не висит на мёртвом воркере: у него свой бюджет, а не таймаут запуска', async () => {
+    // Воркер принял ран, но квитанция не дошла, а на вопрос о статусе он отвечает дольше
+    // бюджета reconcile. Раньше проверка ждала таймаут запуска (10 минут) и флот вставал.
+    const worker = await startMockWorker({ malformed: true, statusDelayMs: 5000 });
+    onTestFinished(() => worker.close());
+    const api = new AgentApi({ workers: [adapterFor(worker)], store: new StatelessStore(), reconcileDeadlineMs: 300 });
+    onTestFinished(() => api.dispose());
+    const startedAt = Date.now();
+    const receipt = api.submit(alpha, 'idem-reconcile-budget', body());
+    await waitForState(api, alpha, receipt.runId, 'unknown');
+    const elapsed = Date.now() - startedAt;
+    expect(elapsed).toBeLessThan(3000);
+  }, 20000);
+
   it('воркер не знает ран после обрыва launch — только тогда ран считается несостоявшимся', async () => {
     // 5xx = запуск не принят (мок не регистрирует ран). Reconcile спрашивает статус,
     // получает «не вижу» и только тогда закрывает ран отказом.
