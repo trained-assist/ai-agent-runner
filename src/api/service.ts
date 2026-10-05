@@ -597,6 +597,12 @@ export class AgentApi {
   private async restoreAndPoll(record: AdmissionRecord, worker: ExternalWorker): Promise<void> {
     try {
       if (record.spec.mcp?.servers.some(server => server.transport === 'remote')) {
+        const status = (await worker.status(record.runId)).status;
+        if (this.disposed) return;
+        if (status === 'succeeded' || status === 'failed' || status === 'cancelled') {
+          await this.collectResult(record, worker, record.createdAt);
+          return;
+        }
         if (!worker.restoreMcp) throw new Error('MCP_RESTORE_UNSUPPORTED');
         await worker.restoreMcp(record.spec, record.createdAt);
       }
