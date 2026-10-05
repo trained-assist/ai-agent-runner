@@ -43,6 +43,12 @@ export interface AdmissionRecord {
   operationId: string;
   ownerGeneration: number;
   spec: RunSpec;
+  /**
+   * Кандидаты приёма рана в порядке проб (issue #100). Хранится в записи, а не пересобирается
+   * в `execute`: после рестарта API цепочка рана обязана быть той же, что была при приёме.
+   * У записей до появления цепочки поля нет — тогда кандидат один, названный клиентом.
+   */
+  engineChain?: string[];
   createdAt: string;
 }
 
@@ -63,6 +69,11 @@ export interface RunProgress {
   updatedAt: string;
   finishedAt: string | null;
   fencing: { rejected: number };
+  /**
+   * Движок, который отработал ран (issue #100): тот, на котором идёт попытка приёма, а после
+   * квитанции — тот, который ран принял. Клиент видит его в `RunStatusView.engine`.
+   */
+  engine: string;
 }
 
 export interface StatelessStoreLimits {
@@ -212,7 +223,7 @@ export class StatelessStore {
     return [...this.byAdmission.values()];
   }
 
-  open(runId: string, startedAt: string): RunProgress {
+  open(runId: string, startedAt: string, engine?: string): RunProgress {
     const existing = this.progress.get(runId);
     if (existing) return existing;
     const created: RunProgress = {
@@ -231,6 +242,9 @@ export class StatelessStore {
       updatedAt: startedAt,
       finishedAt: null,
       fencing: { rejected: 0 },
+      // Движок попытки: до приёма рана это первый кандидат цепочки, дальше его двигает
+      // `setEngine` по мере отказов (issue #100).
+      engine: engine ?? '',
     };
     this.progress.set(runId, created);
     return created;
@@ -238,6 +252,18 @@ export class StatelessStore {
 
   progressOf(runId: string): RunProgress | null {
     return this.progress.get(runId) ?? null;
+  }
+
+  /**
+   * Движок текущей попытки приёма рана (issue #100). Клиент видит его в статусе, поэтому
+   * смена движка не должна быть молчаливой: вызывающий обязан сопроводить её записью в
+   * журнале (`engine_chain_advance`).
+   */
+  setEngine(runId: string, engine: string): void {
+    const run = this.progress.get(runId);
+    if (!run || run.engine === engine) return;
+    run.engine = engine;
+    run.updatedAt = new Date().toISOString();
   }
 
   /**

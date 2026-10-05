@@ -139,30 +139,51 @@ new AgentApi({ workers: [azureWorker, ghActionsWorker] });
 ```
 
 - `submit` выбирает воркер по `request.engine.name`; неизвестный движок → `ENGINE_NOT_ALLOWED`
-  с перечислением доступных.
-- `capabilities().engines` — отсортированный список имён воркеров.
-- `GET /healthz` возвращает `workers: [{engine, baseUrl}]`.
-- Отмена уходит в воркер **своего** движка, а не в первый попавшийся.
+  с перечислением доступных. Заявка без `engine` идёт по приоритетной цепочке (см. ниже).
+- `capabilities().engines` — отсортированный список имён воркеров;
+  `capabilities().engineSelection.chain` — цепочка в порядке проб.
+- `GET /healthz` возвращает `workers: [{engine, baseUrl}]` и `engineChain`.
+- Отмена уходит в воркер **своего** движка, а не в первый попавшийся; при цепочке — в тот,
+  который принял ран.
 - Пустой реестр — отказ на старте: API без способа запустить агента не поднимается.
 
 Конфиг (переменные окружения):
 
 | Переменная | Формат |
 |---|---|
-| `AGENT_API_WORKERS` | JSON-список `[{engine, baseUrl, token}]` — несколько движков |
+| `AGENT_API_WORKERS` | JSON-список `[{engine, baseUrl, token, acceptDeadlineMs?}]` — несколько движков |
+| `AGENT_API_ENGINE_CHAIN` | приоритетная цепочка через запятую, в порядке проб; не задана — ран идёт на названный клиентом движок |
 | `EXTERNAL_WORKER_URL` / `EXTERNAL_WORKER_TOKEN` | одиночный воркер; имя движка — `EXTERNAL_WORKER_ENGINE` либо `dynamic-ip-azure-agent-run` по умолчанию |
 | `EXTERNAL_WORKER_LAUNCH_DEADLINE_MS` / `..._CANCEL_DEADLINE_MS` | таймауты, применяются ко всем воркерам |
+| `EXTERNAL_WORKER_ACCEPT_DEADLINE_MS` | бюджет ожидания квитанции на движок (по умолчанию 30 000) |
 
 Добавление второго движка — это **одна запись в конфиге**, без правок кода:
 
 ```json
 AGENT_API_WORKERS=[
-  {"engine":"dynamic-ip-azure-agent-run","baseUrl":"https://azure-worker.example","token":"…"},
+  {"engine":"dynamic-ip-azure-agent-run","baseUrl":"https://azure-worker.example","token":"…","acceptDeadlineMs":30000},
   {"engine":"github-actions-agent-run","baseUrl":"https://receiver.example","token":"…"}
 ]
 ```
 
 Всё остальное — маршруты, идемпотентность, события, артефакты, ветка рана — не меняется.
+
+### Приоритетная цепочка движков (issue #100)
+
+```bash
+AGENT_API_ENGINE_CHAIN=azure-dynamic-ip-agent-run,eu-vm-agent-run,rf-vm-agent-run
+```
+
+Ран без `engine` в заявке пробует движки по порядку цепочки. Следующий берётся только если
+предыдущий **не принял** ран (`WORKER_LAUNCH_UNREACHABLE`, `WORKER_HTTP_ERROR`,
+`WORKER_PROTOCOL_INVALID`): квитанция получена — перехода нет, ран уже идёт. Перед переходом
+цепочка спрашивает текущий движок, знает ли он ран (контракт, п. 4): знает — ран принимается
+без квитанции и опрашивается там; не знает — переход; спросить не удалось — ран остаётся
+`unknown`, второго запуска нет. `operationId` при переходе не меняется, поэтому дедупликация
+воркера возвращает тот же `runId`. Ни один движок не принял — ран закрывается
+`ENGINE_FLEET_EXHAUSTED` с перечнем попыток. Заявка с явным `engine.name` цепочкой не
+пользуется. Подробности — `docs/EXTERNAL-WORKER-CONTRACT.md`, раздел «Приоритетная цепочка
+движков».
 
 ---
 

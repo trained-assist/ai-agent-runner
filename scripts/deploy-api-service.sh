@@ -18,6 +18,8 @@ WORKER_URL="${EXTERNAL_WORKER_URL:-}"
 WORKER_TOKEN="${EXTERNAL_WORKER_TOKEN:-}"
 ADMISSION_LOG="${AGENT_API_ADMISSION_LOG:-}"
 JOURNAL_DIR="${JOURNAL_DIR:-/var/lib/agent-runner}"
+WORKERS_JSON="${AGENT_API_WORKERS:-}"
+ENGINE_CHAIN="${AGENT_API_ENGINE_CHAIN:-}"
 
 log() { printf '[deploy-api] %s\n' "$*"; }
 warn() { printf '[deploy-api] WARN: %s\n' "$*" >&2; }
@@ -41,12 +43,17 @@ Options:
   --worker-token <token>     shared secret for the worker (default $EXTERNAL_WORKER_TOKEN)
   --admission-log <path>     admission journal file; its directory is created mode 0700 and
                               owned by $SERVICE_USER (default $AGENT_API_ADMISSION_LOG)
+  --workers '<json>'         fleet: JSON array of {engine, baseUrl, token, acceptDeadlineMs?}
+                             (default $AGENT_API_WORKERS); replaces --worker-url
+  --engine-chain <list>      priority chain, comma separated, in probe order
+                             (default $AGENT_API_ENGINE_CHAIN)
   --rotate-key               generate a fresh API key even if one is installed
   --no-ufw                   never touch the firewall
   -h, --help                 this text
 
 Environment overrides: REPO_DIR, SERVICE_USER, AGENT_API_PORT, CONF_DIR, JOURNAL_DIR,
-EXTERNAL_WORKER_URL, EXTERNAL_WORKER_TOKEN, AGENT_API_ADMISSION_LOG, RUNNER_DEFAULT_REPO,
+EXTERNAL_WORKER_URL, EXTERNAL_WORKER_TOKEN, AGENT_API_ADMISSION_LOG, AGENT_API_WORKERS,
+AGENT_API_ENGINE_CHAIN, EXTERNAL_WORKER_ACCEPT_DEADLINE_MS, RUNNER_DEFAULT_REPO,
 AGENT_API_ENV. Extra KEY=value lines already present in the service env file are kept as
 they are.
 
@@ -59,9 +66,11 @@ USAGE
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --port) PORT="${2:-}"; shift 2 ;;
-  --worker-url) WORKER_URL="${2:-}"; shift 2 ;;
-  --worker-token) WORKER_TOKEN="${2:-}"; shift 2 ;;
+    --worker-url) WORKER_URL="${2:-}"; shift 2 ;;
+    --worker-token) WORKER_TOKEN="${2:-}"; shift 2 ;;
     --admission-log) ADMISSION_LOG="${2:-}"; shift 2 ;;
+    --workers) WORKERS_JSON="${2:-}"; shift 2 ;;
+    --engine-chain) ENGINE_CHAIN="${2:-}"; shift 2 ;;
     --rotate-key) ROTATE_KEY=1; shift ;;
     --no-ufw) SKIP_UFW=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -141,8 +150,9 @@ if [[ -f "$ENV_FILE" ]]; then
   [[ -n "$WORKER_URL" ]] || WORKER_URL="$(sed -n 's/^EXTERNAL_WORKER_URL=//p' "$ENV_FILE" | head -n1)"
   [[ -n "$WORKER_TOKEN" ]] || WORKER_TOKEN="$(sed -n 's/^EXTERNAL_WORKER_TOKEN=//p' "$ENV_FILE" | head -n1)"
   [[ -n "$ADMISSION_LOG" ]] || ADMISSION_LOG="$(sed -n 's/^AGENT_API_ADMISSION_LOG=//p' "$ENV_FILE" | head -n1)"
+  [[ -n "$WORKERS_JSON" ]] || WORKERS_JSON="$(sed -n 's/^AGENT_API_WORKERS=//p' "$ENV_FILE" | head -n1)"
+  [[ -n "$ENGINE_CHAIN" ]] || ENGINE_CHAIN="$(sed -n 's/^AGENT_API_ENGINE_CHAIN=//p' "$ENV_FILE" | head -n1)"
 fi
-[[ -n "$WORKER_URL" ]] || die "external worker URL is required: pass --worker-url or set EXTERNAL_WORKER_URL"
 [[ "$WORKER_URL" =~ ^https?:// ]] || die "--worker-url: expected an http(s) URL, got \"$WORKER_URL\""
 
 # Журнал приёмных записей: единственное, что сервис пишет на диск, и единственное, что нужно
@@ -174,18 +184,45 @@ fi
 EXTRA_ENV=""
 if [[ -f "$ENV_FILE" ]]; then
   EXTRA_ENV="$(grep -E '^[A-Za-z_][A-Za-z0-9_]*=' "$ENV_FILE" \
-    | grep -vE '^(AGENT_API_HOST|AGENT_API_PORT|AGENT_API_KEY_REGISTRY|AGENT_API_ADMISSION_LOG|EXTERNAL_WORKER_URL|EXTERNAL_WORKER_TOKEN)=' \
+    | grep -vE '^(AGENT_API_HOST|AGENT_API_PORT|AGENT_API_KEY_REGISTRY|AGENT_API_ADMISSION_LOG|EXTERNAL_WORKER_URL|EXTERNAL_WORKER_TOKEN|AGENT_API_WORKERS|AGENT_API_ENGINE_CHAIN)=' \
     || true)"
+fi
+# Флот и одиночный воркер — два способа описать одно и то же; флот приоритетнее, потому что
+# цепочка движков (#100) выражается только списком.
+if [[ -n "$WORKERS_JSON" ]]; then
+  WORKERS_JSON="$(node -e '
+    const raw = process.argv[1] ?? "";
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed) || parsed.length === 0) throw new Error("expected a non-empty JSON array");
+    for (const [index, entry] of parsed.entries()) {
+      if (typeof entry !== "object" || entry === null) throw new Error(`[${index}]: expected an object`);
+      if (typeof entry.engine !== "string" || entry.engine.trim() === "") throw new Error(`[${index}].engine: required`);
+      if (!/^https?:\/\//.test(entry.baseUrl ?? "")) throw new Error(`[${index}].baseUrl: expected an http(s) URL`);
+    }
+    process.stdout.write(JSON.stringify(parsed));
+  ' "$WORKERS_JSON")" || die "--workers: expected a JSON array of {engine, baseUrl, token}"
+  [[ -z "$ENGINE_CHAIN" ]] || [[ "$ENGINE_CHAIN" =~ ^[A-Za-z0-9._-]+(,[A-Za-z0-9._-]+)*$ ]] \
+    || die "--engine-chain: expected a comma-separated list of engine names, got \"$ENGINE_CHAIN\""
+  WORKER_SUMMARY="fleet: $(node -e 'const p=JSON.parse(process.argv[1]);process.stdout.write(p.map((e)=>e.engine).join(" -> "))' "$WORKERS_JSON")"
+else
+  [[ -n "$WORKER_URL" ]] || die "external worker URL is required: pass --worker-url/--workers or set EXTERNAL_WORKER_URL/AGENT_API_WORKERS"
+  [[ "$WORKER_URL" =~ ^https?:// ]] || die "--worker-url: expected an http(s) URL, got \"$WORKER_URL\""
+  WORKER_SUMMARY="$WORKER_URL"
 fi
 {
   cat <<ENV
 AGENT_API_HOST=0.0.0.0
 AGENT_API_PORT=$PORT
 AGENT_API_KEY_REGISTRY=$REGISTRY_FILE
-EXTERNAL_WORKER_URL=$WORKER_URL
-EXTERNAL_WORKER_TOKEN=$WORKER_TOKEN
 ENV
   if [[ -n "$ADMISSION_LOG" ]]; then printf 'AGENT_API_ADMISSION_LOG=%s\n' "$ADMISSION_LOG"; fi
+  if [[ -n "$WORKERS_JSON" ]]; then
+    printf 'AGENT_API_WORKERS=%s\n' "$WORKERS_JSON"
+    [[ -z "$ENGINE_CHAIN" ]] || printf 'AGENT_API_ENGINE_CHAIN=%s\n' "$ENGINE_CHAIN"
+  else
+    printf 'EXTERNAL_WORKER_URL=%s\n' "$WORKER_URL"
+    printf 'EXTERNAL_WORKER_TOKEN=%s\n' "$WORKER_TOKEN"
+  fi
   if [[ -n "$EXTRA_ENV" ]]; then printf '%s\n' "$EXTRA_ENV"; fi
 } > "$CONF_DIR/.env.tmp"
 chown "$SERVICE_USER:$SERVICE_GROUP" "$CONF_DIR/.env.tmp"
@@ -238,7 +275,7 @@ fi
 
 log "--- summary"
 log "unit:    $UNIT_NAME (enabled, $(systemctl is-active "$UNIT_NAME"))"
-log "port:    $PORT   health: $HEALTH_URL   worker: $WORKER_URL"
+log "port:    $PORT   health: $HEALTH_URL   worker: $WORKER_SUMMARY"
 if [[ -n "$ADMISSION_LOG" ]]; then
   log "journal: $ADMISSION_LOG (dedup by Idempotency-Key and polling of accepted runs survive a restart)"
 else

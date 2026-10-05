@@ -21,9 +21,11 @@ describe('конфигурация воркеров', () => {
         baseUrl: 'https://worker.example',
         token: 'secret',
         launchDeadlineMs: 600000,
+        acceptDeadlineMs: 30000,
         cancelDeadlineMs: 30000,
       },
     ]);
+    expect(config.engineChain).toBeNull();
   });
 
   it('AGENT_API_WORKERS задаёт несколько движков, у каждого свой воркер', () => {
@@ -91,5 +93,48 @@ describe('конфигурация воркеров', () => {
   it('кривой JSON в AGENT_API_WORKERS — отказ с понятной причиной, а не падение позже', () => {
     expect(() => loadAgentApiConfig({ ...base, AGENT_API_WORKERS: '{ nope' })).toThrowError(/JSON array/);
     expect(() => loadAgentApiConfig({ ...base, AGENT_API_WORKERS: '[]' })).toThrowError(/non-empty/);
+  });
+
+  it('AGENT_API_ENGINE_CHAIN задаёт порядок проб, а не сортировку имён', () => {
+    const config = loadAgentApiConfig({
+      ...base,
+      AGENT_API_WORKERS: JSON.stringify([
+        { engine: 'rf-vm-agent-run', baseUrl: 'https://rf.example', token: 'c' },
+        { engine: 'azure-dynamic-ip-agent-run', baseUrl: 'https://gha.example', token: 'a' },
+        { engine: 'eu-vm-agent-run', baseUrl: 'https://eu.example', token: 'b' },
+      ]),
+      AGENT_API_ENGINE_CHAIN: 'azure-dynamic-ip-agent-run,eu-vm-agent-run,rf-vm-agent-run',
+    });
+    expect(config.engineChain).toEqual(['azure-dynamic-ip-agent-run', 'eu-vm-agent-run', 'rf-vm-agent-run']);
+  });
+
+  it('бюджет приёма рана свой у каждого движка, общий — из EXTERNAL_WORKER_ACCEPT_DEADLINE_MS', () => {
+    const config = loadAgentApiConfig({
+      ...base,
+      AGENT_API_WORKERS: JSON.stringify([
+        { engine: 'azure-dynamic-ip-agent-run', baseUrl: 'https://gha.example', acceptDeadlineMs: 30000 },
+        { engine: 'eu-vm-agent-run', baseUrl: 'https://eu.example' },
+      ]),
+      EXTERNAL_WORKER_ACCEPT_DEADLINE_MS: '120000',
+    });
+    expect(config.workers.map((worker) => worker.acceptDeadlineMs)).toEqual([30000, 120000]);
+  });
+
+  it('движок цепочки без воркера — отказ на старте, а не падение рана на середине цепочки', () => {
+    expect(() =>
+      loadAgentApiConfig({
+        ...base,
+        AGENT_API_WORKERS: JSON.stringify([{ engine: 'azure-dynamic-ip-agent-run', baseUrl: 'https://gha.example' }]),
+        AGENT_API_ENGINE_CHAIN: 'azure-dynamic-ip-agent-run,rf-vm-agent-run',
+      }),
+    ).toThrowError(/has no worker/);
+  });
+
+  it('цепочка без воркеров не объявляется: ран идёт на названный клиентом движок', () => {
+    const config = loadAgentApiConfig({
+      ...base,
+      AGENT_API_WORKERS: JSON.stringify([{ engine: 'azure-dynamic-ip-agent-run', baseUrl: 'https://gha.example' }]),
+    });
+    expect(config.engineChain).toBeNull();
   });
 });

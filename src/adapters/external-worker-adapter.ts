@@ -52,6 +52,12 @@ export const DEFAULT_BRANCH_PREFIX = 'agent-run';
 
 export const DEFAULT_LAUNCH_DEADLINE_MS = 10 * 60 * 1000;
 export const DEFAULT_CANCEL_DEADLINE_MS = 30 * 1000;
+/**
+ * Бюджет приёма рана по умолчанию (issue #100): воркер обязан ответить квитанцией за это время.
+ * Стартовое значение для GitHub Actions — 30 с; у своей VM можно задать больше через
+ * `EXTERNAL_WORKER_ACCEPT_DEADLINE_MS` или поле `acceptDeadlineMs` у движка.
+ */
+export const DEFAULT_ACCEPT_DEADLINE_MS = 30 * 1000;
 export const MAX_LOG_EVENT_CHARS = 10_000;
 
 export interface LaunchArtifact {
@@ -233,6 +239,12 @@ export interface ExternalWorkerOptions {
   env?: Record<string, string>;
   /** Таймаут ожидания ответа воркера на launch. По умолчанию 10 минут. */
   deadlineMs?: number;
+  /**
+   * Бюджет приёма рана (issue #100): сколько ждём квитанцию `POST /v1/launch`. Это отдельная
+   * величина от `deadlineMs` — «воркер не ответил» и «ран идёт долго» должны иметь разные
+   * таймауты, иначе замена движка в цепочке ждала бы полчаса. Если не задан — `deadlineMs`.
+   */
+  acceptDeadlineMs?: number;
   cancelDeadlineMs?: number;
   fetchImpl?: typeof fetch;
   now?: () => Date;
@@ -757,13 +769,13 @@ export function workerTransportFailure(
   spec: RunSpec,
   err: unknown,
   times: { startedAt: string; finishedAt: string },
-  options: LaunchMappingOptions = {},
+  options: LaunchMappingOptions & { /** Отказ, если он известен вызывающему (например, исчерпанная цепочка движков). */ failure?: RunFailure } = {},
 ): LaunchMapping {
   const message = err instanceof Error ? err.message : String(err);
   // Отказ на границе воркера не всегда «воркер недоступен»: preflight-отказ (нет промпта,
   // refs без workspace) и таймаут launch несут собственный код, класс и retryable.
   const typed = err instanceof PreflightError ? err : null;
-  const failure: RunFailure = {
+  const failure: RunFailure = options.failure ?? {
     code: typed?.code ?? 'WORKER_UNREACHABLE',
     failureClass: typed?.failureClass ?? 'runtime',
     safeSummary: safeSummary(typed ? typed.message : message),
@@ -807,12 +819,59 @@ export function workerTransportFailure(
   return { result, events, artifacts: [], repo: null, logUrl: null, answer: null };
 }
 
+/**
+ * Отказы запуска, при которых ран **не принят** (issue #100). Ровно на них цепочка движков
+ * вправе перейти к следующему исполнителю: квитанции нет, ран нигде не идёт, второй запуск
+ * ничего не дублирует. Всё остальное — отказ на нашей же стороне (нет промпта, refs без
+ * workspace, не задан `resultUrl`), где повтор на другом движке бесполезен.
+ */
+export const UNACCEPTED_LAUNCH_CODES = ['WORKER_LAUNCH_UNREACHABLE', 'WORKER_HTTP_ERROR', 'WORKER_PROTOCOL_INVALID'] as const;
+
+/** Принял ли воркер ран: квитанция получена, цепочка движков на этом останавливается. */
+export function isUnacceptedLaunchFailure(err: unknown): boolean {
+  if (!(err instanceof PreflightError)) return false;
+  return (UNACCEPTED_LAUNCH_CODES as readonly string[]).includes(err.code);
+}
+
+/** Код отказа запуска для журнала и для разбора исхода рана. */
+export function launchFailureCode(err: unknown): string {
+  return err instanceof PreflightError ? err.code : 'WORKER_UNREACHABLE';
+}
+
+/** Одна неудачная попытка приёма рана — она и есть содержимое отказа «цепочка исчерпана». */
+export interface FleetAttempt {
+  engine: string;
+  code: string;
+  summary: string;
+}
+
+/**
+ * Цепочка движков исчерпана (issue #100): ни один воркер не принял ран. Ран терминален
+ * `failed` — выполнять его некому, а `unknown` обещал бы reconcile запуска, которого нет.
+ * Причина перечисляет все попытки, поэтому клиент видит не «машина упала», а кто и почему
+ * отказал; новый `Idempotency-Key` даёт новую попытку.
+ */
+export function fleetExhaustedFailure(
+  spec: RunSpec,
+  attempts: readonly FleetAttempt[],
+  times: { startedAt: string; finishedAt: string },
+  options: LaunchMappingOptions = {},
+): LaunchMapping {
+  const detail = attempts.map((attempt) => `${attempt.engine}: ${attempt.code}`).join('; ');
+  const summary = `no engine accepted the run — ${attempts.length} attempt(s): ${detail}`;
+  return workerTransportFailure(spec, new Error(summary), times, {
+    ...options,
+    failure: { code: 'ENGINE_FLEET_EXHAUSTED', failureClass: 'runtime', safeSummary: safeSummary(summary), retryable: true },
+  });
+}
+
 export class ExternalWorkerAdapter implements ExternalWorker {
   readonly name: string;
   readonly baseUrl: string | null;
   private readonly token: string | undefined;
   private readonly env: Record<string, string>;
   private readonly deadlineMs: number;
+  private readonly acceptDeadlineMs: number;
   private readonly cancelDeadlineMs: number;
   private readonly fetchImpl: typeof fetch;
   private readonly now: () => Date;
@@ -825,6 +884,9 @@ export class ExternalWorkerAdapter implements ExternalWorker {
     this.token = options.token;
     this.env = options.env ?? {};
     this.deadlineMs = options.deadlineMs ?? DEFAULT_LAUNCH_DEADLINE_MS;
+    // Бюджет приёма по умолчанию равен общему таймауту: без явного accept-бюджета поведение
+    // не меняется, но цепочка движков (#100) задаёт его каждому движку отдельно.
+    this.acceptDeadlineMs = options.acceptDeadlineMs ?? this.deadlineMs;
     this.cancelDeadlineMs = options.cancelDeadlineMs ?? DEFAULT_CANCEL_DEADLINE_MS;
     this.fetchImpl = options.fetchImpl ?? globalThis.fetch;
     this.now = options.now ?? (() => new Date());
@@ -844,17 +906,18 @@ export class ExternalWorkerAdapter implements ExternalWorker {
     const url = `${trimTrailingSlash(base)}/v1/launch`;
     const headers: Record<string, string> = { 'content-type': 'application/json' };
     if (this.token) headers['authorization'] = `Bearer ${this.token}`;
-    this.log({ event: 'worker_launch', runId: spec.runId, url, engine: spec.engine.name, timeoutMs: spec.limits.timeoutMs });
+    this.log({ event: 'worker_launch', runId: spec.runId, url, engine: spec.engine.name, timeoutMs: spec.limits.timeoutMs, acceptDeadlineMs: this.acceptDeadlineMs });
 
     // Запрос короткий: воркер отвечает квитанцией сразу и уходит работать. Держать соединение
     // весь ран не нужно — результат читается отдельно, поэтому таймаут здесь честно означает
-    // «воркер не принял задачу», а не «ран идёт долго».
+    // «воркер не принял задачу», а не «ран идёт долго». Бюджет приёма — свой на каждый движок
+    // (#100): не ответил за него — цепочка берёт следующий движок.
     const controller = new AbortController();
     let response: Response;
     try {
       response = await withDeadline(
         this.fetchImpl(url, { method: 'POST', headers, body: JSON.stringify(request), signal: controller.signal }),
-        this.deadlineMs,
+        this.acceptDeadlineMs,
         'worker launch',
         () => controller.abort(),
       );

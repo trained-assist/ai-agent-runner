@@ -4,10 +4,15 @@ import {
   admissionEvents,
   artifactUrl,
   branchUrl,
+  EXTERNAL_WORKER_ADAPTER_VERSION,
+  fleetExhaustedFailure,
+  isUnacceptedLaunchFailure,
+  launchFailureCode,
   mapLaunchResult,
   mergeUrl,
   workerTransportFailure,
   type ExternalWorker,
+  type FleetAttempt,
   type LaunchMapping,
   type LaunchReceipt,
   type WorkerRunStatus,
@@ -15,7 +20,7 @@ import {
 } from '../adapters/external-worker-adapter.js';
 import type { RunResult } from '../contracts/result.js';
 import { PreflightError } from '../contracts/validate.js';
-import { validateRunSpec, type InputSpec, type RunSpec } from '../contracts/run-spec.js';
+import { validateRunSpec, type EngineSpec, type InputSpec, type RunSpec } from '../contracts/run-spec.js';
 import { DEFAULT_STATELESS_LIMITS, isTerminalApiState, STATELESS_STORE_SCHEMA_VERSION, StatelessStore, type AdmissionRecord } from './stateless-store.js';
 import {
   API_CAPABILITIES_SCHEMA_VERSION,
@@ -44,6 +49,17 @@ import type { Principal } from './auth.js';
 export type ApiLogger = (entry: Record<string, unknown>) => void;
 
 export type RunCancelStatus = 'stopped' | 'stop_pending' | 'already_terminal' | 'too_late' | 'rejected' | 'unknown_run';
+
+/** Итог приёма рана по цепочке: воркер, который держит ран, и квитанция, если она была. */
+export interface ChainAcceptance {
+  engine: string;
+  worker: ExternalWorker;
+  /**
+   * Квитанция запуска. Её может не быть: ответ потерялся, но reconcile подтвердил, что
+   * воркер знает ран, — тогда ран принимается без квитанции и опрашивается по статусу.
+   */
+  receipt?: LaunchReceipt;
+}
 
 export interface RunCancelReceipt {
   runId: string;
@@ -83,6 +99,12 @@ export interface AgentApiOptions {
    * совпало с `engine.name`; неизвестный движок отклоняется до записи в память.
    */
   workers: ExternalWorker[];
+  /**
+   * Приоритетная цепочка движков (issue #100), в порядке проб. Клиент, назвавший конкретный
+   * `engine.name`, цепочкой не пользуется — она включается только для ранов без движка.
+   * Не задана — все раны идут на названный движок, как до появления цепочки.
+   */
+  engineChain?: readonly string[];
   logger?: ApiLogger;
   clock?: () => Date;
   /** Запас сверх лимита рана на persist у воркера. По умолчанию минута. */
@@ -128,6 +150,8 @@ export class AgentApi {
   readonly workers: readonly ExternalWorker[];
   readonly store: StatelessStore;
   private readonly opts: AgentApiOptions;
+  /** Приоритетная цепочка движков; пустая — цепочка не объявлена (каждый ран на своём движке). */
+  private readonly chain: readonly string[];
   private readonly logger: ApiLogger;
   private readonly clock: () => Date;
   /** Запас сверх лимита рана: воркер успел выгрузить лог и запушить ветку. */
@@ -142,6 +166,13 @@ export class AgentApi {
       throw new Error('AgentApi requires at least one external worker: without it there is no way to launch an agent');
     }
     this.workers = options.workers;
+    // Цепочка без воркера — опечатка в конфиге: молча выбросить такой шаг нельзя, иначе ран
+    // падал бы на середине цепочки вместо отказа на старте.
+    const missing = (options.engineChain ?? []).filter((engine) => !this.workerFor(engine));
+    if (missing.length > 0) {
+      throw new Error(`engineChain names engines without a worker: ${missing.join(', ')}`);
+    }
+    this.chain = [...(options.engineChain ?? [])];
     this.store = options.store ?? new StatelessStore({}, options.admissionLogPath ?? null);
     this.maxActiveRuns = options.maxActiveRuns ?? DEFAULT_STATELESS_LIMITS.maxActiveRuns;
     this.logger = options.logger ?? defaultLogger;
@@ -192,20 +223,8 @@ export class AgentApi {
       return { requestId: existing.requestId, userTaskId: existing.userTaskId, runId: existing.runId, deduplicated: true };
     }
 
-    if (!this.workerFor(request.engine.name)) {
-      throw new ApiError(
-        'ENGINE_NOT_ALLOWED',
-        `this API does not run engine "${request.engine.name}"`,
-        { engines: this.engineNames() },
-      );
-    }
-    if (principal.engines && !principal.engines.includes(request.engine.name)) {
-      throw new ApiError(
-        'ENGINE_NOT_ALLOWED',
-        `principal "${principal.principalId}" is not allowed to run engine "${request.engine.name}"`,
-        { engines: [...principal.engines] },
-      );
-    }
+    // Движок рана: назвал клиент — идём ровно на него, не назвал — берёт цепочка (issue #100).
+    const selection = this.resolveEngines(principal, request.engine);
 
     let requestId: string;
     let userTaskId: string;
@@ -239,7 +258,7 @@ export class AgentApi {
       ownerGeneration = 1;
     }
 
-    const spec = this.buildSpec(request, { principal, requestId, userTaskId, jobId, ownerGeneration });
+    const spec = this.buildSpec(request, { principal, requestId, userTaskId, jobId, ownerGeneration, engine: selection.engine });
     const record: AdmissionRecord = {
       schemaVersion: STATELESS_STORE_SCHEMA_VERSION,
       requestId,
@@ -254,6 +273,9 @@ export class AgentApi {
       operationId: spec.operationId,
       ownerGeneration,
       spec,
+      // Кандидаты приёма рана в порядке проб. Хранятся в записи, а не пересобираются в
+      // `execute`: после рестарта API цепочка рана должна быть той же, что была при приёме.
+      engineChain: selection.chain,
       createdAt: this.nowIso(),
     };
     // Незавершённые раны — единственное, что растёт без границы: у процесса память, и
@@ -275,6 +297,7 @@ export class AgentApi {
       runId: spec.runId,
       ownerGeneration,
       engine: spec.engine.name,
+      engineChain: selection.chain,
       worker: this.workerFor(spec.engine.name)?.baseUrl ?? null,
     });
     return { requestId, userTaskId, runId: spec.runId, deduplicated: false };
@@ -291,6 +314,7 @@ export class AgentApi {
         runId,
         ownerGeneration: record.ownerGeneration,
         state: 'queued',
+        engine: record.spec.engine.name,
         cancelRequested: false,
         connectionLost: false,
         observedAt: record.createdAt,
@@ -306,6 +330,7 @@ export class AgentApi {
       runId,
       ownerGeneration: record.ownerGeneration,
       state: run.state,
+      engine: run.engine,
       cancelRequested: run.cancelRequested !== null,
       connectionLost: run.connectionLost,
       observedAt: run.updatedAt,
@@ -408,9 +433,12 @@ export class AgentApi {
     if (isTerminalApiState(run.state)) {
       return { runId, status: 'already_terminal', state: run.state };
     }
-    const worker = this.workerFor(record.spec.engine.name);
+    // Отмена уходит тому, кто реально держит ран: при цепочке движков это может быть не тот
+    // движок, который назвал клиент (issue #100).
+    const engine = run.engine || record.spec.engine.name;
+    const worker = this.workerFor(engine);
     if (!worker) {
-      throw new ApiError('INTERNAL', `run ${runId} names engine "${record.spec.engine.name}", which is not configured on this API`);
+      throw new ApiError('INTERNAL', `run ${runId} names engine "${engine}", which is not configured on this API`);
     }
     this.store.markCancelRequested(runId, 'cancel');
     let receipt: WorkerCancelResult;
@@ -536,12 +564,20 @@ export class AgentApi {
         placement: null,
       },
       engines: this.engineNames(),
+      engineSelection: {
+        chain: [...this.chain],
+        engineOptional: true,
+        retryOnlyWhenUnaccepted: true,
+        relaunchAfterReceipt: false,
+      },
     };
   }
 
   health(): {
     status: 'ok';
     workers: Array<{ engine: string; baseUrl: string | null }>;
+    /** Приоритетная цепочка движков в порядке проб; пустая — цепочка не объявлена. */
+    engineChain: string[];
     runs: number;
     admissions: number;
     events: number;
@@ -550,6 +586,7 @@ export class AgentApi {
     return {
       status: 'ok',
       workers: this.workers.map((worker) => ({ engine: worker.name, baseUrl: worker.baseUrl })),
+      engineChain: [...this.chain],
       ...counts,
     };
   }
@@ -581,10 +618,12 @@ export class AgentApi {
       if (!record) continue;
       const progress = this.store.progressOf(entry.runId);
       if (progress && isTerminalApiState(progress.state)) continue;
-      const worker = this.workerFor(record.spec.engine.name);
+      // Движок берём из отметки о приёме, а не из заявки: ран мог быть принят вторым
+      // движком цепочки, и поллер обязан спрашивать именно его (issue #100).
+      const worker = this.workerFor(entry.engine);
       if (!worker) continue;
-      this.store.open(record.runId, record.createdAt);
-      this.log({ event: 'poll_resumed', runId: record.runId, engine: record.spec.engine.name, operationId: record.spec.operationId });
+      this.store.open(record.runId, record.createdAt, entry.engine);
+      this.log({ event: 'poll_resumed', runId: record.runId, engine: entry.engine, operationId: record.spec.operationId });
       void this.pollUntilTerminal(record, worker, this.nowIso());
       resumed += 1;
     }
@@ -592,62 +631,130 @@ export class AgentApi {
   }
 
   private async execute(record: AdmissionRecord): Promise<void> {
-    const run = this.store.open(record.runId, record.createdAt);
+    const run = this.store.open(record.runId, record.createdAt, this.chainOf(record)[0]);
     const startedAt = this.nowIso();
     run.state = 'running';
     run.updatedAt = startedAt;
     // Журнал рана появляется до сетевого вызова: принятый ран виден сразу.
     this.store.append(record.runId, admissionEvents(record.spec, startedAt));
-    const worker = this.workerFor(record.spec.engine.name);
-    if (!worker) {
-      this.finalize(record, workerTransportFailure(record.spec, new Error('worker is not configured'), { startedAt, finishedAt: this.nowIso() }));
-      return;
-    }
     this.inFlight.add(record.runId);
     try {
-      const receipt = await worker.launch(record.spec);
+      const accepted = await this.acceptOnChain(record, startedAt);
+      if (!accepted) return;
       if (this.disposed || this.store.progressOf(record.runId) === null) return;
       this.log({
-        event: 'worker_accepted',
+        // Ран может быть принят без квитанции: ответ потерялся, но воркер его помнит.
+        event: accepted.receipt ? 'worker_accepted' : 'worker_reconciled',
         runId: record.runId,
-        engine: record.spec.engine.name,
-        worker: worker.baseUrl,
-        operationId: receipt.operationId,
-        statusUrl: receipt.statusUrl,
+        engine: accepted.engine,
+        worker: accepted.worker.baseUrl,
+        ...(accepted.receipt
+          ? { operationId: accepted.receipt.operationId, statusUrl: accepted.receipt.statusUrl }
+          : {}),
       });
       // Ран принят воркером. Помечаем ДО старта поллера: если процесс упадёт между
       // здесь и терминальным состоянием, новый процесс должен поллер перезапустить —
       // иначе результат потерян, а повтор клиента с новым ключом завёл бы второй ран.
-      this.store.appendDispatched(record.runId, record.spec.engine.name, this.nowIso());
-      void this.pollUntilTerminal(record, worker, startedAt);
-    } catch (err) {
-      if (this.disposed) return;
-      // Таймаут/обрыв на LAUNCH не доказывает, что ран не начался: запрос мог дойти,
-      // воркер мог зарегистрировать и запустить агента, а ответ потеряться по дороге.
-      // Контракт (п. 4) требует сначала `unknown` и попытку reconcile, и только потом
-      // считать запуск не состоявшимся — иначе повтор клиента завёл бы второй ран.
-      const uncertain = err instanceof PreflightError && err.failureClass === 'runtime';
-      if (!uncertain) {
-        this.log({ event: 'run_failed', runId: record.runId, message: err instanceof Error ? err.message : String(err) });
-        this.finalize(record, workerTransportFailure(record.spec, err, { startedAt, finishedAt: this.nowIso() }, { workerBaseUrl: worker.baseUrl }));
-      } else {
-        this.log({ event: 'launch_uncertain', runId: record.runId, message: err instanceof Error ? err.message : String(err) });
-        this.inFlight.add(record.runId);
-        this.markUnknown(record, 'launch_response_lost');
-        // Разовый reconcile: воркер помнит operationId, поэтому опрос не создаёт запуска.
-        const known = await this.workerKnowsRun(record, worker);
-        if (known === false) {
-          this.log({ event: 'launch_confirmed_absent', runId: record.runId });
-          this.inFlight.delete(record.runId);
-          this.finalize(record, workerTransportFailure(record.spec, err, { startedAt, finishedAt: this.nowIso() }, { workerBaseUrl: worker.baseUrl }));
-        } else if (known) {
-          this.store.appendDispatched(record.runId, record.spec.engine.name, this.nowIso());
-          void this.pollUntilTerminal(record, worker, startedAt);
-        }
-      }
+      this.store.appendDispatched(record.runId, accepted.engine, this.nowIso());
+      void this.pollUntilTerminal(record, accepted.worker, startedAt);
     } finally {
       this.inFlight.delete(record.runId);
     }
+  }
+
+  /**
+   * Приём рана по приоритетной цепочке движков (issue #100). Следующий движок берётся
+   * **только** если предыдущий не принял ран (квитанции нет): тогда нигде не идёт работа и
+   * повтор ничего не дублирует. Квитанция получена — цепочка окончена, дальше reconcile.
+   *
+   * `operationId` и `runId` при переходе не меняются: если первый движок всё-таки принял
+   * ран (таймаут прошёл ровно на границе), его дедупликация вернёт тот же `runId`, а не
+   * второй запуск.
+   *
+   * Неопределённый отказ (контракт, п. 4) не является доказательством «ран не принят»:
+   * запрос мог дойти, а ответ потеряться. Поэтому перед переходом цепочка спрашивает
+   * текущий движок, знает ли он ран, — и переходит дальше только при отрицательном ответе.
+   */
+  private async acceptOnChain(record: AdmissionRecord, startedAt: string): Promise<ChainAcceptance | null> {
+    const candidates = this.chainOf(record);
+    const attempts: FleetAttempt[] = [];
+    let lastWorker: ExternalWorker | null = null;
+    let lastError: unknown = null;
+    for (let index = 0; index < candidates.length; index += 1) {
+      const engine = candidates[index]!;
+      const worker = this.workerFor(engine);
+      if (!worker) {
+        attempts.push({ engine, code: 'WORKER_NOT_CONFIGURED', summary: 'no worker is configured for this engine' });
+        continue;
+      }
+      lastWorker = worker;
+      // Движок попытки виден клиенту сразу: цепочка двигается по ранe, а не молча меняет
+      // исполнителя под ногами у того, кто опрашивает статус.
+      this.store.setEngine(record.runId, engine);
+      try {
+        const receipt = await worker.launch(this.specForEngine(record, engine));
+        return { engine, worker, receipt };
+      } catch (err) {
+        lastError = err;
+        if (!isUnacceptedLaunchFailure(err)) {
+          // Отказ на нашей стороне (нет промпта, refs без workspace, не задан resultUrl):
+          // другой движок его не обойдёт, поэтому цепочка не тратит на него бюджеты.
+          if (!this.disposed) {
+            this.log({ event: 'run_failed', runId: record.runId, engine, message: err instanceof Error ? err.message : String(err) });
+            this.finalize(record, workerTransportFailure(record.spec, err, { startedAt, finishedAt: this.nowIso() }, { workerBaseUrl: worker.baseUrl }));
+          }
+          return null;
+        }
+        // Квитанции нет, но ран мог стартовать. Спрашиваем движок, прежде чем звать следующий:
+        // положительный ответ означает, что второй запуск был бы дублем.
+        const known = await this.workerKnowsRun(record, worker);
+        if (known === true) {
+          this.log({ event: 'launch_reconciled', runId: record.runId, engine, operationId: record.spec.operationId });
+          return { engine, worker };
+        }
+        if (known === null) {
+          // Спросить не удалось: доказать, что запуск не состоялся, нельзя, а второй запуск
+          // без доказательства контракт запрещает. Ран остаётся `unknown` — клиент решает сам.
+          this.log({ event: 'launch_uncertain', runId: record.runId, engine, message: err instanceof Error ? err.message : String(err) });
+          this.markUnknown(record, 'launch_uncertain');
+          return null;
+        }
+        attempts.push({ engine, code: launchFailureCode(err), summary: err instanceof Error ? err.message : String(err) });
+        const next = candidates[index + 1];
+        this.log({
+          event: 'engine_chain_advance',
+          runId: record.runId,
+          engine,
+          code: launchFailureCode(err),
+          next: next ?? null,
+          attempts: attempts.length,
+          operationId: record.spec.operationId,
+        });
+      }
+    }
+    if (this.disposed) return null;
+    // Один кандидат — это не цепочка, а закреплённый клиентом движок: отказ остаётся его
+    // собственным кодом, а не общим «цепочка исчерпана».
+    if (candidates.length === 1) {
+      this.log({ event: 'run_failed', runId: record.runId, engine: candidates[0], message: lastError instanceof Error ? lastError.message : String(lastError) });
+      this.finalize(record, workerTransportFailure(record.spec, lastError, { startedAt, finishedAt: this.nowIso() }, { workerBaseUrl: lastWorker?.baseUrl ?? null }));
+      return null;
+    }
+    // Никто не принял: ран терминален с перечислением попыток. Молчать здесь нельзя — клиент
+    // должен видеть, что задача не выполнена, и новый `Idempotency-Key` даст новую попытку.
+    this.log({ event: 'engine_chain_exhausted', runId: record.runId, attempts });
+    this.finalize(record, fleetExhaustedFailure(record.spec, attempts, { startedAt, finishedAt: this.nowIso() }, { workerBaseUrl: lastWorker?.baseUrl ?? null }));
+    return null;
+  }
+
+  /**
+   * Попытка приёма рана на конкретном движке цепочки. Отличается от приёмной записи только
+   * именем движка: `runId`, `operationId` и всё остальное сохраняются, поэтому дедупликация
+   * воркера по `operationId` работает и после перехода по цепочке.
+   */
+  private specForEngine(record: AdmissionRecord, engine: string): RunSpec {
+    if (engine === record.spec.engine.name) return record.spec;
+    return { ...record.spec, engine: { ...record.spec.engine, name: engine } };
   }
 
   /**
@@ -746,7 +853,7 @@ export class AgentApi {
     if (!run || isTerminalApiState(run.state) || run.state === 'unknown') return;
     run.state = 'unknown';
     run.updatedAt = this.nowIso();
-    this.log({ event: 'run_outcome_unknown', runId: record.runId, reason, engine: record.spec.engine.name });
+    this.log({ event: 'run_outcome_unknown', runId: record.runId, reason, engine: this.store.progressOf(record.runId)?.engine ?? record.spec.engine.name });
   }
 
   /** Экспоненциальная пауза опроса с потолком, чтобы не молотить воркер в пустую. */
@@ -787,9 +894,50 @@ export class AgentApi {
    * там, где первый ещё идёт. Ключ попытки — `(userTaskId, ownerGeneration)`: он
    * переживает рестарт и меняется ровно тогда, когда началась новая попытка.
    */
-  private buildSpec(
+  /**
+ * Кандидаты приёма рана в порядке проб. У записей до появления цепочки поля нет — тогда
+ * кандидат один: движок, названный клиентом.
+ */
+private chainOf(record: AdmissionRecord): readonly string[] {
+  return record.engineChain ?? [record.spec.engine.name];
+}
+
+/**
+ * Кто будет исполнять ран (issue #100). Клиент назвал движок — цепочка не применяется,
+ * кандидат ровно один. Не назвал — берём приоритетную цепочку, суженную до движков,
+ * которые разрешены принципалу: иначе ран уехал бы туда, куда клиенту ход запрещён.
+ */
+private resolveEngines(principal: Principal, requested: EngineSpec | undefined): { engine: EngineSpec; chain: string[] } {
+  if (requested) {
+    if (!this.workerFor(requested.name)) {
+      throw new ApiError('ENGINE_NOT_ALLOWED', `this API does not run engine "${requested.name}"`, { engines: this.engineNames() });
+    }
+    if (principal.engines && !principal.engines.includes(requested.name)) {
+      throw new ApiError(
+        'ENGINE_NOT_ALLOWED',
+        `principal "${principal.principalId}" is not allowed to run engine "${requested.name}"`,
+        { engines: [...principal.engines] },
+      );
+    }
+    return { engine: requested, chain: [requested.name] };
+  }
+  const allowed = this.chain.filter((engine) => !principal.engines || principal.engines.includes(engine));
+  if (allowed.length === 0) {
+    if (this.chain.length === 0) {
+      throw new ApiError('ENGINE_REQUIRED', 'the run names no engine and this API has no engine chain to pick one', {
+        engines: this.engineNames(),
+      });
+    }
+    throw new ApiError('ENGINE_NOT_ALLOWED', `principal "${principal.principalId}" is not allowed to run any engine of the chain`, {
+      engines: [...(principal.engines ?? [])],
+    });
+  }
+  return { engine: { name: allowed[0]!, adapterVersion: EXTERNAL_WORKER_ADAPTER_VERSION }, chain: allowed };
+}
+
+private buildSpec(
     request: SubmitRequest,
-    context: { principal: Principal; requestId: string; userTaskId: string; jobId: string; ownerGeneration: number },
+    context: { principal: Principal; requestId: string; userTaskId: string; jobId: string; ownerGeneration: number; engine: EngineSpec },
   ): RunSpec {
     const runId = newApiId('run');
     const input: InputSpec = { ...(request.input ?? {}) };
@@ -807,7 +955,7 @@ export class AgentApi {
       profileId: context.principal.profileId,
       conversationId: request.conversationId ?? newApiId('conv'),
       ownerGeneration: context.ownerGeneration,
-      engine: request.engine,
+      engine: context.engine,
       // Каталог не создаётся: его материализует воркер на своей эфемерной машине.
       cwd: `/workspace/${runId}`,
       envAllowlist: request.envAllowlist,

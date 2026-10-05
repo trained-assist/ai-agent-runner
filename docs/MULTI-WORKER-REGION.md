@@ -1,6 +1,11 @@
 > **Статус (epic #74).** Fleet/placement-политика не входит в stateless API (см. `docs/API-SERVICE.md`,
 > раздел «Ограничения»). Документ описывает доставленную функциональность библиотеки
 > `src/release/`; проба `scripts/p30-fleet-probe.mjs` и workflow `p30-fleet-probe.yml` удалены.
+>
+> Исключение — приоритетная цепочка движков (issue #100): порядок проб по конфигу
+> `AGENT_API_ENGINE_CHAIN`, переход только при отсутствии квитанции. Это не placement-политика:
+> регионы, провайдеры и резидентность она не проверяет, а лишь выбирает исполнителя, который
+> ответил квитанцией первым.
 # Multi-worker/region contract (P30, этап I10)
 
 Карточка [#69](https://github.com/trained-assist/trained-agent-architecture/issues/69),
