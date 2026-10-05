@@ -41,6 +41,8 @@ async function main(): Promise<void> {
     env: config.env,
     // Цепочка движков (issue #100): null = ран идёт ровно на названный клиентом движок.
     engineChain: config.engineChain ?? undefined,
+    // Бюджет reconcile: мёртвый движок не должен вешать проверку на таймаут запуска.
+    reconcileDeadlineMs: config.reconcileDeadlineMs,
     ...(config.defaultRepository ? { defaultRepository: config.defaultRepository } : {}),
     ...(admissionLogPath ? { admissionLogPath } : {}),
   });
@@ -93,10 +95,16 @@ async function main(): Promise<void> {
     process.exit(1);
   });
   server.listen(config.port, config.host, () => {
+    // Воркеру нужен адрес, на который он вернёт результат. Порт известен только после
+    // старта, поэтому адрес задаётся здесь: без него каждый запуск падает с
+    // RESULT_URL_UNSET, а воркер не узнаёт, куда отвечать.
+    const publicUrl = config.publicUrl ?? `http://${config.host}:${config.port}`;
+    for (const worker of workers) worker.setResultBaseUrl(publicUrl);
     log({
       event: 'api_listening',
       host: config.host,
       port: config.port,
+      publicUrl,
       keyRegistry: config.keyRegistryPath,
       keys: keys.size(),
       engines: workers.map((entry) => entry.name),

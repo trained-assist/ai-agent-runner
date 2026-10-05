@@ -8,6 +8,7 @@ import { statSync } from 'node:fs';
 import {
   DEFAULT_ACCEPT_DEADLINE_MS,
   DEFAULT_CANCEL_DEADLINE_MS,
+  DEFAULT_RECONCILE_DEADLINE_MS,
   DEFAULT_LAUNCH_DEADLINE_MS,
   EXTERNAL_WORKER_ENGINE,
   ExternalWorkerAdapter,
@@ -47,6 +48,17 @@ export interface AgentApiProcessConfig {
   env: Record<string, string>;
   /** Репозиторий по умолчанию, когда клиент не объявил `repository` (воркер клонирует его сам). */
   defaultRepository: string | null;
+  /**
+   * Публичный адрес этого API: воркер возвращает результат на `POST {resultUrl}`. Без него
+   * воркер не получает адрес для возврата и не может быть запущен.
+   */
+  publicUrl: string | null;
+  /**
+   * Бюджет reconcile (issue #100): сколько ждём ответа на `GET /v1/runs/{id}/status`, когда
+   * квитанции не было. Отдельно от таймаута запуска: мёртвый движок не должен вешать
+   * проверку на 10 минут, иначе флот встаёт.
+   */
+  reconcileDeadlineMs: number;
 }
 
 function envValue(env: Record<string, string | undefined>, name: string): string | undefined {
@@ -220,6 +232,7 @@ export function loadAgentApiConfig(env: Record<string, string | undefined> = pro
   // Бюджет приёма рана: по умолчанию 30 с, у каждого движка переопределяется полем acceptDeadlineMs.
   const acceptDeadlineMs = intEnv(env, 'EXTERNAL_WORKER_ACCEPT_DEADLINE_MS', DEFAULT_ACCEPT_DEADLINE_MS);
   const cancelDeadlineMs = intEnv(env, 'EXTERNAL_WORKER_CANCEL_DEADLINE_MS', DEFAULT_CANCEL_DEADLINE_MS);
+  const reconcileDeadlineMs = intEnv(env, 'EXTERNAL_WORKER_RECONCILE_DEADLINE_MS', DEFAULT_RECONCILE_DEADLINE_MS);
   const workers = parseWorkers(env, env['AGENT_API_WORKERS'], launchDeadlineMs, acceptDeadlineMs, cancelDeadlineMs);
   if (workers.length === 0) {
     throw new Error('no external worker configured: set AGENT_API_WORKERS, or EXTERNAL_WORKER_URL for a single default worker');
@@ -235,6 +248,8 @@ export function loadAgentApiConfig(env: Record<string, string | undefined> = pro
     engineChain,
     env: parseEnvPool(env['AGENT_API_ENV']),
     defaultRepository: env['RUNNER_DEFAULT_REPO']?.trim() || null,
+    publicUrl: env['AGENT_API_PUBLIC_URL']?.trim() || null,
+    reconcileDeadlineMs,
   };
 }
 

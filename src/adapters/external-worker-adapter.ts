@@ -58,6 +58,8 @@ export const DEFAULT_CANCEL_DEADLINE_MS = 30 * 1000;
  * `EXTERNAL_WORKER_ACCEPT_DEADLINE_MS` или поле `acceptDeadlineMs` у движка.
  */
 export const DEFAULT_ACCEPT_DEADLINE_MS = 30 * 1000;
+/** Бюджет reconcile по умолчанию: один короткий GET, а не таймаут запуска. */
+export const DEFAULT_RECONCILE_DEADLINE_MS = 5 * 1000;
 export const MAX_LOG_EVENT_CHARS = 10_000;
 
 export interface LaunchArtifact {
@@ -936,7 +938,7 @@ export class ExternalWorkerAdapter implements ExternalWorker {
     const controller = new AbortController();
     let response: Response;
     try {
-      response = await withDeadline(
+      response = await withTimeout(
         this.fetchImpl(url, { method: 'POST', headers, body: JSON.stringify(request), signal: controller.signal }),
         this.acceptDeadlineMs,
         'worker launch',
@@ -1073,7 +1075,7 @@ export class ExternalWorkerAdapter implements ExternalWorker {
     if (this.token) headers['authorization'] = `Bearer ${this.token}`;
     const controller = new AbortController();
     try {
-      return await withDeadline(this.fetchImpl(url, { method: 'GET', headers, signal: controller.signal }), deadlineMs, label, () => controller.abort());
+      return await withTimeout(this.fetchImpl(url, { method: 'GET', headers, signal: controller.signal }), deadlineMs, label, () => controller.abort());
     } catch (err) {
       if (controller.signal.aborted) controller.abort();
       throw err;
@@ -1093,7 +1095,7 @@ export class ExternalWorkerAdapter implements ExternalWorker {
       if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, CANCEL_DELIVERY_BACKOFF_MS));
       let response: Response;
       try {
-        response = await withDeadline(this.fetchImpl(url, { method: 'POST', headers, body: '{}' }), this.cancelDeadlineMs, 'worker cancel');
+        response = await withTimeout(this.fetchImpl(url, { method: 'POST', headers, body: '{}' }), this.cancelDeadlineMs, 'worker cancel');
       } catch (err) {
         last = err instanceof Error ? err.message : String(err);
         continue;
@@ -1133,7 +1135,11 @@ async function readJson(response: Response): Promise<unknown> {
   }
 }
 
-async function withDeadline<T>(promise: Promise<T>, deadlineMs: number, label: string, onTimeout?: () => void): Promise<T> {
+/**
+ * Ожидание с дедлайном. Экспортируется для reconcile в сервисе: у него свой бюджет,
+ * а не таймаут запуска — иначе мёртвый движок вешает проверку на 10 минут.
+ */
+export async function withTimeout<T>(promise: Promise<T>, deadlineMs: number, label: string, onTimeout?: () => void): Promise<T> {
   let timer: NodeJS.Timeout | undefined;
   try {
     return await Promise.race([
