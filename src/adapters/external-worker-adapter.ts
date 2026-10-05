@@ -825,10 +825,12 @@ export class ExternalWorkerAdapter implements ExternalWorker {
         retryable: false,
       });
     }
+    const bindingController = new AbortController();
     const remoteMcpAttachment = spec.mcp?.servers.length ? await withDeadline(
-      resolveRemoteMcpAttachment(spec, this.remoteMcp, this.now()),
+      resolveRemoteMcpAttachment(spec, this.remoteMcp, this.now(), bindingController.signal),
       Math.min(this.deadlineMs, spec.limits.timeoutMs),
       'trusted MCP binding resolution',
+      () => bindingController.abort(),
     ).catch(error => {
       if (error instanceof PreflightError) throw error;
       throw new PreflightError('MCP_BINDING_UNAVAILABLE', 'trusted MCP binding resolution failed', { failureClass: 'preflight', retryable: false });

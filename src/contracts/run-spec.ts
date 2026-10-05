@@ -663,7 +663,7 @@ export function validateRunSpec(input: unknown): ValidationResult<RunSpec> {
     if (mcp && credentialBindings) {
       const declared = new Set(credentialBindings.filter((binding) => binding.ref !== '').map((binding) => binding.ref));
       mcp.servers.forEach((server, i) => {
-        if (!server.bindingRef) return;
+        if (!server.bindingRef || server.transport === 'remote') return;
         if (!declared.has(server.bindingRef)) {
           collector.push(`spec.mcp.servers[${i}].bindingRef: "${server.bindingRef}" is not declared in spec.credentialBindings`);
         }
