@@ -130,6 +130,20 @@ describe('конфигурация воркеров', () => {
     ).toThrowError(/has no worker/);
   });
 
+  it('бюджет reconcile читается из env: мёртвый движок не вешает проверку на таймаут запуска', () => {
+    const config = loadAgentApiConfig({
+      ...base,
+      EXTERNAL_WORKER_URL: 'https://worker.example',
+      EXTERNAL_WORKER_RECONCILE_DEADLINE_MS: '2500',
+    });
+    expect(config.reconcileDeadlineMs).toBe(2500);
+  });
+
+  it('публичный адрес API читается из AGENT_API_PUBLIC_URL', () => {
+    const config = loadAgentApiConfig({ ...base, EXTERNAL_WORKER_URL: 'https://worker.example', AGENT_API_PUBLIC_URL: 'https://api.example' });
+    expect(config.publicUrl).toBe('https://api.example');
+  });
+
   it('цепочка без воркеров не объявляется: ран идёт на названный клиентом движок', () => {
     const config = loadAgentApiConfig({
       ...base,

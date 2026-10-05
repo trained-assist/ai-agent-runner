@@ -11,6 +11,8 @@ import {
   mapLaunchResult,
   mergeUrl,
   workerTransportFailure,
+  withTimeout,
+  DEFAULT_RECONCILE_DEADLINE_MS,
   type ExternalWorker,
   type FleetAttempt,
   type LaunchMapping,
@@ -105,6 +107,11 @@ export interface AgentApiOptions {
    * Не задана — все раны идут на названный движок, как до появления цепочки.
    */
   engineChain?: readonly string[];
+  /**
+   * Бюджет reconcile (issue #100): сколько ждём ответа воркера на вопрос «знаешь ли ты этот
+   * ран». По умолчанию 5 с — это один короткий GET, а не таймаут запуска.
+   */
+  reconcileDeadlineMs?: number;
   logger?: ApiLogger;
   clock?: () => Date;
   /** Запас сверх лимита рана на persist у воркера. По умолчанию минута. */
@@ -156,6 +163,8 @@ export class AgentApi {
   private readonly clock: () => Date;
   /** Запас сверх лимита рана: воркер успел выгрузить лог и запушить ветку. */
   private readonly resultGraceMs: number;
+  /** Бюджет reconcile: мёртвый движок не должен вешать проверку на таймаут запуска. */
+  private readonly reconcileDeadlineMs: number;
   private disposed = false;
   private readonly maxActiveRuns: number;
   private readonly inFlight = new Set<string>();
@@ -178,6 +187,7 @@ export class AgentApi {
     this.logger = options.logger ?? defaultLogger;
     this.clock = options.clock ?? (() => new Date());
     this.resultGraceMs = options.resultGraceMs ?? DEFAULT_RESULT_GRACE_MS;
+    this.reconcileDeadlineMs = options.reconcileDeadlineMs ?? DEFAULT_RECONCILE_DEADLINE_MS;
   }
 
   /**
@@ -805,7 +815,7 @@ export class AgentApi {
    */
   private async workerKnowsRun(record: AdmissionRecord, worker: ExternalWorker): Promise<boolean | null> {
     try {
-      const status = await worker.status(record.runId);
+      const status = await withTimeout(worker.status(record.runId), this.reconcileDeadlineMs, 'worker reconcile');
       // `unknown` от воркера = «запуска не вижу». Всё остальное — ран известен,
       // даже если исход агента воркеру пока неясен.
       return status.status !== 'unknown';
