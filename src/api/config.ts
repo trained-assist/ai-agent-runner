@@ -12,7 +12,7 @@ import {
   ExternalWorkerAdapter,
 } from '../adapters/external-worker-adapter.js';
 import { KeyRegistry } from './auth.js';
-import { bindingFileResolver, parseRemoteMcpServerPolicies, type RemoteMcpHostOptions, type RemoteMcpBindingResolver } from '../adapters/remote-mcp.js';
+import { bindingFileResolver, configuredDocumentsBindingResolver, parseRemoteMcpServerPolicies, type RemoteMcpHostOptions, type RemoteMcpBindingResolver } from '../adapters/remote-mcp.js';
 
 export const DEFAULT_API_PORT = 8787;
 export const DEFAULT_API_HOST = '0.0.0.0';
@@ -186,7 +186,7 @@ export function loadAgentApiConfig(env: Record<string, string | undefined> = pro
     defaultRepository: env['RUNNER_DEFAULT_REPO']?.trim() || null,
     remoteMcp: {
       servers: parseRemoteMcpServerPolicies(env['AGENT_API_REMOTE_MCP_SERVERS']),
-      resolveBinding: bindingFileResolver(envValue(env, 'AGENT_API_REMOTE_MCP_BINDINGS_FILE')),
+      resolveBinding: configuredDocumentsBindingResolver(envValue(env, 'AGENT_API_DOCUMENTS_MCP_MODULE'), envValue(env, 'AGENT_API_DOCUMENTS_MCP_REGISTRATIONS')) ?? bindingFileResolver(envValue(env, 'AGENT_API_REMOTE_MCP_BINDINGS_FILE')),
     },
   };
 }
