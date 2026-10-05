@@ -189,6 +189,7 @@ export function createExternalWorkers(config: AgentApiProcessConfig, log?: (entr
   return config.workers.map((worker) => new ExternalWorkerAdapter({
     engineName: worker.engine,
     baseUrl: worker.baseUrl,
+    env: config.env,
     ...(config.publicUrl ? { baseUrlForResult: config.publicUrl } : {}),
     ...(worker.token ? { token: worker.token } : {}),
     deadlineMs: worker.launchDeadlineMs,

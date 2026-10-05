@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { createExternalWorkers, loadAgentApiConfig } from '../src/api/config.js';
 import type { RunSpec } from '../src/contracts/run-spec.js';
+import { makeRunSpec } from './helpers.js';
+import { startMockWorker } from './external-worker-harness.js';
 
 /**
  * Конфигурация воркеров — это и есть способ подключить движок. Тест закрепляет оба формата:
@@ -14,6 +16,32 @@ const base = {
 };
 
 describe('конфигурация воркеров', () => {
+  it('forwards only allowed host pool values to the actual launch request', async () => {
+    const mock = await startMockWorker({ autoDeliver: false });
+    try {
+      const logs: Record<string, unknown>[] = [];
+      const config = loadAgentApiConfig({
+        ...base,
+        EXTERNAL_WORKER_URL: mock.baseUrl,
+        EXTERNAL_WORKER_TOKEN: 'worker-token-fixture',
+        AGENT_API_PUBLIC_URL: 'https://runner.example',
+        AGENT_API_ENV: JSON.stringify({ LLM_LADDER_TOKEN: 'model-key-fixture', ROOT_TOKEN: 'root-key-fixture', GOOGLE_APPLICATION_CREDENTIALS: '/host/only/service-account.json' }),
+      });
+      const worker = createExternalWorkers(config, (entry) => logs.push(entry))[0]!;
+      const spec = makeRunSpec({ engine: { name: worker.name, adapterVersion: '1' }, input: { inlinePrompt: 'CSV\ncategory,amount\nfood,150' }, envAllowlist: ['LLM_LADDER_TOKEN'] });
+      await worker.launch(spec);
+      expect(mock.launches[0]!.env).toEqual({ LLM_LADDER_TOKEN: 'model-key-fixture' });
+      expect(mock.launches[0]!.input).toEqual(spec.input);
+      expect(JSON.stringify(mock.launches[0])).not.toContain('root-key-fixture');
+      expect(JSON.stringify(mock.launches[0])).not.toContain('/host/only/service-account.json');
+      expect(JSON.stringify(logs)).not.toContain('model-key-fixture');
+      await worker.launch({ ...spec, runId: 'run-no-model-key', operationId: 'op-no-model-key', envAllowlist: [] });
+      expect(mock.launches[1]!.env).toEqual({});
+    } finally {
+      await mock.close();
+    }
+  });
+
   it('public callback URL reaches every worker without entering the run env pool', () => {
     const config = loadAgentApiConfig({
       ...base,
