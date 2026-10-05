@@ -202,14 +202,6 @@ export interface ExternalWorker {
   cancel(runId: string): Promise<WorkerCancelResult>;
 }
 
-/**
- * Гонка отмены с запуском. Контракт воркера синхронный (`launch` = весь ран), поэтому отмена
- * может прийти раньше, чем воркер зарегистрирует ран. `unknown_run` в такой ситуации означает
- * «ещё не вижу», а не «не существует», и API повторяет запрос, пока ран в полёте.
- */
-export const CANCEL_UNKNOWN_RUN_RETRIES = 5;
-export const CANCEL_UNKNOWN_RUN_BACKOFF_MS = 40;
-
 /** Проверка текста, который в норме может быть пустым (stderr, stdout без вывода). */
 function checkText(value: unknown, path: string, collector: ErrorCollector, maxLen: number): void {
   if (typeof value !== 'string') {

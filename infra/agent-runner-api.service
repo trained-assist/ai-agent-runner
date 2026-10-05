@@ -1,5 +1,5 @@
 [Unit]
-Description=Agent Runner Serverless Agent API (stateless orchestrator, no disk state)
+Description=Agent Runner Serverless Agent API (stateless orchestrator; disk holds only the admission journal)
 After=network-online.target
 Wants=network-online.target
 
@@ -15,14 +15,28 @@ RestartSec=2
 TimeoutStopSec=20
 KillSignal=SIGTERM
 
-# Stateless API (epic #74): процесс не пишет на диск и не запускает агентов, поэтому
-# capabilities, ReadWritePaths и каталог данных ему не нужны. Единственный читаемый файл —
-# реестр ключей из EnvironmentFile, а всё состояние ранов живёт в памяти процесса.
+# Журнал приёмных записей — единственное, что сервис пишет на диск, и единственное, что
+# требует контракт внешнего worker (docs/EXTERNAL-WORKER-CONTRACT.md, п. 2): дедупликация по
+# `Idempotency-Key` обязана переживать рестарт API, иначе повтор клиента с тем же ключом
+# запустит второй ран там, где первый ещё идёт. Путь — AGENT_API_ADMISSION_LOG в env-файле;
+# StateDirectory создаёт каталог и отдаёт его процессу, ReadWritePaths разрешает в нём запись
+# при ProtectSystem=full. Без обеих строк журнал не откроется: процесс не упадёт, но
+# дедупликация останется в памяти, а в stdout будут `persist failed`.
+#
+# Путь журнала по умолчанию — /var/lib/agent-runner/admissions.jsonl (JOURNAL_DIR в
+# scripts/deploy-api-service.sh). Если оператор выбрал другой каталог, его нужно добавить в
+# ReadWritePaths здесь же, иначе настройка не сработает молча.
+StateDirectory=agent-runner
+ReadWritePaths=/var/lib/agent-runner
+
+# Stateless API (epic #74): процесс не запускает агентов и не восстанавливается после
+# рестарта, поэтому capabilities, каталог данных и пути на запись ему не нужны — кроме
+# каталога журнала выше. Единственный читаемый файл — реестр ключей из EnvironmentFile.
 #
 # Защиту оставляем прежней: NoNewPrivileges и ProtectSystem=full запрещают процессу
 # повышать права и писать в системные каталоги, а PrivateTmp изолирует его от /tmp хоста.
-# Никаких CAP_SETUID/CAP_SETGID: переключать идентичность рана теперь нечего — агента
-# запускает внешний воркер на своей машине.
+# Никаких CAP_SETUID/CAP_SETGID: переключать идентичность рана нечего — агента запускает
+# внешний воркер на своей машине.
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
