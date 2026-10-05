@@ -108,7 +108,7 @@ function optionalCommand(name, args) {
 }
 
 function serviceProperties() {
-  const value = command('systemctl', ['show', paths.unit, '-p', 'User', '-p', 'Group', '-p', 'MainPID', '-p', 'ActiveState', '-p', 'WorkingDirectory', '-p', 'EnvironmentFiles']);
+  const value = command('systemctl', ['show', paths.unit, '-p', 'User', '-p', 'Group', '-p', 'MainPID', '-p', 'ActiveState', '-p', 'WorkingDirectory', '-p', 'EnvironmentFiles', '-p', 'Environment', '-p', 'UnsetEnvironment', '-p', 'PassEnvironment']);
   return Object.fromEntries(value.split('\n').map(line => { const index = line.indexOf('='); return [line.slice(0, index), line.slice(index + 1)]; }));
 }
 
@@ -191,8 +191,45 @@ function assertProcess(properties, gate, user, journal, registryPath, code) {
   assert.equal(env.AGENT_API_KEY_REGISTRY, registryPath);
   const argv = readFileSync(`/proc/${gate.mainPid}/cmdline`, 'utf8').split('\0').filter(Boolean);
   assert.deepEqual(argv, ['/usr/local/bin/node', join(code, 'dist/api/main.js')]);
+  assertMcpDisabled(env);
+  return env;
+}
+
+export function assertMcpDisabled(env) {
   assert.ok(!env.AGENT_API_DOCUMENTS_MCP_REGISTRATIONS && !env.AGENT_API_DOCUMENTS_MCP_MODULE
+    && !env.AGENT_API_REMOTE_MCP_BINDINGS_FILE
     && (!env.AGENT_API_REMOTE_MCP_SERVERS || env.AGENT_API_REMOTE_MCP_SERVERS === '{}'));
+}
+
+export function routingEnvironment(env) {
+  return Object.fromEntries(Object.entries(env).filter(([key]) => /^(AGENT_API_|EXTERNAL_WORKER_|DYNAMIC_IP_AZURE_|RUNNER_|NODE_|GOOGLE_|GCLOUD_|GCP_)/.test(key)
+    || ['HTTPS_PROXY', 'HTTP_PROXY', 'ALL_PROXY', 'NO_PROXY', 'LD_PRELOAD', 'LD_LIBRARY_PATH'].includes(key)).sort(([left], [right]) => left.localeCompare(right)));
+}
+
+export function validateStagedEnvironment(actual, baseline, overrides = {}) {
+  assertMcpDisabled(actual);
+  assertMcpDisabled(baseline);
+  assert.deepEqual(routingEnvironment(actual), routingEnvironment({ ...baseline, ...overrides }));
+}
+
+export function validateEnvironmentPin(bytes, expected) {
+  assert.equal(digest(bytes), expected);
+}
+
+function parseSystemdEnvironment(file, expected) {
+  validateEnvironmentPin(privateBytes(file), expected);
+  const output = command('systemd-run', ['--quiet', '--wait', '--pipe', '--collect',
+    '--property=Type=exec', '--property=User=sandbox', '--property=Group=sandbox',
+    '--property=NoNewPrivileges=yes', '--property=ProtectSystem=strict', '--property=ProtectHome=yes',
+    '--property=PrivateNetwork=yes', '--property=PrivateTmp=yes', '--property=RuntimeMaxSec=10',
+    `--property=EnvironmentFile=${file}`, '/usr/bin/env', '-0']);
+  const parsed = Object.fromEntries(output.split('\0').filter(Boolean).map(entry => {
+    const index = entry.indexOf('=');
+    assert.ok(index > 0);
+    return [entry.slice(0, index), entry.slice(index + 1)];
+  }));
+  validateEnvironmentPin(privateBytes(file), expected);
+  return parsed;
 }
 
 export function cutoverPlan() {
@@ -226,10 +263,17 @@ function performCutover(action, gateFile) {
   const release = verifyRootRelease(gate.releaseCommit);
   const currentCode = action === 'apply' ? paths.code : release;
   const properties = serviceProperties();
-  assertProcess(properties, gate, action === 'apply' ? 'sandbox' : paths.user, journal, action === 'apply' ? paths.oldRegistry : registry, currentCode);
+  const baseline = assertProcess(properties, gate, action === 'apply' ? 'sandbox' : paths.user, journal, action === 'apply' ? paths.oldRegistry : registry, currentCode);
+  for (const key of ['Environment', 'UnsetEnvironment', 'PassEnvironment']) assert.equal(properties[key], '');
   let state;
   let env;
   let keys;
+  let staged;
+  let stagedFile;
+  let stagedHash;
+  const overrides = { AGENT_API_HOST: '127.0.0.1', AGENT_API_PORT: '18879',
+    AGENT_API_KEY_REGISTRY: action === 'apply' ? registry : paths.oldRegistry,
+    AGENT_API_ADMISSION_LOG: action === 'apply' ? newJournal : rollbackJournal };
   if (action === 'apply') {
     assert.equal(properties.EnvironmentFiles, `${paths.oldEnv} (ignore_errors=no)`);
     assert.ok(!existsSync(paths.backup) && !existsSync(paths.config) && !existsSync(paths.data) && !existsSync(paths.dropin));
@@ -246,11 +290,18 @@ function performCutover(action, gateFile) {
     keys = privateBytes(paths.oldRegistry, [0, 1002]);
     state = { schemaVersion: 'own-native-uid-cutover-v1', targetUid: uid, releaseCommit: gate.releaseCommit, originalJournalSha256: digest(bytes),
       originalEnvironmentSha256: digest(env), originalRegistrySha256: digest(keys) };
+    directory(paths.backup, 0, 0, 0o700);
+    const original = join(paths.backup, 'original.env');
+    publish(original, env);
+    validateStagedEnvironment(parseSystemdEnvironment(original, digest(env)), baseline);
+    staged = Buffer.concat([env, Buffer.from(`\nAGENT_API_HOST=127.0.0.1\nAGENT_API_PORT=18879\nAGENT_API_KEY_REGISTRY=${registry}\nAGENT_API_ADMISSION_LOG=${newJournal}\n`)]);
+    stagedFile = join(paths.backup, 'staged.env');
   } else {
     state = JSON.parse(privateBytes(stateFile));
     assert.equal(state.schemaVersion, 'own-native-uid-cutover-v1');
     assert.equal(state.targetUid, uid);
     assert.equal(state.releaseCommit, gate.releaseCommit);
+    validateEnvironmentPin(privateBytes(environment), state.stagedEnvironmentSha256);
     assert.equal(digest(privateBytes(paths.oldEnv, [0, 1002])), state.originalEnvironmentSha256);
     assert.equal(digest(privateBytes(paths.oldRegistry, [0, 1002])), state.originalRegistrySha256);
     assert.equal(digest(privateBytes(paths.oldJournal, [1002])), state.originalJournalSha256);
@@ -258,15 +309,26 @@ function performCutover(action, gateFile) {
     assert.equal(command('id', ['-g', paths.user]), String(uid));
     assert.equal(readFileSync(paths.dropin, 'utf8'), dropinText(release));
     assert.ok(!existsSync(paths.rollbackData));
+    env = privateBytes(join(paths.backup, 'original.env'));
+    validateEnvironmentPin(env, state.originalEnvironmentSha256);
+    staged = Buffer.concat([env, Buffer.from(`\nAGENT_API_ADMISSION_LOG=${rollbackJournal}\n`)]);
+    stagedFile = join(paths.backup, 'staged-rollback.env');
   }
-  assertProcess(serviceProperties(), gate, action === 'apply' ? 'sandbox' : paths.user, journal, action === 'apply' ? paths.oldRegistry : registry, currentCode);
+  stagedHash = digest(staged);
+  if (action === 'apply') state.stagedEnvironmentSha256 = stagedHash;
+  publish(stagedFile, staged);
+  const expectedEnvironment = parseSystemdEnvironment(stagedFile, stagedHash);
+  validateStagedEnvironment(expectedEnvironment, baseline, overrides);
+  const beforeStop = serviceProperties();
+  assert.deepEqual(beforeStop, properties);
+  validateStagedEnvironment(assertProcess(beforeStop, gate, action === 'apply' ? 'sandbox' : paths.user, journal, action === 'apply' ? paths.oldRegistry : registry, currentCode), baseline);
   verifyRootRelease(gate.releaseCommit);
   validateQuiescence(gate, privateBytes(journal, [action === 'apply' ? 1002 : uid]), action);
+  validateEnvironmentPin(privateBytes(stagedFile), stagedHash);
   command('systemctl', ['stop', paths.unit]);
   assert.equal(serviceProperties().ActiveState, 'inactive');
   validateQuiescence(gate, privateBytes(journal, [action === 'apply' ? 1002 : uid]), action);
   if (action === 'apply') {
-    directory(paths.backup, 0, 0, 0o700);
     publish(join(paths.backup, 'original-admission.jsonl'), bytes);
     publish(stateFile, JSON.stringify(state));
     command('groupadd', ['--gid', String(uid), paths.user]);
@@ -276,7 +338,7 @@ function performCutover(action, gateFile) {
     directory(paths.data, uid, uid, 0o700);
     publish(registry, keys, uid, uid);
     publish(newJournal, bytes, uid, uid);
-    publish(environment, Buffer.concat([env, Buffer.from(`\nAGENT_API_HOST=127.0.0.1\nAGENT_API_PORT=18879\nAGENT_API_KEY_REGISTRY=${registry}\nAGENT_API_ADMISSION_LOG=${newJournal}\n`)]));
+    publish(environment, privateBytes(stagedFile));
     const dropinDirectory = dirname(paths.dropin);
     if (!existsSync(dropinDirectory)) mkdirSync(dropinDirectory, { mode: 0o755 });
     assert.ok(lstatSync(dropinDirectory).isDirectory() && !lstatSync(dropinDirectory).isSymbolicLink() && lstatSync(dropinDirectory).uid === 0);
@@ -286,12 +348,16 @@ function performCutover(action, gateFile) {
     publish(join(paths.backup, 'rollback-admission.jsonl'), bytes);
     directory(paths.rollbackData, 1002, 1002, 0o700);
     publish(rollbackJournal, bytes, 1002, 1002);
-    publish(join(paths.config, 'rollback.env'), `AGENT_API_ADMISSION_LOG=${rollbackJournal}\n`);
-    publish(paths.dropin, `[Service]\nEnvironmentFile=${paths.config}/rollback.env\n`, 0, 0, true);
+    publish(join(paths.config, 'rollback.env'), privateBytes(stagedFile));
+    publish(paths.dropin, `[Service]\nEnvironmentFile=\nEnvironmentFile=${paths.config}/rollback.env\n`, 0, 0, true);
     chmodSync(paths.dropin, 0o644);
   }
   command('systemctl', ['daemon-reload']);
+  const activeEnvironment = action === 'apply' ? environment : join(paths.config, 'rollback.env');
+  validateEnvironmentPin(privateBytes(activeEnvironment), stagedHash);
+  validateStagedEnvironment(parseSystemdEnvironment(activeEnvironment, stagedHash), expectedEnvironment);
   command('systemctl', ['start', paths.unit]);
+  try {
   const after = serviceProperties();
   assert.equal(after.User, action === 'apply' ? paths.user : 'sandbox');
   assert.equal(after.Group, after.User);
@@ -299,9 +365,18 @@ function performCutover(action, gateFile) {
   assert.equal(after.WorkingDirectory, action === 'apply' ? release : paths.code);
   const effectiveUid = Number(readFileSync(`/proc/${after.MainPID}/status`, 'utf8').match(/^Uid:\s+\d+\s+(\d+)/m)?.[1]);
   assert.equal(effectiveUid, action === 'apply' ? uid : 1002);
+  assert.equal(after.EnvironmentFiles, `${activeEnvironment} (ignore_errors=no)`);
+  for (const key of ['Environment', 'UnsetEnvironment', 'PassEnvironment']) assert.equal(after[key], '');
+  validateEnvironmentPin(privateBytes(activeEnvironment), stagedHash);
+  validateStagedEnvironment(assertProcess(after, { mainPid: Number(after.MainPID) }, after.User,
+    overrides.AGENT_API_ADMISSION_LOG, overrides.AGENT_API_KEY_REGISTRY, after.WorkingDirectory), expectedEnvironment);
   assert.equal(digest(privateBytes(action === 'apply' ? newJournal : rollbackJournal, [action === 'apply' ? uid : 1002])), digest(bytes));
   return { action, unit: paths.unit, user: after.User, admissionBytesPreserved: true,
     healthAndNativeReadbackPending: true, ingressMustRemainBlocked: true };
+  } catch (error) {
+    command('systemctl', ['stop', paths.unit]);
+    throw error;
+  }
 }
 
 function dropinText(release) {

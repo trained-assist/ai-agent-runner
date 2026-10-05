@@ -3,10 +3,48 @@ import { createHash } from 'node:crypto';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
-import { cutoverPlan, paths, releasePath, validateQuiescence } from './own-native-uid-cutover.mjs';
+import { cutoverPlan, paths, releasePath, validateEnvironmentPin, validateQuiescence, validateStagedEnvironment } from './own-native-uid-cutover.mjs';
 import { stagePlan, validateSourceTar } from './stage-own-native-release.mjs';
 
 const now = Date.parse('2026-10-05T07:00:00Z');
+const runningEnv = { AGENT_API_HOST: '127.0.0.1', AGENT_API_PORT: '18879',
+  EXTERNAL_WORKER_URL: 'https://worker.invalid', EXTERNAL_WORKER_TOKEN: 'fixture-only',
+  AGENT_API_PUBLIC_URL: 'https://callback.invalid', AGENT_API_ENV: '{"MODE":"fixture"}',
+  AGENT_API_ADMISSION_LOG: '/old/journal', AGENT_API_KEY_REGISTRY: '/old/registry' };
+
+test('validated staged settings preserve routing, callback and child environment', () => {
+  const overrides = { AGENT_API_ADMISSION_LOG: '/new/journal', AGENT_API_KEY_REGISTRY: '/new/registry' };
+  validateStagedEnvironment({ ...runningEnv, ...overrides }, runningEnv, overrides);
+});
+
+for (const key of ['EXTERNAL_WORKER_URL', 'EXTERNAL_WORKER_TOKEN', 'AGENT_API_PUBLIC_URL', 'AGENT_API_ENV']) {
+  test(`stale on-disk ${key} refuses rather than silently replacing checked process`, () => {
+    assert.throws(() => validateStagedEnvironment({ ...runningEnv, [key]: 'stale' }, runningEnv));
+  });
+}
+
+for (const key of ['AGENT_API_DOCUMENTS_MCP_MODULE', 'AGENT_API_DOCUMENTS_MCP_REGISTRATIONS', 'AGENT_API_REMOTE_MCP_SERVERS', 'AGENT_API_REMOTE_MCP_BINDINGS_FILE']) {
+  test(`staged or post-start ${key} activation refuses`, () => {
+    assert.throws(() => validateStagedEnvironment({ ...runningEnv, [key]: 'unexpected' }, runningEnv));
+  });
+}
+
+test('staged bytes cannot change after validation, including semantically identical edits', () => {
+  const bytes = Buffer.from('AGENT_API_PORT=18879\n');
+  const pin = createHash('sha256').update(bytes).digest('hex');
+  validateEnvironmentPin(bytes, pin);
+  assert.throws(() => validateEnvironmentPin(Buffer.concat([bytes, Buffer.from('# change\n')]), pin));
+});
+
+test('systemd parser and stage validation precede stop; effective checks follow start', () => {
+  const source = readFileSync(new URL('./own-native-uid-cutover.mjs', import.meta.url), 'utf8');
+  assert.match(source, /command\('systemd-run'/);
+  assert.match(source, /--property=EnvironmentFile=\$\{file\}/);
+  assert.match(source, /'\/usr\/bin\/env', '-0'/);
+  assert.ok(source.indexOf('validateStagedEnvironment(expectedEnvironment, baseline, overrides)') < source.indexOf("command('systemctl', ['stop', paths.unit])"));
+  assert.ok(source.indexOf('validateStagedEnvironment(assertProcess(after') > source.indexOf("command('systemctl', ['start', paths.unit])"));
+  assert.match(source, /EnvironmentFile=\\nEnvironmentFile=\$\{paths.config\}\/rollback.env/);
+});
 test('release base excludes sandbox-owned ancestor', () => {
   assert.equal(paths.releases, '/opt/ta-integrator-runner-native-releases');
   for (const file of ['stage-own-native-release.mjs', 'own-native-uid-cutover.mjs']) {

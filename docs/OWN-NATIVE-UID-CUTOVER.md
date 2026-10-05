@@ -143,8 +143,23 @@ empty supplementary groups, umask 0077, the private copied EnvironmentFile and
 the pinned root release WorkingDirectory/ExecStart. Endpoint/worker/callback
 settings are preserved; only own journal/registry and executable paths change.
 The tool does daemon-reload/start, not legacy enable/restart. It
-checks the actual new process UID and journal preservation. Raw credentials,
+checks the actual new process UID, effective routing/MCP-off environment and journal preservation. Raw credentials,
 environment, stderr, addresses and task text are never printed.
+
+Before stopping Runner, the tool freezes the original and staged environment
+bytes in root-private 0600 files. An inert transient systemd service evaluates
+the actual `EnvironmentFile` syntax using `/usr/bin/env -0`, not a shell or a
+hand-written dotenv parser. It runs as sandbox with no new privileges, a private
+network and read-only system filesystem; it does not launch Runner or a job.
+Runner/worker/callback/child environment settings must match the checked running
+process, except the explicit own journal/registry path changes. Nonempty unit
+`Environment`, `PassEnvironment` or `UnsetEnvironment` settings refuse this narrow
+recipe. Process-specific HOME/PATH and systemd runtime metadata are not routing
+comparison fields. Staged byte hashes are checked before stop and before/after
+start; effective post-start routing and MCP-off settings must match the parsed
+stage. A failed post-start check stops only the own unit and leaves ingress sealed.
+Pre-stop validation failure can leave the private preparation directory; do not
+retry automatically. Offline tests do not prove Linux/systemd runtime acceptance.
 
 Success is **not health/native/MCP acceptance**. Parent must verify actual service
 health, authenticated prior-run result retrieval, unchanged worker/callback
@@ -174,7 +189,7 @@ isolated `/var/lib/ta-integrator-runner-native-rollback-v1` directory, UID/GID10
 0700/0600. It never reverts to an old admission snapshot and never writes through
 the sandbox-owned original journal directory. Original combined environment and
 registry must remain byte-identical. The own UID drop-in is replaced with a
-journal-only EnvironmentFile override, restoring the inherited sandbox identity,
+validated frozen-original EnvironmentFile with a journal override, restoring the inherited sandbox identity,
 original executable/working directory and configuration while retaining every
 latest admission/idempotency key.
 Private backups, dedicated account and new journal remain for review; no shared
