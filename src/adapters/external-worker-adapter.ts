@@ -183,7 +183,8 @@ export interface ExternalWorker {
   readonly name: string;
   readonly baseUrl: string | null;
   /** Квитанция запуска, а не финальный результат (асинхронный контракт, #73). */
-  launch(spec: RunSpec): Promise<LaunchReceipt>;
+  launch(spec: RunSpec, admittedAt?: string): Promise<LaunchReceipt>;
+  restoreMcp?(spec: RunSpec, admittedAt: string): Promise<void>;
   status(runId: string): Promise<WorkerStatusView>;
   result(runId: string): Promise<LaunchResult>;
   cancel(runId: string): Promise<WorkerCancelResult>;
@@ -821,7 +822,24 @@ export class ExternalWorkerAdapter implements ExternalWorker {
     this.baseUrlForResult = options.baseUrlForResult;
   }
 
-  async launch(spec: RunSpec): Promise<LaunchReceipt> {
+  async restoreMcp(spec: RunSpec, admittedAt: string): Promise<void> {
+    await this.resolveMcp(spec, 'restore', admittedAt);
+  }
+
+  private async resolveMcp(spec: RunSpec, mode: 'launch' | 'restore', admittedAt: string): Promise<RemoteMcpAttachment | undefined> {
+    const bindingController = new AbortController();
+    return withDeadline(
+      resolveRemoteMcpAttachment(spec, this.remoteMcp, this.now(), bindingController.signal, mode, admittedAt),
+      Math.min(this.deadlineMs, spec.limits.timeoutMs),
+      'trusted MCP binding resolution',
+      () => bindingController.abort(),
+    ).catch(error => {
+      if (error instanceof PreflightError) throw error;
+      throw new PreflightError('MCP_BINDING_UNAVAILABLE', 'trusted MCP binding resolution failed', { failureClass: 'preflight', retryable: false });
+    });
+  }
+
+  async launch(spec: RunSpec, admittedAt = this.now().toISOString()): Promise<LaunchReceipt> {
     const base = this.baseUrl;
     if (!base) {
       throw new PreflightError('WORKER_NOT_CONFIGURED', 'no external worker URL is configured for this engine', {
@@ -829,16 +847,7 @@ export class ExternalWorkerAdapter implements ExternalWorker {
         retryable: false,
       });
     }
-    const bindingController = new AbortController();
-    const remoteMcpAttachment = spec.mcp?.servers.length ? await withDeadline(
-      resolveRemoteMcpAttachment(spec, this.remoteMcp, this.now(), bindingController.signal),
-      Math.min(this.deadlineMs, spec.limits.timeoutMs),
-      'trusted MCP binding resolution',
-      () => bindingController.abort(),
-    ).catch(error => {
-      if (error instanceof PreflightError) throw error;
-      throw new PreflightError('MCP_BINDING_UNAVAILABLE', 'trusted MCP binding resolution failed', { failureClass: 'preflight', retryable: false });
-    }) : undefined;
+    const remoteMcpAttachment = spec.mcp?.servers.length ? await this.resolveMcp(spec, 'launch', admittedAt) : undefined;
     const request = launchRequestFromSpec(spec, { env: this.env, resultUrl: this.resultUrlFor(spec), remoteMcpAttachment });
     const redactAttachment = (value: string): string => Object.values(remoteMcpAttachment?.mcpSecrets ?? {}).reduce((safe, secret) => safe.split(secret).join('[REDACTED]'), value);
     const url = `${trimTrailingSlash(base)}/v1/launch`;
