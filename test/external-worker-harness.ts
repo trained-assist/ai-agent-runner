@@ -237,7 +237,7 @@ export async function startMockWorker(options: MockWorkerOptions = {}): Promise<
         timedOut: exitReason === 'timeout',
         outputTruncated: false,
         artifacts: (settings['artifacts'] as unknown[] | undefined) ?? [],
-        logUrl: settings['logUrl'] === null ? undefined : String(settings['logUrl']).replace('PLACEHOLDER', runId),
+        logUrl: resultLogUrl(exitReason, settings, runId),
         repo: { fullName: 'owner/name', branch: `agent-run/${runId}`, commit: 'abc1234', baseRef: 'main' },
         ...over,
       } as unknown as LaunchResult;
@@ -260,6 +260,17 @@ export async function startMockWorker(options: MockWorkerOptions = {}): Promise<
   return worker;
 }
 
+/**
+ * Ссылка на лог рана от мока. Отменённый ран лога не имеет: джобу убили до загрузки в GCS,
+ * поэтому настоящий воркер отвечает `logUrl: ''` (`cancelledResult` в opencode-gha-runner).
+ * Мок обязан повторять это, иначе отмена в тестах выглядит лучше, чем на бою (#133).
+ */
+function resultLogUrl(exitReason: string, settings: MockWorkerOptions & Record<string, unknown>, runId: string): string | undefined {
+  if (settings['logUrl'] === null) return undefined;
+  if (exitReason === 'cancelled') return '';
+  return String(settings['logUrl']).replace('PLACEHOLDER', runId);
+}
+
 /** Статусы, при которых воркер отдаёт результат, а не 409. */
 const TERMINAL = new Set(['succeeded', 'failed', 'cancelled']);
 
@@ -280,7 +291,7 @@ function buildResult(runId: string, exitReason: string, settings: MockWorkerOpti
     timedOut: exitReason === 'timeout',
     outputTruncated: false,
     artifacts: (settings['artifacts'] as unknown[] | undefined) ?? [],
-    logUrl: settings['logUrl'] === null ? undefined : String(settings['logUrl']).replace('PLACEHOLDER', runId),
+    logUrl: resultLogUrl(exitReason, settings, runId),
     repo: { fullName: 'owner/name', branch: `agent-run/${runId}`, commit: 'abc1234', baseRef: 'main' },
   };
 }

@@ -133,6 +133,28 @@ describe('валидация LaunchResult', () => {
     expect(errors.some((entry) => entry.includes('launch.logUrl'))).toBe(true);
     expect(errors.some((entry) => entry.includes('launch.repo'))).toBe(true);
   });
+
+  it('пустой logUrl — законный ответ «лог не опубликован», а не расхождение с контрактом (#133)', () => {
+    // Боевой воркер отвечает `logUrl: ''` на отменённый ран и на любой отказ до загрузки
+    // лога. Раньше `checkString` отвергал такой результат, и отмена доходила до клиента
+    // как failed + WORKER_PROTOCOL_INVALID + worker_crash, неповторяемый отказ.
+    for (const exitReason of ['cancelled', 'startup_failure'] as const) {
+      const validated = validateLaunchResult(launchResult({ exitCode: null, exitReason, logUrl: '' }), 'run-1');
+      expect(validated.ok, `${exitReason}: ${validated.ok ? '' : validated.errors.join('; ')}`).toBe(true);
+    }
+    // Непустая ссылка по-прежнему принимается и остаётся ссылкой воркера.
+    const withUrl = validateLaunchResult(launchResult({ logUrl: 'https://storage.googleapis.com/b/run-1.log' }), 'run-1');
+    expect(withUrl.ok).toBe(true);
+    // Ключ обязателен: нет ключа — расхождение с контрактом, даже если значение пустое.
+    const { logUrl: _logUrl, ...withoutKey } = launchResult({ logUrl: '' });
+    const missing = validateLaunchResult(withoutKey, 'run-1');
+    expect(missing.ok).toBe(false);
+    expect(missing.ok ? [] : missing.errors.some((entry) => entry.includes('logUrl'))).toBe(true);
+    // Не строка — тоже отказ: пустую строку вправе прислать только воркер.
+    for (const bad of [null, undefined, 42]) {
+      expect(validateLaunchResult(launchResult({ logUrl: bad as unknown as string }), 'run-1').ok).toBe(false);
+    }
+  });
 });
 
 describe('маппинг LaunchResult → RunResult + RunnerEvent (epic #74, шаг 2)', () => {
@@ -188,6 +210,63 @@ describe('маппинг LaunchResult → RunResult + RunnerEvent (epic #74, ш�
     expect(mapping.result.exitObserved).toBe(false);
     expect(mapping.result.failure).toBeUndefined();
     expect(mapping.events[mapping.events.length - 1]!.type).toBe('cancelled');
+  });
+
+  it('отменённый ран без лога: cancelled, без отказа, logPath — адрес рана у воркера (#133)', () => {
+    // Боевой отчёт об отмене: джобу убили (SIGTERM) до загрузки лога, поэтому logUrl пуст.
+    // Отчёт обязан дойти до клиента отменой, а logPath — остаться непустым (runLogRef).
+    const spec = makeRunSpec({ runId: 'run-1', jobId: 'job-1' });
+    const report = launchResult({
+      status: 'failed',
+      pid: null,
+      exitCode: null,
+      exitSignal: 'SIGTERM',
+      exitReason: 'cancelled',
+      answer: null,
+      answerSource: null,
+      artifacts: [],
+      logUrl: '',
+      repo: { fullName: 'owner/name', branch: 'agent-run/run-1', commit: '0000000000000000000000000000000000000000' },
+    });
+    const validated = validateLaunchResult(report, 'run-1');
+    expect(validated.ok, validated.ok ? '' : validated.errors.join('; ')).toBe(true);
+
+    const mapping = mapLaunchResult(spec, validated.ok ? validated.value : report, TIMES, { workerBaseUrl: 'https://worker.example' });
+    expect(validateRunResult(mapping.result).ok).toBe(true);
+    expect(mapping.result.outcome).toBe('cancelled');
+    expect(mapping.result.exitReason).toBe('cancelled');
+    expect(mapping.result.exitSignal).toBe('SIGTERM');
+    expect(mapping.result.failure).toBeUndefined();
+    expect(mapping.result.logPath).toBe('https://worker.example/v1/runs/run-1');
+    // Лога нет — и в наружу это `null`, а не ссылка на пустое и не выдуманное событие.
+    expect(mapping.logUrl).toBeNull();
+    expect(mapping.events.some((event) => event.type === 'log' && String(event.payload['message']).includes('session log'))).toBe(false);
+    for (const event of mapping.events) expect(validateRunnerEvent(event).ok).toBe(true);
+    expect(mapping.events[mapping.events.length - 1]!.type).toBe('cancelled');
+  });
+
+  it('отказ до старта агента (startup_failure) с пустым logUrl доезжает своим кодом (#133)', () => {
+    // Тот же дефект, что и у отмены: `emptyResult` в воркере всегда ставит logUrl: ''.
+    // Раньше реальная причина отказа терялась под WORKER_PROTOCOL_INVALID + worker_crash.
+    const spec = makeRunSpec({ runId: 'run-1' });
+    const report = launchResult({
+      status: 'failed',
+      pid: null,
+      exitCode: null,
+      exitReason: 'startup_failure',
+      artifacts: [],
+      logUrl: '',
+      failure: { code: 'WORKSPACE_CLONE_FAILED', failureClass: 'runtime', safeSummary: 'could not clone the repository', retryable: true },
+    });
+    const validated = validateLaunchResult(report, 'run-1');
+    expect(validated.ok, validated.ok ? '' : validated.errors.join('; ')).toBe(true);
+
+    const mapping = mapLaunchResult(spec, validated.ok ? validated.value : report, TIMES, { workerBaseUrl: 'https://worker.example' });
+    expect(validateRunResult(mapping.result).ok).toBe(true);
+    expect(mapping.result.outcome).toBe('failed');
+    expect(mapping.result.exitReason).toBe('startup_failure');
+    expect(mapping.result.failure?.code).toBe('WORKSPACE_CLONE_FAILED');
+    expect(mapping.result.logPath).toBe('https://worker.example/v1/runs/run-1');
   });
 
   it('код отказа воркера переносится в RunFailure без потерь', () => {
@@ -300,6 +379,15 @@ describe('runLogRef и artifactUrl', () => {
     );
     expect(runLogRef(null, 'https://worker.example/', 'run-1')).toBe('https://worker.example/v1/runs/run-1');
     expect(runLogRef(null, null, 'run-1')).toBe('worker://unconfigured/v1/runs/run-1');
+  });
+
+  it('пустой logUrl даёт тот же непустой logPath, что и отсутствие результата (#133)', () => {
+    // `RunResult.logPath` обязан быть непустой строкой, иначе результат рана невалиден.
+    expect(runLogRef(launchResult({ logUrl: '' }), 'https://worker.example/', 'run-1')).toBe(
+      'https://worker.example/v1/runs/run-1',
+    );
+    expect(runLogRef(launchResult({ logUrl: '' }), null, 'run-1')).toBe('worker://unconfigured/v1/runs/run-1');
+    expect(isRetrievableLogUrl('')).toBe(false);
   });
 
   it('артефакт адресуется коммитом, ветка рана — страницей, результат — ссылкой на merge', () => {
@@ -451,6 +539,28 @@ describe('ExternalWorkerAdapter по HTTP', () => {
     try {
       const receipt = await adapterFor(worker).cancel('run-never-launched');
       expect(receipt.status).toBe('unknown_run');
+    } finally {
+      await worker.close();
+    }
+  });
+
+  it('результат отменённого рана по HTTP читается, а не отвергается контрактом (#133)', async () => {
+    // Мок повторяет боевого воркера: у отменённого рана лога нет, `logUrl` пуст. До #133
+    // такой ответ падал в WORKER_PROTOCOL_INVALID — и отмена выглядела как отказ воркера.
+    const worker = await startMockWorker();
+    try {
+      const adapter = adapterFor(worker);
+      const receipt = await adapter.launch(makeRunSpec({ runId: 'run-http-cancelled', input: { inlinePrompt: 'x' } }));
+      await adapter.cancel(receipt.runId);
+      expect((await adapter.status(receipt.runId)).status).toBe('cancelled');
+
+      const result = await adapter.result(receipt.runId);
+      expect(result.exitReason).toBe('cancelled');
+      expect(result.logUrl).toBe('');
+      const spec = makeRunSpec({ runId: 'run-http-cancelled', input: { inlinePrompt: 'x' } });
+      const mapping = mapLaunchResult(spec, result, TIMES, { workerBaseUrl: worker.baseUrl });
+      expect(mapping.result.outcome).toBe('cancelled');
+      expect(mapping.result.logPath).toBe(`${worker.baseUrl}/v1/runs/run-http-cancelled`);
     } finally {
       await worker.close();
     }
