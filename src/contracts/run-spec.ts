@@ -301,8 +301,16 @@ function validateInput(value: unknown, path: string, collector: ErrorCollector):
     }
   }
   if (value['inlinePrompt'] !== undefined) {
-    checkString(value['inlinePrompt'], `${path}.inlinePrompt`, collector, 100_000);
-    if (typeof value['inlinePrompt'] === 'string') input.inlinePrompt = value['inlinePrompt'];
+    const prompt = value['inlinePrompt'];
+    if (typeof prompt !== 'string' || prompt.length === 0) {
+      collector.push(`${path}.inlinePrompt: expected non-empty string`);
+    } else {
+      if (prompt.length > 100_000) collector.push(`${path}.inlinePrompt: longer than 100000`);
+      if (/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/.test(prompt)) {
+        collector.push(`${path}.inlinePrompt: control characters are not allowed`);
+      }
+      input.inlinePrompt = prompt;
+    }
   }
   return input;
 }

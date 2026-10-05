@@ -2,6 +2,8 @@
 
 ## External-worker callback configuration
 
+`input.inlinePrompt` preserves multiline text, including LF, CR, and tabs, up to 100,000 characters. Other C0/C1 controls and DEL are rejected. ID, path, ref, and other string validators remain strict.
+
 Set host-only `AGENT_API_PUBLIC_URL` to the externally reachable base URL of this API process. The entry point passes it to every external worker adapter, which appends `/v1/worker/launches/{runId}/result`. HTTP and HTTPS are accepted; credentials, query strings, and fragments are rejected. The setting is not added to the run environment pool. Without it, the existing `RESULT_URL_UNSET` preflight refusal remains.
 
 This wiring change preserves the existing result polling. Revision `8598170` does not expose the callback POST route; workers that require callback delivery rather than a readable status/result endpoint still need that receiver implemented separately.
