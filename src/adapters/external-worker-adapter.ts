@@ -582,7 +582,7 @@ export function mapLaunchResult(
   const repo = launch.repo ?? null;
   const logUrl = launch.logUrl ?? null;
   const outputRefs = artifacts.map((artifact) => (repo ? artifactUrl(repo, artifact.path) : artifact.path));
-  const persistence = artifacts.length > 0 ? 'persisted' : 'not_required';
+  const persistence = artifacts.length > 0 ? 'persisted' : (spec.outputs?.length ?? 0) > 0 ? 'failed' : 'not_required';
   const result: RunResult = {
     schemaVersion: RUN_RESULT_SCHEMA_VERSION,
     runId: spec.runId,
@@ -604,7 +604,9 @@ export function mapLaunchResult(
     persistenceReason:
       persistence === 'persisted'
         ? `artifacts are committed to ${repo?.fullName ?? 'the user repository'} at ${repo?.commit ?? 'unknown'}; the API keeps no bytes`
-        : 'the worker reported no artifacts',
+        : persistence === 'failed'
+          ? 'missing declared outputs: the worker reported no artifacts'
+          : 'the worker reported no artifacts',
     cleanup: 'completed',
     cleanupReason: 'the external worker owns the workspace and tears it down with its ephemeral host; there is nothing to clean on the API host',
     logPath: runLogRef(launch, options.workerBaseUrl ?? null, spec.runId),

@@ -240,6 +240,35 @@ describe('маппинг LaunchResult → RunResult + RunnerEvent (epic #74, ш�
     expect(mapping.result.outputRefs).toEqual([]);
   });
 
+  it('empty declared outputs need no artifact persistence', () => {
+    const spec = makeRunSpec({ outputs: [] });
+    const mapping = mapLaunchResult(spec, launchResult({ artifacts: [] }), TIMES);
+    expect(mapping.result.persistence).toBe('not_required');
+    expect(mapping.result.outcome).toBe('succeeded');
+    expect(mapping.answer).toBe('отчёт готов');
+  });
+
+  it.each([{ label: 'empty', artifacts: [] }, { label: 'absent', artifacts: undefined }])('declared outputs without artifacts fail persistence: $label', ({ artifacts }) => {
+    const spec = makeRunSpec({ outputs: [{ path: 'report.md', name: 'Report', mime: 'text/markdown' }] });
+    const mapping = mapLaunchResult(spec, launchResult({ artifacts }), TIMES);
+    expect(mapping.result.persistence).toBe('failed');
+    expect(mapping.result.persistenceReason).toBe('missing declared outputs: the worker reported no artifacts');
+    expect(mapping.result.outputRefs).toEqual([]);
+    expect(mapping.result.outcome).toBe('succeeded');
+    expect(mapping.result.exitCode).toBe(0);
+    expect(mapping.result.exitReason).toBe('completed');
+    expect(validateRunResult(mapping.result).ok).toBe(true);
+  });
+
+  it('declared outputs with artifacts retain persisted metadata', () => {
+    const spec = makeRunSpec({ outputs: [{ path: 'report.md', name: 'Report', mime: 'text/markdown' }] });
+    const launch = launchResult();
+    const mapping = mapLaunchResult(spec, launch, TIMES);
+    expect(mapping.result.persistence).toBe('persisted');
+    expect(mapping.artifacts).toEqual(launch.artifacts);
+    expect(mapping.result.outputRefs).toHaveLength(1);
+  });
+
   it('доступный секрет в stdout не попадает в событие рана', () => {
     const spec = makeRunSpec({ runId: 'run-1' });
     const mapping = mapLaunchResult(spec, launchResult({ stdout: 'using token: ghp_abcdefghijklmnopqrstuvwxyz012345' }), TIMES);
