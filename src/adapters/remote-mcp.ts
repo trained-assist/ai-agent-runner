@@ -10,6 +10,7 @@ export interface RemoteMcpServerPolicy {
   headers: Record<string, string>;
   allowedTools: string[];
   bindingScopes: Record<string, string>;
+  startupTimeoutMs: number;
 }
 
 export interface RemoteMcpBinding {
@@ -28,6 +29,10 @@ export interface RemoteMcpBinding {
 }
 
 export interface RemoteMcpBindingContext {
+  mode: 'launch' | 'restore';
+  admittedAt: string;
+  checkedAt: string;
+  startupTimeoutMs: number;
   scope: string;
   timeoutMs: number;
   signal?: AbortSignal;
@@ -68,6 +73,9 @@ export interface DocumentsHttpRegistration {
   allowedTools: string[];
   userTaskId: string;
   expectedActorProfile: 'integration-v1';
+  conversationId: string;
+  ownerGeneration: number;
+  engine: string;
   credentialProfile: 'sandbox-integrator-google';
   mintOnResolve?: boolean;
   startOnResolve?: boolean;
@@ -76,6 +84,7 @@ export interface DocumentsHttpRegistration {
 
 export interface DocumentsHttpStartedHost {
   server: { listening: boolean };
+  isReady: () => boolean;
   close: () => Promise<void>;
 }
 
@@ -90,12 +99,12 @@ export function localDocumentsBindingResolver(
   host: DocumentsHttpHost,
 ): ManagedRemoteMcpBindingResolver {
   const resolveRegistered = registeredDocumentsBindingResolver(registrations, async runtime => host.readBinding(runtime), async (registered, context) => {
-    if (!registered.mintOnResolve || context.signal?.aborted ||
+    if (context.mode === 'restore' || !registered.mintOnResolve || context.signal?.aborted ||
         !/^run_[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(context.runId) ||
-        context.timeoutMs + 60000 > 86400000) return;
+        context.startupTimeoutMs + context.timeoutMs + 60000 > 86400000) return;
     await host.mintBinding({ runtime: registered.runtime, userTaskId: context.userTaskId,
       expectedActorProfile: registered.expectedActorProfile, credentialProfile: registered.credentialProfile, runId: context.runId,
-      expiresAt: new Date(Date.now() + context.timeoutMs + 60000).toISOString() });
+      expiresAt: new Date(Date.parse(context.admittedAt) + context.startupTimeoutMs + context.timeoutMs + 60000).toISOString() });
   });
   const started = new Map<string, { runId: string; userTaskId: string; promise: Promise<DocumentsHttpStartedHost>; closing?: Promise<void> }>();
   let disposed = false;
@@ -123,7 +132,11 @@ export function localDocumentsBindingResolver(
     if (context.signal?.aborted) abort();
     try {
       const running = await promise;
-      if (disposed || context.signal?.aborted || !running.server.listening) return null;
+      if (disposed || context.signal?.aborted || !running.server.listening || typeof running.isReady !== 'function' || !running.isReady()) {
+        abort();
+        await current.closing;
+        return null;
+      }
       return binding;
     } finally {
       context.signal?.removeEventListener('abort', abort);
@@ -150,11 +163,14 @@ export function configuredDocumentsBindingResolver(modulePath: string | undefine
     if (!isRecord(registrations) || Object.keys(registrations).length === 0 || Object.keys(registrations).length > 8) throw new Error();
     for (const [ref, registration] of Object.entries(registrations)) {
       if (!ref || ref.length > 300 || !isRecord(registration) ||
-          Object.keys(registration).some(key => !['runtime', 'serverId', 'url', 'scope', 'allowedTools', 'userTaskId', 'expectedActorProfile', 'credentialProfile', 'mintOnResolve', 'startOnResolve', 'port'].includes(key)) ||
+          Object.keys(registration).some(key => !['runtime', 'serverId', 'url', 'scope', 'allowedTools', 'userTaskId', 'expectedActorProfile', 'credentialProfile', 'conversationId', 'ownerGeneration', 'engine', 'mintOnResolve', 'startOnResolve', 'port'].includes(key)) ||
           typeof registration.runtime !== 'string' || !isAbsolute(registration.runtime) ||
           typeof registration.serverId !== 'string' || !isRemoteMcpUrl(registration.url) ||
           typeof registration.scope !== 'string' || !registration.scope ||
           registration.expectedActorProfile !== 'integration-v1' || registration.credentialProfile !== 'sandbox-integrator-google' ||
+          typeof registration.conversationId !== 'string' || !registration.conversationId ||
+          !Number.isSafeInteger(registration.ownerGeneration) || Number(registration.ownerGeneration) < 1 ||
+          typeof registration.engine !== 'string' || !registration.engine ||
           typeof registration.userTaskId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(registration.userTaskId) ||
           !Array.isArray(registration.allowedTools) || !registration.allowedTools.length ||
           !registration.allowedTools.every(tool => ['gdrive_create_spreadsheet', 'gdrive_read_sheet', 'gdrive_write_sheet'].includes(tool)) ||
@@ -180,13 +196,14 @@ export function registeredDocumentsBindingResolver(
     if (!registered || registered.serverId !== context.serverId || registered.url !== context.url || registered.scope !== context.scope ||
         registered.expectedActorProfile !== 'integration-v1' || registered.credentialProfile !== 'sandbox-integrator-google' ||
         context.profileId !== registered.expectedActorProfile || context.userTaskId !== registered.userTaskId || context.signal?.aborted ||
+        context.conversationId !== registered.conversationId || context.ownerGeneration !== registered.ownerGeneration || context.engine !== registered.engine ||
         !/^run_[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(context.runId) ||
         !context.allowedTools.every(tool => registered.allowedTools.includes(tool))) return null;
     let native: unknown;
     try {
       native = await readBinding(registered.runtime);
     } catch (error) {
-      if (!isRecord(error) || error.code !== 'ENOENT' || !mintMissing || context.signal?.aborted) throw error;
+      if (!isRecord(error) || error.code !== 'ENOENT' || !mintMissing || context.mode === 'restore' || context.signal?.aborted) throw error;
       try {
         await mintMissing(registered, context);
       } catch (mintError) {
@@ -198,6 +215,9 @@ export function registeredDocumentsBindingResolver(
     if (!isRecord(native) || native.runId !== context.runId || native.userTaskId !== context.userTaskId ||
         native.profile !== registered.expectedActorProfile || native.credentialProfile !== registered.credentialProfile || typeof native.expiresAt !== 'string' ||
         typeof native.authToken !== 'string' || !/^[A-Za-z0-9_-]{43,128}$/.test(native.authToken)) return null;
+    const expiry = Date.parse(native.expiresAt);
+    const deadline = Date.parse(context.admittedAt) + context.startupTimeoutMs + context.timeoutMs;
+    if (!Number.isFinite(deadline) || !Number.isFinite(expiry) || expiry <= Date.parse(context.checkedAt) || expiry < deadline) return null;
     return {
       runId: context.runId, profileId: context.profileId, userTaskId: context.userTaskId,
       conversationId: context.conversationId, ownerGeneration: context.ownerGeneration,
@@ -221,10 +241,11 @@ export function parseRemoteMcpServerPolicies(raw: string | undefined): Record<st
     const tokenNames = new Set<string>();
     for (const [serverId, policy] of Object.entries(input)) {
       if (!/^[A-Za-z0-9._-]{1,64}$/.test(serverId) || !isRecord(policy) ||
-          Object.keys(policy).some(key => !['url', 'tokenEnvName', 'headers', 'allowedTools', 'bindingScopes'].includes(key)) ||
+          Object.keys(policy).some(key => !['url', 'tokenEnvName', 'headers', 'allowedTools', 'bindingScopes', 'startupTimeoutMs'].includes(key)) ||
           !isRemoteMcpUrl(policy.url) || typeof policy.tokenEnvName !== 'string' ||
           !/^RUNNER_MCP_[A-Z0-9_]{1,48}$/.test(policy.tokenEnvName) || tokenNames.has(policy.tokenEnvName) ||
           !isRecord(policy.headers) || !isRecord(policy.bindingScopes) || Object.keys(policy.bindingScopes).length === 0 ||
+          !Number.isSafeInteger(policy.startupTimeoutMs) || Number(policy.startupTimeoutMs) < 0 || Number(policy.startupTimeoutMs) > 86400000 ||
           !Object.entries(policy.bindingScopes).every(([ref, scope]) => ref.length > 0 && ref.length <= 300 && typeof scope === 'string' && scope.length > 0 && scope.length <= 300) || !Array.isArray(policy.allowedTools) ||
           policy.allowedTools.length === 0 || policy.allowedTools.length > 50 ||
           !policy.allowedTools.every(tool => typeof tool === 'string' && MCP_TOOL_NAME.test(tool)) ||
@@ -239,7 +260,7 @@ export function parseRemoteMcpServerPolicies(raw: string | undefined): Record<st
         headers[name] = template;
       }
       tokenNames.add(policy.tokenEnvName);
-      servers[serverId] = { url: policy.url, tokenEnvName: policy.tokenEnvName, headers, allowedTools: [...policy.allowedTools], bindingScopes: { ...policy.bindingScopes } as Record<string, string> };
+      servers[serverId] = { url: policy.url, tokenEnvName: policy.tokenEnvName, headers, allowedTools: [...policy.allowedTools], bindingScopes: { ...policy.bindingScopes } as Record<string, string>, startupTimeoutMs: Number(policy.startupTimeoutMs) };
     }
     return servers;
   } catch {
@@ -267,6 +288,8 @@ export async function resolveRemoteMcpAttachment(
   host: RemoteMcpHostOptions | undefined,
   now: Date,
   signal?: AbortSignal,
+  mode: 'launch' | 'restore' = 'launch',
+  admittedAt = now.toISOString(),
 ): Promise<RemoteMcpAttachment | undefined> {
   const servers = spec.mcp?.servers ?? [];
   if (servers.length === 0) return undefined;
@@ -282,12 +305,14 @@ export async function resolveRemoteMcpAttachment(
   for (const server of servers as McpRemoteServerSpec[]) {
     const policy = Object.hasOwn(policies, server.serverId) ? policies[server.serverId] : undefined;
     if (!policy || policy.url !== server.url) refuse('MCP_ENDPOINT_NOT_ALLOWED');
+    if (policy.startupTimeoutMs + spec.limits.timeoutMs + 60000 > 86400000 || !Number.isFinite(Date.parse(admittedAt))) refuse('MCP_BINDING_EXPIRED');
     if (!server.allowedTools.every(tool => policy.allowedTools.includes(tool))) refuse('MCP_TOOL_NOT_ALLOWED');
     const scope = Object.hasOwn(policy.bindingScopes, server.bindingRef) ? policy.bindingScopes[server.bindingRef] : undefined;
     if (!scope || signal?.aborted) refuse('MCP_BINDING_MISSING');
     const declared = spec.credentialBindings?.find(binding => binding.ref === server.bindingRef);
     if (declared && declared.scope !== scope) refuse('MCP_BINDING_SCOPE_MISMATCH');
     const context: RemoteMcpBindingContext = {
+      mode, admittedAt, checkedAt: now.toISOString(), startupTimeoutMs: policy.startupTimeoutMs,
       timeoutMs: spec.limits.timeoutMs, signal, scope,
       runId: spec.runId, profileId: spec.profileId, userTaskId: spec.userTaskId,
       conversationId: spec.conversationId, ownerGeneration: spec.ownerGeneration,
@@ -306,7 +331,9 @@ export async function resolveRemoteMcpAttachment(
     }
     if (signal?.aborted || binding.scope !== scope || !Array.isArray(binding.allowedTools) ||
         !server.allowedTools.every(tool => binding.allowedTools.includes(tool))) refuse('MCP_BINDING_SCOPE_MISMATCH');
-    if (!(Date.parse(binding.expiresAt) >= now.getTime() + spec.limits.timeoutMs)) refuse('MCP_BINDING_EXPIRED');
+    const originalDeadline = Date.parse(admittedAt) + policy.startupTimeoutMs + spec.limits.timeoutMs;
+    if (!Number.isFinite(originalDeadline) || !(Date.parse(binding.expiresAt) > now.getTime()) ||
+        !(Date.parse(binding.expiresAt) >= originalDeadline)) refuse('MCP_BINDING_EXPIRED');
     if (typeof binding.token !== 'string' || !/^[A-Za-z0-9._~-]{16,2048}$/.test(binding.token)) refuse('MCP_BINDING_INVALID');
     if (Object.hasOwn(attachment.mcpSecrets, policy.tokenEnvName)) refuse('MCP_TOKEN_NAME_CONFLICT');
     const headers: Record<string, string> = Object.create(null);

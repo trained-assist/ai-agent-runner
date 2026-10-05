@@ -28,16 +28,17 @@ Set `AGENT_API_REMOTE_MCP_SERVERS` to a host-owned JSON map (example values only
     "tokenEnvName":"RUNNER_MCP_DOCUMENTS_TOKEN",
     "headers":{"Authorization":"Bearer {env:RUNNER_MCP_DOCUMENTS_TOKEN}"},
     "bindingScopes":{"documents-approved":"documents:owner-target"},
-    "allowedTools":["gdrive_create_spreadsheet","gdrive_read_sheet","gdrive_write_sheet"]
+    "allowedTools":["gdrive_create_spreadsheet","gdrive_read_sheet","gdrive_write_sheet"],
+    "startupTimeoutMs":600000
   }
 }
 ```
 
 Each descriptor must match the host's exact server ID, URL, binding reference and tool policy. Configured headers accept only opaque-token environment placeholders, optionally prefixed with `Bearer `. Runner generates all three scope headers from validated context: task, actor profile (`integration-v1` for documents), and unchanged `run_<UUID>`. Neither caller nor policy can override them. Vault identity is never a scope-header alias. Root keys and SA credentials are never header values.
 
-The trusted host hook `RemoteMcpBindingResolver(bindingRef, context)` receives generated run ID, actor profile, task, conversation, owner generation, operation, engine, server ID, expected URL, tools, timeout and an abort signal. Supply it through `createExternalWorkers(config, log, resolveBinding)` or the local process configuration below. Resolution has the bounded launch deadline and must stop before minting if aborted. Readiness is established from the real host binding, not a caller-provided verified flag. No new mint endpoint, broker or controller is introduced.
+The trusted host hook `RemoteMcpBindingResolver(bindingRef, context)` receives generated run ID, actor profile, task, conversation, owner generation, operation, engine, server ID, expected URL, tools, engine/startup budgets, original admission time, check time, launch/restore mode and an abort signal. Supply it through `createExternalWorkers(config, log, resolveBinding)` or the local process configuration below. Resolution has the bounded launch deadline and must stop before minting if aborted. Readiness is established from the real host binding, not a caller-provided verified flag. No new mint endpoint, broker or controller is introduced.
 
-The resolver returns `RemoteMcpBinding`: exact context identities except operation ID, plus host-declared scope, permitted tools, expiry and opaque token. `profileId` remains the admission actor. Missing, mismatched or insufficiently long-lived bindings are refused before worker contact. Expiry must cover the run timeout. Wrapper targets still require separate owner approval.
+The resolver returns `RemoteMcpBinding`: exact context identities except operation ID, plus host-declared scope, permitted tools, expiry and opaque token. `profileId` remains the admission actor. Missing, mismatched or insufficiently long-lived bindings are refused before worker contact. Trusted `startupTimeoutMs` is required in host policy (zero only for a host with no startup allowance), not caller limits. Expiry must cover the original admission time plus startup and engine budgets; mint adds one minute, with total lifetime bounded to 24 hours. Wrapper targets still require separate owner approval.
 
 For pre-registered bindings, the default process resolver reads `AGENT_API_REMOTE_MCP_BINDINGS_FILE`, a private mode-0600 JSON map keyed by binding reference. Each value has the above binding shape, including the **actual generated** `runId`. A guessed or generic run ID fails closed. This file fallback does not mint tokens and cannot pre-authorize unknown future run IDs; fresh Submit flows require the trusted host hook or an existing host registration integration. Keep private runtime files outside the repository. Missing configuration or binding never silently launches without MCP.
 
@@ -56,6 +57,9 @@ Use `registeredDocumentsBindingResolver(registrations, readBinding)` for metadat
     "scope":"documents:owner-target",
     "allowedTools":["gdrive_create_spreadsheet","gdrive_read_sheet","gdrive_write_sheet"],
     "userTaskId":"OPERATOR_APPROVED_TASK",
+    "conversationId":"OPERATOR_APPROVED_CONVERSATION",
+    "ownerGeneration":1,
+    "engine":"dynamic-ip-azure-agent-run",
     "expectedActorProfile":"integration-v1",
     "credentialProfile":"sandbox-integrator-google",
     "mintOnResolve":false,
@@ -67,7 +71,11 @@ Use `registeredDocumentsBindingResolver(registrations, readBinding)` for metadat
 
 Provision registrations after CP intake has supplied the task ID, before routing/submitting its agent attempt. The only v1 actor-to-vault mapping supported is explicit `expectedActorProfile: integration-v1` to `credentialProfile: sandbox-integrator-google`; all other actors refuse. Native `binding.profile`, scope headers and owner-target profile are the actor. Native `binding.credentialProfile` and the physical folder/child `USER_ID` are the vault. No admission ownership changes, old task migration or caller-controlled vault selection occurs.
 
-Mint and startup opt-ins default off. After owner authorization, enabling both permits missing-file (`ENOENT`) local mint followed by `createHttpHost`. Mint receives the exact actor/vault pair, pinned task, unchanged canonical run ID and bounded expiry (timeout plus one minute, at most 24 hours). Invalid/expired/mismatched records are never replaced; `EEXIST` triggers exact verification. Same-run repeats reuse token and started host; changed scope requires a new isolated runtime/host. Startup errors are cached, not automatically retried. Deadline abort closes late-starting hosts; Runner disposal closes started hosts. Startup uses the existing SA on its host, but no mint/startup function calls Google artifact tools.
+Mint and startup opt-ins default off. After owner authorization, enabling both permits missing-file (`ENOENT`) local mint followed by `createHttpHost`. Mint receives the exact actor/vault pair, pinned task, unchanged canonical run ID and bounded expiry (original admission plus startup budget, engine timeout and one minute, at most 24 hours). Invalid/expired/mismatched records are never replaced; `EEXIST` triggers exact verification. Same-run repeats reuse token and started host; changed scope requires a new isolated runtime/host. Startup errors are cached, not automatically retried. Deadline abort closes late-starting hosts; Runner disposal closes started hosts. Startup uses the existing SA on its host, but no mint/startup function calls Google artifact tools.
+
+Journal replay restores the existing binding and domain before polling the already-dispatched run. It passes the original admission time and exact canonical run/task/conversation/generation/engine tuple. Restore never mints or launches another job, including when the binding file is missing. Lease checks use the remaining original budget, not a fresh startup/engine budget measured from recovery. Missing, expired or mismatched scope/domain produces explicit `mcp_restore_tool_outcome_unknown`, not successful tool evidence or an automatic rerun.
+
+The local startup export must return `{server,close,isReady}`; `isReady()` must reflect live stdio child/RPC health as well as a listening socket. An unready cached host is closed and cannot automatically restart. Documents source `217a8b4` does not expose this readiness hook and is intentionally refused by this lifecycle contract; integration additionally requires the documents owner to close the listener immediately on child/RPC failure. Until that native change and composition review, restart/child-crash acceptance remains pending, not live-ready.
 
 Native `{runId,userTaskId,profile,credentialProfile,expiresAt,authToken}` is converted only after exact run/task/actor/vault checks. Runtime paths and vault identity never enter engine headers. Do not enable mint/startup before owner authorization/target input. Fixtures are not live-ready proof.
 
