@@ -687,10 +687,8 @@ export class AgentApi {
       }
       if (Date.now() >= deadline) {
         this.markUnknown(record, 'budget_exceeded');
-        if (!this.inFlight.has(record.runId)) return;
         // Reconcile: воркер помнит operationId, поэтому мы можем спрашивать бесконечно,
         // не рискуя вторым запуском. Клиент видит unknown и решает сам.
-        continue;
       }
       await this.pollBackoff(attempt);
       attempt += 1;
