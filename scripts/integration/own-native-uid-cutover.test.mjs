@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
-import { cutoverPlan, loaderVariables, paths, rejectLoaderEnvironment, releasePath, validateEnvironmentPin, validateQuiescence, validateRunnerArgv, validateStagedEnvironment } from './own-native-uid-cutover.mjs';
+import { cutoverPlan, loaderVariables, paths, rejectLoaderEnvironment, releasePath, validateEnvironmentPin, validateInactiveRecovery, validateQuiescence, validateRunnerArgv, validateStagedEnvironment } from './own-native-uid-cutover.mjs';
 import { stagePlan, validateSourceTar } from './stage-own-native-release.mjs';
 
 const now = Date.parse('2026-10-05T07:00:00Z');
@@ -103,6 +103,50 @@ function fixture(action = 'apply') {
     runs: [{ runId, userTaskId: 'task-1', ownerGeneration: 1, state: 'succeeded', exitObserved: true }] };
   return { bytes, gate };
 }
+
+function inactiveFixture() {
+  const fixtureValue = fixture('rollback');
+  fixtureValue.gate.inactiveRecovery = true;
+  fixtureValue.gate.mainPid = 0;
+  const release = releasePath(fixtureValue.gate.releaseCommit);
+  const properties = { MainPID: '0', ActiveState: 'inactive', SubState: 'dead',
+    User: paths.user, Group: paths.user, WorkingDirectory: release,
+    EnvironmentFiles: `${paths.config}/service.env (ignore_errors=no)`,
+    Environment: '', UnsetEnvironment: '', PassEnvironment: '', ControlGroup: '' };
+  return { ...fixtureValue, properties, release };
+}
+
+test('explicit inactive rollback accepts fresh complete terminal gate and no process/cgroup', () => {
+  const { gate, bytes, properties, release } = inactiveFixture();
+  validateQuiescence(gate, bytes, 'rollback', now);
+  validateInactiveRecovery(properties, gate, release);
+});
+
+for (const [field, value] of Object.entries({ MainPID: '123', ActiveState: 'active', SubState: 'failed',
+  ControlGroup: '/system.slice/residual', User: 'sandbox', Group: 'sandbox', WorkingDirectory: '/other',
+  EnvironmentFiles: '/other (ignore_errors=no)', Environment: 'UNEXPECTED=1', UnsetEnvironment: 'AGENT_API_ENV', PassEnvironment: 'AGENT_API_ENV' })) {
+  test(`inactive rollback refuses unexpected ${field}`, () => {
+    const { gate, properties, release } = inactiveFixture();
+    assert.throws(() => validateInactiveRecovery({ ...properties, [field]: value }, gate, release));
+  });
+}
+
+test('inactive flag cannot bypass apply PID check or terminal/admission gate', () => {
+  const { gate, bytes } = inactiveFixture();
+  assert.throws(() => validateQuiescence({ ...gate, action: 'apply' }, bytes, 'apply', now));
+  assert.throws(() => validateQuiescence({ ...gate, inactiveRecovery: false }, bytes, 'rollback', now));
+  assert.throws(() => validateQuiescence({ ...gate, mainPid: 12 }, bytes, 'rollback', now));
+  assert.throws(() => validateQuiescence({ ...gate, runs: [{ ...gate.runs[0], state: 'running' }] }, bytes, 'rollback', now));
+  assert.throws(() => validateQuiescence({ ...gate, ingressBlocked: false }, bytes, 'rollback', now));
+});
+
+test('inactive recovery retains byte pins and skips only old-process inspection and redundant stop', () => {
+  const source = readFileSync(new URL('./own-native-uid-cutover.mjs', import.meta.url), 'utf8');
+  assert.match(source, /if \(!inactive\) command\('systemctl', \['stop', paths.unit\]\)/);
+  assert.match(source, /if \(inactive\) baseline = parseSystemdEnvironment\(environment, state.stagedEnvironmentSha256\)/);
+  assert.match(source, /validateEnvironmentPin\(privateBytes\(environment\), state.stagedEnvironmentSha256\)/);
+  assert.match(source, /assert.equal\(readFileSync\(paths.dropin, 'utf8'\), dropinText\(release\)\)/);
+});
 
 test('default CLI prints a plan without Linux/root/file/service access', () => {
   const output = execFileSync(process.execPath, [new URL('./own-native-uid-cutover.mjs', import.meta.url).pathname], { encoding: 'utf8' });

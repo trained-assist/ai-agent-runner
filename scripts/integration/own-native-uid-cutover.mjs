@@ -46,7 +46,13 @@ export function validateQuiescence(gate, bytes, action, now = Date.now()) {
   assert.equal(gate.mcpDisabled, true);
   releasePath(gate.releaseCommit);
   assert.ok(Number.isSafeInteger(gate.targetUid) && gate.targetUid >= 10000 && gate.targetUid <= 60000);
-  assert.ok(Number.isSafeInteger(gate.mainPid) && gate.mainPid > 1);
+  if (gate.inactiveRecovery === true) {
+    assert.equal(action, 'rollback');
+    assert.equal(gate.mainPid, 0);
+  } else {
+    assert.ok(gate.inactiveRecovery === undefined || gate.inactiveRecovery === false);
+    assert.ok(Number.isSafeInteger(gate.mainPid) && gate.mainPid > 1);
+  }
   const checked = Date.parse(gate.checkedAt);
   assert.ok(Number.isFinite(checked) && checked <= now && now - checked <= 300000);
   assert.equal(gate.journalSha256, digest(bytes));
@@ -112,7 +118,7 @@ function optionalCommand(name, args) {
 }
 
 function serviceProperties() {
-  const value = command('systemctl', ['show', paths.unit, '-p', 'User', '-p', 'Group', '-p', 'MainPID', '-p', 'ActiveState', '-p', 'WorkingDirectory', '-p', 'EnvironmentFiles', '-p', 'Environment', '-p', 'UnsetEnvironment', '-p', 'PassEnvironment']);
+  const value = command('systemctl', ['show', paths.unit, '-p', 'User', '-p', 'Group', '-p', 'MainPID', '-p', 'ActiveState', '-p', 'SubState', '-p', 'ControlGroup', '-p', 'WorkingDirectory', '-p', 'EnvironmentFiles', '-p', 'Environment', '-p', 'UnsetEnvironment', '-p', 'PassEnvironment']);
   return Object.fromEntries(value.split('\n').map(line => { const index = line.indexOf('='); return [line.slice(0, index), line.slice(index + 1)]; }));
 }
 
@@ -212,6 +218,21 @@ export function validateRunnerArgv(argv, workingDirectory, code) {
   assert.ok(argv[1] === join(code, 'dist/api/main.js') || argv[1] === 'dist/api/main.js');
 }
 
+export function validateInactiveRecovery(properties, gate, release) {
+  assert.equal(gate.action, 'rollback');
+  assert.equal(gate.inactiveRecovery, true);
+  assert.equal(gate.mainPid, 0);
+  assert.equal(properties.MainPID, '0');
+  assert.equal(properties.ActiveState, 'inactive');
+  assert.equal(properties.SubState, 'dead');
+  assert.equal(properties.User, paths.user);
+  assert.equal(properties.Group, paths.user);
+  assert.equal(properties.WorkingDirectory, release);
+  assert.equal(properties.EnvironmentFiles, `${environment} (ignore_errors=no)`);
+  for (const key of ['Environment', 'UnsetEnvironment', 'PassEnvironment']) assert.equal(properties[key], '');
+  assert.equal(properties.ControlGroup, '');
+}
+
 export function routingEnvironment(env) {
   return Object.fromEntries(Object.entries(env).filter(([key]) => /^(AGENT_API_|EXTERNAL_WORKER_|DYNAMIC_IP_AZURE_|RUNNER_|NODE_|GOOGLE_|GCLOUD_|GCP_)/.test(key)
     || ['HTTPS_PROXY', 'HTTP_PROXY', 'ALL_PROXY', 'NO_PROXY', 'LD_PRELOAD', 'LD_LIBRARY_PATH'].includes(key)).sort(([left], [right]) => left.localeCompare(right)));
@@ -287,8 +308,11 @@ function performCutover(action, gateFile) {
   const release = verifyRootRelease(gate.releaseCommit);
   const currentCode = action === 'apply' ? paths.code : release;
   const properties = serviceProperties();
-  const baseline = assertProcess(properties, gate, action === 'apply' ? 'sandbox' : paths.user, journal, action === 'apply' ? paths.oldRegistry : registry, currentCode);
-  rejectLoaderEnvironment(baseline, Buffer.alloc(0));
+  const inactive = gate.inactiveRecovery === true;
+  let baseline;
+  if (inactive) validateInactiveRecovery(properties, gate, release);
+  else baseline = assertProcess(properties, gate, action === 'apply' ? 'sandbox' : paths.user, journal, action === 'apply' ? paths.oldRegistry : registry, currentCode);
+  if (baseline) rejectLoaderEnvironment(baseline, Buffer.alloc(0));
   for (const key of ['Environment', 'UnsetEnvironment', 'PassEnvironment']) assert.equal(properties[key], '');
   let state;
   let env;
@@ -329,6 +353,7 @@ function performCutover(action, gateFile) {
     assert.equal(state.targetUid, uid);
     assert.equal(state.releaseCommit, gate.releaseCommit);
     validateEnvironmentPin(privateBytes(environment), state.stagedEnvironmentSha256);
+    if (inactive) baseline = parseSystemdEnvironment(environment, state.stagedEnvironmentSha256);
     verifyRootAncestors(paths.oldEnv);
     assert.equal(digest(privateBytes(paths.oldEnv)), state.originalEnvironmentSha256);
     assert.equal(digest(privateBytes(paths.oldRegistry, [0, 1002])), state.originalRegistrySha256);
@@ -349,12 +374,16 @@ function performCutover(action, gateFile) {
   validateStagedEnvironment(expectedEnvironment, baseline, overrides);
   const beforeStop = serviceProperties();
   assert.deepEqual(beforeStop, properties);
-  validateStagedEnvironment(assertProcess(beforeStop, gate, action === 'apply' ? 'sandbox' : paths.user, journal, action === 'apply' ? paths.oldRegistry : registry, currentCode), baseline);
+  if (inactive) {
+    validateInactiveRecovery(beforeStop, gate, release);
+    validateStagedEnvironment(parseSystemdEnvironment(environment, state.stagedEnvironmentSha256), baseline);
+  } else validateStagedEnvironment(assertProcess(beforeStop, gate, action === 'apply' ? 'sandbox' : paths.user, journal, action === 'apply' ? paths.oldRegistry : registry, currentCode), baseline);
   verifyRootRelease(gate.releaseCommit);
   validateQuiescence(gate, privateBytes(journal, [action === 'apply' ? 1002 : uid]), action);
   validateEnvironmentPin(privateBytes(stagedFile), stagedHash);
-  command('systemctl', ['stop', paths.unit]);
+  if (!inactive) command('systemctl', ['stop', paths.unit]);
   assert.equal(serviceProperties().ActiveState, 'inactive');
+  if (inactive) validateInactiveRecovery(serviceProperties(), gate, release);
   validateQuiescence(gate, privateBytes(journal, [action === 'apply' ? 1002 : uid]), action);
   if (action === 'apply') {
     publish(join(paths.backup, 'original-admission.jsonl'), bytes);

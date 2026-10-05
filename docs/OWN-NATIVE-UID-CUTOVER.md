@@ -202,6 +202,26 @@ Private backups, dedicated account and new journal remain for review; no shared
 ownership changes or account deletion occur. Parent repeats post-cutover checks
 before reopening ingress. A second cutover requires a separately reviewed plan.
 
+### Inactive post-apply recovery (source only)
+
+A fresh rollback gate may explicitly set `inactiveRecovery:true` and `mainPid:0`.
+All ordinary owner approval, ingress seal, five-minute freshness, exact latest
+journal hash, admission/task/generation and independently observed terminal-run
+requirements still apply. The own unit must be `inactive/dead`, have MainPID0
+and an empty systemd ControlGroup, the dedicated User/Group, exact release cwd
+and expected single EnvironmentFile. Active, failed, residual-cgroup or ambiguous
+states refuse; this mode is not a general partial-install repair mechanism.
+
+The saved apply state, account, exact own drop-in, original files and frozen
+environment byte pins must all still validate. Baseline routing is obtained from
+the pinned applied environment through the guarded systemd parser, not a missing
+process or operator-supplied routing values. Only `/proc` inspection of the old
+process and its redundant stop are skipped. Recovery preserves the latest journal,
+uses the frozen original environment, and performs the ordinary post-start checks.
+Missing/modified state, environment or incomplete installation refuse. A fresh
+operator authorization and independent review are required before any actual use.
+No inactive recovery or rollback has been executed as part of the live acceptance.
+
 ## Deployment evidence — 2026-10-05
 
 Parent reports successful actual cutover using operational source
@@ -221,11 +241,11 @@ were still pending at this checkpoint. These are parent-reported live results,
 not a live run performed by this source author. Evidence is tracked in
 [architecture issue141](https://github.com/trained-assist/trained-agent-architecture/issues/141).
 
-Actual rollback was **not performed**. Current rollback requires an active
-isolated Runner with its expected PID and environment. It cannot recover an
-inactive partial apply (including a failed post-start check that stops the unit).
-Such recovery requires a separately reviewed inactive recovery gate and explicit
-operator authorization; do not restart, rerun jobs, or claim rollback acceptance.
+Actual rollback was **not performed**. Deployed c877 operational tools require an
+active isolated Runner with its expected PID/environment. The later source-only
+inactive post-apply mode above is not deployed or live-validated. Such recovery
+requires independent review, a fresh gate and explicit operator authorization;
+do not restart, rerun jobs, or claim rollback acceptance.
 This cutover proves neither Google/vault access nor external GHA/model sandbox
 isolation. No Google vault transfer or Google activation is part of this evidence.
 
