@@ -12,6 +12,7 @@ import {
   ExternalWorkerAdapter,
 } from '../adapters/external-worker-adapter.js';
 import { KeyRegistry } from './auth.js';
+import { bindingFileResolver, parseRemoteMcpServerPolicies, type RemoteMcpHostOptions, type RemoteMcpBindingResolver } from '../adapters/remote-mcp.js';
 
 export const DEFAULT_API_PORT = 8787;
 export const DEFAULT_API_HOST = '0.0.0.0';
@@ -26,6 +27,7 @@ export interface WorkerConfig {
 }
 
 export interface AgentApiProcessConfig {
+  remoteMcp?: RemoteMcpHostOptions;
   host: string;
   port: number;
   keyRegistryPath: string;
@@ -182,10 +184,14 @@ export function loadAgentApiConfig(env: Record<string, string | undefined> = pro
     workers,
     env: parseEnvPool(env['AGENT_API_ENV']),
     defaultRepository: env['RUNNER_DEFAULT_REPO']?.trim() || null,
+    remoteMcp: {
+      servers: parseRemoteMcpServerPolicies(env['AGENT_API_REMOTE_MCP_SERVERS']),
+      resolveBinding: bindingFileResolver(envValue(env, 'AGENT_API_REMOTE_MCP_BINDINGS_FILE')),
+    },
   };
 }
 
-export function createExternalWorkers(config: AgentApiProcessConfig, log?: (entry: Record<string, unknown>) => void): ExternalWorkerAdapter[] {
+export function createExternalWorkers(config: AgentApiProcessConfig, log?: (entry: Record<string, unknown>) => void, resolveBinding?: RemoteMcpBindingResolver): ExternalWorkerAdapter[] {
   return config.workers.map((worker) => new ExternalWorkerAdapter({
     engineName: worker.engine,
     baseUrl: worker.baseUrl,
@@ -195,5 +201,6 @@ export function createExternalWorkers(config: AgentApiProcessConfig, log?: (entr
     deadlineMs: worker.launchDeadlineMs,
     cancelDeadlineMs: worker.cancelDeadlineMs,
     log,
+    ...(config.remoteMcp ? { remoteMcp: { ...config.remoteMcp, resolveBinding: resolveBinding ?? config.remoteMcp.resolveBinding } } : {}),
   }));
 }
