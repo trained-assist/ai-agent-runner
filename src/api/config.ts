@@ -29,6 +29,7 @@ export interface AgentApiProcessConfig {
   host: string;
   port: number;
   keyRegistryPath: string;
+  publicUrl: string | null;
   /** Воркеры по движкам. Имя движка — адрес воркера, а не его внутренняя деталь. */
   workers: WorkerConfig[];
   /** Пулы значений окружения, которые можно передать воркеру (по envAllowlist рана). */
@@ -160,13 +161,38 @@ export function loadAgentApiConfig(env: Record<string, string | undefined> = pro
     throw new Error('no external worker configured: set AGENT_API_WORKERS, or EXTERNAL_WORKER_URL for a single default worker');
   }
 
+  const publicUrl = envValue(env, 'AGENT_API_PUBLIC_URL') ?? null;
+  if (publicUrl !== null) {
+    let parsed: URL;
+    try {
+      parsed = new URL(publicUrl);
+    } catch {
+      throw new Error('AGENT_API_PUBLIC_URL: expected an absolute http(s) URL without credentials, query, or fragment');
+    }
+    if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password || parsed.search || parsed.hash) {
+      throw new Error('AGENT_API_PUBLIC_URL: expected an absolute http(s) URL without credentials, query, or fragment');
+    }
+  }
+
   return {
     host: env['AGENT_API_HOST']?.trim() || DEFAULT_API_HOST,
     port,
     keyRegistryPath,
+    publicUrl,
     workers,
     env: parseEnvPool(env['AGENT_API_ENV']),
     defaultRepository: env['RUNNER_DEFAULT_REPO']?.trim() || null,
   };
 }
 
+export function createExternalWorkers(config: AgentApiProcessConfig, log?: (entry: Record<string, unknown>) => void): ExternalWorkerAdapter[] {
+  return config.workers.map((worker) => new ExternalWorkerAdapter({
+    engineName: worker.engine,
+    baseUrl: worker.baseUrl,
+    ...(config.publicUrl ? { baseUrlForResult: config.publicUrl } : {}),
+    ...(worker.token ? { token: worker.token } : {}),
+    deadlineMs: worker.launchDeadlineMs,
+    cancelDeadlineMs: worker.cancelDeadlineMs,
+    log,
+  }));
+}

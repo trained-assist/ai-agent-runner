@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { loadAgentApiConfig } from '../src/api/config.js';
+import { createExternalWorkers, loadAgentApiConfig } from '../src/api/config.js';
+import type { RunSpec } from '../src/contracts/run-spec.js';
 
 /**
  * Конфигурация воркеров — это и есть способ подключить движок. Тест закрепляет оба формата:
@@ -13,6 +14,44 @@ const base = {
 };
 
 describe('конфигурация воркеров', () => {
+  it('public callback URL reaches every worker without entering the run env pool', () => {
+    const config = loadAgentApiConfig({
+      ...base,
+      AGENT_API_PUBLIC_URL: ' https://runner.example/sandbox/ ',
+      AGENT_API_WORKERS: JSON.stringify([
+        { engine: 'dynamic-ip-azure-agent-run', baseUrl: 'https://azure.example', token: 'a' },
+        { engine: 'github-actions-agent-run', baseUrl: 'https://receiver.example', token: 'b' },
+      ]),
+    });
+    expect(config.publicUrl).toBe('https://runner.example/sandbox/');
+    expect(config.env).toEqual({});
+    const spec = { runId: 'run-callback' } as RunSpec;
+    for (const worker of createExternalWorkers(config)) {
+      expect(worker.resultUrlFor(spec)).toBe('https://runner.example/sandbox/v1/worker/launches/run-callback/result');
+    }
+  });
+
+  it.each([undefined, '   '])('missing public callback URL retains the existing preflight refusal (%s)', (publicUrl) => {
+    const config = loadAgentApiConfig({ ...base, EXTERNAL_WORKER_URL: 'https://worker.example', AGENT_API_PUBLIC_URL: publicUrl });
+    expect(config.publicUrl).toBeNull();
+    expect(() => createExternalWorkers(config)[0]!.resultUrlFor({ runId: 'run-callback' } as RunSpec)).toThrowError(/does not know its own public URL/);
+  });
+
+  it('allows an explicitly configured HTTP sandbox callback', () => {
+    const config = loadAgentApiConfig({ ...base, EXTERNAL_WORKER_URL: 'https://worker.example', AGENT_API_PUBLIC_URL: 'http://runner.example:18878' });
+    expect(createExternalWorkers(config)[0]!.resultUrlFor({ runId: 'run-callback' } as RunSpec)).toBe('http://runner.example:18878/v1/worker/launches/run-callback/result');
+  });
+
+  it.each(['not-a-url', 'ftp://runner.example', 'https://user:secret@runner.example', 'https://runner.example?token=secret', 'https://runner.example#fragment'])('rejects invalid callback configuration without echoing its value (%s)', (publicUrl) => {
+    const load = () => loadAgentApiConfig({ ...base, EXTERNAL_WORKER_URL: 'https://worker.example', AGENT_API_PUBLIC_URL: publicUrl });
+    expect(load).toThrowError('AGENT_API_PUBLIC_URL: expected an absolute http(s) URL without credentials, query, or fragment');
+    try {
+      load();
+    } catch (error) {
+      expect((error as Error).message).not.toContain(publicUrl);
+    }
+  });
+
   it('одиночный EXTERNAL_WORKER_URL остаётся рабочим и отвечает дефолтному движку', () => {
     const config = loadAgentApiConfig({ ...base, EXTERNAL_WORKER_URL: 'https://worker.example', EXTERNAL_WORKER_TOKEN: 'secret' });
     expect(config.workers).toEqual([

@@ -10,7 +10,7 @@ import {
 import { KeyRegistry } from './auth.js';
 import { createAgentApiServer } from './server.js';
 import { AgentApi, type ApiLogger } from './service.js';
-import { loadAgentApiConfig, requireKeyRegistry } from './config.js';
+import { createExternalWorkers, loadAgentApiConfig, requireKeyRegistry } from './config.js';
 
 /** Путь журнала приёмных записей: явный env, без значения — дедупликация только в памяти. */
 function admissionLogFile(raw: string | undefined): string | null {
@@ -24,17 +24,7 @@ async function main(): Promise<void> {
     process.stdout.write(`${JSON.stringify({ ts: new Date().toISOString(), ...entry })}\n`);
   };
   const keys = requireKeyRegistry(config.keyRegistryPath);
-  const workers = config.workers.map(
-    (worker) =>
-      new ExternalWorkerAdapter({
-        engineName: worker.engine,
-        baseUrl: worker.baseUrl,
-        ...(worker.token ? { token: worker.token } : {}),
-        deadlineMs: worker.launchDeadlineMs,
-        cancelDeadlineMs: worker.cancelDeadlineMs,
-        log,
-      }),
-  );
+  const workers = createExternalWorkers(config, log);
   // Журнал приёмных записей: дедупликация по `Idempotency-Key` переживает рестарт API.
   // Без него повторный submit с тем же ключом после рестарта запустил бы второй ран.
   //

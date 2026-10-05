@@ -1,5 +1,13 @@
 # Serverless Agent API — деплой, конфигурация, смоук
 
+## External-worker callback configuration
+
+Set host-only `AGENT_API_PUBLIC_URL` to the externally reachable base URL of this API process. The entry point passes it to every external worker adapter, which appends `/v1/worker/launches/{runId}/result`. HTTP and HTTPS are accepted; credentials, query strings, and fragments are rejected. The setting is not added to the run environment pool. Without it, the existing `RESULT_URL_UNSET` preflight refusal remains.
+
+This wiring change preserves the existing result polling. Revision `8598170` does not expose the callback POST route; workers that require callback delivery rather than a readable status/result endpoint still need that receiver implemented separately.
+
+For an isolated sandbox process, set `AGENT_API_PORT=18878`, use a separate `AGENT_API_ADMISSION_LOG`, and retain the existing host-only key registry and worker configuration. Set `RUNNER_DEFAULT_REPO` to a valid `owner/name`, or provide an explicit repository in submit. Point both the CP Runner binding and `AGENT_API_PUBLIC_URL` at a tunnel or proxy targeting this same process on port 18878. A callback to the active service on port 8787 cannot resolve a run accepted by the isolated process. Keep callback routing available until its runs finish. Do not restart or reconfigure the active service for this experiment.
+
 Статус документа: **04.10.2026, модель epic #74.** API — stateless-оркестратор: он не пишет
 на диск, не запускает процессов и не восстанавливается после рестарта. Единственное, что он
 делает, — ходит по HTTP во внешнего воркера и отдаёт клиенту то, что тот вернул.
@@ -46,6 +54,7 @@ API больше не используется** и удаляется отде�
 | Переменная | По умолчанию | Смысл |
 |---|---|---|
 | `AGENT_API_HOST` / `AGENT_API_PORT` | `0.0.0.0` / `8787` | адрес прослушивания |
+| `AGENT_API_PUBLIC_URL` | — | публичный base URL этого же API instance для callback внешнего воркера; только host configuration |
 | `AGENT_API_ENV` | `{}` | JSON-пул значений окружения; в воркер уходят только те, что перечислил клиент в `envAllowlist` |
 | `RUNNER_DEFAULT_REPO` | — | `owner/name` для клиентов, не объявивших `repository` |
 | `EXTERNAL_WORKER_LAUNCH_DEADLINE_MS` | `600000` | таймаут ожидания `LaunchResult` |
