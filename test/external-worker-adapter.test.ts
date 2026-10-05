@@ -97,6 +97,50 @@ describe('launch request: RunSpec → LaunchRequest (issue #73)', () => {
 });
 
 describe('валидация LaunchResult', () => {
+  it('accepts native ANSI stderr and stdout while preserving multiline log content', () => {
+    const stdout = 'category,amount\r\nfood,150\n\ttravel,275\n';
+    const stderr = '\u001b[?25l\u001b[33m> build\u001b[0m\r\n\tartifact push failed: could not create branch\n\u001b[?25h';
+    const payload = launchResult({ stdout: `\u001b[32m${stdout}\u001b[0m`, stderr });
+    const validated = validateLaunchResult(payload, 'run-1');
+    expect(validated.ok).toBe(true);
+    if (validated.ok) {
+      expect(validated.value.stdout).toBe(payload.stdout);
+      expect(validated.value.stderr).toBe(stderr);
+      expect(payload.stderr).toBe(stderr);
+      const mapping = mapLaunchResult(makeRunSpec({ runId: 'run-1' }), validated.value, TIMES);
+      expect(mapping.events.every((event) => validateRunnerEvent(event).ok)).toBe(true);
+    }
+  });
+
+  it.each(['stdout', 'stderr'] as const)('preserves plain multiline %s exactly', (stream) => {
+    const text = 'first\r\n\tsecond\nthird\r';
+    const validated = validateLaunchResult(launchResult({ [stream]: text }), 'run-1');
+    expect(validated.ok).toBe(true);
+    if (validated.ok) expect(validated.value[stream]).toBe(text);
+  });
+
+  it.each(['stdout', 'stderr'] as const)('rejects NUL and unsupported control characters in %s', (stream) => {
+    for (const control of ['\u0000', '\u0001', '\u000b', '\u000c', '\u001f']) {
+      const validated = validateLaunchResult(launchResult({ [stream]: `before${control}after` }), 'run-1');
+      expect(validated.ok).toBe(false);
+      if (!validated.ok) expect(validated.errors).toContain(`launch.${stream}: control characters are not allowed`);
+    }
+    expect(validateLaunchResult(launchResult({ [stream]: 'bare escape\u001b' }), 'run-1').ok).toBe(false);
+    expect(validateLaunchResult(launchResult({ [stream]: '\u001b]0;hidden\u0000control\u001b\\' }), 'run-1').ok).toBe(false);
+  });
+
+  it('keeps raw log size limits even when ANSI formatting would strip below the limit', () => {
+    const validated = validateLaunchResult(launchResult({ stderr: '\u001b[32m'.repeat(200001) }), 'run-1');
+    expect(validated.ok).toBe(false);
+    if (!validated.ok) expect(validated.errors).toContain('launch.stderr: longer than 1000000');
+  });
+
+  it('does not relax answer, run ID, or artifact path validation', () => {
+    expect(validateLaunchResult(launchResult({ answer: '\u001b[32manswer' }), 'run-1').ok).toBe(false);
+    expect(validateLaunchResult(launchResult({ runId: 'run-1\n' }), 'run-1').ok).toBe(false);
+    expect(validateLaunchResult(launchResult({ artifacts: [{ path: 'out/\nreport.csv', name: 'report.csv', mime: 'text/csv', sha256: 'a'.repeat(64), size: 10 }] }), 'run-1').ok).toBe(false);
+  });
+
   it('принимает ответ, соответствующий контракту', () => {
     const validated = validateLaunchResult(launchResult(), 'run-1');
     expect(validated.ok).toBe(true);

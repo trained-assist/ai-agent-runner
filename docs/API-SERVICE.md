@@ -4,6 +4,8 @@
 
 `input.inlinePrompt` preserves multiline text, including LF, CR, and tabs, up to 100,000 characters. Other C0/C1 controls and DEL are rejected. ID, path, ref, and other string validators remain strict.
 
+Native `LaunchResult.stdout` and `stderr` preserve their exact multiline text and recognized ANSI terminal sequences. Validation checks text with terminal formatting removed, while retaining the raw size limit and rejecting NUL/other unsupported controls even inside a terminal sequence. This stream-only exception does not relax answer, ID, path, or generic string validation.
+
 The entry-point worker factory passes the host-only `AGENT_API_ENV` pool to the adapter. Launch `env` still contains only values named in that run's `envAllowlist`. For the native `opencode-gha-runner` gateway, place only the model credential under `LLM_LADDER_TOKEN` in this pool and authorize `LLM_LADDER_TOKEN` in the run allowlist (CP host policy: `RUN_SPEC_ENV_ALLOWLIST`). The gateway resolves its claim `llmKey` from this named environment value when optional typed `credentials` are absent (`opencode-gha-runner` revision `ed81ae7`, `src/gateway/app.ts`, `handleClaim`). Root/service-account credentials must stay outside the run allowlist. The worker authentication token remains a separate host-only `EXTERNAL_WORKER_TOKEN`.
 
 Set host-only `AGENT_API_PUBLIC_URL` to the externally reachable base URL of this API process. The entry point passes it to every external worker adapter, which appends `/v1/worker/launches/{runId}/result`. HTTP and HTTPS are accepted; credentials, query strings, and fragments are rejected. The setting is not added to the run environment pool. Without it, the existing `RESULT_URL_UNSET` preflight refusal remains.

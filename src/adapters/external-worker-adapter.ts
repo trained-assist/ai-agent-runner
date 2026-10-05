@@ -1,4 +1,5 @@
 import { randomUUID, timingSafeEqual } from 'node:crypto';
+import { stripVTControlCharacters } from 'node:util';
 import { RUNNER_EVENT_SCHEMA_VERSION, type RunnerEvent } from '../contracts/events.js';
 import { RUN_RESULT_SCHEMA_VERSION, type ExitReason, type FailureClass, type RunFailure, type RunOutcome, type RunResult } from '../contracts/result.js';
 import { validateRunResult } from '../contracts/result.js';
@@ -201,6 +202,18 @@ function checkText(value: unknown, path: string, collector: ErrorCollector, maxL
   if (value.length > maxLen) collector.push(`${path}: longer than ${maxLen}`);
   if (/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/.test(value)) {
     collector.push(`${path}: control characters are not allowed`);
+  }
+}
+
+function checkLogText(value: unknown, path: string, collector: ErrorCollector, maxLen: number): void {
+  if (typeof value === 'string' && /[\u0000-\u0008\u000b\u000c\u000e-\u001a\u001c-\u001f]/.test(value)) {
+    checkText(value, path, collector, maxLen);
+    return;
+  }
+  const normalized = typeof value === 'string' ? stripVTControlCharacters(value) : value;
+  checkText(normalized, path, collector, maxLen);
+  if (typeof value === 'string' && value.length > maxLen && typeof normalized === 'string' && normalized.length <= maxLen) {
+    collector.push(`${path}: longer than ${maxLen}`);
   }
 }
 
@@ -417,8 +430,8 @@ export function validateLaunchResult(input: unknown, expectedRunId: string): Val
   if (typeof input['exitReason'] !== 'string' || !(EXIT_REASONS as readonly string[]).includes(input['exitReason'])) {
     collector.push(`launch.exitReason: expected one of ${EXIT_REASONS.join(', ')}`);
   }
-  checkText(input['stdout'], 'launch.stdout', collector, 1_000_000);
-  checkText(input['stderr'], 'launch.stderr', collector, 1_000_000);
+  checkLogText(input['stdout'], 'launch.stdout', collector, 1_000_000);
+  checkLogText(input['stderr'], 'launch.stderr', collector, 1_000_000);
   if (input['answer'] !== undefined && input['answer'] !== null) checkText(input['answer'], 'launch.answer', collector, 1_000_000);
   if (input['answerSource'] !== undefined && !(ANSWER_SOURCES as readonly LaunchAnswerSource[]).includes(input['answerSource'] as LaunchAnswerSource)) {
     collector.push('launch.answerSource: expected engine_stdout | agent_file | null');
