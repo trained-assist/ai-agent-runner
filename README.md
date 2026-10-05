@@ -1,5 +1,8 @@
 # AI Agent Runner
 
+**GCP VM exit (05.10.2026):** New work on `alesa-personal-assistent/us-central1-a/alesa-vm` is prohibited. Use serverless by default; the existing French VM only for a proven persistent or local requirement. Other Google services remain allowed. See [the exit plan](https://github.com/trained-assist/trained-agent-architecture/issues/145).
+
+
 Статус: **API переведён в serverless-модель (epic #74): без диска и без spawn, запуск агента — во внешний воркер по HTTP** · 04.10.2026. Приёмные записи и прогресс ранов живут в памяти процесса, артефакты возвращаются ссылками на репозиторий юзера, лог сессии — ссылкой на Google Storage. Код жизненного цикла Run, внешний admission/result adapter, storage-контракт с менеджментом артефактов и цикл приёмки владельца есть в этом репозитории; materialize/sweep и межмашинные leases ещё не вынесены (см. roadmap).
 
 **Agent Runner** управляет запуском **ai-agent-job** на выбранной виртуальной машине: готовит **Agent clean room**, запускает агентский движок с разрешёнными правами, наблюдает выполнение, сохраняет результат и освобождает ресурсы.
