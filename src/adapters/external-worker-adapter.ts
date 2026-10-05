@@ -200,6 +200,11 @@ export interface LaunchResult {
   timedOut: boolean;
   outputTruncated: boolean;
   artifacts: LaunchArtifact[];
+  /**
+   * Ссылка на лог рана. Ключ обязателен, значение может быть пустым (#133): джобу убили до
+   * загрузки лога (отмена) или до неё дошло отказать (startup_failure). Отсутствие ключа —
+   * расхождение с контрактом; пустая строка — честный ответ «лог не опубликован».
+   */
   logUrl: string;
   repo: LaunchRepo;
   failure?: LaunchFailure;
@@ -313,12 +318,6 @@ export function trimTrailingSlash(value: string): string {
   return value.endsWith('/') ? value.slice(0, -1) : value;
 }
 
-/**
- * Ссылка на лог рана. В serverless-модели это НЕ путь в файловой системе: успешный ран —
- * ссылка GCS, которую вернул воркер; недоступный воркер — его собственный URL рана, где лог
- * лежал бы, если бы воркер успел его написать. `RunResult.logPath` обязан быть непустой
- * строкой, поэтому подставлять сюда пустоту нельзя.
- */
 /** Строка вывода агента в виде, пригодном для события рана: без секретов и управляющих символов. */
 export function logMessage(text: string): string {
   return truncateLine(redactSecrets(text).replace(/[\u0000-\u001f\u007f]/g, ' ').trim(), MAX_LOG_EVENT_CHARS - 32);
@@ -330,6 +329,13 @@ export function safeSummary(message: string): string {
   return truncateLine(redactSecrets(message), 450);
 }
 
+/**
+ * Ссылка на лог рана. В serverless-модели это НЕ путь в файловой системе: успешный ран —
+ * ссылка GCS, которую вернул воркер; недоступный воркер — его собственный URL рана, где лог
+ * лежал бы, если бы воркер успел его написать. Пустой `logUrl` (лог не опубликован, #133) и
+ * отсутствие результата дают одно и то же — адрес рана у воркера: `RunResult.logPath` обязан
+ * быть непустой строкой, иначе результат рана сам станет невалидным.
+ */
 export function runLogRef(launch: LaunchResult | null, workerBaseUrl: string | null, runId: string): string {
   if (launch?.logUrl) return launch.logUrl;
   const base = workerBaseUrl ?? 'worker://unconfigured';
@@ -529,7 +535,13 @@ export function validateLaunchResult(input: unknown, expectedRunId: string): Val
       }
     });
   }
-  checkString(input['logUrl'], 'launch.logUrl', collector, 500);
+  // Ключ `logUrl` обязателен, а значение может быть пустым (#133): отменённый ран и любой
+  // отказ до загрузки лога приходят с `logUrl: ''` — джобу убили, лог в GCS не лежит.
+  // Требовать непустую строку здесь означало отвергнуть весь результат рана как
+  // WORKER_PROTOCOL_INVALID: отмена возвращалась клиенту как `failed`/`worker_crash`,
+  // а реальный отказ воркера — как расхождение с контрактом. Пустую ссылку `runLogRef`
+  // заменяет адресом рана у воркера, а `mapLaunchResult` — на `null`.
+  checkText(input['logUrl'], 'launch.logUrl', collector, 500);
   if (!checkObject(input['repo'], 'launch.repo', collector)) {
     // уже сообщено
   } else {
@@ -645,7 +657,9 @@ export function mapLaunchResult(
   const failure = launchFailureFor(spec, launch, outcome);
   const artifacts = launch.artifacts ?? [];
   const repo = launch.repo ?? null;
-  const logUrl = launch.logUrl ?? null;
+  // Пустой `logUrl` — «лог не опубликован» (#133), а не «ссылка на пустое»: наружу это
+  // `null`, иначе в ответе API ездила бы пустая строка вместо отсутствующей ссылки.
+  const logUrl = launch.logUrl.length > 0 ? launch.logUrl : null;
   const outputRefs = artifacts.map((artifact) => (repo ? artifactUrl(repo, artifact.path) : artifact.path));
   const persistence = artifacts.length > 0 ? 'persisted' : 'not_required';
   const result: RunResult = {
