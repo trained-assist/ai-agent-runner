@@ -14,6 +14,7 @@ import {
   ResultNotReadyError,
 } from '../adapters/external-worker-adapter.js';
 import type { RunResult } from '../contracts/result.js';
+import { PreflightError } from '../contracts/validate.js';
 import { validateRunSpec, type InputSpec, type RunSpec } from '../contracts/run-spec.js';
 import { DEFAULT_STATELESS_LIMITS, isTerminalApiState, STATELESS_STORE_SCHEMA_VERSION, StatelessStore, type AdmissionRecord } from './stateless-store.js';
 import {
@@ -621,8 +622,29 @@ export class AgentApi {
       void this.pollUntilTerminal(record, worker, startedAt);
     } catch (err) {
       if (this.disposed) return;
-      this.log({ event: 'run_failed', runId: record.runId, message: err instanceof Error ? err.message : String(err) });
-      this.finalize(record, workerTransportFailure(record.spec, err, { startedAt, finishedAt: this.nowIso() }, { workerBaseUrl: worker.baseUrl }));
+      // Таймаут/обрыв на LAUNCH не доказывает, что ран не начался: запрос мог дойти,
+      // воркер мог зарегистрировать и запустить агента, а ответ потеряться по дороге.
+      // Контракт (п. 4) требует сначала `unknown` и попытку reconcile, и только потом
+      // считать запуск не состоявшимся — иначе повтор клиента завёл бы второй ран.
+      const uncertain = err instanceof PreflightError && err.failureClass === 'runtime';
+      if (!uncertain) {
+        this.log({ event: 'run_failed', runId: record.runId, message: err instanceof Error ? err.message : String(err) });
+        this.finalize(record, workerTransportFailure(record.spec, err, { startedAt, finishedAt: this.nowIso() }, { workerBaseUrl: worker.baseUrl }));
+      } else {
+        this.log({ event: 'launch_uncertain', runId: record.runId, message: err instanceof Error ? err.message : String(err) });
+        this.inFlight.add(record.runId);
+        this.markUnknown(record, 'launch_response_lost');
+        // Разовый reconcile: воркер помнит operationId, поэтому опрос не создаёт запуска.
+        const known = await this.workerKnowsRun(record, worker);
+        if (known === false) {
+          this.log({ event: 'launch_confirmed_absent', runId: record.runId });
+          this.inFlight.delete(record.runId);
+          this.finalize(record, workerTransportFailure(record.spec, err, { startedAt, finishedAt: this.nowIso() }, { workerBaseUrl: worker.baseUrl }));
+        } else if (known) {
+          this.store.appendDispatched(record.runId, record.spec.engine.name, this.nowIso());
+          void this.pollUntilTerminal(record, worker, startedAt);
+        }
+      }
     } finally {
       this.inFlight.delete(record.runId);
     }
@@ -667,6 +689,22 @@ export class AgentApi {
       }
       await this.pollBackoff(attempt);
       attempt += 1;
+    }
+  }
+
+  /**
+   * Знает ли воркер про этот ран. `true` — виден (ответ потерялся, ран идёт), `false` —
+   * воркер его не видел (запуск не состоялся), `null` — спросить не удалось.
+   */
+  private async workerKnowsRun(record: AdmissionRecord, worker: ExternalWorker): Promise<boolean | null> {
+    try {
+      const status = await worker.status(record.runId);
+      // `unknown` от воркера = «запуска не вижу». Всё остальное — ран известен,
+      // даже если исход агента воркеру пока неясен.
+      return status.status !== 'unknown';
+    } catch (err) {
+      this.log({ event: 'launch_reconcile_failed', runId: record.runId, message: err instanceof Error ? err.message : String(err) });
+      return null;
     }
   }
 
