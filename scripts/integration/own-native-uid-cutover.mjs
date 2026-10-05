@@ -190,7 +190,7 @@ function assertProcess(properties, gate, user, journal, registryPath, code) {
   assert.equal(env.AGENT_API_ADMISSION_LOG, journal);
   assert.equal(env.AGENT_API_KEY_REGISTRY, registryPath);
   const argv = readFileSync(`/proc/${gate.mainPid}/cmdline`, 'utf8').split('\0').filter(Boolean);
-  assert.deepEqual(argv, ['/usr/local/bin/node', join(code, 'dist/api/main.js')]);
+  validateRunnerArgv(argv, properties.WorkingDirectory, code);
   assertMcpDisabled(env);
   return env;
 }
@@ -199,6 +199,13 @@ export function assertMcpDisabled(env) {
   assert.ok(!env.AGENT_API_DOCUMENTS_MCP_REGISTRATIONS && !env.AGENT_API_DOCUMENTS_MCP_MODULE
     && !env.AGENT_API_REMOTE_MCP_BINDINGS_FILE
     && (!env.AGENT_API_REMOTE_MCP_SERVERS || env.AGENT_API_REMOTE_MCP_SERVERS === '{}'));
+}
+
+export function validateRunnerArgv(argv, workingDirectory, code) {
+  assert.equal(workingDirectory, code);
+  assert.ok(Array.isArray(argv) && argv.length === 2);
+  assert.equal(argv[0], '/usr/local/bin/node');
+  assert.ok(argv[1] === join(code, 'dist/api/main.js') || argv[1] === 'dist/api/main.js');
 }
 
 export function routingEnvironment(env) {
@@ -219,7 +226,7 @@ export function validateEnvironmentPin(bytes, expected) {
 function parseSystemdEnvironment(file, expected) {
   validateEnvironmentPin(privateBytes(file), expected);
   const output = command('systemd-run', ['--quiet', '--wait', '--pipe', '--collect',
-    '--property=Type=exec', '--property=User=sandbox', '--property=Group=sandbox',
+    '--property=Type=exec', '--property=User=root', '--property=Group=root',
     '--property=NoNewPrivileges=yes', '--property=ProtectSystem=strict', '--property=ProtectHome=yes',
     '--property=PrivateNetwork=yes', '--property=PrivateTmp=yes', '--property=RuntimeMaxSec=10',
     `--property=EnvironmentFile=${file}`, '/usr/bin/env', '-0']);

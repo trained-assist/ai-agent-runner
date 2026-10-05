@@ -149,7 +149,7 @@ environment, stderr, addresses and task text are never printed.
 Before stopping Runner, the tool freezes the original and staged environment
 bytes in root-private 0600 files. An inert transient systemd service evaluates
 the actual `EnvironmentFile` syntax using `/usr/bin/env -0`, not a shell or a
-hand-written dotenv parser. It runs as sandbox with no new privileges, a private
+hand-written dotenv parser. It runs as root (never the shared sandbox UID) with no new privileges, a private
 network and read-only system filesystem; it does not launch Runner or a job.
 Runner/worker/callback/child environment settings must match the checked running
 process, except the explicit own journal/registry path changes. Nonempty unit

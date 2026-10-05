@@ -3,10 +3,30 @@ import { createHash } from 'node:crypto';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
-import { cutoverPlan, paths, releasePath, validateEnvironmentPin, validateQuiescence, validateStagedEnvironment } from './own-native-uid-cutover.mjs';
+import { cutoverPlan, paths, releasePath, validateEnvironmentPin, validateQuiescence, validateRunnerArgv, validateStagedEnvironment } from './own-native-uid-cutover.mjs';
 import { stagePlan, validateSourceTar } from './stage-own-native-release.mjs';
 
 const now = Date.parse('2026-10-05T07:00:00Z');
+test('Runner accepts only exact relative or absolute entrypoint with exact working directory', () => {
+  for (const code of [paths.code, releasePath('a'.repeat(40))]) {
+    validateRunnerArgv(['/usr/local/bin/node', 'dist/api/main.js'], code, code);
+    validateRunnerArgv(['/usr/local/bin/node', `${code}/dist/api/main.js`], code, code);
+    for (const argv of [
+      ['/usr/local/bin/node', '--inspect', 'dist/api/main.js'],
+      ['/usr/local/bin/node', './dist/api/main.js'],
+      ['/usr/local/bin/node', '/other/dist/api/main.js'],
+      ['/usr/bin/node', 'dist/api/main.js'],
+      ['/usr/local/bin/node', 'dist/api/main.js', 'extra'],
+    ]) assert.throws(() => validateRunnerArgv(argv, code, code));
+    assert.throws(() => validateRunnerArgv(['/usr/local/bin/node', 'dist/api/main.js'], '/other', code));
+  }
+});
+
+test('secret-bearing systemd parser never runs as shared sandbox UID', () => {
+  const source = readFileSync(new URL('./own-native-uid-cutover.mjs', import.meta.url), 'utf8');
+  assert.match(source, /'--property=User=root', '--property=Group=root'/);
+  assert.doesNotMatch(source, /--property=(User|Group)=sandbox/);
+});
 const runningEnv = { AGENT_API_HOST: '127.0.0.1', AGENT_API_PORT: '18879',
   EXTERNAL_WORKER_URL: 'https://worker.invalid', EXTERNAL_WORKER_TOKEN: 'fixture-only',
   AGENT_API_PUBLIC_URL: 'https://callback.invalid', AGENT_API_ENV: '{"MODE":"fixture"}',
