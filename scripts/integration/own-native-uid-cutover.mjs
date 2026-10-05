@@ -9,6 +9,7 @@ export const paths = Object.freeze({
   unit: 'ta-integrator-runner-native-v1.service',
   user: 'ta-integrator-native-v1',
   code: '/opt/sb/ta-integrator-runner-native-v1',
+  releases: '/opt/sb/ta-integrator-runner-native-releases',
   oldJournal: '/var/lib/ta-integrator-runner-native-v1/admission.jsonl',
   oldRegistry: '/etc/agent-runner/integrator-native-v1-key-registry.json',
   oldEnv: '/etc/agent-runner/integrator-native-v1-combined.env',
@@ -26,6 +27,11 @@ const stateFile = join(paths.backup, 'state.json');
 const digest = bytes => createHash('sha256').update(bytes).digest('hex');
 const canonicalRun = /^run_[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 
+export function releasePath(commit) {
+  assert.ok(typeof commit === 'string' && /^[a-f0-9]{40}$/.test(commit));
+  return join(paths.releases, commit);
+}
+
 export function validateQuiescence(gate, bytes, action, now = Date.now()) {
   assert.ok(['apply', 'rollback'].includes(action));
   assert.equal(gate.schemaVersion, 'own-native-uid-quiescence-v1');
@@ -34,6 +40,7 @@ export function validateQuiescence(gate, bytes, action, now = Date.now()) {
   assert.equal(gate.ownerApproved, true);
   assert.equal(gate.ingressBlocked, true);
   assert.equal(gate.mcpDisabled, true);
+  releasePath(gate.releaseCommit);
   assert.ok(Number.isSafeInteger(gate.targetUid) && gate.targetUid >= 10000 && gate.targetUid <= 60000);
   assert.ok(Number.isSafeInteger(gate.mainPid) && gate.mainPid > 1);
   const checked = Date.parse(gate.checkedAt);
@@ -105,19 +112,34 @@ function serviceProperties() {
   return Object.fromEntries(value.split('\n').map(line => { const index = line.indexOf('='); return [line.slice(0, index), line.slice(index + 1)]; }));
 }
 
-function publicCode(file = paths.code) {
+export function verifyReleaseTree(root, file = root) {
+  assert.equal(realpathSync(root), root);
   const stat = lstatSync(file);
   assert.equal(stat.uid, 0);
   if (stat.isSymbolicLink()) {
     const target = realpathSync(file);
-    assert.ok(target.startsWith(`${paths.code}/`));
+    assert.ok(target.startsWith(`${root}/`));
     assert.equal(lstatSync(target).uid, 0);
     assert.equal(lstatSync(target).mode & 0o022, 0);
     return;
   }
   assert.equal(stat.mode & 0o022, 0);
   assert.ok(stat.isDirectory() || stat.isFile());
-  if (stat.isDirectory()) for (const name of readdirSync(file)) publicCode(join(file, name));
+  if (stat.isDirectory()) for (const name of readdirSync(file)) verifyReleaseTree(root, join(file, name));
+}
+
+export function verifyRootRelease(commit) {
+  const root = releasePath(commit);
+  const parent = lstatSync(paths.releases);
+  assert.ok(parent.isDirectory() && !parent.isSymbolicLink() && parent.uid === 0 && (parent.mode & 0o022) === 0);
+  verifyReleaseTree(root);
+  const manifest = JSON.parse(readFileSync(join(root, 'root-release.json'), 'utf8'));
+  assert.equal(manifest.schemaVersion, 'own-native-root-release-v1');
+  assert.equal(manifest.sourceCommit, commit);
+  assert.equal(digest(readFileSync(join(root, 'package-lock.json'))), manifest.packageLockSha256);
+  assert.equal(digest(readFileSync(join(root, 'dist/api/main.js'))), manifest.mainSha256);
+  assert.equal(manifest.dependenciesInstalledWithScriptsDisabled, true);
+  return root;
 }
 
 function publish(file, bytes, uid = 0, gid = 0, replace = false) {
@@ -144,10 +166,10 @@ function directory(file, uid, gid, mode) {
   chmodSync(file, mode);
 }
 
-function assertProcess(properties, gate, user, journal, registryPath) {
+function assertProcess(properties, gate, user, journal, registryPath, code) {
   assert.equal(properties.User, user);
   assert.equal(properties.Group, user);
-  assert.equal(properties.WorkingDirectory, paths.code);
+  assert.equal(properties.WorkingDirectory, code);
   assert.equal(properties.ActiveState, 'active');
   assert.equal(Number(properties.MainPID), gate.mainPid);
   const entries = readFileSync(`/proc/${gate.mainPid}/environ`, 'utf8').split('\0');
@@ -156,6 +178,8 @@ function assertProcess(properties, gate, user, journal, registryPath) {
   assert.equal(env.AGENT_API_HOST, '127.0.0.1');
   assert.equal(env.AGENT_API_ADMISSION_LOG, journal);
   assert.equal(env.AGENT_API_KEY_REGISTRY, registryPath);
+  const argv = readFileSync(`/proc/${gate.mainPid}/cmdline`, 'utf8').split('\0').filter(Boolean);
+  assert.deepEqual(argv, ['/usr/local/bin/node', join(code, 'dist/api/main.js')]);
   assert.ok(!env.AGENT_API_DOCUMENTS_MCP_REGISTRATIONS && !env.AGENT_API_DOCUMENTS_MCP_MODULE
     && (!env.AGENT_API_REMOTE_MCP_SERVERS || env.AGENT_API_REMOTE_MCP_SERVERS === '{}'));
 }
@@ -164,6 +188,7 @@ export function cutoverPlan() {
   return { unit: paths.unit, newUser: paths.user, legacyUidUntouched: 1002,
     sourceOnly: true, defaultAction: 'plan', quiescenceRequired: true,
     journalHasNoTerminalProof: true, newJournal, newRegistry: registry,
+    rootReleaseBase: paths.releases, sourceReleaseRequired: true,
     dropin: paths.dropin, vaultProvisioning: false, sharedChown: false,
     rollback: 'fresh gate; stop own unit; copy current journal to isolated rollback path; replace only own drop-in with journal override; start own unit' };
 }
@@ -187,9 +212,10 @@ function performCutover(action, gateFile) {
   const journal = action === 'apply' ? paths.oldJournal : newJournal;
   const bytes = privateBytes(journal, [action === 'apply' ? 1002 : uid]);
   validateQuiescence(gate, bytes, action);
+  const release = verifyRootRelease(gate.releaseCommit);
+  const currentCode = action === 'apply' ? paths.code : release;
   const properties = serviceProperties();
-  assertProcess(properties, gate, action === 'apply' ? 'sandbox' : paths.user, journal, action === 'apply' ? paths.oldRegistry : registry);
-  publicCode();
+  assertProcess(properties, gate, action === 'apply' ? 'sandbox' : paths.user, journal, action === 'apply' ? paths.oldRegistry : registry, currentCode);
   let state;
   let env;
   let keys;
@@ -207,21 +233,23 @@ function performCutover(action, gateFile) {
     assert.equal(optionalCommand('getent', ['group', String(uid)]), '');
     env = privateBytes(paths.oldEnv, [0, 1002]);
     keys = privateBytes(paths.oldRegistry, [0, 1002]);
-    state = { schemaVersion: 'own-native-uid-cutover-v1', targetUid: uid, originalJournalSha256: digest(bytes),
+    state = { schemaVersion: 'own-native-uid-cutover-v1', targetUid: uid, releaseCommit: gate.releaseCommit, originalJournalSha256: digest(bytes),
       originalEnvironmentSha256: digest(env), originalRegistrySha256: digest(keys) };
   } else {
     state = JSON.parse(privateBytes(stateFile));
     assert.equal(state.schemaVersion, 'own-native-uid-cutover-v1');
     assert.equal(state.targetUid, uid);
+    assert.equal(state.releaseCommit, gate.releaseCommit);
     assert.equal(digest(privateBytes(paths.oldEnv, [0, 1002])), state.originalEnvironmentSha256);
     assert.equal(digest(privateBytes(paths.oldRegistry, [0, 1002])), state.originalRegistrySha256);
     assert.equal(digest(privateBytes(paths.oldJournal, [1002])), state.originalJournalSha256);
     assert.equal(command('id', ['-u', paths.user]), String(uid));
     assert.equal(command('id', ['-g', paths.user]), String(uid));
-    assert.equal(readFileSync(paths.dropin, 'utf8'), dropinText());
+    assert.equal(readFileSync(paths.dropin, 'utf8'), dropinText(release));
     assert.ok(!existsSync(paths.rollbackData));
   }
-  assertProcess(serviceProperties(), gate, action === 'apply' ? 'sandbox' : paths.user, journal, action === 'apply' ? paths.oldRegistry : registry);
+  assertProcess(serviceProperties(), gate, action === 'apply' ? 'sandbox' : paths.user, journal, action === 'apply' ? paths.oldRegistry : registry, currentCode);
+  verifyRootRelease(gate.releaseCommit);
   validateQuiescence(gate, privateBytes(journal, [action === 'apply' ? 1002 : uid]), action);
   command('systemctl', ['stop', paths.unit]);
   assert.equal(serviceProperties().ActiveState, 'inactive');
@@ -241,7 +269,7 @@ function performCutover(action, gateFile) {
     const dropinDirectory = dirname(paths.dropin);
     if (!existsSync(dropinDirectory)) mkdirSync(dropinDirectory, { mode: 0o755 });
     assert.ok(lstatSync(dropinDirectory).isDirectory() && !lstatSync(dropinDirectory).isSymbolicLink() && lstatSync(dropinDirectory).uid === 0);
-    publish(paths.dropin, dropinText());
+    publish(paths.dropin, dropinText(release));
     chmodSync(paths.dropin, 0o644);
   } else {
     publish(join(paths.backup, 'rollback-admission.jsonl'), bytes);
@@ -257,6 +285,7 @@ function performCutover(action, gateFile) {
   assert.equal(after.User, action === 'apply' ? paths.user : 'sandbox');
   assert.equal(after.Group, after.User);
   assert.equal(after.ActiveState, 'active');
+  assert.equal(after.WorkingDirectory, action === 'apply' ? release : paths.code);
   const effectiveUid = Number(readFileSync(`/proc/${after.MainPID}/status`, 'utf8').match(/^Uid:\s+\d+\s+(\d+)/m)?.[1]);
   assert.equal(effectiveUid, action === 'apply' ? uid : 1002);
   assert.equal(digest(privateBytes(action === 'apply' ? newJournal : rollbackJournal, [action === 'apply' ? uid : 1002])), digest(bytes));
@@ -264,8 +293,8 @@ function performCutover(action, gateFile) {
     healthAndNativeReadbackPending: true, ingressMustRemainBlocked: true };
 }
 
-function dropinText() {
-  return `[Service]\nUser=${paths.user}\nGroup=${paths.user}\nSupplementaryGroups=\nUMask=0077\nEnvironmentFile=\nEnvironmentFile=${environment}\n`;
+function dropinText(release) {
+  return `[Service]\nUser=${paths.user}\nGroup=${paths.user}\nSupplementaryGroups=\nUMask=0077\nWorkingDirectory=${release}\nExecStart=\nExecStart=/usr/local/bin/node ${release}/dist/api/main.js\nEnvironmentFile=\nEnvironmentFile=${environment}\n`;
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {

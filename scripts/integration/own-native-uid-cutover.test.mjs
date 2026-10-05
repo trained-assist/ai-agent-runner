@@ -3,7 +3,8 @@ import { createHash } from 'node:crypto';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
-import { cutoverPlan, paths, validateQuiescence } from './own-native-uid-cutover.mjs';
+import { cutoverPlan, paths, releasePath, validateQuiescence } from './own-native-uid-cutover.mjs';
+import { stagePlan, validateSourceTar } from './stage-own-native-release.mjs';
 
 const now = Date.parse('2026-10-05T07:00:00Z');
 const runId = 'run_00000000-0000-0000-0000-000000000001';
@@ -13,6 +14,7 @@ const record = { schemaVersion: 2, runId, principalId: 'integration-v1', profile
 function fixture(action = 'apply') {
   const bytes = Buffer.from(`${JSON.stringify({ kind: 'admission', record })}\n${JSON.stringify({ kind: 'dispatched', runId, engine: 'dynamic-ip-azure-agent-run' })}\n`);
   const gate = { schemaVersion: 'own-native-uid-quiescence-v1', action, unit: paths.unit, ownerApproved: true,
+    releaseCommit: '97956c5bca4a9d6c87d71b826354ab05ab48811d',
     ingressBlocked: true, mcpDisabled: true, targetUid: 12079, mainPid: 12345,
     checkedAt: new Date(now - 1000).toISOString(), journalSha256: createHash('sha256').update(bytes).digest('hex'),
     runs: [{ runId, userTaskId: 'task-1', ownerGeneration: 1, state: 'succeeded', exitObserved: true }] };
@@ -39,6 +41,7 @@ for (const [name, change] of [
   ['stale', { checkedAt: new Date(now - 300001).toISOString() }], ['future', { checkedAt: new Date(now + 1).toISOString() }],
   ['wrong journal', { journalSha256: '0'.repeat(64) }], ['wrong action', { action: 'rollback' }],
   ['omitted run', { runs: [] }],
+  ['missing release', { releaseCommit: undefined }], ['release path injection', { releaseCommit: '../legacy' }],
 ]) test(`refuses ${name} before any mutation`, () => {
   const { bytes, gate } = fixture();
   assert.throws(() => validateQuiescence({ ...gate, ...change }, bytes, 'apply', now));
@@ -100,4 +103,34 @@ test('script never invokes recursive chown, legacy units, SSH, Google or vault p
   assert.ok(!source.includes("['restart'"));
   assert.ok(!source.includes("['enable'"));
   assert.ok(!source.includes('publish(paths.oldJournal'));
+});
+
+test('release staging defaults to a no-op plan and has no service/vault actions', () => {
+  const output = execFileSync(process.execPath, [new URL('./stage-own-native-release.mjs', import.meta.url).pathname], { encoding: 'utf8' });
+  assert.deepEqual(JSON.parse(output), stagePlan());
+  assert.equal(stagePlan().sharedChown, false);
+  assert.equal(stagePlan().serviceOperations, false);
+  assert.equal(stagePlan().vaultAccess, false);
+  assert.equal(releasePath('a'.repeat(40)), `${paths.releases}/${'a'.repeat(40)}`);
+  for (const input of ['../legacy', '/tmp/release', '', 'A'.repeat(40)]) assert.throws(() => releasePath(input));
+});
+
+test('actual pinned source archive excluding tracked dependency symlink validates offline', () => {
+  const commit = fixture().gate.releaseCommit;
+  const archive = execFileSync('git', ['archive', '--format=tar', commit, '--', '.', ':(exclude)node_modules'], {
+    cwd: new URL('../..', import.meta.url), maxBuffer: 67108864,
+  });
+  assert.ok(validateSourceTar(archive, commit).entries > 100);
+  assert.throws(() => validateSourceTar(archive, 'b'.repeat(40)));
+  const unsafe = execFileSync('git', ['archive', '--format=tar', commit], { cwd: new URL('../..', import.meta.url), maxBuffer: 67108864 });
+  assert.throws(() => validateSourceTar(unsafe, commit));
+  const corrupt = Buffer.from(archive);
+  corrupt[0] ^= 1;
+  assert.throws(() => validateSourceTar(corrupt, commit));
+});
+
+test('stager never stops services, copies private runtime or changes shared ownership', () => {
+  const source = readFileSync(new URL('./stage-own-native-release.mjs', import.meta.url), 'utf8');
+  assert.ok(!/systemctl|chown|\.host-encryption-key|paths\.oldJournal|paths\.oldEnv|paths\.oldRegistry/.test(source));
+  assert.ok(source.includes("'--ignore-scripts'"));
 });

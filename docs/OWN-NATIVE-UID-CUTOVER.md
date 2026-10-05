@@ -25,14 +25,67 @@ Before a later **explicit parent authorization**:
    Historical "three runs terminal" does not cover the new Telegram CSV run.
    `/healthz` counts and an admission/dispatched journal are not terminal proof.
 3. MCP must remain disabled. Existing bindings/listeners/vaults are not migrated.
-4. Own code, build and dependencies must be root-owned/read-only to non-root;
-   symlink targets must stay inside the own code directory. If node_modules points
-   to legacy/shared dependencies, stage an independent public dependency tree
-   first, without chowning that shared tree. The cutover refuses this situation.
+4. Stage a new commit-addressed root release using the procedure below. Its code,
+   build and dependencies must be root-owned/read-only to non-root; symlink
+   targets must stay inside that exact release. Never chown the current tree or
+   follow its shared node_modules symlink. The cutover verifies the new release
+   and switches only the own unit's WorkingDirectory/ExecStart to it.
 5. Own unit must still use its one existing combined EnvironmentFile, original
    own key registry/journal and User/Group sandbox. Other configuration refuses
    rather than guessing. Record the current MainPID, verify installed source,
    and keep ingress blocked through post-cutover checks.
+
+## Independent root release remediation
+
+Read-only inventory on 2026-10-05 found the current own checkout
+`/opt/sb/ta-integrator-runner-native-v1` owned by UID1002, directory mode0750.
+There were 348 non-root-owned and 347 group/world-writable paths. Both `src` and
+`dist` accounted for 107 non-root-owned/writable paths each; `docs` for 43 and
+`test` for 54. The one external symlink was root-owned `node_modules`. The own
+unit remained active under sandbox, PID205775. This is inventory, not a quiescence
+or cutover proof; refresh it before any operational approval.
+
+Remediation creates a separate release at
+`/opt/sb/ta-integrator-runner-native-releases/<40-character-source-commit>`.
+It never changes the current tree, follows that dependency symlink, or chowns
+shared code. Source, compiled build and production dependencies are rebuilt from
+the exact reviewed commit and its unchanged package-lock, not copied from the
+writable current build. `97956c5bca4a9d6c87d71b826354ab05ab48811d` is the current
+reviewed native source baseline; a newer source requires separate review/pinning.
+
+Prepare the public archive locally, excluding the repository's tracked external
+dependency symlink. Record its exact SHA256 and the pinned package-lock SHA256;
+transfer only this public source to a private root-owned operator directory.
+
+```sh
+SOURCE_COMMIT=97956c5bca4a9d6c87d71b826354ab05ab48811d
+git archive --format=tar "$SOURCE_COMMIT" -- . ':(exclude)node_modules' > "$PUBLIC_SOURCE_TAR"
+shasum -a 256 "$PUBLIC_SOURCE_TAR"
+git show "$SOURCE_COMMIT:package-lock.json" | shasum -a 256
+node scripts/integration/stage-own-native-release.mjs plan
+# Later only: explicit review + parent source-staging authorization on the VM.
+sudo /usr/local/bin/node scripts/integration/stage-own-native-release.mjs stage \
+  "$ROOT_PRIVATE_SOURCE_TAR" "$SOURCE_COMMIT" "$ARCHIVE_SHA256" "$PACKAGE_LOCK_SHA256"
+```
+
+Staging checks root-private nonsymlink input, archive hash, embedded commit and
+every tar header/path/type before extraction. Only regular files/directories and
+the exact git commit comment are accepted; links, traversal, node_modules and
+prebuilt dist refuse. A fresh `.staging` directory is used, never an existing
+release. `npm ci --ignore-scripts` installs lock-pinned build dependencies, the
+reviewed build scripts produce dist, then another script-disabled ci installs
+only production dependencies. The build environment contains no inherited host
+credentials/configuration, only local PATH/HOME/npm cache. This requires npm
+registry access during later staging, not Google/provider calls.
+
+The stager checks module/dependency loading without running API main, hardens
+only newly-created files to root-owned 0755 directories / 0644 nonexecutables,
+and rejects links outside the exact release before publishing it. It writes
+`root-release.json` with commit/archive/lock/main hashes. Build stdout/stderr stays
+in a root-only 0600 sibling log; no raw output or secrets are printed. Incomplete
+staging remains for operator review, not automatic deletion/retry. Existing
+releases refuse replacement. Staging does not stop/start any unit, provision a
+UID, touch journals/configuration/vaults or make Runner submissions.
 
 ## Parent-owned quiescence authorization
 
@@ -47,6 +100,7 @@ operator directory, with SHA256 of exact journal bytes and one result per admiss
   "ownerApproved": true,
   "ingressBlocked": true,
   "mcpDisabled": true,
+  "releaseCommit": "97956c5bca4a9d6c87d71b826354ab05ab48811d",
   "targetUid": 12079,
   "mainPid": 12345,
   "checkedAt": "ACTUAL_CURRENT_ISO_TIME",
@@ -83,9 +137,10 @@ is readable only by the new UID. A private root backup lives under
 `/var/lib/ta-integrator-native-uid-cutover-v1`.
 
 Only `90-own-uid.conf` in the own unit's drop-in directory is added: new User/Group,
-empty supplementary groups, umask 0077 and the private copied EnvironmentFile.
-Endpoint/worker/callback settings are preserved; only own journal and registry
-paths change. The tool does daemon-reload/start, not legacy enable/restart. It
+empty supplementary groups, umask 0077, the private copied EnvironmentFile and
+the pinned root release WorkingDirectory/ExecStart. Endpoint/worker/callback
+settings are preserved; only own journal/registry and executable paths change.
+The tool does daemon-reload/start, not legacy enable/restart. It
 checks the actual new process UID and journal preservation. Raw credentials,
 environment, stderr, addresses and task text are never printed.
 
@@ -105,7 +160,8 @@ or retry based only on an apparently idle service.
 
 For rollback, block ingress again, reconcile **all current new-journal runs**,
 and issue a new `action:rollback` gate with current MainPID/hash and the same
-target UID. Do not reuse the apply gate or an old three-run snapshot.
+target UID and source release commit. Do not reuse the apply gate or an old
+three-run snapshot. The pinned release must still validate.
 
 ```sh
 sudo /usr/local/bin/node scripts/integration/own-native-uid-cutover.mjs rollback "$PRIVATE_ROLLBACK_GATE"
@@ -116,8 +172,9 @@ isolated `/var/lib/ta-integrator-runner-native-rollback-v1` directory, UID/GID10
 0700/0600. It never reverts to an old admission snapshot and never writes through
 the sandbox-owned original journal directory. Original combined environment and
 registry must remain byte-identical. The own UID drop-in is replaced with a
-journal-only EnvironmentFile override, restoring the inherited sandbox identity
-and configuration while retaining every latest admission/idempotency key.
+journal-only EnvironmentFile override, restoring the inherited sandbox identity,
+original executable/working directory and configuration while retaining every
+latest admission/idempotency key.
 Private backups, dedicated account and new journal remain for review; no shared
 ownership changes or account deletion occur. Parent repeats post-cutover checks
 before reopening ingress. A second cutover requires a separately reviewed plan.
@@ -135,5 +192,6 @@ Offline checks (no root, systemctl, SSH, Google, live Runner or vault access):
 
 ```sh
 node --check scripts/integration/own-native-uid-cutover.mjs
+node --check scripts/integration/stage-own-native-release.mjs
 node --test scripts/integration/own-native-uid-cutover.test.mjs
 ```
