@@ -31,6 +31,9 @@ async function main(): Promise<void> {
         baseUrl: worker.baseUrl,
         ...(worker.token ? { token: worker.token } : {}),
         deadlineMs: worker.launchDeadlineMs,
+        // Бюджет приёма рана — свой у каждого движка (issue #100): не ответил за него,
+        // цепочка берёт следующий исполнитель.
+        acceptDeadlineMs: worker.acceptDeadlineMs,
         cancelDeadlineMs: worker.cancelDeadlineMs,
         log,
       }),
@@ -53,6 +56,8 @@ async function main(): Promise<void> {
     workers,
     logger: log,
     env: config.env,
+    // Цепочка движков (issue #100): null = ран идёт ровно на названный клиентом движок.
+    engineChain: config.engineChain ?? undefined,
     ...(config.defaultRepository ? { defaultRepository: config.defaultRepository } : {}),
     ...(admissionLogPath ? { admissionLogPath } : {}),
   });
@@ -112,6 +117,7 @@ async function main(): Promise<void> {
       keyRegistry: config.keyRegistryPath,
       keys: keys.size(),
       engines: workers.map((entry) => entry.name),
+      engineChain: config.engineChain,
       workers: workers.map((entry) => ({ engine: entry.name, baseUrl: entry.baseUrl })),
       storage: 'stateless: receipts and run progress live in process memory',
       artifacts: 'github links returned by the worker; the API keeps no bytes',

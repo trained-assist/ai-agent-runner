@@ -61,6 +61,9 @@ API больше не используется** и удаляется отде�
 | `AGENT_API_HOST` / `AGENT_API_PORT` | `0.0.0.0` / `8787` | адрес прослушивания |
 | `EXTERNAL_WORKER_ENGINE` | `azure-dynamic-ip-agent-run` | имя движка для одиночного воркера: им API отвечает в `/healthz` и `/v1/capabilities` |
 | `AGENT_API_ENV` | `{}` | JSON-пул значений окружения; в воркер уходят только те, что перечислил клиент в `envAllowlist` |
+| `AGENT_API_WORKERS` | — | JSON-список `[{engine, baseUrl, token, acceptDeadlineMs?}]` — несколько движков |
+| `AGENT_API_ENGINE_CHAIN` | — | приоритетная цепочка движков через запятую, в порядке проб (issue #100) |
+| `EXTERNAL_WORKER_ACCEPT_DEADLINE_MS` | `30000` | бюджет ожидания квитанции на движок; не ответил — цепочка берёт следующий |
 | `RUNNER_DEFAULT_REPO` | — | `owner/name` для клиентов, не объявивших `repository` |
 | `AGENT_API_ADMISSION_LOG` | — (выключено) | путь файла журнала приёмных записей; **единственное**, что сервис пишет на диск. Без него рестарт API = потеря дедупликации и потерянные результаты уже принятых ранов (§9) |
 | `EXTERNAL_WORKER_LAUNCH_DEADLINE_MS` | `600000` | таймаут ожидания **квитанции** от `POST /v1/launch` (не всего рана) |
@@ -180,6 +183,8 @@ POST /v1/runs   → 202 receipt              память: AdmissionRecord + с�
 
 - `engines` — отсортированный список имён воркеров из конфига (`AGENT_API_WORKERS` или
   `EXTERNAL_WORKER_ENGINE`), а не один захардкоженный движок;
+- `engineSelection.chain` — приоритетная цепочка движков в порядке проб
+  (`AGENT_API_ENGINE_CHAIN`, issue #100); пустая — цепочка не объявлена;
 - `isolation.mode: "none"`, `launcher: null` — на хосте API нечего изолировать, агента
   запускает воркер на своей машине и объявляет границу в ответе;
 - `artifacts.export.enabled: false`, `download: false`, `shareLink: false`,
@@ -262,6 +267,10 @@ curl -s -H "Authorization: Bearer $KEY" $RUNNER_API_URL/v1/runs/<runId>/artifact
   задачу и даже завершить её, пока не было связи. Это известный пробел, он же предмет
   **#92**: там же — дедлайн квитанции (`EXTERNAL_WORKER_LAUNCH_DEADLINE_MS`, сейчас 10 минут)
   и его разумное значение.
+  Частично его закрывает цепочка движков (issue #100): бюджет приёма на движок
+  (`acceptDeadlineMs`, по умолчанию 30 с) меньше дедлайна запуска, и не ответивший
+  исполнитель уступает место следующему, а не роняет ран. Но если квитанция всё же не
+  пришла ни от кого, ран остаётся `failed` — вопрос #92 открыт.
 - **TLS нет.** На песочнице допустимо, на проде нужен прокси или Cloudflare Worker.
 - **Open question ТЗ §13.1** (CF Worker или тонкий VM) не решена: до решения API разворачивается
   как stateless-процесс на VM, и `infra/agent-runner-api.service` — временная обвязка.

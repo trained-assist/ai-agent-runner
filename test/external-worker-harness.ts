@@ -28,14 +28,16 @@ export interface MockWorkerOptions {
   malformed?: boolean;
   /** Отдать тело результата, не проходящее контракт. */
   malformedResult?: boolean;
-  /** Терминальный статус рана у воркера (асинхронный контракт, #73). */
-  terminalStatus?: 'succeeded' | 'failed' | 'cancelled' | 'running';
+  /** Терминальный статус рана у воркера (асинхронный контракт, #73). `unknown` — исход не установлен. */
+  terminalStatus?: 'succeeded' | 'failed' | 'cancelled' | 'running' | 'unknown';
   /** Задержка доставки результата через callback (мс). */
   resultDelayMs?: number;
   /** Не доставлять результат самому: тест забирает его опросом. */
   autoDeliver?: boolean;
   /** Промежуточный статус, который воркер отдаёт до терминального. */
   runningStatus?: 'running';
+  /** Ответить HTTP-ошибкой на запрос статуса: воркер недоступен для reconcile (#73, п. 4). */
+  statusHttpStatus?: number;
 }
 
 export interface MockWorker {
@@ -142,6 +144,11 @@ export async function startMockWorker(options: MockWorkerOptions = {}): Promise<
       // Статус рана: наш API опрашивает его, пока ран не станет терминальным.
       const statusMatch = /^\/v1\/runs\/([^/]+)\/status$/.exec(url.pathname);
       if (statusMatch) {
+        if (settings.statusHttpStatus !== undefined) {
+          res.writeHead(settings.statusHttpStatus, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: 'worker is unreachable' }));
+          return;
+        }
         const runId = statusMatch[1]!;
         const record = [...live].find((entry) => entry.runId === runId);
         if (!record || record.pending) {
@@ -155,12 +162,14 @@ export async function startMockWorker(options: MockWorkerOptions = {}): Promise<
         return;
       }
 
-      // Результат рана: отдаём только когда ран терминальный, иначе 409.
-      const resultMatch = /^\/v1\/runs\/([^/]+)\/result$/.exec(url.pathname);
-      if (resultMatch) {
-        const runId = resultMatch[1]!;
-        const record = [...live].find((entry) => entry.runId === runId);
-        if (!record || record.pending || !TERMINAL.has(settings.terminalStatus)) {
+// Результат рана: отдаём только когда ран терминальный, иначе 409. Отменённый ран —
+        // исключение: он закончен отменой, и результат обязан вернуться, даже если настроенный
+        // терминальный статус воркера — `running` (иначе отмена не закрыла бы ран).
+        const resultMatch = /^\/v1\/runs\/([^/]+)\/result$/.exec(url.pathname);
+        if (resultMatch) {
+          const runId = resultMatch[1]!;
+          const record = [...live].find((entry) => entry.runId === runId);
+          if (!record || record.pending || (!TERMINAL.has(settings.terminalStatus) && !record.cancelled)) {
           res.writeHead(409, { 'content-type': 'application/json' });
           res.end(JSON.stringify({ runId, status: 'not_ready' }));
           return;
@@ -294,7 +303,7 @@ async function readBody(req: IncomingMessage): Promise<string> {
 
 export function adapterFor(
   worker: MockWorker,
-  options: { token?: string; env?: Record<string, string>; deadlineMs?: number; engineName?: string; noResultBase?: boolean } = {},
+  options: { token?: string; env?: Record<string, string>; deadlineMs?: number; acceptDeadlineMs?: number; engineName?: string; noResultBase?: boolean } = {},
 ): ExternalWorkerAdapter {
   return new ExternalWorkerAdapter({
     baseUrl: worker.baseUrl,
@@ -302,6 +311,8 @@ export function adapterFor(
     ...(options.engineName ? { engineName: options.engineName } : {}),
     ...(options.env ? { env: options.env } : {}),
     deadlineMs: options.deadlineMs ?? 5000,
+    // Бюджет приёма рана — свой у каждого движка (issue #100); без него он равен deadlineMs.
+    ...(options.acceptDeadlineMs !== undefined ? { acceptDeadlineMs: options.acceptDeadlineMs } : {}),
     cancelDeadlineMs: 2000,
     // Тесты без HTTP-сервера всё равно получают осмысленный LaunchRequest.resultUrl.
     ...(options.noResultBase ? {} : { baseUrlForResult: 'https://api.test' }),

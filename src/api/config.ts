@@ -6,6 +6,7 @@
 
 import { statSync } from 'node:fs';
 import {
+  DEFAULT_ACCEPT_DEADLINE_MS,
   DEFAULT_CANCEL_DEADLINE_MS,
   DEFAULT_LAUNCH_DEADLINE_MS,
   EXTERNAL_WORKER_ENGINE,
@@ -22,6 +23,11 @@ export interface WorkerConfig {
   baseUrl: string;
   token: string;
   launchDeadlineMs: number;
+  /**
+   * Бюджет приёма рана этим движком (issue #100): сколько ждём квитанцию `POST /v1/launch`.
+   * Не ответил за бюджет — цепочка берёт следующий движок, поэтому у GitHub Actions он короткий.
+   */
+  acceptDeadlineMs: number;
   cancelDeadlineMs: number;
 }
 
@@ -31,6 +37,12 @@ export interface AgentApiProcessConfig {
   keyRegistryPath: string;
   /** Воркеры по движкам. Имя движка — адрес воркера, а не его внутренняя деталь. */
   workers: WorkerConfig[];
+  /**
+   * Приоритетная цепочка движков (issue #100): `AGENT_API_ENGINE_CHAIN`. Порядок проб задаёт
+   * конфиг, а не сортировка имён. `null` — цепочка не объявлена, ран идёт ровно на тот движок,
+   * который назвал клиент.
+   */
+  engineChain: string[] | null;
   /** Пулы значений окружения, которые можно передать воркеру (по envAllowlist рана). */
   env: Record<string, string>;
   /** Репозиторий по умолчанию, когда клиент не объявил `repository` (воркер клонирует его сам). */
@@ -46,11 +58,20 @@ function envValue(env: Record<string, string | undefined>, name: string): string
 
 /** Читает из переданного окружения, а не из `process.env`: иначе аргумент функции не работает. */
 function intEnv(env: Record<string, string | undefined>, name: string, fallback: number): number {
-  const raw = envValue(env, name);
-  if (raw === undefined) return fallback;
-  const value = Number(raw);
+  return positiveInt(envValue(env, name), name, fallback);
+}
+
+/** Положительное целое из строки (env) или из уже разобранного значения (JSON-конфиг). */
+function positiveInt(raw: unknown, name: string, fallback: number): number {
+  if (raw === undefined || raw === null) return fallback;
+  if (typeof raw !== 'string' && typeof raw !== 'number') {
+    throw new Error(`${name}: expected a positive integer`);
+  }
+  const text = typeof raw === 'number' ? String(raw) : raw.trim();
+  if (text === '') return fallback;
+  const value = Number(text);
   if (!Number.isInteger(value) || value < 1) {
-    throw new Error(`${name}: expected a positive integer, got "${raw}"`);
+    throw new Error(`${name}: expected a positive integer, got "${text}"`);
   }
   return value;
 }
@@ -60,7 +81,13 @@ function intEnv(env: Record<string, string | undefined>, name: string, fallback:
  * Формат списком, потому что движков больше одного, а одиночный `EXTERNAL_WORKER_*` больше
  * не выражает «какой воркер какому движку».
  */
-function parseWorkers(env: Record<string, string | undefined>, raw: string | undefined, launchDeadlineMs: number, cancelDeadlineMs: number): WorkerConfig[] {
+function parseWorkers(
+  env: Record<string, string | undefined>,
+  raw: string | undefined,
+  launchDeadlineMs: number,
+  acceptDeadlineMs: number,
+  cancelDeadlineMs: number,
+): WorkerConfig[] {
   if (raw === undefined) {
     // Одиночный конфиг остаётся рабочим: у нас пока один движок.
     const baseUrl = env['EXTERNAL_WORKER_URL']?.trim() || env['DYNAMIC_IP_AZURE_URL']?.trim();
@@ -76,6 +103,7 @@ function parseWorkers(env: Record<string, string | undefined>, raw: string | und
         baseUrl,
         token: env['EXTERNAL_WORKER_TOKEN']?.trim() || env['DYNAMIC_IP_AZURE_TOKEN']?.trim() || '',
         launchDeadlineMs,
+        acceptDeadlineMs,
         cancelDeadlineMs,
       },
     ];
@@ -100,8 +128,43 @@ function parseWorkers(env: Record<string, string | undefined>, raw: string | und
     if (!/^https?:\/\//.test(baseUrl)) throw new Error(`AGENT_API_WORKERS[${index}].baseUrl: expected an http(s) URL`);
     if (seen.has(engine)) throw new Error(`AGENT_API_WORKERS: engine "${engine}" is declared twice`);
     seen.add(engine);
-    return { engine, baseUrl, token, launchDeadlineMs, cancelDeadlineMs };
+    // Бюджет приёма свой у каждого движка (issue #100): не задан — общий из env.
+    return {
+      engine,
+      baseUrl,
+      token,
+      launchDeadlineMs,
+      acceptDeadlineMs: positiveInt(record['acceptDeadlineMs'], `AGENT_API_WORKERS[${index}].acceptDeadlineMs`, acceptDeadlineMs),
+      cancelDeadlineMs,
+    };
   });
+}
+
+/**
+ * Приоритетная цепочка движков: `AGENT_API_ENGINE_CHAIN='gha,eu,rf'`. Порядок в конфиге — это
+ * порядок проб; сортировать имена нельзя, потому что приоритет задаёт владелец, а не алфавит.
+ * Не объявлена — `null`, и ран идёт ровно на названный клиентом движок (прежнее поведение).
+ */
+function parseEngineChain(raw: string | undefined, workers: readonly WorkerConfig[]): string[] | null {
+  const value = raw?.trim();
+  if (!value) return null;
+  const chain = value
+    .split(',')
+    .map((name) => name.trim())
+    .filter((name) => name.length > 0);
+  if (chain.length === 0) throw new Error('AGENT_API_ENGINE_CHAIN: expected a comma-separated list of engine names');
+  const seen = new Set<string>();
+  const configured = new Set(workers.map((worker) => worker.engine));
+  for (const engine of chain) {
+    if (seen.has(engine)) throw new Error(`AGENT_API_ENGINE_CHAIN: engine "${engine}" is listed twice`);
+    // Движок цепочки без воркера — опечатка в конфиге: молча пропустить его нельзя, иначе ран
+    // будет падать на середине цепочки вместо отказа на старте.
+    if (!configured.has(engine)) {
+      throw new Error(`AGENT_API_ENGINE_CHAIN: engine "${engine}" has no worker in AGENT_API_WORKERS (declared: ${[...configured].join(', ')})`);
+    }
+    seen.add(engine);
+  }
+  return chain;
 }
 
 /** `AGENT_API_ENV='{"PATH":"/usr/bin","LANG":"C.UTF-8"}'` — значения, отдаваемые воркеру. */
@@ -154,17 +217,22 @@ export function loadAgentApiConfig(env: Record<string, string | undefined> = pro
   }
 
   const launchDeadlineMs = intEnv(env, 'EXTERNAL_WORKER_LAUNCH_DEADLINE_MS', DEFAULT_LAUNCH_DEADLINE_MS);
+  // Бюджет приёма рана: по умолчанию 30 с, у каждого движка переопределяется полем acceptDeadlineMs.
+  const acceptDeadlineMs = intEnv(env, 'EXTERNAL_WORKER_ACCEPT_DEADLINE_MS', DEFAULT_ACCEPT_DEADLINE_MS);
   const cancelDeadlineMs = intEnv(env, 'EXTERNAL_WORKER_CANCEL_DEADLINE_MS', DEFAULT_CANCEL_DEADLINE_MS);
-  const workers = parseWorkers(env, env['AGENT_API_WORKERS'], launchDeadlineMs, cancelDeadlineMs);
+  const workers = parseWorkers(env, env['AGENT_API_WORKERS'], launchDeadlineMs, acceptDeadlineMs, cancelDeadlineMs);
   if (workers.length === 0) {
     throw new Error('no external worker configured: set AGENT_API_WORKERS, or EXTERNAL_WORKER_URL for a single default worker');
   }
+  // Цепочка разбирается после воркеров: её имена обязаны быть среди объявленных движков.
+  const engineChain = parseEngineChain(env['AGENT_API_ENGINE_CHAIN'], workers);
 
   return {
     host: env['AGENT_API_HOST']?.trim() || DEFAULT_API_HOST,
     port,
     keyRegistryPath,
     workers,
+    engineChain,
     env: parseEnvPool(env['AGENT_API_ENV']),
     defaultRepository: env['RUNNER_DEFAULT_REPO']?.trim() || null,
   };

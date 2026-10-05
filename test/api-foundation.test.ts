@@ -96,11 +96,19 @@ describe('submit contract validation', () => {
     expect(result.value.limits).toEqual({ timeoutMs: 5000 });
   });
 
-  it('rejects missing engine, unknown server-owned fields and bad types', () => {
-    expect(validateSubmitRequest({ limits: { timeoutMs: 1000 } })).toMatchObject({ ok: false });
-    const missing = validateSubmitRequest({ limits: { timeoutMs: 1000 } });
-    expect(!missing.ok && missing.errors.join(' ')).toContain('missing required field "engine"');
+  it('engine необязателен: без него исполнителя выбирает цепочка движков (#100)', () => {
+    const withoutEngine = validateSubmitRequest({ limits: { timeoutMs: 1000 } });
+    expect(withoutEngine.ok).toBe(true);
+    if (!withoutEngine.ok) return;
+    expect(withoutEngine.value.engine).toBeUndefined();
 
+    const withEngine = validateSubmitRequest({ ...validBody });
+    expect(withEngine.ok).toBe(true);
+    if (!withEngine.ok) return;
+    expect(withEngine.value.engine).toEqual({ name: 'fake', adapterVersion: '1' });
+  });
+
+  it('rejects unknown server-owned fields and bad types', () => {
     const unknown = validateSubmitRequest({ ...validBody, runId: 'run_hijack', cwd: '/etc' });
     expect(!unknown.ok && unknown.errors.join(' ')).toContain('unknown field "runId"');
     expect(!unknown.ok && unknown.errors.join(' ')).toContain('unknown field "cwd"');
