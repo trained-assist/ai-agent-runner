@@ -447,6 +447,25 @@ describe('ExternalWorkerAdapter по HTTP', () => {
     }
   });
 
+  it('5xx на launch оставляет исход неизвестным, 4xx — нет: отказ по запросу не про запуск', async () => {
+    // 5xx — состояние воркера: он мог принять ран и упасть уже на ответе, поэтому API
+    // обязан сначала спросить `status` (контракт, п. 4). 4xx — отказ по самому запросу:
+    // тот же запрос получит тот же отказ, и ран не зарегистрирован.
+    const spec = () => makeRunSpec({ runId: 'run-http-status', input: { inlinePrompt: 'x' } });
+    const server = await startMockWorker({ httpStatus: 503 });
+    try {
+      await expect(adapterFor(server).launch(spec())).rejects.toMatchObject({ code: 'WORKER_HTTP_ERROR', outcomeUnknown: true });
+    } finally {
+      await server.close();
+    }
+    const refused = await startMockWorker({ httpStatus: 400 });
+    try {
+      await expect(adapterFor(refused).launch(spec())).rejects.toMatchObject({ code: 'WORKER_HTTP_ERROR', outcomeUnknown: false });
+    } finally {
+      await refused.close();
+    }
+  });
+
   it('тело вне контракта — WORKER_PROTOCOL_INVALID, а не «успешный» ран', async () => {
     const worker = await startMockWorker({ malformed: true });
     try {
@@ -458,13 +477,16 @@ describe('ExternalWorkerAdapter по HTTP', () => {
     }
   });
 
-  it('таймаут launch обрывает HTTP-запрос: воркер не принял задачу, повтор безопасен', async () => {
+  it('таймаут launch обрывает HTTP-запрос: исход неизвестен, а не «ран не принят»', async () => {
     const worker = await startMockWorker({ delayMs: 3000 });
     try {
       const adapter = adapterFor(worker, { deadlineMs: 150 });
       await expect(adapter.launch(makeRunSpec({ runId: 'run-http-timeout', input: { inlinePrompt: 'x' } }))).rejects.toMatchObject({
         code: 'WORKER_LAUNCH_UNREACHABLE',
-        // Ран не принят — никто его не выполняет, поэтому повтор не создаст второй.
+        // Таймаут не доказывает, что ран не запущен: запрос мог дойти, а ответ потеряться.
+        // Поэтому исход неизвестен (outcomeUnknown) — API обязан спросить `status` существующего
+        // запуска, прежде чем считать ран несостоявшимся (контракт, п. 4; issue #92).
+        outcomeUnknown: true,
         retryable: true,
       });
       // Отменять нечего: задача не дошла до воркера, и осиротевшего рана нет.

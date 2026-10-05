@@ -18,12 +18,12 @@ const alpha: Principal = {
   principalId: 'p-alpha',
   profileId: 'profile-a',
   scopes: ['runs:read', 'runs:write'],
-  engines: ['dynamic-ip-azure-agent-run'],
+  engines: ['azure-dynamic-ip-agent-run'],
 };
 
 function body(over: Record<string, unknown> = {}): Record<string, unknown> {
   return {
-    engine: { name: 'dynamic-ip-azure-agent-run', adapterVersion: '1' },
+    engine: { name: 'azure-dynamic-ip-agent-run', adapterVersion: '1' },
     limits: { timeoutMs: 15000 },
     envAllowlist: [],
     input: { inlinePrompt: 'hello agent' },
@@ -101,12 +101,13 @@ describe('launch без ответа: unknown + reconcile, а не failed (#92)'
     await waitForState(api, receipt.runId, 'failed');
 
     const progress = store.progressOf(receipt.runId)!;
-    const unknownIndex = progress.events.findIndex((event) => event.type === 'log' && event.payload['level'] === 'warn');
+    const unknownIndex = progress.events.findIndex((event) => event.type === 'log' && (event.payload as { level?: string })['level'] === 'warn');
     const failedIndex = progress.events.findIndex((event) => event.type === 'failed');
     expect(unknownIndex).toBeGreaterThanOrEqual(0);
     expect(failedIndex).toBeGreaterThan(unknownIndex);
     // Причина в событии: клиент читает журнал рана, а не только лог API.
-    expect(String(progress.events[unknownIndex]!.payload['message'])).toContain('outcome unknown (worker_unreachable)');
+    const unknownMessage = (progress.events[unknownIndex]!.payload as { message?: string })['message'];
+    expect(String(unknownMessage)).toContain('outcome unknown (worker_unreachable)');
     // Нумерация монотонна: события финализации не переиспользуют номера отметки unknown.
     const sequences = progress.events.map((event) => event.sequence);
     expect(sequences).toEqual([...sequences].sort((left, right) => left - right));
@@ -120,7 +121,7 @@ describe('launch без ответа: unknown + reconcile, а не failed (#92)'
     const runId = 'run-reconcile-running';
     const statuses: WorkerRunStatus[] = ['running', 'succeeded'];
     const worker: ExternalWorker = {
-      name: 'dynamic-ip-azure-agent-run',
+      name: 'azure-dynamic-ip-agent-run',
       baseUrl: 'http://worker.test',
       async launch(): Promise<LaunchReceipt> {
         throw new PreflightError('WORKER_LAUNCH_UNREACHABLE', 'the external worker did not answer the launch request', {
@@ -172,7 +173,7 @@ describe('launch без ответа: unknown + reconcile, а не failed (#92)'
     // Отказ известен: запрос отклонён до отправки. Спрашивать воркер нечего — запуска нет.
     const api = makeApi(adapterFor(await startMockWorker()), []);
     const receipt = api.submit(alpha, 'idem-reconcile-preflight', {
-      engine: { name: 'dynamic-ip-azure-agent-run', adapterVersion: '1' },
+      engine: { name: 'azure-dynamic-ip-agent-run', adapterVersion: '1' },
       limits: { timeoutMs: 5000 },
       envAllowlist: [],
       input: { refs: [{ ref: 'snap-1', snapshotId: 'snapshot-1' }] },

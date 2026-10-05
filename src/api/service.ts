@@ -663,9 +663,8 @@ export class AgentApi {
     } catch (probeErr) {
       this.log({ event: 'worker_status_failed', runId: record.runId, message: probeErr instanceof Error ? probeErr.message : String(probeErr) });
     }
-    if (this.disposed || this.store.progressOf(record.runId) === null) return;
     const run = this.store.progressOf(record.runId);
-    if (!run || isTerminalApiState(run.state)) return;
+    if (this.disposed || !run || isTerminalApiState(run.state)) return;
     this.log({ event: 'worker_launch_reconciled', runId: record.runId, code, status: status ?? 'unreachable' });
     // 3. Воркер видит ран: поллер доводит его до терминала штатно. Помечаем до старта
     //    поллера, чтобы ран пережил рестарт API (§8.2 ревью).
