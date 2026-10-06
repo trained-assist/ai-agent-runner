@@ -420,8 +420,8 @@ export function launchRequestFromSpec(
     env,
     limits: {
       timeoutMs: spec.limits.timeoutMs,
-      maxOutputBytes: spec.limits.maxOutputBytes ?? 0,
-      maxLogBytes: spec.limits.maxLogBytes ?? 0,
+      maxOutputBytes: spec.limits.maxOutputBytes ?? 5_000_000,
+      maxLogBytes: spec.limits.maxLogBytes ?? 5_000_000,
     },
     repository: {
       fullName: spec.repository?.fullName ?? '',
