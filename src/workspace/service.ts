@@ -83,6 +83,8 @@ export interface WorkspaceServiceDeps {
   policy?: ExportPolicy;
   /** Сколько раз пересчитать merge при конкурентной публикации, прежде чем объявить конфликт. */
   mergeAttempts?: number;
+  /** Deterministic publication tie-break; manual conflicts remain available to legacy callers. */
+  conflictPolicy?: 'prefer_larger_final_tree' | 'preserve_conflict';
   /** Сколько попыток разрешения конфликта до `awaiting_user_input` (запрет цикла). */
   resolutionAttempts?: number;
   manifestLimits?: { maxFiles: number; maxBytes: number };
@@ -217,6 +219,7 @@ export class WorkspaceService {
   private readonly journal: WorkspaceJournalPort;
   private readonly policy: CompiledPolicy;
   private readonly mergeAttempts: number;
+  private readonly conflictPolicy: NonNullable<WorkspaceServiceDeps['conflictPolicy']>;
   private readonly resolutionAttempts: number;
   private readonly manifestLimits: { maxFiles: number; maxBytes: number };
   private readonly branch: string;
@@ -231,6 +234,7 @@ export class WorkspaceService {
     this.journal = deps.journal;
     this.policy = compilePolicy(deps.policy ?? DEFAULT_EXPORT_POLICY);
     this.mergeAttempts = Math.max(1, deps.mergeAttempts ?? DEFAULT_MERGE_ATTEMPTS);
+    this.conflictPolicy = deps.conflictPolicy ?? 'prefer_larger_final_tree';
     this.resolutionAttempts = Math.max(1, deps.resolutionAttempts ?? DEFAULT_RESOLUTION_ATTEMPTS);
     this.manifestLimits = deps.manifestLimits ?? DEFAULT_MANIFEST_LIMITS;
     this.branch = deps.defaultBranch ?? DEFAULT_BRANCH;
@@ -1150,7 +1154,7 @@ export class WorkspaceService {
     const current = toTreeMap(head === null ? [] : await this.git.listTree(mirror, head));
     const runTree = toTreeMap(await this.git.listTree(mirror, conflict.runRevision));
     const scope = new Set([...base.keys(), ...runTree.keys(), ...current.keys()]);
-    const merged = await mergeTrees(this.git, mirror, { base, run: runTree, current, scope });
+    const merged = await mergeTrees(this.git, mirror, { base, run: runTree, current, scope, conflictPolicy: 'preserve_conflict' });
     const writes = [...merged.writes];
 
     if (source === 'deterministic') {
@@ -1547,7 +1551,7 @@ export class WorkspaceService {
         mainCommit = runCommit;
       } else {
         const current = toTreeMap(await this.git.listTree(mirror, head));
-        const merged = await mergeTrees(this.git, mirror, { base, run: runTree, current, scope });
+        const merged = await mergeTrees(this.git, mirror, { base, run: runTree, current, scope, conflictPolicy: this.conflictPolicy });
         if (!merged.clean) {
           return this.recordConflict(withCandidate, binding, mirror, {
             base,
@@ -1566,7 +1570,8 @@ export class WorkspaceService {
           parents: [head, runCommit],
           message: `merge ${record.branch} into ${binding.branch}`,
           author: COMMIT_AUTHOR,
-          metadata: { publicationId: record.publicationId, baseRevision: record.baseRevision, manifestHash: record.manifestHash, kind: 'merge' },
+          metadata: { publicationId: record.publicationId, baseRevision: record.baseRevision, manifestHash: record.manifestHash, kind: 'merge',
+            conflictPolicy: this.conflictPolicy, resolvedConflicts: JSON.stringify(merged.resolvedByLargerTree) },
         });
       }
 
@@ -1700,6 +1705,7 @@ export class WorkspaceService {
       run: candidate,
       current,
       scope: new Set([...base.keys(), ...candidate.keys(), ...current.keys()]),
+      conflictPolicy: 'preserve_conflict',
     });
     const nextConflict: WorkspaceConflict = {
       ...conflict,

@@ -404,6 +404,49 @@ describe('publish → prepare: the persistent state survives the run', () => {
 });
 
 describe('two runs from one base revision', () => {
+  it('default conflict policy preserves the larger final tree when a later run deletes an edited file', async () => {
+    const h = harness({ conflictPolicy: 'prefer_larger_final_tree' });
+    await ensureProfile(h, ALICE);
+    const base = runWorkspace({ 'notes/keep.md': 'keep\n', 'notes/shared.md': 'initial contents\n' });
+    const basePublication = await h.service.publishRunChanges({
+      operationId: 'pub-base', ...ALICE, runId: 'run-base', workspacePath: base, baseRevision: EMPTY_TREE,
+    });
+    const baseRevision = basePublication.committedRevision as string;
+
+    // A changes the file; later-started B saw that file, removes it, and finishes first.
+    const runA = runWorkspace({ 'notes/keep.md': 'keep\n', 'notes/shared.md': 'important result from A\n' });
+    const runB = runWorkspace({ 'notes/keep.md': 'keep\n' });
+    await h.service.publishRunChanges({ operationId: 'pub-a', ...ALICE, runId: 'run-a', workspacePath: runA, baseRevision });
+    const pubB = await h.service.publishRunChanges({ operationId: 'pub-b', ...ALICE, runId: 'run-b', workspacePath: runB, baseRevision });
+
+    expect(pubB.status).toBe('published');
+    expect(pubB.conflictId).toBeNull();
+    const tree = remoteTree(h.admin, `${OWNER}/profile-alice`);
+    expect(tree['notes/shared.md']).toBe('important result from A\n');
+    // B's complete final state is still retained on its candidate branch for recovery/audit.
+    const binding = [...h.bindings.byBindingId.values()][0]!;
+    const mirror = await h.git.ensureMirror(binding, { tokenRef: 'fixture' });
+    const runTree = await h.git.listTree(mirror, `refs/heads/agent-run/run-b`);
+    expect(runTree.some(entry => entry.path === 'notes/shared.md')).toBe(false);
+  });
+
+  it('default conflict policy selects the run branch when its complete final tree is larger', async () => {
+    const h = harness({ conflictPolicy: 'prefer_larger_final_tree' });
+    await ensureProfile(h, ALICE);
+    const base = runWorkspace({ 'notes/shared.md': 'seed\n' });
+    const basePublication = await h.service.publishRunChanges({
+      operationId: 'pub-base', ...ALICE, runId: 'run-base', workspacePath: base, baseRevision: EMPTY_TREE,
+    });
+    const baseRevision = basePublication.committedRevision as string;
+    const runA = runWorkspace({ 'notes/shared.md': 'seed\n' });
+    const runB = runWorkspace({ 'notes/shared.md': `complete result ${'x'.repeat(512)}\n` });
+    await h.service.publishRunChanges({ operationId: 'pub-a', ...ALICE, runId: 'run-a', workspacePath: runA, baseRevision });
+    const publication = await h.service.publishRunChanges({ operationId: 'pub-b', ...ALICE, runId: 'run-b', workspacePath: runB, baseRevision });
+
+    expect(publication.status).toBe('published');
+    expect(remoteTree(h.admin, `${OWNER}/profile-alice`)['notes/shared.md']).toBe(`complete result ${'x'.repeat(512)}\n`);
+  });
+
   it('merges non-overlapping edits automatically', async () => {
     const h = harness();
     await ensureProfile(h, ALICE);
@@ -433,7 +476,7 @@ describe('two runs from one base revision', () => {
   });
 
   it('reports a same-file conflict and keeps both sides', async () => {
-    const h = harness();
+    const h = harness({ conflictPolicy: 'preserve_conflict' });
     await ensureProfile(h, ALICE);
     const base = runWorkspace({ 'notes/shared.md': 'line1\nline2\nline3\n' });
     const basePublication = await h.service.publishRunChanges({
@@ -466,7 +509,7 @@ describe('two runs from one base revision', () => {
   });
 
   it('reports an edit/delete conflict as delete_modify and keeps the deletion visible', async () => {
-    const h = harness();
+    const h = harness({ conflictPolicy: 'preserve_conflict' });
     await ensureProfile(h, ALICE);
     const base = runWorkspace({ 'notes/keep.md': 'keep\n', 'notes/gone.md': 'gone\n' });
     const basePublication = await h.service.publishRunChanges({
@@ -492,7 +535,7 @@ describe('two runs from one base revision', () => {
   });
 
   it('marks a rename over an edited path as a rename conflict', async () => {
-    const h = harness();
+    const h = harness({ conflictPolicy: 'preserve_conflict' });
     await ensureProfile(h, ALICE);
     const base = runWorkspace({ 'notes/original.md': 'shared body\n' });
     const basePublication = await h.service.publishRunChanges({
@@ -535,7 +578,7 @@ describe('conflict resolution', () => {
   }
 
   it('a deterministic resolution of an unresolvable conflict asks the user instead of guessing', async () => {
-    const h = harness();
+    const h = harness({ conflictPolicy: 'preserve_conflict' });
     const { conflictId } = await conflictingRuns(h);
     const resolution = await h.service.resolveWorkspaceConflict({
       operationId: 'res-1',
@@ -548,7 +591,7 @@ describe('conflict resolution', () => {
   });
 
   it('an explicit side choice becomes a candidate and publishes under the expected head', async () => {
-    const h = harness();
+    const h = harness({ conflictPolicy: 'preserve_conflict' });
     const { conflictId } = await conflictingRuns(h);
     const conflict = h.journal.getConflict(conflictId);
     const resolution = await h.service.resolveWorkspaceConflict({
@@ -574,7 +617,7 @@ describe('conflict resolution', () => {
   });
 
   it('does not publish a stale candidate when the head moved during the resolution', async () => {
-    const h = harness();
+    const h = harness({ conflictPolicy: 'preserve_conflict' });
     const { conflictId } = await conflictingRuns(h);
     const resolution = await h.service.resolveWorkspaceConflict({
       operationId: 'res-3',
@@ -602,7 +645,7 @@ describe('conflict resolution', () => {
   });
 
   it('an external candidate must carry evidence and may not contain excluded paths', async () => {
-    const h = harness();
+    const h = harness({ conflictPolicy: 'preserve_conflict' });
     const { conflictId } = await conflictingRuns(h);
     await expect(
       h.service.resolveWorkspaceConflict({
@@ -630,7 +673,7 @@ describe('conflict resolution', () => {
   });
 
   it('does not loop: the attempt limit moves the conflict to awaiting user input', async () => {
-    const h = harness({ resolutionAttempts: 2 });
+    const h = harness({ resolutionAttempts: 2, conflictPolicy: 'preserve_conflict' });
     const { conflictId } = await conflictingRuns(h);
     for (const attempt of [1, 2]) {
       const result = await h.service.resolveWorkspaceConflict({
@@ -977,7 +1020,7 @@ describe('каждый ран публикует свою ветку (agent-run/
   });
 
   it('сохраняет ветку рана при конфликте — работа не теряется', async () => {
-    const h = harness();
+    const h = harness({ conflictPolicy: 'preserve_conflict' });
     await ensureProfile(h, ALICE);
     const base = runWorkspace({ 'notes/shared.md': 'line1\nline2\nline3\n' });
     const basePublication = await h.service.publishRunChanges({
