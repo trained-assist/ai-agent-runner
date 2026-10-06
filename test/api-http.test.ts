@@ -216,6 +216,51 @@ describe('http submit, status, result, artifacts, events and cancel', () => {
 });
 
 describe('http sse replay', () => {
+  it('mirrors live worker stdout/stderr before completion and does not append duplicate final logs after cursor reconnect', async () => {
+    const h = await startHttpHarness({
+      worker: { liveLogs: true, terminalStatus: 'running', stdout: 'first output second output', stderr: 'diagnostic output', delayedTerminalLogMs: 1500 },
+      workerEngineName: 'eu-vm-agent-run',
+      streamPollMs: 10,
+    });
+    h.worker.autoDeliver = false;
+    const submit = await postSubmit(h.base, alphaKey, 'idem-live-worker-sse', submitBody({ engine: { name: 'eu-vm-agent-run', adapterVersion: '1' } }));
+    const receipt = (await submit.json()) as { runId: string };
+    await waitForAsync(async () => (await (await getStatus(h.base, alphaKey, receipt.runId)).json() as { state: string }).state === 'running');
+
+    const firstController = new AbortController();
+    const firstResponse = await fetch(`${h.base}/v1/runs/${receipt.runId}/events`, {
+      headers: { ...authHeader(alphaKey), accept: 'text/event-stream' },
+      signal: firstController.signal,
+    });
+    const firstCollector = new SseCollector(firstResponse.body!.getReader());
+    await firstCollector.waitFor(frames => frames.some(frame => frame.event === 'snapshot'));
+    h.worker.pushLog(receipt.runId, 'stdout', 'first output');
+    h.worker.pushLog(receipt.runId, 'stderr', 'diagnostic output');
+    await firstCollector.waitFor(frames => frames.filter(frame => frame.event === 'log').length === 2);
+    expect((await (await getStatus(h.base, alphaKey, receipt.runId)).json() as { state: string }).state).toBe('running');
+
+    const cursor = firstCollector.lastEventId();
+    firstController.abort();
+    await new Promise(resolve => setTimeout(resolve, 10));
+
+    const resumed = await fetch(`${h.base}/v1/runs/${receipt.runId}/events`, {
+      headers: { ...authHeader(alphaKey), accept: 'text/event-stream', 'last-event-id': String(cursor) },
+    });
+    const resumedCollector = new SseCollector(resumed.body!.getReader());
+    await resumedCollector.waitFor(frames => frames.some(frame => frame.event === 'snapshot'));
+    h.worker.finishLogs(receipt.runId, { stream: 'stdout', message: 'second output' });
+    await resumedCollector.waitFor(frames => frames.some(frame => frame.event === 'log' && frame.data?.includes('second output')));
+
+    await resumedCollector.waitFor(frames => frames.some(frame => frame.event === 'succeeded'));
+    await resumedCollector.waitEnd();
+    const logFrames = resumedCollector.all.filter(frame => frame.event === 'log');
+    expect(logFrames.filter(frame => frame.data?.includes('second output'))).toHaveLength(1);
+    expect(logFrames.filter(frame => frame.data?.includes('first output'))).toHaveLength(0);
+    expect(logFrames.filter(frame => frame.data?.includes('diagnostic output'))).toHaveLength(0);
+    expect(h.worker.logCursors).toContain(2);
+    expect((await (await getStatus(h.base, alphaKey, receipt.runId)).json() as { state: string }).state).toBe('succeeded');
+  }, 30000);
+
   it('стримит события, переживает оборванную связь, переигрывает по курсору и закрывается на терминальном событии', async () => {
     const h = await startHttpHarness({ worker: { delayMs: 300 }, streamPollMs: 10 });
     const submit = await postSubmit(h.base, alphaKey, 'idem-sse', submitBody());

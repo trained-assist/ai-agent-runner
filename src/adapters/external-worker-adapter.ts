@@ -232,6 +232,8 @@ export interface ExternalWorker {
   launch(spec: RunSpec, admittedAt?: string): Promise<LaunchReceipt>;
   restoreMcp?(spec: RunSpec, admittedAt: string): Promise<void>;
   status(runId: string): Promise<WorkerStatusView>;
+  /** Follow replayable live stdout/stderr logs when a worker exposes its SSE endpoint. */
+  streamLogs?(runId: string, after: number, signal: AbortSignal, onLog: (stream: 'stdout' | 'stderr', message: string, sequence: number) => void): Promise<{ cursor: number; completed: boolean; supported: boolean }>;
   result(runId: string): Promise<LaunchResult>;
   cancel(runId: string): Promise<WorkerCancelResult>;
 }
@@ -1130,6 +1132,70 @@ export class ExternalWorkerAdapter implements ExternalWorker {
       );
     }
     return validated.value;
+  }
+
+  /** Subscribe to the worker's replayable stdout/stderr SSE. The caller owns reconnects. */
+  async streamLogs(
+    runId: string,
+    after: number,
+    signal: AbortSignal,
+    onLog: (stream: 'stdout' | 'stderr', message: string, sequence: number) => void,
+  ): Promise<{ cursor: number; completed: boolean; supported: boolean }> {
+    const base = this.baseUrl;
+    if (!base) return { cursor: after, completed: false, supported: false };
+    const url = `${trimTrailingSlash(base)}/v1/runs/${encodeURIComponent(runId)}/logs?after=${after}`;
+    const headers: Record<string, string> = { accept: 'text/event-stream' };
+    if (this.token) headers.authorization = `Bearer ${this.token}`;
+    const response = await this.fetchImpl(url, { method: 'GET', headers, signal });
+    if (response.status === 404 || response.status === 405) return { cursor: after, completed: false, supported: false };
+    if (!response.ok) throw new Error(`worker logs returned HTTP ${response.status}`);
+    if (!response.body) throw new Error('worker logs response has no body');
+
+    let cursor = after;
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    try {
+      for (;;) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        buffer += decoder.decode(chunk.value, { stream: true });
+        let boundary = buffer.indexOf('\n\n');
+        while (boundary >= 0) {
+          const block = buffer.slice(0, boundary);
+          buffer = buffer.slice(boundary + 2);
+          let event = '';
+          let id = '';
+          const data: string[] = [];
+          for (const line of block.split(/\r?\n/)) {
+            if (line.startsWith(':')) continue;
+            const colon = line.indexOf(':');
+            if (colon < 0) continue;
+            const field = line.slice(0, colon);
+            const value = line.slice(colon + 1).replace(/^ /, '');
+            if (field === 'event') event = value;
+            else if (field === 'id') id = value;
+            else if (field === 'data') data.push(value);
+          }
+          if (event === 'end') return { cursor, completed: true, supported: true };
+          if ((event === 'stdout' || event === 'stderr') && data.length > 0) {
+            const sequence = Number(id);
+            if (Number.isSafeInteger(sequence) && sequence > cursor) {
+              let message: unknown;
+              try { message = JSON.parse(data.join('\n')); } catch { message = data.join('\n'); }
+              if (typeof message === 'string') {
+                cursor = sequence;
+                onLog(event, message, sequence);
+              }
+            }
+          }
+          boundary = buffer.indexOf('\n\n');
+        }
+      }
+      return { cursor, completed: false, supported: true };
+    } finally {
+      try { await reader.cancel(); } catch { /* the server may have already closed */ }
+    }
   }
 
   /** Финальный результат. Пока ран идёт, воркер отвечает 409 — мы поднимаем `ResultNotReadyError`. */

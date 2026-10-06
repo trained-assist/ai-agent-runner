@@ -7,6 +7,7 @@ import {
   EXTERNAL_WORKER_ADAPTER_VERSION,
   fleetExhaustedFailure,
   isUnacceptedLaunchFailure,
+  logMessage,
   launchFailureCode,
   mapLaunchResult,
   mergeUrl,
@@ -23,6 +24,7 @@ import {
   ResultNotReadyError,
 } from '../adapters/external-worker-adapter.js';
 import type { RunResult } from '../contracts/result.js';
+import { RUNNER_EVENT_SCHEMA_VERSION, type RunnerEvent } from '../contracts/events.js';
 import { PreflightError } from '../contracts/validate.js';
 import { validateRunSpec, type EngineSpec, type InputSpec, type RunSpec } from '../contracts/run-spec.js';
 import { DEFAULT_STATELESS_LIMITS, isTerminalApiState, STATELESS_STORE_SCHEMA_VERSION, StatelessStore, type AdmissionRecord } from './stateless-store.js';
@@ -57,6 +59,23 @@ export type ApiLogger = (entry: Record<string, unknown>) => void;
 
 function isRegionalVmEngine(name: string): boolean {
   return name === 'eu-vm-agent-run' || name === 'rf-vm-agent-run';
+}
+
+type LiveLogState = {
+  controller: AbortController;
+  drainController: AbortController | null;
+  outputs: Record<'stdout' | 'stderr', string>;
+  initialSourceCursor: number;
+  completed: boolean;
+  stopping: boolean;
+};
+
+function remainingFinalOutput(finalOutput: string, streamedOutput: string): string {
+  if (!finalOutput || !streamedOutput) return finalOutput;
+  if (streamedOutput.includes(finalOutput)) return '';
+  if (finalOutput.startsWith(streamedOutput)) return finalOutput.slice(streamedOutput.length).trim();
+  if (finalOutput.endsWith(streamedOutput)) return finalOutput.slice(0, -streamedOutput.length).trim();
+  return finalOutput;
 }
 
 function isGhaEngine(name: string): boolean {
@@ -185,6 +204,7 @@ export class AgentApi {
   private readonly maxActiveRuns: number;
   private readonly inFlight = new Set<string>();
   private readonly resuming = new Set<string>();
+  private readonly liveLogStreams = new Map<string, LiveLogState>();
 
   constructor(options: AgentApiOptions) {
     this.opts = options;
@@ -666,6 +686,12 @@ export class AgentApi {
   async dispose(): Promise<void> {
     this.disposed = true;
     this.inFlight.clear();
+    for (const stream of this.liveLogStreams.values()) {
+      stream.stopping = true;
+      stream.controller.abort();
+      stream.drainController?.abort();
+    }
+    this.liveLogStreams.clear();
     await Promise.all(this.workers.map(worker => worker.dispose?.()));
   }
 
@@ -697,6 +723,7 @@ export class AgentApi {
       const worker = this.workerFor(entry.engine);
       if (!worker) continue;
       this.store.open(record.runId, record.createdAt, entry.engine);
+      this.startWorkerLogStream(record, worker);
       this.log({ event: 'poll_resumed', runId: record.runId, engine: entry.engine, operationId: record.spec.operationId });
       this.resuming.add(record.runId);
       void this.restoreAndPoll(record, worker);
@@ -770,6 +797,7 @@ export class AgentApi {
       // здесь и терминальным состоянием, новый процесс должен поллер перезапустить —
       // иначе результат потерян, а повтор клиента с новым ключом завёл бы второй ран.
       this.store.appendDispatched(record.runId, accepted.engine, this.nowIso());
+      this.startWorkerLogStream(record, accepted.worker);
       void this.pollUntilTerminal(record, accepted.worker, startedAt);
     } finally {
       this.inFlight.delete(record.runId);
@@ -960,6 +988,7 @@ export class AgentApi {
     if (this.disposed || this.store.progressOf(record.runId) === null) return true;
     try {
       const launch = await worker.result(record.runId);
+      await this.drainWorkerLogStream(record, worker);
       const mapping = mapLaunchResult(record.spec, launch, { startedAt, finishedAt: this.nowIso() }, { workerBaseUrl: worker.baseUrl });
       let publication = null;
       if (this.opts.profileWorkspace && launch.status === 'started') {
@@ -1035,7 +1064,24 @@ export class AgentApi {
 
   /** Единственное место, где ран становится терминальным. */
   private finalize(record: AdmissionRecord, mapping: LaunchMapping, publication: import('./stateless-store.js').RunProgress['publication'] = null): void {
-    this.store.append(record.runId, mapping.events);
+    const live = this.liveLogStreams.get(record.runId);
+    if (live) {
+      live.stopping = true;
+      live.controller.abort();
+      live.drainController?.abort();
+    }
+    this.liveLogStreams.delete(record.runId);
+    const filtered = mapping.events.flatMap(event => {
+      if (event.type !== 'log' || (event.payload.stream !== 'stdout' && event.payload.stream !== 'stderr') || !live) return [event];
+      const stream = event.payload.stream;
+      if (live.initialSourceCursor === 0 && live.completed && live.outputs[stream].length > 0) return [];
+      const remaining = remainingFinalOutput(event.payload.message, live.outputs[stream]);
+      return remaining.length > 0 ? [{ ...event, payload: { ...event.payload, message: remaining } }] : [];
+    });
+    const progress = this.store.progressOf(record.runId);
+    let sequence = progress?.sequence ?? 0;
+    const sequenced = filtered.map(event => ({ ...event, sequence: ++sequence }));
+    this.store.append(record.runId, sequenced);
     this.store.complete(record.runId, {
       state: mapping.result.outcome,
       result: mapping.result,
@@ -1046,6 +1092,104 @@ export class AgentApi {
       finishedAt: mapping.result.finishedAt,
       publication,
     });
+  }
+
+  /**
+   * Mirror a VM's replayable log SSE into the central event journal. Reconnect with the
+   * last worker sequence after transport loss; the worker's `end` frame closes the tail.
+   */
+  private startWorkerLogStream(record: AdmissionRecord, worker: ExternalWorker): void {
+    if (!worker.streamLogs || !isRegionalVmEngine(worker.name) || this.liveLogStreams.has(record.runId) || this.disposed) return;
+    const sourceCursor = this.store.workerLogCursor(record.runId).sourceSequence;
+    const state: LiveLogState = {
+      controller: new AbortController(),
+      drainController: null,
+      outputs: { stdout: '', stderr: '' },
+      initialSourceCursor: sourceCursor,
+      completed: false,
+      stopping: false,
+    };
+    this.liveLogStreams.set(record.runId, state);
+    void (async () => {
+      let cursor = sourceCursor;
+      while (!state.controller.signal.aborted && !state.stopping && !this.disposed) {
+        try {
+          const result = await worker.streamLogs!(record.runId, cursor, state.controller.signal,
+            (stream, message, workerSequence) => this.appendWorkerLog(record, state, stream, message, workerSequence));
+          cursor = Math.max(cursor, result.cursor);
+          if (result.completed) state.completed = true;
+          if (!result.supported || result.completed) return;
+        } catch (err) {
+          if (state.controller.signal.aborted || state.stopping || this.disposed) return;
+          this.log({ event: 'worker_log_stream_retry', runId: record.runId, cursor, message: err instanceof Error ? err.message : String(err) });
+        }
+        if (state.controller.signal.aborted || state.stopping || this.disposed) return;
+        await new Promise<void>(resolve => {
+          const done = (): void => {
+            clearTimeout(timer);
+            state.controller.signal.removeEventListener('abort', done);
+            resolve();
+          };
+          const timer = setTimeout(done, 250);
+          state.controller.signal.addEventListener('abort', done, { once: true });
+        });
+      }
+    })();
+  }
+
+  private appendWorkerLog(
+    record: AdmissionRecord,
+    state: LiveLogState,
+    stream: 'stdout' | 'stderr',
+    message: string,
+    sourceSequence: number,
+  ): void {
+    const cursor = this.store.workerLogCursor(record.runId);
+    if (sourceSequence <= cursor.sourceSequence) return;
+    const progress = this.store.progressOf(record.runId);
+    const safeMessage = logMessage(message);
+    let apiSequence = progress?.sequence ?? cursor.apiSequence;
+    if (progress && !isTerminalApiState(progress.state) && safeMessage.length > 0) {
+      const event: RunnerEvent = {
+        schemaVersion: RUNNER_EVENT_SCHEMA_VERSION,
+        eventId: newApiId('evt'),
+        runId: record.runId,
+        jobId: record.jobId,
+        userTaskId: record.userTaskId,
+        profileId: record.profileId,
+        ownerGeneration: record.ownerGeneration,
+        sequence: progress.sequence + 1,
+        timestamp: this.nowIso(),
+        type: 'log',
+        payload: { stream, level: 'info', message: safeMessage },
+      };
+      this.store.append(record.runId, [event]);
+      apiSequence = event.sequence;
+      state.outputs[stream] = `${state.outputs[stream]}${state.outputs[stream] ? ' ' : ''}${safeMessage}`.slice(-20_000);
+    }
+    this.store.recordWorkerLogCursor(record.runId, sourceSequence, apiSequence);
+  }
+
+  /** The terminal status can beat the worker's 250ms log poll; replay once at the terminal cursor before finalizing. */
+  private async drainWorkerLogStream(record: AdmissionRecord, worker: ExternalWorker): Promise<void> {
+    const state = this.liveLogStreams.get(record.runId);
+    if (!state || !worker.streamLogs || state.stopping) return;
+    state.stopping = true;
+    state.controller.abort();
+    const controller = new AbortController();
+    state.drainController = controller;
+    const timer = setTimeout(() => controller.abort(), 3000);
+    try {
+      const cursor = this.store.workerLogCursor(record.runId).sourceSequence;
+      const result = await worker.streamLogs(record.runId, cursor, controller.signal,
+        (stream, message, sourceSequence) => this.appendWorkerLog(record, state, stream, message, sourceSequence));
+      state.completed = result.supported && result.completed;
+    } catch (err) {
+      this.log({ event: 'worker_log_drain_incomplete', runId: record.runId, message: err instanceof Error ? err.message : String(err) });
+    } finally {
+      clearTimeout(timer);
+      state.drainController = null;
+    }
   }
 
   private principalFor(record: AdmissionRecord): Principal {
