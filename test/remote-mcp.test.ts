@@ -1,6 +1,6 @@
 import { describe, expect, it, vi, onTestFinished } from 'vitest';
 import { ExternalWorkerAdapter } from '../src/adapters/external-worker-adapter.js';
-import { configuredDocumentsBindingResolver, localDocumentsBindingResolver, parseRemoteMcpServerPolicies, registeredDocumentsBindingResolver, registryFixtureBindingResolver, REGISTRY_FIXTURE_BINDING_REF, REGISTRY_FIXTURE_EXPIRY_ENV, REGISTRY_FIXTURE_PROFILE_ID, REGISTRY_FIXTURE_SERVER_ID, REGISTRY_FIXTURE_TOKEN_ENV, REGISTRY_FIXTURE_TOOL, REGISTRY_FIXTURE_URL, resolveRemoteMcpAttachment, type DocumentsHttpRegistration, type RemoteMcpBinding, type RemoteMcpBindingContext, type RemoteMcpHostOptions } from '../src/adapters/remote-mcp.js';
+import { configuredDocumentsBindingResolver, localDocumentsBindingResolver, parseRemoteMcpServerPolicies, registeredDocumentsBindingResolver, registryFixtureBindingResolver, REGISTRY_FIXTURE_BINDING_REF, REGISTRY_FIXTURE_CATALOGUE_VERSION, REGISTRY_FIXTURE_EXPIRY_ENV, REGISTRY_FIXTURE_POLICY_VERSION, REGISTRY_FIXTURE_PROFILE_ID, REGISTRY_FIXTURE_REGISTRY_DIGEST, REGISTRY_FIXTURE_SCOPE, REGISTRY_FIXTURE_SERVER_ID, REGISTRY_FIXTURE_TOKEN_ENV, REGISTRY_FIXTURE_TOOL, REGISTRY_FIXTURE_URL, resolveRemoteMcpAttachment, type DocumentsHttpRegistration, type RemoteMcpBinding, type RemoteMcpBindingContext, type RemoteMcpHostOptions } from '../src/adapters/remote-mcp.js';
 import { validateSubmitRequest } from '../src/api/contracts.js';
 import { validateRunSpec, type RunSpec } from '../src/contracts/run-spec.js';
 import { makeRunSpec } from './helpers.js';
@@ -19,6 +19,7 @@ const now = new Date('2026-10-05T00:00:00.000Z');
 const descriptor = { serverId: 'documents', transport: 'remote' as const, url: 'https://mcp.example.test/mcp', bindingRef: 'docs-binding', allowedTools: ['read_sheet'], toolTimeoutMs: 1000 };
 const policies = { documents: { url: descriptor.url, tokenEnvName: 'RUNNER_MCP_DOCS_TOKEN', headers: { Authorization: 'Bearer {env:RUNNER_MCP_DOCS_TOKEN}' }, allowedTools: ['read_sheet', 'write_sheet'], bindingScopes: { 'docs-binding': 'documents:approved' }, startupTimeoutMs: 0 } };
 const token = 'opaque_fixture_token_123456';
+import { registryMcpTest160Descriptor as cpDescriptorFixture } from './fixtures/registry-mcp-test-160-descriptor.js';
 
 function setup() {
   const spec = makeRunSpec({ input: { inlinePrompt: 'read approved sheet' }, mcp: { servers: [descriptor] }, credentialBindings: [{ ref: descriptor.bindingRef, scope: 'documents:approved', status: 'active' }] });
@@ -75,6 +76,9 @@ describe('trusted registry fixture binding', () => {
       bindingScopes: { [REGISTRY_FIXTURE_BINDING_REF]: 'registry:fixture-read' },
       allowedTools: [REGISTRY_FIXTURE_TOOL],
       startupTimeoutMs: 0,
+      policyVersion: REGISTRY_FIXTURE_POLICY_VERSION,
+      catalogueVersion: REGISTRY_FIXTURE_CATALOGUE_VERSION,
+      registryDigest: REGISTRY_FIXTURE_REGISTRY_DIGEST,
     },
   };
   const context: RemoteMcpBindingContext = {
@@ -83,7 +87,8 @@ describe('trusted registry fixture binding', () => {
     profileId: REGISTRY_FIXTURE_PROFILE_ID, userTaskId: 'telegram-task-160', conversationId: 'telegram-conversation-160',
     ownerGeneration: 1, operationId: 'operation-160', engine: 'dynamic-ip-azure-agent-run',
     serverId: REGISTRY_FIXTURE_SERVER_ID, url: REGISTRY_FIXTURE_URL, allowedTools: [REGISTRY_FIXTURE_TOOL],
-    catalogueVersion: 'registry-fixture-catalogue-v1', policyVersion: 'registry-fixture-policy-v1',
+    catalogueVersion: REGISTRY_FIXTURE_CATALOGUE_VERSION, policyVersion: REGISTRY_FIXTURE_POLICY_VERSION,
+    registryDigest: REGISTRY_FIXTURE_REGISTRY_DIGEST,
   };
 
   it('creates a run-scoped binding only for the pinned test profile/server/tool and shared expiry', async () => {
@@ -106,7 +111,7 @@ describe('trusted registry fixture binding', () => {
       serverId: REGISTRY_FIXTURE_SERVER_ID, bindingRef: REGISTRY_FIXTURE_BINDING_REF,
       allowedTools: [REGISTRY_FIXTURE_TOOL], policyVersion: 'registry-fixture-policy-v1',
       catalogueVersion: 'registry-fixture-catalogue-v1',
-      registryDigest: '129ab5033964c3ed5be47414711026cc2469b3d9af90ce83ee071cba7f005ea9',
+      registryDigest: REGISTRY_FIXTURE_REGISTRY_DIGEST, scope: REGISTRY_FIXTURE_SCOPE,
     });
     expect(verifySignature(null, Buffer.from(`${parts[0]}.${parts[1]}`), signing.publicKey, Buffer.from(parts[2]!, 'base64url'))).toBe(true);
   });
@@ -119,6 +124,7 @@ describe('trusted registry fixture binding', () => {
     { label: 'catalogue version', ref: REGISTRY_FIXTURE_BINDING_REF, change: { catalogueVersion: 'other-catalogue' } },
     { label: 'policy version', ref: REGISTRY_FIXTURE_BINDING_REF, change: { policyVersion: 'other-policy' } },
     { label: 'scope', ref: REGISTRY_FIXTURE_BINDING_REF, change: { scope: 'registry:write' } },
+    { label: 'registry digest', ref: REGISTRY_FIXTURE_BINDING_REF, change: { registryDigest: '0'.repeat(64) } },
     { label: 'tool', ref: REGISTRY_FIXTURE_BINDING_REF, change: { allowedTools: ['registry.fixture_write'] } },
     { label: 'multiple tools', ref: REGISTRY_FIXTURE_BINDING_REF, change: { allowedTools: [REGISTRY_FIXTURE_TOOL, 'registry.fixture_write'] } },
   ] as Array<{ label: string; ref: string; change: Partial<RemoteMcpBindingContext> }>)('refuses a mismatched $label', async ({ ref, change }) => {
@@ -142,6 +148,9 @@ describe('trusted registry fixture binding', () => {
     expect(() => registryFixtureBindingResolver({ [REGISTRY_FIXTURE_SERVER_ID]: {
       ...registryPolicy[REGISTRY_FIXTURE_SERVER_ID], allowedTools: [REGISTRY_FIXTURE_TOOL, 'registry.fixture_write'],
     } }, token, expiry, fixtureSigningKey)).toThrow(/single read-only tool/);
+    expect(() => registryFixtureBindingResolver({ [REGISTRY_FIXTURE_SERVER_ID]: {
+      ...registryPolicy[REGISTRY_FIXTURE_SERVER_ID], registryDigest: '0'.repeat(64),
+    } }, token, expiry, fixtureSigningKey)).toThrow(/single read-only tool/);
     expect(registryFixtureBindingResolver({}, token, expiry)).toBeUndefined();
   });
 
@@ -149,8 +158,7 @@ describe('trusted registry fixture binding', () => {
     const spec = makeRunSpec({
       profileId: REGISTRY_FIXTURE_PROFILE_ID,
       userTaskId: context.userTaskId,
-      mcp: { servers: [{ serverId: REGISTRY_FIXTURE_SERVER_ID, transport: 'remote', url: REGISTRY_FIXTURE_URL, bindingRef: REGISTRY_FIXTURE_BINDING_REF,
-        allowedTools: [REGISTRY_FIXTURE_TOOL], catalogueVersion: 'registry-fixture-catalogue-v1', policyVersion: 'registry-fixture-policy-v1' }] },
+      mcp: { servers: [cpDescriptorFixture] },
     });
     spec.runId = context.runId;
     const resolver = registryFixtureBindingResolver(registryPolicy, token, expiry, fixtureSigningKey)!;
@@ -161,7 +169,23 @@ describe('trusted registry fixture binding', () => {
     const payload = JSON.parse(Buffer.from(parts[1]!, 'base64url').toString('utf8'));
     expect(payload).toMatchObject({ runId: context.runId, userTaskId: context.userTaskId, allowedTools: [REGISTRY_FIXTURE_TOOL] });
     expect(headers['X-MCP-Run-Id']).toBe(context.runId);
+    expect(headers['X-MCP-Scope']).toBe(REGISTRY_FIXTURE_SCOPE);
     expect(attachment!.mcpSecrets[REGISTRY_FIXTURE_TOKEN_ENV]).toBe(token);
+  });
+
+  it.each([
+    { label: 'scope', patch: { scope: 'registry:write' } },
+    { label: 'Registry digest', patch: { registryDigest: '0'.repeat(64) } },
+    { label: 'catalogue version', patch: { catalogueVersion: 'another-catalogue' } },
+    { label: 'policy version', patch: { policyVersion: 'another-policy' } },
+    { label: 'binding reference', patch: { bindingRef: 'another-binding' } },
+    { label: 'tool allowlist', patch: { allowedTools: ['registry.fixture_write'] } },
+  ])('refuses a drifted CP descriptor ($label) before calling the binding resolver', async ({ patch }) => {
+    const descriptor = { ...cpDescriptorFixture, ...patch };
+    const spec = makeRunSpec({ profileId: REGISTRY_FIXTURE_PROFILE_ID, mcp: { servers: [descriptor] } });
+    const resolver = vi.fn(registryFixtureBindingResolver(registryPolicy, token, expiry, fixtureSigningKey)!);
+    await expect(resolveRemoteMcpAttachment(spec, { servers: registryPolicy, resolveBinding: resolver }, now)).rejects.toThrow();
+    expect(resolver).not.toHaveBeenCalled();
   });
 
   it('loads test credentials only from dedicated host env and fails closed when incomplete', async () => {
