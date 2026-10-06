@@ -44,10 +44,13 @@ not registered or started, so the API can route the new run directly to the next
 If acceptance is uncertain, preserve the existing reconcile-before-failover rule; never
 start a second copy merely because a capacity response or connection was ambiguous.
 
-The API's configured order should be France → Russia → GitHub Actions. A France capacity
-refusal advances a new run to Russia; a Russia capacity refusal advances it to GHA. Once
-any worker accepts, capacity changes do not preempt or migrate that run. In Russia the
-existing regional engine policy must independently limit execution to OpenCode.
+The API's normal configured order should be France → Russia → GitHub Actions. A confirmed
+`WORKER_CAPACITY` refusal at or above the 60% CPU or RAM limit skips any remaining regional
+VM and sends that new run directly to GitHub Actions, preserving the 40% headroom for other
+host services. Unknown capacity or admission availability does not prove saturation and
+continues through the configured order. Once any worker accepts, capacity changes do not
+preempt or migrate that run. In Russia the existing regional engine policy must independently
+limit execution to OpenCode.
 
 ## Open implementation inputs
 
