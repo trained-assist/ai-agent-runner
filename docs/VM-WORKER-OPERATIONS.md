@@ -65,6 +65,27 @@ but publish only presence, source/store path, owner, and rotation metadata. Neve
 secret values. The updater requires `VM_WORKER_PUBLIC_URL` to be a valid HTTP(S) origin
 before it changes the active release.
 
+## Start another machine
+
+For a replacement VM, install the same signed release and preserve the existing
+`/var/lib/ai-agent-runner` data disk. Provision the OS, attach that disk at the same
+path, restore `/etc/ai-agent-runner/worker.env` and `worker-bindings.json` from the
+approved secret/config stores, then run the install and updater steps below. Give the
+replacement a unique `VM_WORKER_ID`; keep the regional engine (`eu-vm-agent-run` for
+France or `rf-vm-agent-run` for Russia). Verify `systemctl`, `/healthz`, `/version`,
+`/readyz`, and a small canary run before pointing the central API at the replacement.
+
+The router currently accepts only one `AGENT_API_WORKERS` entry per engine and rejects
+duplicate engine names. Therefore a second VM in the same region cannot yet be attached
+as a concurrent replica to add capacity. For a replacement, update that one engine's
+`baseUrl` and token in central `AGENT_API_WORKERS`; keep
+`AGENT_API_ENGINE_CHAIN=eu-vm-agent-run,rf-vm-agent-run,azure-dynamic-ip-agent-run`.
+The scheduled GitHub drift check also has one URL/token pair per region, so update the
+matching `EU_VM_WORKER_*` or `RU_VM_WORKER_*` repository secrets to the replacement.
+Adding multiple same-region VMs requires a router change that models endpoints under a
+single regional engine and selects among their health/capacity; do not assign a fake
+engine name to bypass the duplicate check.
+
 Prerequisites: Node.js 20+, systemd, GitHub CLI (`gh`), curl, an authenticated
 read-only GitHub token for release/attestation reads, an installed OpenCode binary,
 outbound access to the configured GCS bucket, and a TLS reverse proxy or equivalent
