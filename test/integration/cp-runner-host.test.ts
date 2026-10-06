@@ -119,7 +119,7 @@ describe('CP serialized submit → Runner admission/proof → Host MCP', () => {
 
         const actualHeaders = attached.headers as Record<string, string>;
         for (const [claim, value] of Object.entries({
-          catalogueVersion: 'other-catalogue', registryDigest: '0'.repeat(64), scope: 'registry:write',
+          catalogueVersion: 'other-catalogue', policyVersion: 'other-policy', registryDigest: '0'.repeat(64), scope: 'registry:write',
           userTaskId: 'foreign-task', profileId: 'foreign-profile', runId: 'run_aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
         })) {
           const parts = actualHeaders['X-MCP-Run-Binding'].split('.');
