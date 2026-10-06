@@ -1,6 +1,6 @@
 {
   "name": "ai-agent-runner",
-  "version": "0.1.0",
+  "version": "0.3.1",
   "private": true,
   "type": "module",
   "description": "Agent Runner \u2014 lifecycle of ai-agent-job runs (RunSpec, engine adapters, scoped events, fault injection) plus external Serverless Agent API (admission/result, idempotent receipts, replayable events) for a single VM",
@@ -10,8 +10,9 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "build": "tsc -p tsconfig.build.json && node scripts/copy-mcp-fixtures.mjs && node scripts/copy-isolation-probe.mjs",
+    "build": "tsc -p tsconfig.build.json && node scripts/copy-mcp-fixtures.mjs && node scripts/copy-isolation-probe.mjs && node scripts/write-vm-worker-build-info.mjs",
     "start": "node dist/api/main.js",
+    "start:vm-worker": "node dist/vm-worker/main.js",
     "test": "vitest run",
     "test:watch": "vitest"
   },

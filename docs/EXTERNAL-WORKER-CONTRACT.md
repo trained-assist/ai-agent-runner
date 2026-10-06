@@ -7,14 +7,19 @@
 ## Приоритетная цепочка движков (issue #100)
 
 У API может быть несколько воркеров — по одному на движок. Порядок проб задаёт конфиг
-`AGENT_API_ENGINE_CHAIN` (например `azure-dynamic-ip-agent-run,eu-vm-agent-run,rf-vm-agent-run`),
+`AGENT_API_ENGINE_CHAIN` (для текущей очереди `eu-vm-agent-run,rf-vm-agent-run,azure-dynamic-ip-agent-run`),
 а не сортировка имён: приоритет — решение владельца, и алфавит его не выражает.
 
 | Шаг | Движок | Где | Роль |
 |---|---|---|---|
-| 1 | `azure-dynamic-ip-agent-run` | GitHub Actions на Azure, динамический IP | основной, пробуем первым |
-| 2 | `eu-vm-agent-run` | наша VM в Европе | если первый не принял ран |
-| 3 | `rf-vm-agent-run` | наша VM в РФ | последний резерв |
+| 1 | `eu-vm-agent-run` | наша France VM | основной VM worker |
+| 2 | `rf-vm-agent-run` | наша Russia VM | следующий VM worker |
+| 3 | `azure-dynamic-ip-agent-run` | GitHub Actions, внешний Azure worker | serverless резерв |
+
+Capacity response `WORKER_CAPACITY` from either regional VM preserves 40% host headroom
+and cuts the new run directly over to GHA, skipping any remaining regional VM.
+`WORKER_CAPACITY_UNKNOWN` and `WORKER_ADMISSION_UNAVAILABLE` do not prove saturation, so
+they follow the configured regional order. Once any worker accepts, the run is not moved.
 
 ### Бюджет приёма рана
 
@@ -32,6 +37,8 @@
 | `WORKER_LAUNCH_UNREACHABLE` (нет ответа за бюджет) | да, но сначала reconcile (см. ниже) |
 | `WORKER_HTTP_ERROR` (воркер ответил ошибкой) | да, но сначала reconcile |
 | `WORKER_PROTOCOL_INVALID` (ответ вне контракта) | да, но сначала reconcile |
+| `WORKER_CAPACITY` (подтверждённый предел 60%) | для France/Russia — сразу GHA, без промежуточной VM |
+| `WORKER_CAPACITY_UNKNOWN` / `WORKER_ADMISSION_UNAVAILABLE` | следующий worker по очереди; отказ доказывает, что запуск не принят |
 | квитанция получена | **нет**: ран уже идёт, дальше только reconcile |
 | `unknown` (исход не установился) | **нет**: повод спрашивать принявший движок, а не запускать заново |
 | отказ на стороне API (нет промпта, `refs` без workspace, не задан `resultUrl`) | **нет**: другой движок его не обойдёт |
@@ -219,3 +226,12 @@ declared и verified. Snapshot/materialize, артефакты, MCP и interacti
 после рестарта API нет второго запуска, пользователь читает ответ и артефакт,
 ephemeral ресурс исчезает только после persist, следующая среда видит сохранённые
 данные. До этого #75/#76 не считаются завершённой serverless-миграцией.
+
+## Task-scoped ingress manifests
+
+`ingressManifest` is forwarded only to the France/Russia VM engines, whose packaged
+Runner wires `ControlPlaneIngressResolver` from the trusted `RUNNER_CONTROL_PLANE_*`
+bindings. The generic Azure/GitHub Actions worker has no configured resolver and is
+refused locally with `INGRESS_MANIFEST_UNSUPPORTED` before submit. Do not drop the pin
+or retry that run as a prompt-only task; configure a trusted resolver on that worker
+before enabling the capability there.

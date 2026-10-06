@@ -44,6 +44,7 @@ import type { CapabilityRegistry } from '../mcp/capabilities.js';
 import { bridgeSocketPath, newBridgeToken } from '../mcp/bridge.js';
 import { McpRunSession, McpStartupError, type EngineMcpConfig, type McpLogFields, type McpLogLevel } from '../mcp/session.js';
 import { McpRunScope, McpScopeError, type BindingValueResolver } from '../mcp/scope.js';
+import type { RunBranchWorker } from '../workspace/run-branch-worker.js';
 
 
 export interface RunnerHostInfo {
@@ -113,6 +114,8 @@ export interface RunnerOptions {
   inputs?: InputMaterializer;
   /** Private task-scoped Control Plane resolver. Credentials belong to deployment config only. */
   ingressResolver?: IngressArtifactResolver;
+  /** Profile workspace checkout/publication lifecycle; tokens remain memory-only. */
+  profileWorkspace?: RunBranchWorker;
   /**
    * Реестр capability handler'ов хоста (P13). Один и тот же реестр обслуживает вызовы MCP
    * ран'а и внутренний API control plane — бизнес-логика домена не дублируется в транспортах.
@@ -140,6 +143,8 @@ export interface RunnerOptions {
   bindingResolver?: BindingValueResolver;
   /** Команда broker'а MCP для движка; по умолчанию — per-run прокси из репозитория. */
   mcpBrokerCommand?: { command: string; args: string[] };
+  /** If false, a queued run recovered after a process restart is failed closed instead of relaunched. */
+  resumeQueuedRuns?: boolean;
 }
 
 export interface StartReceipt {
@@ -258,6 +263,13 @@ interface InternalRun {
    * содержимое не попадает — только источник и размер.
    */
   answerTail: string[];
+  /** Launch-only credentials. Deliberately memory-only and never written to RunStore. */
+  runtimeEnv: Record<string, string>;
+  /** Allowlisted secret values used to scrub engine output before it reaches durable logs. */
+  runtimeSecrets: string[];
+  workspaceToken: string | null;
+  repositoryCommit: string | null;
+  workspacePublishFailed: boolean;
 }
 
 /**
@@ -376,6 +388,14 @@ function formatMcpFields(fields: McpLogFields): string {
     .join(' ');
 }
 
+function redactRunSecrets(text: string, secrets: readonly string[]): string {
+  let result = text;
+  for (const secret of secrets) {
+    if (secret.length >= 4 && result.includes(secret)) result = result.split(secret).join('[redacted]');
+  }
+  return result;
+}
+
 export class Runner {
   private readonly opts: RunnerOptions;
   private readonly store: RunStore;
@@ -420,6 +440,11 @@ export class Runner {
         mcpConfigPath: null,
         room: null,
         answerTail: [],
+        runtimeEnv: {},
+        runtimeSecrets: [],
+        workspaceToken: null,
+        repositoryCommit: state.profileWorkspaceCommit ?? state.result?.repositoryCommit ?? null,
+        workspacePublishFailed: false,
       });
     }
   }
@@ -477,6 +502,23 @@ export class Runner {
     };
   }
 
+  /** Internal worker adapter view; repository credentials are removed from the returned copy. */
+  getRunSpec(runId: string): RunSpec | null {
+    const run = this.runs.get(runId);
+    if (!run) return null;
+    const spec = structuredClone(run.state.spec);
+    stripRepositoryToken(spec);
+    return spec;
+  }
+
+  /** Commit confirmed on the profile run branch. */
+  profileWorkspaceCommit(runId: string): string | null {
+    const run = this.runs.get(runId);
+    return run?.repositoryCommit ?? run?.state.profileWorkspaceCommit ?? run?.state.result?.repositoryCommit ?? null;
+  }
+
+  supportsProfileWorkspace(): boolean { return this.opts.profileWorkspace !== undefined; }
+
   events(runId: string, afterSequence = 0): RunnerEvent[] {
     const run = this.runs.get(runId);
     if (!run) return [];
@@ -499,7 +541,7 @@ export class Runner {
     return this.runExport(run.state, { force: true });
   }
 
-  start(input: unknown, operationIdArg?: string): StartReceipt {
+  start(input: unknown, operationIdArg?: string, runtimeEnv: Record<string, string> = {}): StartReceipt {
     const validated = validateRunSpec(input);
     if (!validated.ok) throw new SpecValidationError(validated.errors);
     const spec = validated.value;
@@ -585,6 +627,11 @@ export class Runner {
       mcpConfigPath: null,
       room: null,
       answerTail: [],
+      runtimeEnv: { ...runtimeEnv },
+      runtimeSecrets: [],
+      workspaceToken: spec.profileWorkspace ? spec.repository?.token ?? null : null,
+      repositoryCommit: null,
+      workspacePublishFailed: false,
     });
     this.emit(state, 'claimed', { operationId });
     void this.execute(spec.runId).catch(() => undefined);
@@ -757,8 +804,18 @@ export class Runner {
       }
       switch (st.state) {
         case 'queued':
-          report.resumedQueued += 1;
-          void this.execute(st.runId).catch(() => undefined);
+          if (this.opts.resumeQueuedRuns === false) {
+            this.completeWithoutEngine(st, 'failed', 'worker_crash', {
+              code: 'WORKER_RESTARTED_BEFORE_ENGINE_START',
+              failureClass: 'runtime',
+              safeSummary: 'worker restarted before the engine was confirmed; run was not relaunched',
+              retryable: true,
+            });
+            report.lost += 1;
+          } else {
+            report.resumedQueued += 1;
+            void this.execute(st.runId).catch(() => undefined);
+          }
           break;
         case 'starting':
           report.orphanedMcp += await this.reapOrphanedMcp(run);
@@ -825,6 +882,7 @@ export class Runner {
 
   dispose(): void {
     this.disposed = true;
+    for (const run of this.runs.values()) { run.runtimeEnv = {}; run.runtimeSecrets = []; }
     for (const controller of this.cloneControllers.values()) controller.abort();
     this.cloneControllers.clear();
     for (const run of this.runs.values()) {
@@ -1087,6 +1145,12 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
 
   private preflight(st: PersistedRunState): void {
     const spec = st.spec;
+    if (spec.profileWorkspace && !this.opts.profileWorkspace) {
+      throw new PreflightError('WORKER_PROFILE_WORKSPACE_UNSUPPORTED', 'this Runner has no profile workspace checkout/publication lifecycle');
+    }
+    if (spec.profileWorkspace && (!spec.repository?.revision || !spec.repository.token)) {
+      throw new PreflightError('CREDENTIALS_UNAVAILABLE', 'profile workspace requires a pinned base revision and publication token');
+    }
     if (spec.budget && !spec.budget.approved) {
       throw new PreflightError('BUDGET_UNAVAILABLE', spec.budget.reason ?? 'no approved budget for this run', { retryable: true });
     }
@@ -1140,6 +1204,11 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
       this.cloneControllers.set(st.runId, controller);
       if (this.disposed) controller.abort();
       await cloneRepository(source, st.spec.cwd, { signal: controller.signal });
+      const run = this.runs.get(st.runId);
+      if (st.spec.profileWorkspace && this.opts.profileWorkspace) {
+        if (!run?.workspaceToken) throw new PreflightError('CREDENTIALS_UNAVAILABLE', 'profile workspace publication credential is unavailable');
+        await this.opts.profileWorkspace.prepare(st.spec, st.spec.cwd, run.workspaceToken);
+      }
     } finally {
       this.cloneControllers.delete(st.runId);
       // токен живёт только до попытки clone: в движок, env и журналы он не уходит
@@ -1466,6 +1535,10 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
    */
   private buildEngineEnv(run: InternalRun, spec: RunSpec): Record<string, string> {
     const env = this.buildEnv(spec);
+    for (const name of spec.envAllowlist) {
+      if (Object.prototype.hasOwnProperty.call(run.runtimeEnv, name)) env[name] = run.runtimeEnv[name]!;
+    }
+    run.runtimeSecrets = spec.envAllowlist.map((name) => env[name]).filter((value): value is string => typeof value === 'string' && value.length >= 4);
     const room = run.room;
     if (room) {
       // run-scoped HOME/config/cache/tmp: движок не видит и не пишет пользовательский
@@ -1674,7 +1747,7 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
     const st = run.state;
     if (isTerminalState(st.state)) return;
     const limit = st.spec.limits.maxOutputBytes ?? st.spec.limits.maxLogBytes ?? DEFAULT_MAX_LOG_LINE;
-    const sanitized = redactSecrets(truncateLine(rawLine, limit)).replace(/[\x00-\x1f]/g, ' ');
+    const sanitized = redactRunSecrets(redactSecrets(truncateLine(rawLine, limit)), run.runtimeSecrets).replace(/[\x00-\x1f]/g, ' ');
     if (sanitized.length === 0) return;
     if (stream === 'stdout') this.rememberAnswerLine(run, sanitized);
     this.emit(st, 'log', { stream, level: 'info', message: sanitized });
@@ -1697,6 +1770,8 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
     const st = run.state;
     if (isTerminalState(st.state)) return;
     run.exitReceived = true;
+    run.runtimeEnv = {};
+    run.runtimeSecrets = [];
     this.clearTimers(run);
     // P13: MCP-процессы рана живут дольше движка только до его выхода; дальше — cleanup.
     // Причина берётся из состояния рана: отмена/таймаут двигателя гасят MCP с той же причиной.
@@ -1734,6 +1809,8 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
     exitReason: 'cancelled' | 'preflight_refused' | 'worker_crash' | 'startup_failure',
     failure?: RunResult['failure'],
   ): void {
+    const internalRun = this.runs.get(st.runId);
+    if (internalRun) { internalRun.runtimeEnv = {}; internalRun.runtimeSecrets = []; }
     const result: RunResult = {
       schemaVersion: 1,
       runId: st.runId,
@@ -1815,6 +1892,23 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
     // Выход определяется здесь: объявленные выходы плюс явный манифест агента, а текст
     // ответа сохраняется отдельным выходом до того, как начнётся экспорт (issue #52).
     const run = this.runs.get(st.runId);
+    if (st.spec.profileWorkspace && this.opts.profileWorkspace) {
+      try {
+        if (st.profileWorkspaceCommit) {
+          if (run) run.repositoryCommit = st.profileWorkspaceCommit;
+        } else {
+          if (!run?.workspaceToken) throw new Error('profile workspace publication credential is unavailable');
+          run.repositoryCommit = await this.opts.profileWorkspace.publish(st.spec, st.spec.cwd, run.workspaceToken);
+          st.profileWorkspaceCommit = run.repositoryCommit;
+          this.store.saveState(st);
+          run.workspaceToken = null;
+        }
+      } catch (error) {
+        if (run) { run.workspacePublishFailed = true; run.workspaceToken = null; }
+        const detail = truncateLine(redactSecrets(error instanceof Error ? error.message : String(error)), 300);
+        this.emit(st, 'log', { stream: 'runner', level: 'error', message: `profile_workspace.publish_failed runId=${st.runId} detail=${detail}; workspace retained` });
+      }
+    }
     const exit = run ? this.resolveExit(run, st) : null;
     // Fast result boundary: persist the engine outcome and answer before any declared
     // output upload. The checkpoint + result are durable on the Runner host; the clean
@@ -1860,7 +1954,7 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
     // Единственная копия выхода остаётся на диске: слот не отдаём, переиспользование
     // открыло бы прежние данные рана.
     const cleanup = await this.sweepRunEnvironment(run, soleCopies.length > 0 ? 'sole_copy_retained' : `finalized_${st.exit ? 'engine_exit' : 'startup_failure'}`, {
-      keepWorkspace: soleCopies.length > 0,
+      keepWorkspace: soleCopies.length > 0 || run?.workspacePublishFailed === true,
     });
 
     const result: RunResult = {
@@ -2443,6 +2537,7 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
       cleanup: cleanupStatus.status,
       cleanupReason: cleanupStatus.reason,
       logPath: this.store.relLogPath(st.runId),
+      ...(this.runs.get(st.runId)?.repositoryCommit ? { repositoryCommit: this.runs.get(st.runId)!.repositoryCommit! } : {}),
     };
     if (failure) result.failure = failure;
     return result;

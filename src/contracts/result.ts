@@ -52,6 +52,8 @@ export interface RunResult {
   persistence: 'pending' | 'persisted' | 'failed' | 'not_required';
   /** Причина статуса сохранения (какой выход остался единственной копией и почему). */
   persistenceReason?: string;
+  /** Commit published by a profile-workspace worker; never contains credentials. */
+  repositoryCommit?: string;
   /**
    * Уборка чистой среды — тоже отдельный статус (issue #52, шаг 5).
    * `completed` означает проверенный контракт уборки (каталоги и сокет рана сняты,
@@ -96,6 +98,7 @@ const RESULT_KEYS = [
   'outputRefs',
   'persistence',
   'persistenceReason',
+  'repositoryCommit',
   'cleanup',
   'cleanupReason',
   'logPath',
@@ -110,7 +113,7 @@ const OUTCOME_EXIT_REASONS: Record<RunOutcome, readonly ExitReason[]> = {
 export function validateRunResult(input: unknown): ValidationResult<RunResult> {
   const collector = new ErrorCollector();
   if (!checkObject(input, 'result', collector)) return collector.finish(undefined as never);
-  const optional = new Set(['failure', 'persistenceReason', 'cleanupReason', 'text']);
+  const optional = new Set(['failure', 'persistenceReason', 'repositoryCommit', 'cleanupReason', 'text']);
   const required = RESULT_KEYS.filter((key) => !optional.has(key));
   checkKeys(input, RESULT_KEYS, required, 'result', collector);
 
@@ -139,6 +142,7 @@ export function validateRunResult(input: unknown): ValidationResult<RunResult> {
 
   if (input['exitCode'] !== null && typeof input['exitCode'] !== 'number') collector.push('result.exitCode: expected number or null');
   if (input['exitSignal'] !== null && typeof input['exitSignal'] !== 'string') collector.push('result.exitSignal: expected string or null');
+  if (input['repositoryCommit'] !== undefined && (typeof input['repositoryCommit'] !== 'string' || !/^[0-9a-f]{40}$/.test(input['repositoryCommit']))) collector.push('result.repositoryCommit: expected commit sha');
   if (typeof input['exitObserved'] !== 'boolean') collector.push('result.exitObserved: expected boolean');
   if (!isUtcTimestamp(input['startedAt'])) collector.push('result.startedAt: expected UTC ISO timestamp');
   if (!isUtcTimestamp(input['finishedAt'])) collector.push('result.finishedAt: expected UTC ISO timestamp');
