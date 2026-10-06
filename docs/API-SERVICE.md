@@ -71,6 +71,7 @@ API больше не используется** и удаляется отде�
 | `AGENT_API_PROFILE_OWNER` | — | организация приватных репозиториев профиля; обязательна при включении профиля |
 | `AGENT_API_PROFILE_GITHUB_TOKEN` | — | хостовый токен GitHub для ensure/fetch/publish; не попадает в агентское окружение или журнал |
 | `AGENT_API_PROFILE_OBJECT_BACKEND` | `gcs` | хранилище тяжёлых файлов; `local-fs` только для локального fixture, GCS использует `GCS_BUCKET` и ADC |
+| `GCP_PROJECT` / `GOOGLE_CLOUD_PROJECT` | — | ID проекта GCS; задавайте явно при Workload Identity Federation, чтобы чтение метаданных объекта не запрашивало доступ к Cloud Resource Manager |
 | `AGENT_API_PUBLIC_URL` | `http://<host>:<port>` | публичный адрес API: воркер возвращает результат на `POST {resultUrl}`. Без него запуск падает с `RESULT_URL_UNSET` |
 | `EXTERNAL_WORKER_LAUNCH_DEADLINE_MS` | `600000` | таймаут опроса `status`/`result`; заодно бюджет приёма, если у движка не задан `acceptDeadlineMs` |
 | `EXTERNAL_WORKER_CANCEL_DEADLINE_MS` | `30000` | таймаут ожидания подтверждения отмены |
@@ -97,7 +98,8 @@ GHA worker сохраняет разрешённые изменения отсл
 
 Для включения режима профиля API нужны `AGENT_API_PROFILE_WORKSPACE_ROOT` на постоянном
 томе, `AGENT_API_ADMISSION_LOG` на том же постоянном томе, `AGENT_API_PROFILE_OWNER`,
-`AGENT_API_PROFILE_GITHUB_TOKEN`, `AGENT_API_PROFILE_OBJECT_BACKEND=gcs` и `GCS_BUCKET`.
+`AGENT_API_PROFILE_GITHUB_TOKEN`, `AGENT_API_PROFILE_OBJECT_BACKEND=gcs`, `GCS_BUCKET`
+и `GCP_PROJECT` (либо `GOOGLE_CLOUD_PROJECT`) при WIF.
 Ключи в `AGENT_API_KEY_REGISTRY` должны задавать `tenantId` и `profileId`. У GHA worker
 переменная `GCS_PROFILE_BUCKET` должна совпадать с `GCS_BUCKET` API, а Workload Identity
 service account должен читать и записывать объекты этого приватного bucket.
