@@ -17,7 +17,7 @@ import {
   type RunLimits,
   type RunSpec,
 } from '../contracts/run-spec.js';
-import { ErrorCollector, checkKeys, checkObject, checkString, type ValidationResult } from '../contracts/validate.js';
+import { ErrorCollector, checkKeys, checkObject, checkString, checkText, type ValidationResult } from '../contracts/validate.js';
 
 /**
  * Способность границы изоляции. Объявлена здесь, а не импортом из `src/isolation/`: stateless-ядро
@@ -322,7 +322,7 @@ export function validateSubmitRequest(input: unknown): ValidationResult<SubmitRe
   checkKeys(input, SUBMIT_KEYS, SUBMIT_REQUIRED, 'request', collector);
   if (input['userTaskId'] !== undefined) checkString(input['userTaskId'], 'request.userTaskId', collector, 200);
   if (input['conversationId'] !== undefined) checkString(input['conversationId'], 'request.conversationId', collector, 200);
-  if (input['instructions'] !== undefined) checkString(input['instructions'], 'request.instructions', collector, 10_000);
+  if (input['instructions'] !== undefined) checkText(input['instructions'], 'request.instructions', collector, 10_000);
   if (input['ingressManifest'] !== undefined && checkObject(input['ingressManifest'], 'request.ingressManifest', collector)) {
     const pin = input['ingressManifest'];
     checkKeys(pin, ['contractVersion', 'manifestRef', 'manifestVersion'], ['contractVersion', 'manifestRef', 'manifestVersion'], 'request.ingressManifest', collector);
