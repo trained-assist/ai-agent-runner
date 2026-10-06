@@ -187,12 +187,27 @@ RunSpec получил необязательную группу `repository`: �
 |---|---|---|
 | `repository.fullName` | `owner/name` (regex, до 200 символов) | целевая репозитория, клонируется из `<base>/<fullName>.git` |
 | `repository.token` | непустая строка до 500 символов (опционально) | токен доступа для приватной репы |
+| `repository.revision` | commit SHA (опционально) | закреплённая базовая ревизия; используется для постоянного профиля |
 
 - **Пустая/отсутствующая группа = дефолтный режим**: клонируется `trained-assist/ai-agent-runner` (константа `DEFAULT_REPOSITORY_FULL_NAME`, env-оверрайд `RUNNER_DEFAULT_REPO` — для тестов: `owner/name` либо готовый источник вида `/tmp/fixture.git`/`file:///…`). Задачи без явной репозитории идут в контексте этого продукта.
 - **Клон делает runner, не движок**: child-процесс `git clone --depth 1` в `src/runner/repository.ts`, таймаут 60 с (`CLONE_TIMEOUT_MS`). Движок получает только `cwd` готового клона; токен в его окружение не передаётся.
 - **Секретность токена**: в stateless API токен репозитории не показывается клиенту — его нет ни в receipt/status/events/result/artifacts, ни в логах, ни в журнале приёма на диск. Воркеру он уходит в `LaunchRequest.publicationToken` (`external-worker-adapter.ts`), потому что воркер запускается в чужом репозитории и кладёт выходы именно в `repository.fullName` задачи: на живом замере 05.10.2026 без этого артефакты легли в 1 запуск из 16. В `workflow_dispatch` токен не попадает — воркер забирает его по одноразовому claim-токену, а claim-ответ помечен `no-store`; в диспатч уезжают только `runId` и `claimToken`. У оставшегося Runner'а (библиотека, не обслуживающий путь) токен не попадает в argv git — он уходит в окружение child'а и доходит до git через статический `GIT_ASKPASS`-помошник; `redactRepositoryToken` вычищает поле из `state.json` и из хэшей (`specHash`/`submitPayloadHash` — ротация токена не ломает идемпотентность), `stripRepositoryToken` — из живой структуры после clone; `redactSecrets` дополнительно маскирует `ghp_…`/`github_pat_…`/`x-access-token:…`.
 - **Ошибки**: любой сбой clone (404/403/нет сети/нет git/таймаут) — не crash, а структурированный отказ: `failure.code = REPOSITORY_UNAVAILABLE`, состояние `failed`, `exitReason = preflight_refused`, понятное сообщение в `safeSummary` (через redaction). API-валидация кривого `fullName` → **400 `INVALID_REPOSITORY`**.
 - **Переопределения для тестов/гетерогенных стендов**: `RUNNER_DEFAULT_REPO`, `RUNNER_REPOSITORY_BASE_URL` (базовый URL вместо `https://github.com` — локальный git-сервер в тестах, self-hosted GitHub). Тесты офлайновые: `npm test` поднимает локальный фикстурный репозиторий (`test/default-repo-fixture-setup.ts`), интеграционные пробы идут на локальном git-сервере с Basic-auth.
+
+### Постоянное состояние профиля на VM
+
+Для `profileWorkspace` VM Runner использует переданные API `repository.revision`,
+артефактные refs и краткоживущий `publicationToken`: checkout идёт на
+`agent-run/<runId>`, большие файлы проверяются и материализуются из GCS, а файлы,
+исключённые `DEFAULT_EXPORT_POLICY`, удаляются до старта движка. После движка Runner
+формирует отдельный безопасный Git index, публикует текстовые изменения в run branch,
+загружает большие объекты с read-back SHA-проверкой и возвращает commit в
+`RunResult.repositoryCommit` / `LaunchResult.repo.commit`. API проверяет этот commit и
+делает каноническую публикацию через `publishRunBranch` с CAS. Если push или проверка
+объекта не прошли, workspace остаётся на диске, commit не подтверждается, и API не
+показывает сохранение как успешное. Реализация и локальный bare-Git тест находятся в
+`src/workspace/run-branch-worker.ts` и `test/profile-workspace-run-branch.test.ts`.
 
 Env/константы: `RUNNER_DEFAULT_REPO` (дефолтная репа), `RUNNER_REPOSITORY_BASE_URL` (база URL), `CLONE_TIMEOUT_MS=60000` (таймаут clone).
 

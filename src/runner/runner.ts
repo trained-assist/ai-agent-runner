@@ -44,6 +44,7 @@ import type { CapabilityRegistry } from '../mcp/capabilities.js';
 import { bridgeSocketPath, newBridgeToken } from '../mcp/bridge.js';
 import { McpRunSession, McpStartupError, type EngineMcpConfig, type McpLogFields, type McpLogLevel } from '../mcp/session.js';
 import { McpRunScope, McpScopeError, type BindingValueResolver } from '../mcp/scope.js';
+import type { RunBranchWorker } from '../workspace/run-branch-worker.js';
 
 
 export interface RunnerHostInfo {
@@ -113,6 +114,8 @@ export interface RunnerOptions {
   inputs?: InputMaterializer;
   /** Private task-scoped Control Plane resolver. Credentials belong to deployment config only. */
   ingressResolver?: IngressArtifactResolver;
+  /** Profile workspace checkout/publication lifecycle; tokens remain memory-only. */
+  profileWorkspace?: RunBranchWorker;
   /**
    * Реестр capability handler'ов хоста (P13). Один и тот же реестр обслуживает вызовы MCP
    * ран'а и внутренний API control plane — бизнес-логика домена не дублируется в транспортах.
@@ -264,6 +267,9 @@ interface InternalRun {
   runtimeEnv: Record<string, string>;
   /** Allowlisted secret values used to scrub engine output before it reaches durable logs. */
   runtimeSecrets: string[];
+  workspaceToken: string | null;
+  repositoryCommit: string | null;
+  workspacePublishFailed: boolean;
 }
 
 /**
@@ -436,6 +442,9 @@ export class Runner {
         answerTail: [],
         runtimeEnv: {},
         runtimeSecrets: [],
+        workspaceToken: null,
+        repositoryCommit: state.profileWorkspaceCommit ?? state.result?.repositoryCommit ?? null,
+        workspacePublishFailed: false,
       });
     }
   }
@@ -501,6 +510,14 @@ export class Runner {
     stripRepositoryToken(spec);
     return spec;
   }
+
+  /** Commit confirmed on the profile run branch. */
+  profileWorkspaceCommit(runId: string): string | null {
+    const run = this.runs.get(runId);
+    return run?.repositoryCommit ?? run?.state.profileWorkspaceCommit ?? run?.state.result?.repositoryCommit ?? null;
+  }
+
+  supportsProfileWorkspace(): boolean { return this.opts.profileWorkspace !== undefined; }
 
   events(runId: string, afterSequence = 0): RunnerEvent[] {
     const run = this.runs.get(runId);
@@ -612,6 +629,9 @@ export class Runner {
       answerTail: [],
       runtimeEnv: { ...runtimeEnv },
       runtimeSecrets: [],
+      workspaceToken: spec.profileWorkspace ? spec.repository?.token ?? null : null,
+      repositoryCommit: null,
+      workspacePublishFailed: false,
     });
     this.emit(state, 'claimed', { operationId });
     void this.execute(spec.runId).catch(() => undefined);
@@ -1111,6 +1131,12 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
 
   private preflight(st: PersistedRunState): void {
     const spec = st.spec;
+    if (spec.profileWorkspace && !this.opts.profileWorkspace) {
+      throw new PreflightError('WORKER_PROFILE_WORKSPACE_UNSUPPORTED', 'this Runner has no profile workspace checkout/publication lifecycle');
+    }
+    if (spec.profileWorkspace && (!spec.repository?.revision || !spec.repository.token)) {
+      throw new PreflightError('CREDENTIALS_UNAVAILABLE', 'profile workspace requires a pinned base revision and publication token');
+    }
     if (spec.budget && !spec.budget.approved) {
       throw new PreflightError('BUDGET_UNAVAILABLE', spec.budget.reason ?? 'no approved budget for this run', { retryable: true });
     }
@@ -1164,6 +1190,11 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
       this.cloneControllers.set(st.runId, controller);
       if (this.disposed) controller.abort();
       await cloneRepository(source, st.spec.cwd, { signal: controller.signal });
+      const run = this.runs.get(st.runId);
+      if (st.spec.profileWorkspace && this.opts.profileWorkspace) {
+        if (!run?.workspaceToken) throw new PreflightError('CREDENTIALS_UNAVAILABLE', 'profile workspace publication credential is unavailable');
+        await this.opts.profileWorkspace.prepare(st.spec, st.spec.cwd, run.workspaceToken);
+      }
     } finally {
       this.cloneControllers.delete(st.runId);
       // токен живёт только до попытки clone: в движок, env и журналы он не уходит
@@ -1847,6 +1878,23 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
     // Выход определяется здесь: объявленные выходы плюс явный манифест агента, а текст
     // ответа сохраняется отдельным выходом до того, как начнётся экспорт (issue #52).
     const run = this.runs.get(st.runId);
+    if (st.spec.profileWorkspace && this.opts.profileWorkspace) {
+      try {
+        if (st.profileWorkspaceCommit) {
+          if (run) run.repositoryCommit = st.profileWorkspaceCommit;
+        } else {
+          if (!run?.workspaceToken) throw new Error('profile workspace publication credential is unavailable');
+          run.repositoryCommit = await this.opts.profileWorkspace.publish(st.spec, st.spec.cwd, run.workspaceToken);
+          st.profileWorkspaceCommit = run.repositoryCommit;
+          this.store.saveState(st);
+          run.workspaceToken = null;
+        }
+      } catch (error) {
+        if (run) { run.workspacePublishFailed = true; run.workspaceToken = null; }
+        const detail = truncateLine(redactSecrets(error instanceof Error ? error.message : String(error)), 300);
+        this.emit(st, 'log', { stream: 'runner', level: 'error', message: `profile_workspace.publish_failed runId=${st.runId} detail=${detail}; workspace retained` });
+      }
+    }
     const exit = run ? this.resolveExit(run, st) : null;
     // Ответ агента уходит в хранилище до экспорта объявленных выходов: сбой экспорта
     // не должен стоить клиенту текста ответа.
@@ -1870,7 +1918,7 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
     // Единственная копия выхода остаётся на диске: слот не отдаём, переиспользование
     // открыло бы прежние данные рана.
     const cleanup = await this.sweepRunEnvironment(run, soleCopies.length > 0 ? 'sole_copy_retained' : `finalized_${st.exit ? 'engine_exit' : 'startup_failure'}`, {
-      keepWorkspace: soleCopies.length > 0,
+      keepWorkspace: soleCopies.length > 0 || run?.workspacePublishFailed === true,
     });
 
     const result = this.computeResult(st, exportManifest, cleanup);
@@ -2447,6 +2495,7 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
       cleanup: cleanupStatus.status,
       cleanupReason: cleanupStatus.reason,
       logPath: this.store.relLogPath(st.runId),
+      ...(this.runs.get(st.runId)?.repositoryCommit ? { repositoryCommit: this.runs.get(st.runId)!.repositoryCommit! } : {}),
     };
     if (failure) result.failure = failure;
     return result;
