@@ -1,6 +1,11 @@
-import { describe, expect, it } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { describe, expect, it, onTestFinished } from 'vitest';
+import { StatelessStore } from '../src/api/stateless-store.js';
 import {
   SseCollector,
+  alphaPrincipal,
   alphaKey,
   authHeader,
   getArtifacts,
@@ -85,6 +90,32 @@ describe('http auth, scopes and structured refusals', () => {
 });
 
 describe('http submit, status, result, artifacts, events and cancel', () => {
+  it('requires run ownership and writes an explicit operator tombstone without claiming Runner result', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'runner-http-operator-resolution-'));
+    onTestFinished(() => rmSync(dir, { recursive: true, force: true }));
+    const h = await startHttpHarness({ worker: { registerAfterMs: 5000 }, store: new StatelessStore({}, join(dir, 'admissions.jsonl')) });
+    const submit = await postSubmit(h.base, alphaKey, 'idem-http-operator-resolution', submitBody());
+    expect(submit.status).toBe(202);
+    const receipt = await submit.json() as { runId: string };
+    await waitForAsync(async () => ((await getStatus(h.base, alphaKey, receipt.runId).then((r) => r.json())) as { state: string }).state === 'unknown');
+
+    const response = await fetch(`${h.base}/v1/runs/${receipt.runId}/resolve-unknown`, {
+      method: 'POST',
+      headers: { ...authHeader(alphaKey), 'content-type': 'application/json' },
+      body: JSON.stringify({ confirmation: 'process_confirmed_absent', evidence: 'Operator verified process absence.' }),
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      runId: receipt.runId,
+      state: 'unknown',
+      pollingStopped: true,
+      runnerResultObserved: false,
+      operatorResolution: { kind: 'process_confirmed_absent', actorPrincipalId: alphaPrincipal.principalId },
+    });
+    expect(h.worker.launches).toHaveLength(1);
+    await h.close();
+  }, 20000);
+
   it('принимает задачу, дедуплицирует по ключу и отдаёт status/result/artifacts/events', async () => {
     const h = await startHttpHarness();
 

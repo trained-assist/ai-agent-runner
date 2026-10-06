@@ -27,7 +27,16 @@ export const STATELESS_STORE_SCHEMA_VERSION = 2 as const;
  */
 export type JournalLine =
   | { kind: 'admission'; record: AdmissionRecord }
-  | { kind: 'dispatched'; runId: string; engine: string; at: string };
+  | { kind: 'dispatched'; runId: string; engine: string; at: string }
+  | { kind: 'operator_resolution'; runId: string; resolution: OperatorResolution };
+
+/** Operator attestation stops reconcile without fabricating a Runner result. */
+export interface OperatorResolution {
+  kind: 'process_confirmed_absent';
+  actorPrincipalId: string;
+  evidence: string;
+  resolvedAt: string;
+}
 
 export interface AdmissionRecord {
   schemaVersion: typeof STATELESS_STORE_SCHEMA_VERSION;
@@ -53,6 +62,7 @@ export interface RunProgress {
   /** Сколько событий отброшено по лимиту памяти процесса. */
   droppedEvents: number;
   cancelRequested: 'cancel' | 'timeout' | null;
+  operatorResolution: OperatorResolution | null;
   connectionLost: boolean;
   result: RunResult | null;
   artifacts: LaunchArtifact[];
@@ -137,6 +147,11 @@ export class StatelessStore {
     }
   }
 
+  private writeRequired(line: JournalLine): void {
+    if (!this.persistPath) return;
+    appendFileSync(this.persistPath, `${JSON.stringify(line)}\n`, 'utf8');
+  }
+
   /** Восстановить приёмные записи из журнала. Повреждённые хвостовые строки пропускаются. */
   private replay(path: string): void {
     let raw: string;
@@ -146,16 +161,23 @@ export class StatelessStore {
       return; // журнала ещё нет — это первый запуск
     }
     let restored = 0;
-    let resumed = 0;
     for (const line of raw.split('\n')) {
       const trimmed = line.trim();
       if (!trimmed) continue;
       try {
         const entry = JSON.parse(trimmed) as JournalLine;
+        if (entry.kind === 'operator_resolution') {
+          const record = this.byRun.get(entry.runId);
+          if (!record || !isOperatorResolution(entry.resolution) || entry.resolution.actorPrincipalId !== record.principalId) continue;
+          const run = this.open(entry.runId, record.createdAt);
+          run.operatorResolution = entry.resolution;
+          run.state = 'unknown';
+          run.updatedAt = entry.resolution.resolvedAt;
+          continue;
+        }
         if (entry.kind === 'dispatched') {
           if (typeof entry.runId === 'string' && entry.runId.length > 0) {
             this.dispatched.set(entry.runId, { runId: entry.runId, engine: String(entry.engine ?? ''), at: String(entry.at ?? '') });
-            resumed += 1;
           }
           continue;
         }
@@ -170,6 +192,7 @@ export class StatelessStore {
       }
     }
     if (restored > 0) console.warn(`[stateless-store] restored ${restored} admission records from ${path}`);
+    const resumed = [...this.dispatched.keys()].filter((runId) => !this.progress.get(runId)?.operatorResolution).length;
     if (resumed > 0) console.warn(`[stateless-store] ${resumed} dispatched runs will resume polling`);
   }
 
@@ -221,6 +244,7 @@ export class StatelessStore {
       events: [],
       droppedEvents: 0,
       cancelRequested: null,
+      operatorResolution: null,
       connectionLost: false,
       result: null,
       artifacts: [],
@@ -238,6 +262,23 @@ export class StatelessStore {
 
   progressOf(runId: string): RunProgress | null {
     return this.progress.get(runId) ?? null;
+  }
+
+  hasDurableJournal(): boolean {
+    return this.persistPath !== null;
+  }
+
+  resolveUnknown(runId: string, resolution: OperatorResolution): OperatorResolution {
+    const run = this.progress.get(runId);
+    if (!run) throw new Error('operator resolution requires an open run');
+    if (run.operatorResolution) return run.operatorResolution;
+    if (run.state !== 'unknown') throw new Error('only unknown runs can be operator-resolved');
+    // This is a tombstone, not a Runner result: persist before stopping future polling.
+    // Unlike best-effort admission journaling, failure here must leave reconciliation active.
+    this.writeRequired({ kind: 'operator_resolution', runId, resolution });
+    run.operatorResolution = resolution;
+    run.updatedAt = resolution.resolvedAt;
+    return resolution;
   }
 
   /**
@@ -323,7 +364,7 @@ export class StatelessStore {
   activeRuns(): number {
     let active = 0;
     for (const run of this.progress.values()) {
-      if (!isTerminalApiState(run.state)) active += 1;
+      if (!isTerminalApiState(run.state) && !run.operatorResolution) active += 1;
     }
     return active;
   }
@@ -369,6 +410,19 @@ function admissionKey(principalId: string, idempotencyKey: string): string {
 
 function taskKey(principalId: string, userTaskId: string): string {
   return `${principalId}\u0000${userTaskId}`;
+}
+
+function isOperatorResolution(value: unknown): value is OperatorResolution {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const resolution = value as Record<string, unknown>;
+  return resolution.kind === 'process_confirmed_absent'
+    && typeof resolution.actorPrincipalId === 'string'
+    && resolution.actorPrincipalId.length > 0
+    && typeof resolution.evidence === 'string'
+    && resolution.evidence.trim().length >= 8
+    && resolution.evidence.length <= 500
+    && typeof resolution.resolvedAt === 'string'
+    && Number.isFinite(Date.parse(resolution.resolvedAt));
 }
 
 function isTerminalEvent(event: RunnerEvent): boolean {

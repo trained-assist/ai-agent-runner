@@ -84,6 +84,16 @@ API больше не используется** и удаляется отде�
 | `GET /v1/runs/{id}/artifacts` | ветка рана, ссылка на merge, ссылки на файлы по коммиту и `logUrl` |
 | `GET /v1/runs/{id}/log` | `302` на ссылку лога в Google Storage |
 | `POST /v1/runs/{id}/cancel` | пробрасывает отмену воркеру; `202` — принята, `200` — уже терминальный |
+| `POST /v1/runs/{id}/resolve-unknown` | owner-only операторский tombstone при подтверждённом отсутствии процесса; сохраняет `unknown`, не подменяет Runner result |
+
+`resolve-unknown` требует scope `runs:write`, durable admission journal и тело
+`{"confirmation":"process_confirmed_absent","evidence":"..."}`. Он разрешает только
+Run в `unknown`, сохраняет principal/evidence/timestamp отдельной строкой, останавливает
+polling/recovery и сохраняет исходный admission и idempotency key. Повторный submit с тем
+же ключом возвращает тот же receipt; replacement здесь не создаётся. `RunStatusView`
+остаётся `unknown` и возвращает operator tombstone; response содержит
+`runnerResultObserved:false`, а endpoint `result` остаётся `RESULT_NOT_READY`. Запись не
+утверждает, что Runner прислал terminal result.
 
 Маршрутов ниже больше нет: `/v1/runs/{id}/export`, `/v1/runs/{id}/upload`,
 `/v1/runs/{id}/upload-session/{sid}`, `/v1/runs/{id}/snapshot`,

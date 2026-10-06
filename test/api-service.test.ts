@@ -242,6 +242,57 @@ describe('stateless AgentApi: финализация', () => {
   }, 20000);
 });
 
+describe('stateless AgentApi: operator resolution of verified absent processes', () => {
+  it('keeps an unknown run and its idempotency tombstone, but stops polling across restart', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'runner-operator-resolution-'));
+    onTestFinished(() => rmSync(dir, { recursive: true, force: true }));
+    const logPath = join(dir, 'admissions.jsonl');
+    const worker = await startMockWorker({ registerAfterMs: 5000 });
+    onTestFinished(() => worker.close());
+
+    const first = new AgentApi({ workers: [adapterFor(worker)], admissionLogPath: logPath });
+    const receipt = first.submit(alpha, 'idem-operator-resolution', body());
+    await waitForState(first, alpha, receipt.runId, 'unknown');
+    const resolved = first.resolveUnknownRun(alpha, receipt.runId, {
+      confirmation: 'process_confirmed_absent',
+      evidence: 'Operator verified the worker process is absent.',
+    });
+    expect(resolved).toMatchObject({ state: 'unknown', pollingStopped: true, runnerResultObserved: false });
+    expect(resolved.operatorResolution.actorPrincipalId).toBe(alpha.principalId);
+    expect(first.status(alpha, receipt.runId).state).toBe('unknown');
+    expect(first.status(alpha, receipt.runId).operatorResolution).toEqual(resolved.operatorResolution);
+    expect(() => first.result(alpha, receipt.runId)).toThrowError(expect.objectContaining({ code: 'RESULT_NOT_READY' }));
+
+    const duplicate = first.submit(alpha, 'idem-operator-resolution', body());
+    expect(duplicate).toMatchObject({ runId: receipt.runId, deduplicated: true });
+    expect(worker.launches).toHaveLength(1);
+    first.dispose();
+
+    const revivedStore = new StatelessStore({}, logPath);
+    expect(revivedStore.dispatchedRuns().map((entry) => entry.runId)).toContain(receipt.runId);
+    const revived = new AgentApi({ workers: [adapterFor(worker)], store: revivedStore, admissionLogPath: logPath });
+    onTestFinished(() => revived.dispose());
+    expect(revived.status(alpha, receipt.runId).operatorResolution).toEqual(resolved.operatorResolution);
+    expect(revived.resumeDispatched()).toBe(0);
+    const duplicateAfterRestart = revived.submit(alpha, 'idem-operator-resolution', body());
+    expect(duplicateAfterRestart).toMatchObject({ runId: receipt.runId, deduplicated: true });
+    expect(worker.launches).toHaveLength(1);
+    expect(revived.store.activeRuns()).toBe(0);
+  }, 20000);
+
+  it('requires ownership, explicit process-absence confirmation, and an unknown state', async () => {
+    const api = await makeApi({ delayMs: 500 });
+    const receipt = api.submit(alpha, 'idem-operator-resolution-guards', body());
+    expect(() => api.resolveUnknownRun({ ...alpha, principalId: 'p-other' }, receipt.runId, {
+      confirmation: 'process_confirmed_absent', evidence: 'Process is absent.',
+    })).toThrowError(expect.objectContaining({ code: 'NOT_FOUND' }));
+    expect(() => api.resolveUnknownRun(alpha, receipt.runId, {
+      confirmation: 'process_confirmed_absent', evidence: 'Process is absent.',
+    })).toThrowError(expect.objectContaining({ code: 'RESULT_NOT_READY' }));
+    await waitForState(api, alpha, receipt.runId, 'succeeded');
+  }, 20000);
+});
+
 describe('stateless AgentApi: capabilities отчитываются честно (#74, шаг 7)', () => {
   it('изоляции на хосте нет, движок один, байты API не отдаёт', async () => {
     const api = await makeApi();

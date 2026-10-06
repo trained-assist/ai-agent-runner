@@ -151,6 +151,13 @@ export function createAgentApiServer(service: AgentApi, options: AgentApiServerO
         sendJson(res, status, receipt);
         return status;
       }
+      case 'resolve-unknown': {
+        if (req.method !== 'POST') throw new ApiError('METHOD_NOT_ALLOWED', 'unknown-run resolution supports POST only');
+        requireScope(principal, 'runs:write');
+        const body = await readJsonBody(req, maxBodyBytes);
+        sendJson(res, 200, service.resolveUnknownRun(principal, runId, body));
+        return 200;
+      }
       default:
         throw new ApiError('ROUTE_NOT_FOUND', `no route for ${path}`);
     }

@@ -90,6 +90,13 @@ export interface RunStatusView {
   fencing: { rejected: number };
   /** Текст ответа агента, если воркер его извлёк. */
   answer: string | null;
+  /** Operator tombstone halts polling; it does not stand in for a Runner result. */
+  operatorResolution: {
+    kind: 'process_confirmed_absent';
+    actorPrincipalId: string;
+    evidence: string;
+    resolvedAt: string;
+  } | null;
 }
 
 export interface EventsPage {

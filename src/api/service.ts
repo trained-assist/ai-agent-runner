@@ -16,7 +16,7 @@ import {
 import type { RunResult } from '../contracts/result.js';
 import { validateRunSpec, type InputSpec, type RunSpec } from '../contracts/run-spec.js';
 import { PreflightError } from '../contracts/validate.js';
-import { DEFAULT_STATELESS_LIMITS, isTerminalApiState, STATELESS_STORE_SCHEMA_VERSION, StatelessStore, type AdmissionRecord } from './stateless-store.js';
+import { DEFAULT_STATELESS_LIMITS, isTerminalApiState, STATELESS_STORE_SCHEMA_VERSION, StatelessStore, type AdmissionRecord, type OperatorResolution } from './stateless-store.js';
 import {
   API_CAPABILITIES_SCHEMA_VERSION,
   API_CONTRACT_VERSION,
@@ -298,6 +298,7 @@ export class AgentApi {
         sequence: 0,
         fencing: { rejected: 0 },
         answer: null,
+        operatorResolution: null,
       };
     }
     return {
@@ -313,6 +314,7 @@ export class AgentApi {
       sequence: run.sequence,
       fencing: { rejected: run.fencing.rejected },
       answer: run.answer,
+      operatorResolution: run.operatorResolution,
     };
   }
 
@@ -435,6 +437,52 @@ export class AgentApi {
     }
     this.log({ event: 'cancel', principalId: principal.principalId, runId, status: receipt.status, ownerGeneration: record.ownerGeneration });
     return { runId, status: 'stop_pending', state: current?.state ?? run.state };
+  }
+
+  resolveUnknownRun(principal: Principal, runId: string, rawBody: unknown): {
+    runId: string;
+    state: 'unknown';
+    pollingStopped: true;
+    runnerResultObserved: false;
+    operatorResolution: OperatorResolution;
+  } {
+    this.requireRun(principal, runId);
+    if (!rawBody || typeof rawBody !== 'object' || Array.isArray(rawBody)) {
+      throw new ApiError('INVALID_REQUEST', 'resolution body must be an object');
+    }
+    const body = rawBody as Record<string, unknown>;
+    if (Object.keys(body).sort().join(',') !== 'confirmation,evidence'
+      || body.confirmation !== 'process_confirmed_absent'
+      || typeof body.evidence !== 'string'
+      || body.evidence.trim().length < 8
+      || body.evidence.trim().length > 500) {
+      throw new ApiError('INVALID_REQUEST', 'resolution requires confirmation=process_confirmed_absent and 8–500 characters of evidence');
+    }
+    const run = this.store.progressOf(runId);
+    if (!run) throw new ApiError('INTERNAL', `run ${runId} has no in-memory progress`);
+    if (run.operatorResolution) {
+      return { runId, state: 'unknown', pollingStopped: true, runnerResultObserved: false, operatorResolution: run.operatorResolution };
+    }
+    if (run.state !== 'unknown') {
+      throw new ApiError('RESULT_NOT_READY', `only unknown runs can be operator-resolved (current state: ${run.state})`, { runId, state: run.state });
+    }
+    if (!this.store.hasDurableJournal()) {
+      throw new ApiError('INTERNAL', 'operator resolution requires a durable admission journal; reconciliation remains active');
+    }
+    const resolution: OperatorResolution = {
+      kind: 'process_confirmed_absent',
+      actorPrincipalId: principal.principalId,
+      evidence: body.evidence.trim(),
+      resolvedAt: this.nowIso(),
+    };
+    try {
+      this.store.resolveUnknown(runId, resolution);
+    } catch (err) {
+      this.log({ event: 'operator_resolution_persist_failed', runId, principalId: principal.principalId });
+      throw new ApiError('INTERNAL', 'operator resolution was not persisted; reconciliation remains active');
+    }
+    this.log({ event: 'operator_resolved_unknown_run', runId, principalId: principal.principalId, kind: resolution.kind });
+    return { runId, state: 'unknown', pollingStopped: true, runnerResultObserved: false, operatorResolution: resolution };
   }
 
   /**
@@ -583,6 +631,7 @@ export class AgentApi {
       if (!record) continue;
       if (this.resuming.has(record.runId)) continue;
       const progress = this.store.progressOf(entry.runId);
+      if (progress?.operatorResolution) continue;
       if (progress && isTerminalApiState(progress.state)) continue;
       const worker = this.workerFor(record.spec.engine.name);
       if (!worker) continue;
@@ -597,6 +646,7 @@ export class AgentApi {
 
   private async restoreAndPoll(record: AdmissionRecord, worker: ExternalWorker): Promise<void> {
     try {
+      if (this.store.progressOf(record.runId)?.operatorResolution) return;
       if (record.spec.mcp?.servers.some(server => server.transport === 'remote')) {
         const status = (await worker.status(record.runId)).status;
         if (this.disposed) return;
@@ -607,6 +657,7 @@ export class AgentApi {
           }
           return;
         }
+        if (this.store.progressOf(record.runId)?.operatorResolution) return;
         if (!worker.restoreMcp) throw new Error('MCP_RESTORE_UNSUPPORTED');
         await worker.restoreMcp(record.spec, record.createdAt);
       }
@@ -670,7 +721,8 @@ export class AgentApi {
     const deadline = Date.now() + budgetMs;
     let attempt = 0;
     for (;;) {
-      if (this.disposed || this.store.progressOf(record.runId) === null) return;
+      const current = this.store.progressOf(record.runId);
+      if (this.disposed || current === null || current.operatorResolution) return;
       let status: WorkerRunStatus;
       try {
         status = (await worker.status(record.runId)).status;
@@ -679,6 +731,9 @@ export class AgentApi {
         status = 'unknown';
       }
       this.log({ event: 'worker_status', runId: record.runId, status, attempt });
+
+      const afterStatus = this.store.progressOf(record.runId);
+      if (afterStatus?.operatorResolution && status !== 'succeeded' && status !== 'failed' && status !== 'cancelled') return;
 
       if (status === 'succeeded' || status === 'failed' || status === 'cancelled') {
         if (await this.collectResult(record, worker, startedAt)) return;
