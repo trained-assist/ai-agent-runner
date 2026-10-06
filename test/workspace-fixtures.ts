@@ -339,7 +339,7 @@ export interface Harness {
  * Сборка стенда. `interception` позволяет тесту подменить исход push — без этого
  * «timeout после записи кандидата» и «kill перед push» не воспроизводятся.
  */
-export function harness(options: { interception?: GitInterception; mergeAttempts?: number; resolutionAttempts?: number; policyTextMaxBytes?: number } = {}): Harness {
+export function harness(options: { interception?: GitInterception; mergeAttempts?: number; resolutionAttempts?: number; policyTextMaxBytes?: number; conflictPolicy?: 'prefer_larger_final_tree' | 'preserve_conflict' } = {}): Harness {
   const root = tempDir('workspace-harness-');
   const stateDir = join(root, 'state');
   const mirrorDir = join(root, 'mirrors');
@@ -360,6 +360,7 @@ export function harness(options: { interception?: GitInterception; mergeAttempts
     admin,
     journal,
     ...(options.mergeAttempts !== undefined ? { mergeAttempts: options.mergeAttempts } : {}),
+    conflictPolicy: options.conflictPolicy ?? 'prefer_larger_final_tree',
     ...(options.resolutionAttempts !== undefined ? { resolutionAttempts: options.resolutionAttempts } : {}),
     // Порог «тяжёлого» файла меняется без потери правил исключения: иначе тест на
     // тяжёлые артефакты тихо публиковал бы credential'ы.

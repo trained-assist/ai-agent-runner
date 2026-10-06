@@ -138,12 +138,16 @@ export interface MergeInput {
   current: TreeMap;
   /** Подмножество путей, о котором идёт публикация (остальное head не трогает). */
   scope: ReadonlySet<string>;
+  /** Default publication policy is deterministic by final tree byte size. */
+  conflictPolicy?: 'prefer_larger_final_tree' | 'preserve_conflict';
 }
 
 export interface MergeOutcome {
   /** Записи дерева, которые надо применить к current, чтобы получить merged. */
   writes: TreeWrite[];
   conflicts: WorkspaceConflictEntry[];
+  /** Конфликты, автоматически разрешённые в пользу дерева с большим финальным объёмом. */
+  resolvedByLargerTree: Array<WorkspaceConflictEntry & { winner: 'run' | 'current'; runTreeBytes: number; currentTreeBytes: number }>;
   /** Разрешился ли конфликт полностью. */
   clean: boolean;
 }
@@ -161,9 +165,9 @@ function samePath(a: TreePath | null, b: TreePath | null): boolean {
  * - рана не касается пути → остаётся current;
  * - current не касается пути → берётся run;
  * - оба пришли к одному → берётся run (идемпотентно);
- * - оба изменили один файл → обычное git-слияние одного файла; неразрешимое = конфликт;
- * - удаление против правки / добавление против добавления → конфликт, ничего не теряется:
- *   обе стороны остаются в конфликте и в durable-кандидате рана.
+ * - оба изменили один файл → обычное git-слияние одного файла; неразрешимое выбирает
+ *   более объёмное финальное дерево (при равенстве остаётся текущая canonical head);
+ * - остальные path-level конфликты решаются тем же правилом, обе ветки остаются durable.
  *
  * Rename в git — это delete+add (объекта rename не существует). Модуль не угадывает
  * «настоящий rename» по имени, но помечает конфликт как `rename`, когда удаление и
@@ -175,6 +179,7 @@ export async function mergeTrees(git: GitRepositoryPort, mirror: GitMirror, inpu
   const paths = new Set<string>([...input.base.keys(), ...input.run.keys(), ...input.current.keys()]);
   const writes: TreeWrite[] = [];
   const conflicts: WorkspaceConflictEntry[] = [];
+  const resolvedByLargerTree: MergeOutcome['resolvedByLargerTree'] = [];
 
   const hashedOf = async (tree: TreeMap, wanted: Iterable<string>): Promise<Map<string, string>> => {
     const out = new Map<string, string>();
@@ -204,6 +209,7 @@ export async function mergeTrees(git: GitRepositoryPort, mirror: GitMirror, inpu
   };
   const renamedFrom = new Map<string, string>([...(await renamesOf(input.run)), ...(await renamesOf(input.current))]);
 
+  const conflicted: { path: string; runHash: string | null; currentHash: string | null; kind: WorkspaceConflictEntry['kind'] }[] = [];
   for (const path of [...paths].sort()) {
     if (input.scope.size > 0 && !input.scope.has(path)) continue;
     const base = input.base.get(path) ?? null;
@@ -223,16 +229,11 @@ export async function mergeTrees(git: GitRepositoryPort, mirror: GitMirror, inpu
     const currentHash = current && current.mode !== GIT_MODE_LINK ? await blobSha256(git, mirror, current) : null;
 
     if (run === null || current === null) {
-      conflicts.push({
-        path,
-        kind: renamedFrom.has(path) ? 'rename' : 'delete_modify',
-        runSha256: runHash,
-        currentSha256: currentHash,
-      });
+      conflicted.push({ path, runHash, currentHash, kind: renamedFrom.has(path) ? 'rename' : 'delete_modify' });
       continue;
     }
     if (base === null) {
-      conflicts.push({ path, kind: 'add_add', runSha256: runHash, currentSha256: currentHash });
+      conflicted.push({ path, runHash, currentHash, kind: 'add_add' });
       continue;
     }
     const merged = await git.mergeBlobs(mirror, { baseOid: base.oid, currentOid: current.oid, otherOid: run.oid });
@@ -240,15 +241,40 @@ export async function mergeTrees(git: GitRepositoryPort, mirror: GitMirror, inpu
       writes.push({ path, oid: merged.oid, mode: current.mode });
       continue;
     }
-    conflicts.push({
-      path,
-      kind: merged.detail && /binary/i.test(merged.detail) ? 'binary' : 'content',
-      runSha256: runHash,
-      currentSha256: currentHash,
-    });
+    conflicted.push({ path, runHash, currentHash, kind: merged.detail && /binary/i.test(merged.detail) ? 'binary' : 'content' });
   }
 
-  return { writes, conflicts, clean: conflicts.length === 0 };
+  if (conflicted.length > 0) {
+    // Compare the final branch trees, not diff sizes. A delete therefore lowers that
+    // branch's score by the bytes removed; it cannot silently beat a branch retaining
+    // the file. Ties preserve current (already-published canonical head).
+    const treeBytes = async (tree: TreeMap): Promise<number> => {
+      let total = 0;
+      for (const entry of tree.values()) {
+        if (entry.mode === GIT_MODE_LINK || entry.mode === GIT_MODE_SUBMODULE) continue;
+        total += (await git.readBlob(mirror, entry.oid)).byteLength;
+      }
+      return total;
+    };
+    if ((input.conflictPolicy ?? 'prefer_larger_final_tree') === 'preserve_conflict') {
+      conflicts.push(...conflicted.map(({ path, kind, runHash, currentHash }) => ({
+        path, kind, runSha256: runHash, currentSha256: currentHash,
+      })));
+    } else {
+      const [runBytes, currentBytes] = await Promise.all([treeBytes(input.run), treeBytes(input.current)]);
+      const runWins = runBytes > currentBytes;
+      for (const item of conflicted) {
+        const run = input.run.get(item.path) ?? null;
+        const current = input.current.get(item.path) ?? null;
+        const winner = runWins ? run : current;
+        writes.push({ path: item.path, oid: winner?.oid ?? null, ...(winner ? { mode: winner.mode } : {}) });
+        resolvedByLargerTree.push({ path: item.path, kind: item.kind, runSha256: item.runHash, currentSha256: item.currentHash,
+          winner: runWins ? 'run' : 'current', runTreeBytes: runBytes, currentTreeBytes: currentBytes });
+      }
+    }
+  }
+
+  return { writes, conflicts, resolvedByLargerTree, clean: conflicts.length === 0 };
 }
 
 export { EMPTY_TREE };
