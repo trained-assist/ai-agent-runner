@@ -137,6 +137,8 @@ export interface RunnerOptions {
   bindingResolver?: BindingValueResolver;
   /** Команда broker'а MCP для движка; по умолчанию — per-run прокси из репозитория. */
   mcpBrokerCommand?: { command: string; args: string[] };
+  /** If false, a queued run recovered after a process restart is failed closed instead of relaunched. */
+  resumeQueuedRuns?: boolean;
 }
 
 export interface StartReceipt {
@@ -255,6 +257,10 @@ interface InternalRun {
    * содержимое не попадает — только источник и размер.
    */
   answerTail: string[];
+  /** Launch-only credentials. Deliberately memory-only and never written to RunStore. */
+  runtimeEnv: Record<string, string>;
+  /** Allowlisted secret values used to scrub engine output before it reaches durable logs. */
+  runtimeSecrets: string[];
 }
 
 /**
@@ -373,6 +379,14 @@ function formatMcpFields(fields: McpLogFields): string {
     .join(' ');
 }
 
+function redactRunSecrets(text: string, secrets: readonly string[]): string {
+  let result = text;
+  for (const secret of secrets) {
+    if (secret.length >= 4 && result.includes(secret)) result = result.split(secret).join('[redacted]');
+  }
+  return result;
+}
+
 export class Runner {
   private readonly opts: RunnerOptions;
   private readonly store: RunStore;
@@ -417,6 +431,8 @@ export class Runner {
         mcpConfigPath: null,
         room: null,
         answerTail: [],
+        runtimeEnv: {},
+        runtimeSecrets: [],
       });
     }
   }
@@ -474,6 +490,15 @@ export class Runner {
     };
   }
 
+  /** Internal worker adapter view; repository credentials are removed from the returned copy. */
+  getRunSpec(runId: string): RunSpec | null {
+    const run = this.runs.get(runId);
+    if (!run) return null;
+    const spec = structuredClone(run.state.spec);
+    stripRepositoryToken(spec);
+    return spec;
+  }
+
   events(runId: string, afterSequence = 0): RunnerEvent[] {
     const run = this.runs.get(runId);
     if (!run) return [];
@@ -496,7 +521,7 @@ export class Runner {
     return this.runExport(run.state, { force: true });
   }
 
-  start(input: unknown, operationIdArg?: string): StartReceipt {
+  start(input: unknown, operationIdArg?: string, runtimeEnv: Record<string, string> = {}): StartReceipt {
     const validated = validateRunSpec(input);
     if (!validated.ok) throw new SpecValidationError(validated.errors);
     const spec = validated.value;
@@ -582,6 +607,8 @@ export class Runner {
       mcpConfigPath: null,
       room: null,
       answerTail: [],
+      runtimeEnv: { ...runtimeEnv },
+      runtimeSecrets: [],
     });
     this.emit(state, 'claimed', { operationId });
     void this.execute(spec.runId).catch(() => undefined);
@@ -740,8 +767,18 @@ export class Runner {
       }
       switch (st.state) {
         case 'queued':
-          report.resumedQueued += 1;
-          void this.execute(st.runId).catch(() => undefined);
+          if (this.opts.resumeQueuedRuns === false) {
+            this.completeWithoutEngine(st, 'failed', 'worker_crash', {
+              code: 'WORKER_RESTARTED_BEFORE_ENGINE_START',
+              failureClass: 'runtime',
+              safeSummary: 'worker restarted before the engine was confirmed; run was not relaunched',
+              retryable: true,
+            });
+            report.lost += 1;
+          } else {
+            report.resumedQueued += 1;
+            void this.execute(st.runId).catch(() => undefined);
+          }
           break;
         case 'starting':
           report.orphanedMcp += await this.reapOrphanedMcp(run);
@@ -808,6 +845,7 @@ export class Runner {
 
   dispose(): void {
     this.disposed = true;
+    for (const run of this.runs.values()) { run.runtimeEnv = {}; run.runtimeSecrets = []; }
     for (const controller of this.cloneControllers.values()) controller.abort();
     this.cloneControllers.clear();
     for (const run of this.runs.values()) {
@@ -1384,6 +1422,10 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
    */
   private buildEngineEnv(run: InternalRun, spec: RunSpec): Record<string, string> {
     const env = this.buildEnv(spec);
+    for (const name of spec.envAllowlist) {
+      if (Object.prototype.hasOwnProperty.call(run.runtimeEnv, name)) env[name] = run.runtimeEnv[name]!;
+    }
+    run.runtimeSecrets = spec.envAllowlist.map((name) => env[name]).filter((value): value is string => typeof value === 'string' && value.length >= 4);
     const room = run.room;
     if (room) {
       // run-scoped HOME/config/cache/tmp: движок не видит и не пишет пользовательский
@@ -1592,7 +1634,7 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
     const st = run.state;
     if (isTerminalState(st.state)) return;
     const limit = st.spec.limits.maxOutputBytes ?? st.spec.limits.maxLogBytes ?? DEFAULT_MAX_LOG_LINE;
-    const sanitized = redactSecrets(truncateLine(rawLine, limit)).replace(/[\x00-\x1f]/g, ' ');
+    const sanitized = redactRunSecrets(redactSecrets(truncateLine(rawLine, limit)), run.runtimeSecrets).replace(/[\x00-\x1f]/g, ' ');
     if (sanitized.length === 0) return;
     if (stream === 'stdout') this.rememberAnswerLine(run, sanitized);
     this.emit(st, 'log', { stream, level: 'info', message: sanitized });
@@ -1615,6 +1657,8 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
     const st = run.state;
     if (isTerminalState(st.state)) return;
     run.exitReceived = true;
+    run.runtimeEnv = {};
+    run.runtimeSecrets = [];
     this.clearTimers(run);
     // P13: MCP-процессы рана живут дольше движка только до его выхода; дальше — cleanup.
     // Причина берётся из состояния рана: отмена/таймаут двигателя гасят MCP с той же причиной.
@@ -1652,6 +1696,8 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
     exitReason: 'cancelled' | 'preflight_refused' | 'worker_crash' | 'startup_failure',
     failure?: RunResult['failure'],
   ): void {
+    const internalRun = this.runs.get(st.runId);
+    if (internalRun) { internalRun.runtimeEnv = {}; internalRun.runtimeSecrets = []; }
     const result: RunResult = {
       schemaVersion: 1,
       runId: st.runId,

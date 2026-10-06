@@ -12,6 +12,7 @@
     "typecheck": "tsc --noEmit",
     "build": "tsc -p tsconfig.build.json && node scripts/copy-mcp-fixtures.mjs && node scripts/copy-isolation-probe.mjs",
     "start": "node dist/api/main.js",
+    "start:vm-worker": "node dist/vm-worker/main.js",
     "test": "vitest run",
     "test:watch": "vitest"
   },
