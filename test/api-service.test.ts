@@ -49,6 +49,15 @@ async function waitForState(api: AgentApi, principal: Principal, runId: string, 
   throw new Error(`run ${runId} never reached ${state}: ${api.status(principal, runId).state}`);
 }
 
+async function waitForCondition(condition: () => boolean, timeoutMs = 5000, label = 'condition'): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (condition()) return;
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  throw new Error(`timed out waiting for ${label}`);
+}
+
 describe('stateless AgentApi: приём запроса', () => {
   it('без Idempotency-Key — MISSING_IDEMPOTENCY_KEY', async () => {
     const api = await makeApi();
@@ -387,6 +396,44 @@ describe('stateless AgentApi: capabilities отчитываются честно
     expect(again.runId).toBe(submitted.runId);
     expect(again.deduplicated).toBe(true);
     expect(worker.launches.length).toBe(launchesBefore);
+  }, 30000);
+
+  it('после рестарта API VM log tail возобновляется с сохранённого worker cursor без повторной выдачи старых строк', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'runner-live-log-resume-'));
+    onTestFinished(() => rmSync(dir, { recursive: true, force: true }));
+    const logPath = join(dir, 'admissions.jsonl');
+    const worker = await startMockWorker({ liveLogs: true, terminalStatus: 'running', stdout: 'old output new output' });
+    worker.autoDeliver = false;
+    onTestFinished(() => worker.close());
+    const vmPrincipal: Principal = { ...alpha, engines: ['eu-vm-agent-run'] };
+    const vmBody = body({ engine: { name: 'eu-vm-agent-run', adapterVersion: '1' } });
+
+    const first = new AgentApi({ workers: [adapterFor(worker, { engineName: 'eu-vm-agent-run' })], admissionLogPath: logPath });
+    const submitted = first.submit(vmPrincipal, 'idem-live-log-resume', vmBody);
+    await waitForState(first, vmPrincipal, submitted.runId, 'running');
+    worker.pushLog(submitted.runId, 'stdout', 'old output');
+    await waitForCondition(() => first.store.workerLogCursor(submitted.runId).sourceSequence === 1, 5000, 'first worker log cursor');
+    const apiCursorBeforeRestart = first.store.workerLogCursor(submitted.runId).apiSequence;
+    expect(first.events(vmPrincipal, submitted.runId).events.filter(event => event.type === 'log')).toHaveLength(1);
+    await first.dispose();
+
+    const revivedStore = new StatelessStore({}, logPath);
+    expect(revivedStore.workerLogCursor(submitted.runId)).toEqual({ sourceSequence: 1, apiSequence: apiCursorBeforeRestart });
+    const second = new AgentApi({ workers: [adapterFor(worker, { engineName: 'eu-vm-agent-run' })], store: revivedStore, admissionLogPath: logPath });
+    onTestFinished(() => second.dispose());
+    expect(second.resumeDispatched()).toBe(1);
+    await waitForCondition(() => worker.logCursors.at(-1) === 1, 5000, 'worker stream to resume after source sequence one');
+    expect(second.events(vmPrincipal, submitted.runId).events.filter(event => event.type === 'log')).toHaveLength(0);
+
+    worker.pushLog(submitted.runId, 'stdout', 'new output');
+    await waitForCondition(() => second.events(vmPrincipal, submitted.runId, apiCursorBeforeRestart).events.some(event =>
+      event.type === 'log' && event.payload.message === 'new output'), 5000, 'new worker output after API restart');
+    worker.finishLogs(submitted.runId);
+    await waitForState(second, vmPrincipal, submitted.runId, 'succeeded');
+    const resumedEvents = second.events(vmPrincipal, submitted.runId, apiCursorBeforeRestart).events;
+    expect(resumedEvents.filter(event => event.type === 'log' && event.payload.message === 'new output')).toHaveLength(1);
+    expect(resumedEvents.filter(event => event.type === 'log' && event.payload.message === 'old output')).toHaveLength(1);
+    expect(worker.logCursors).toContain(1);
   }, 30000);
 
   it('operationId стабилен в пределах попытки — на этом держится дедупликация воркера', () => {

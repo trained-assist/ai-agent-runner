@@ -45,6 +45,8 @@ export interface MockWorkerOptions {
   statusDelayMs?: number;
   /** Expose a controllable live stdout/stderr SSE endpoint for API streaming tests. */
   liveLogs?: boolean;
+  /** Hold the terminal connection's pending tail briefly to force result/SSE races. */
+  delayedTerminalLogMs?: number;
 }
 
 export interface MockWorker {
@@ -62,8 +64,9 @@ export interface MockWorker {
   /** Дослать результат рана (тесты вручную, минуя autoDeliver). */
   deliverResult(runId: string, over?: Partial<LaunchResult>, token?: string): Promise<Response>;
   options: MockWorkerOptions;
+  readonly logCursors: number[];
   pushLog(runId: string, stream: 'stdout' | 'stderr', message: string): void;
-  finishLogs(runId: string): void;
+  finishLogs(runId: string, delayedTail?: { stream: 'stdout' | 'stderr'; message: string }): void;
   close(): Promise<void>;
 }
 
@@ -81,8 +84,9 @@ export async function startMockWorker(options: MockWorkerOptions = {}): Promise<
   const results: Array<Record<string, unknown>> = [];
   const live = new Set<{ runId: string; cancelled: boolean; pending: boolean }>();
   const streamedLogs = new Map<string, Array<{ sequence: number; stream: 'stdout' | 'stderr'; message: string }>>();
-  const logSubscribers = new Map<string, Set<ServerResponse>>();
+  const logSubscribers = new Map<string, Set<{ response: ServerResponse; cursor: number }>>();
   const finishedLogStreams = new Set<string>();
+  const logCursors: number[] = [];
   let lastAuthorization: string | undefined;
 
   const defaults = {
@@ -166,19 +170,23 @@ export async function startMockWorker(options: MockWorkerOptions = {}): Promise<
         }
         const runId = logsMatch[1]!;
         const after = Number(url.searchParams.get('after') ?? '0');
+        logCursors.push(after);
         res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-cache', connection: 'keep-alive' });
-        const subscribers = logSubscribers.get(runId) ?? new Set<ServerResponse>();
-        subscribers.add(res);
+        const subscribers = logSubscribers.get(runId) ?? new Set<{ response: ServerResponse; cursor: number }>();
+        const subscriber = { response: res, cursor: after };
+        subscribers.add(subscriber);
         logSubscribers.set(runId, subscribers);
-        res.on('close', () => subscribers.delete(res));
+        res.on('close', () => subscribers.delete(subscriber));
         for (const entry of streamedLogs.get(runId) ?? []) {
-          if (entry.sequence > after) res.write(`id: ${entry.sequence}\nevent: ${entry.stream}\ndata: ${JSON.stringify(entry.message)}\n\n`);
+          if (entry.sequence > subscriber.cursor) {
+            res.write(`id: ${entry.sequence}\nevent: ${entry.stream}\ndata: ${JSON.stringify(entry.message)}\n\n`);
+            subscriber.cursor = entry.sequence;
+          }
         }
         if (finishedLogStreams.has(runId)) {
-          const cursor = (streamedLogs.get(runId) ?? []).at(-1)?.sequence ?? after;
-          res.write(`id: ${cursor + 1}\nevent: end\ndata: {}\n\n`);
+          res.write(`id: ${subscriber.cursor + 1}\nevent: end\ndata: {}\n\n`);
           res.end();
-          subscribers.delete(res);
+          subscribers.delete(subscriber);
         }
         return;
       }
@@ -255,24 +263,40 @@ export async function startMockWorker(options: MockWorkerOptions = {}): Promise<
     autoDeliver: true,
     resultSink: null,
     options,
+    logCursors,
     pushLog(runId: string, stream: 'stdout' | 'stderr', message: string): void {
       const entries = streamedLogs.get(runId) ?? [];
       const entry = { sequence: (entries.at(-1)?.sequence ?? 0) + 1, stream, message };
       entries.push(entry);
       streamedLogs.set(runId, entries);
       for (const subscriber of logSubscribers.get(runId) ?? []) {
-        subscriber.write(`id: ${entry.sequence}\nevent: ${stream}\ndata: ${JSON.stringify(message)}\n\n`);
+        subscriber.response.write(`id: ${entry.sequence}\nevent: ${stream}\ndata: ${JSON.stringify(message)}\n\n`);
+        subscriber.cursor = entry.sequence;
       }
     },
-    finishLogs(runId: string): void {
+    finishLogs(runId: string, delayedTail?: { stream: 'stdout' | 'stderr'; message: string }): void {
       finishedLogStreams.add(runId);
       settings.terminalStatus = 'succeeded';
-      const cursor = (streamedLogs.get(runId) ?? []).at(-1)?.sequence ?? 0;
-      for (const subscriber of logSubscribers.get(runId) ?? []) {
-        subscriber.write(`id: ${cursor + 1}\nevent: end\ndata: {}\n\n`);
-        subscriber.end();
+      if (delayedTail) {
+        const entries = streamedLogs.get(runId) ?? [];
+        entries.push({ sequence: (entries.at(-1)?.sequence ?? 0) + 1, ...delayedTail });
+        streamedLogs.set(runId, entries);
       }
-      logSubscribers.delete(runId);
+      const finishSubscribers = (): void => {
+        for (const subscriber of logSubscribers.get(runId) ?? []) {
+          for (const entry of streamedLogs.get(runId) ?? []) {
+            if (entry.sequence > subscriber.cursor) {
+              subscriber.response.write(`id: ${entry.sequence}\nevent: ${entry.stream}\ndata: ${JSON.stringify(entry.message)}\n\n`);
+              subscriber.cursor = entry.sequence;
+            }
+          }
+          subscriber.response.write(`id: ${subscriber.cursor + 1}\nevent: end\ndata: {}\n\n`);
+          subscriber.response.end();
+        }
+        logSubscribers.delete(runId);
+      };
+      if (delayedTail && settings.delayedTerminalLogMs) setTimeout(finishSubscribers, settings.delayedTerminalLogMs);
+      else finishSubscribers();
     },
     lastAuthorization: () => lastAuthorization,
     async deliverResult(runId: string, over: Partial<LaunchResult> = {}, token?: string): Promise<Response> {

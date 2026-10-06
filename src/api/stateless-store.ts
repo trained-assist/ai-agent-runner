@@ -30,6 +30,7 @@ export type JournalLine =
   | { kind: 'prepared'; runId: string; repository: { fullName: string; revision?: string }; profileWorkspace?: RunSpec['profileWorkspace'] }
   | { kind: 'launch_intent'; runId: string; engine: string; at: string }
   | { kind: 'dispatched'; runId: string; engine: string; at: string }
+  | { kind: 'worker_log_cursor'; runId: string; sourceSequence: number; apiSequence: number }
   | { kind: 'completed'; runId: string; patch: CompletedRunPatch };
 
 export interface AdmissionRecord {
@@ -127,6 +128,7 @@ export class StatelessStore {
   private readonly strictPersistence: boolean;
   /** Раны, отправленные воркеру: нужны, чтобы поллеры пережили рестарт API. */
   private readonly dispatched = new Map<string, { runId: string; engine: string; at: string }>();
+  private readonly workerLogCursors = new Map<string, { sourceSequence: number; apiSequence: number }>();
 
   constructor(limits: Partial<StatelessStoreLimits> = {}, persistPath: string | null = null, strictPersistence = false) {
     this.limits = { ...DEFAULT_STATELESS_LIMITS, ...limits };
@@ -160,6 +162,21 @@ export class StatelessStore {
   appendLaunchIntent(runId: string, engine: string, at: string): void {
     this.write({ kind: 'launch_intent', runId, engine, at });
     this.dispatched.set(runId, { runId, engine, at });
+  }
+
+  /** Persist the VM log source cursor alongside the central event cursor for restart-safe tailing. */
+  recordWorkerLogCursor(runId: string, sourceSequence: number, apiSequence: number): void {
+    const prior = this.workerLogCursors.get(runId);
+    if (prior && sourceSequence <= prior.sourceSequence) return;
+    const next = { sourceSequence: Math.max(sourceSequence, prior?.sourceSequence ?? 0), apiSequence: Math.max(apiSequence, prior?.apiSequence ?? 0) };
+    this.workerLogCursors.set(runId, next);
+    const progress = this.progress.get(runId);
+    if (progress) progress.sequence = Math.max(progress.sequence, next.apiSequence);
+    this.write({ kind: 'worker_log_cursor', runId, ...next });
+  }
+
+  workerLogCursor(runId: string): { sourceSequence: number; apiSequence: number } {
+    return this.workerLogCursors.get(runId) ?? { sourceSequence: 0, apiSequence: 0 };
   }
 
   /** Раны, отправленные воркеру. */
@@ -209,6 +226,17 @@ export class StatelessStore {
           if (typeof entry.runId === 'string' && entry.runId.length > 0) {
             this.dispatched.set(entry.runId, { runId: entry.runId, engine: String(entry.engine ?? ''), at: String(entry.at ?? '') });
             resumed += 1;
+          }
+          continue;
+        }
+        if (entry.kind === 'worker_log_cursor') {
+          if (typeof entry.runId === 'string' && Number.isSafeInteger(entry.sourceSequence) && entry.sourceSequence >= 0 &&
+              Number.isSafeInteger(entry.apiSequence) && entry.apiSequence >= 0) {
+            const prior = this.workerLogCursors.get(entry.runId);
+            this.workerLogCursors.set(entry.runId, {
+              sourceSequence: Math.max(prior?.sourceSequence ?? 0, entry.sourceSequence),
+              apiSequence: Math.max(prior?.apiSequence ?? 0, entry.apiSequence),
+            });
           }
           continue;
         }
@@ -286,7 +314,7 @@ export class StatelessStore {
     if (existing) return existing;
     const created: RunProgress = {
       state: 'queued',
-      sequence: 0,
+      sequence: this.workerLogCursors.get(runId)?.apiSequence ?? 0,
       events: [],
       droppedEvents: 0,
       cancelRequested: null,

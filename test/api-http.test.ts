@@ -218,7 +218,7 @@ describe('http submit, status, result, artifacts, events and cancel', () => {
 describe('http sse replay', () => {
   it('mirrors live worker stdout/stderr before completion and does not append duplicate final logs after cursor reconnect', async () => {
     const h = await startHttpHarness({
-      worker: { liveLogs: true, terminalStatus: 'running', stdout: 'first output', stderr: 'diagnostic output' },
+      worker: { liveLogs: true, terminalStatus: 'running', stdout: 'first output second output', stderr: 'diagnostic output', delayedTerminalLogMs: 1500 },
       workerEngineName: 'eu-vm-agent-run',
       streamPollMs: 10,
     });
@@ -242,21 +242,22 @@ describe('http sse replay', () => {
     const cursor = firstCollector.lastEventId();
     firstController.abort();
     await new Promise(resolve => setTimeout(resolve, 10));
-    h.worker.pushLog(receipt.runId, 'stdout', 'second output');
 
     const resumed = await fetch(`${h.base}/v1/runs/${receipt.runId}/events`, {
       headers: { ...authHeader(alphaKey), accept: 'text/event-stream', 'last-event-id': String(cursor) },
     });
     const resumedCollector = new SseCollector(resumed.body!.getReader());
+    await resumedCollector.waitFor(frames => frames.some(frame => frame.event === 'snapshot'));
+    h.worker.finishLogs(receipt.runId, { stream: 'stdout', message: 'second output' });
     await resumedCollector.waitFor(frames => frames.some(frame => frame.event === 'log' && frame.data?.includes('second output')));
 
-    h.worker.finishLogs(receipt.runId);
     await resumedCollector.waitFor(frames => frames.some(frame => frame.event === 'succeeded'));
     await resumedCollector.waitEnd();
     const logFrames = resumedCollector.all.filter(frame => frame.event === 'log');
     expect(logFrames.filter(frame => frame.data?.includes('second output'))).toHaveLength(1);
     expect(logFrames.filter(frame => frame.data?.includes('first output'))).toHaveLength(0);
     expect(logFrames.filter(frame => frame.data?.includes('diagnostic output'))).toHaveLength(0);
+    expect(h.worker.logCursors).toContain(2);
     expect((await (await getStatus(h.base, alphaKey, receipt.runId)).json() as { state: string }).state).toBe('succeeded');
   }, 30000);
 
