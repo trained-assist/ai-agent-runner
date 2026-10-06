@@ -830,11 +830,28 @@ export class AgentApi {
         continue;
       }
       lastWorker = worker;
-      // Движок попытки виден клиенту сразу: цепочка двигается по ранe, а не молча меняет
-      // исполнителя под ногами у того, кто опрашивает статус.
-      this.store.setEngine(record.runId, engine);
-      this.store.appendLaunchIntent(record.runId, engine, this.nowIso());
       try {
+        // VM readiness is checked before creating a launch intent or sending the run. A
+        // failed probe is a proven no-start and may advance the chain. If readiness passed
+        // but launch/reconcile later becomes ambiguous, retain the existing unknown path.
+        if (isRegionalVmEngine(engine)) {
+          const readiness = worker.readiness ? await worker.readiness() : { state: 'unavailable' as const };
+          if (readiness.state === 'capacity') {
+            throw new PreflightError('WORKER_CAPACITY', 'the regional VM readiness probe reports saturated capacity', {
+              failureClass: 'runtime', retryable: true,
+            });
+          }
+          if (readiness.state !== 'ready') {
+            throw new PreflightError('WORKER_ADMISSION_UNAVAILABLE', 'the regional VM failed its readiness probe before launch', {
+              failureClass: 'runtime', retryable: true,
+            });
+          }
+          this.log({ event: 'worker_ready', runId: record.runId, engine });
+        }
+        // Движок попытки виден клиенту сразу: цепочка двигается по рану, а не молча меняет
+        // исполнителя под ногами у того, кто опрашивает статус.
+        this.store.setEngine(record.runId, engine);
+        this.store.appendLaunchIntent(record.runId, engine, this.nowIso());
         const receipt = await worker.launch(this.specForEngine(record, engine));
         return { engine, worker, receipt };
       } catch (err) {

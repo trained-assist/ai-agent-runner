@@ -22,6 +22,9 @@ export interface MockWorkerOptions {
   delayMs?: number;
   /** Ответить HTTP-ошибкой вместо LaunchResult. */
   httpStatus?: number;
+  /** VM /readyz response before launch-chain admission. Defaults to healthy. */
+  readinessState?: 'ready' | 'unavailable' | 'capacity';
+  readinessDelayMs?: number;
   /** Structured no-start refusal used to test capacity-aware dispatch. */
   capacityRefusal?: boolean;
   admissionRefusal?: 'WORKER_CAPACITY_UNKNOWN' | 'WORKER_ADMISSION_UNAVAILABLE' | 'WORKER_PROFILE_WORKSPACE_UNSUPPORTED';
@@ -108,6 +111,18 @@ export async function startMockWorker(options: MockWorkerOptions = {}): Promise<
       const url = new URL(req.url ?? '/', 'http://worker.local');
       const auth = req.headers.authorization;
       if (typeof auth === 'string') lastAuthorization = auth;
+      if (url.pathname === '/readyz' && req.method === 'GET') {
+        if (settings.readinessDelayMs) await new Promise((resolve) => setTimeout(resolve, settings.readinessDelayMs));
+        const state = settings.readinessState ?? 'ready';
+        const ready = state === 'ready';
+        res.writeHead(ready ? 200 : 503, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+          status: ready ? 'ready' : 'not_ready',
+          ready,
+          checks: { capacity: { state: state === 'capacity' ? 'saturated' : 'available' } },
+        }));
+        return;
+      }
       if (url.pathname === '/v1/launch') {
         const body = JSON.parse(await readBody(req)) as Record<string, unknown>;
         launches.push(body);

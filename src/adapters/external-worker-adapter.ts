@@ -222,12 +222,20 @@ export interface WorkerCancelResult {
   reason?: string;
 }
 
+/** Result of checking a VM worker before a launch request is sent. */
+export type WorkerReadiness =
+  | { state: 'ready' }
+  | { state: 'unavailable' }
+  | { state: 'capacity' };
+
 /** Порт, который использует stateless-ядро API. Реализация — `ExternalWorkerAdapter`. */
 export interface ExternalWorker {
   dispose?(): Promise<void>;
   readonly remoteMcpEnabled?: boolean;
   readonly name: string;
   readonly baseUrl: string | null;
+  /** Optional pre-launch probe. Regional VM workers implement it; GHA has no receiver to probe. */
+  readiness?(): Promise<WorkerReadiness>;
   /** Квитанция запуска, а не финальный результат (асинхронный контракт, #73). */
   launch(spec: RunSpec, admittedAt?: string): Promise<LaunchReceipt>;
   restoreMcp?(spec: RunSpec, admittedAt: string): Promise<void>;
@@ -1017,6 +1025,43 @@ export class ExternalWorkerAdapter implements ExternalWorker {
 
   async restoreMcp(spec: RunSpec, admittedAt: string): Promise<void> {
     await this.resolveMcp(spec, 'restore', admittedAt);
+  }
+
+  /**
+   * Probe the VM's public readiness endpoint before sending a launch. A failed probe is
+   * definitive for this attempt because no run request has been sent yet; a failure after
+   * this probe still follows the normal unknown/reconcile path to avoid duplicate runs.
+   */
+  async readiness(): Promise<WorkerReadiness> {
+    const base = this.baseUrl;
+    if (!base) return { state: 'unavailable' };
+    const controller = new AbortController();
+    try {
+      const { response, payload } = await withTimeout(
+        (async () => {
+          const response = await this.fetchImpl(`${trimTrailingSlash(base)}/readyz`, { method: 'GET', signal: controller.signal });
+          return { response, payload: await readJson(response) };
+        })(),
+        Math.min(this.deadlineMs, 2_000),
+        'worker readiness',
+        () => controller.abort(),
+      );
+      if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) return { state: 'unavailable' };
+      const record = payload as Record<string, unknown>;
+      const checks = record['checks'];
+      const capacity = typeof checks === 'object' && checks !== null && !Array.isArray(checks)
+        ? (checks as Record<string, unknown>)['capacity']
+        : undefined;
+      const capacityState = typeof capacity === 'object' && capacity !== null && !Array.isArray(capacity)
+        ? (capacity as Record<string, unknown>)['state']
+        : undefined;
+      if (capacityState === 'saturated') return { state: 'capacity' };
+      if (response.ok && record['ready'] === true && capacityState === 'available') return { state: 'ready' };
+      return { state: 'unavailable' };
+    } catch {
+      controller.abort();
+      return { state: 'unavailable' };
+    }
   }
 
   private async resolveMcp(spec: RunSpec, mode: 'launch' | 'restore', admittedAt: string): Promise<RemoteMcpAttachment | undefined> {
