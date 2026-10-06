@@ -169,6 +169,12 @@ export class AgentApi {
       throw new ApiError('INVALID_REQUEST', `invalid submit body: ${bodyResult.errors.join('; ')}`, { errors: bodyResult.errors });
     }
     const request = bodyResult.value;
+    const testRegistryRequested = request.mcp?.servers.some(server => server.transport === 'remote' &&
+      (server.serverId === 'trained-assist-registry-test' || server.bindingRef === 'registry-mcp-test-160-read')) ?? false;
+    if ((testRegistryRequested || principal.profileId === 'integration-telegram-ux-v1') &&
+        (principal.profileId !== 'integration-telegram-ux-v1' || principal.principalId !== 'integration-telegram-ux-v1')) {
+      throw new ApiError('FORBIDDEN', 'test registry MCP requires the pinned integration principal and profile');
+    }
     const payloadHash = submitPayloadHash(request);
 
     const existing = this.store.getByAdmission(principal.principalId, idempotencyKey);

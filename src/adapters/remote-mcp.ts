@@ -1,6 +1,7 @@
 import { readFile, stat } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { isAbsolute } from 'node:path';
+import { createPrivateKey, sign as cryptoSign } from 'node:crypto';
 import { isRemoteMcpUrl, MCP_TOOL_NAME, type McpRemoteServerSpec, type RunSpec } from '../contracts/run-spec.js';
 import { PreflightError, isRecord } from '../contracts/validate.js';
 
@@ -11,6 +12,8 @@ export interface RemoteMcpServerPolicy {
   allowedTools: string[];
   bindingScopes: Record<string, string>;
   startupTimeoutMs: number;
+  policyVersion?: string;
+  catalogueVersion?: string;
 }
 
 export interface RemoteMcpBinding {
@@ -26,6 +29,7 @@ export interface RemoteMcpBinding {
   allowedTools: string[];
   expiresAt: string;
   token: string;
+  runnerProof?: string;
 }
 
 export interface RemoteMcpBindingContext {
@@ -46,6 +50,8 @@ export interface RemoteMcpBindingContext {
   serverId: string;
   url: string;
   allowedTools: string[];
+  policyVersion?: string;
+  catalogueVersion?: string;
 }
 
 export type RemoteMcpBindingResolver = (
@@ -63,6 +69,52 @@ export interface RemoteMcpAttachment {
 export interface RemoteMcpHostOptions {
   servers: Readonly<Record<string, RemoteMcpServerPolicy>>;
   resolveBinding: ManagedRemoteMcpBindingResolver;
+}
+
+export interface TestRegistryBindingConfig {
+  token: string;
+  privateKeyPem: string;
+  registryDigest: string;
+  catalogueVersion: string;
+}
+
+const TEST_PROFILE = 'integration-telegram-ux-v1';
+const TEST_SERVER = 'trained-assist-registry-test';
+const TEST_REF = 'registry-mcp-test-160-read';
+const TEST_TOOL = 'registry.fixture_read';
+const TEST_POLICY = 'registry-fixture-policy-v1';
+
+/** Trusted process-only binding for the pinned Telegram UX integration profile. */
+export function configuredTestRegistryBindingResolver(config: TestRegistryBindingConfig | undefined): RemoteMcpBindingResolver | undefined {
+  if (!config) return undefined;
+  if (!/^[A-Za-z0-9._~-]{16,2048}$/.test(config.token) || config.registryDigest !== '129ab5033964c3ed5be47414711026cc2469b3d9af90ce83ee071cba7f005ea9' ||
+      !/^[A-Za-z0-9._-]{1,200}$/.test(config.catalogueVersion)) throw new Error('test registry MCP binding configuration is invalid');
+  let key;
+  try { key = createPrivateKey(config.privateKeyPem); } catch { throw new Error('test registry MCP signing key is invalid'); }
+  if (key.asymmetricKeyType !== 'ed25519') throw new Error('test registry MCP signing key must be Ed25519');
+  return (bindingRef, context) => {
+    if (bindingRef !== TEST_REF || context.profileId !== TEST_PROFILE || context.serverId !== TEST_SERVER ||
+        context.allowedTools.length !== 1 || context.allowedTools[0] !== TEST_TOOL) return null;
+    if (context.policyVersion !== TEST_POLICY || context.catalogueVersion !== config.catalogueVersion || context.scope !== 'registry:fixture:read') return null;
+    const now = Math.floor(Date.now() / 1000);
+    const payload = Buffer.from(JSON.stringify({
+      iss: 'trained-assist-agent-runner', aud: 'trained-assist:registry-mcp:test', sub: context.runId,
+      runId: context.runId, userTaskId: context.userTaskId, profileId: TEST_PROFILE, principalId: TEST_PROFILE,
+      serverId: TEST_SERVER, bindingRef: TEST_REF, allowedTools: [TEST_TOOL], policyVersion: TEST_POLICY,
+      catalogueVersion: config.catalogueVersion, registryDigest: config.registryDigest, iat: now,
+      exp: now + Math.max(60, Math.ceil((context.startupTimeoutMs + context.timeoutMs) / 1000) + 60),
+    })).toString('base64url');
+    const header = Buffer.from(JSON.stringify({ alg: 'EdDSA', typ: 'JWT' })).toString('base64url');
+    const unsigned = `${header}.${payload}`;
+    const runnerProof = `${unsigned}.${cryptoSign(null, Buffer.from(unsigned), key).toString('base64url')}`;
+    return {
+      runId: context.runId, profileId: context.profileId, userTaskId: context.userTaskId,
+      conversationId: context.conversationId, ownerGeneration: context.ownerGeneration, engine: context.engine,
+      serverId: context.serverId, url: context.url, scope: context.scope, allowedTools: [TEST_TOOL],
+      expiresAt: new Date((now + Math.max(60, Math.ceil((context.startupTimeoutMs + context.timeoutMs) / 1000) + 60)) * 1000).toISOString(),
+      token: config.token, runnerProof,
+    };
+  };
 }
 
 export interface DocumentsHttpRegistration {
@@ -241,7 +293,7 @@ export function parseRemoteMcpServerPolicies(raw: string | undefined): Record<st
     const tokenNames = new Set<string>();
     for (const [serverId, policy] of Object.entries(input)) {
       if (!/^[A-Za-z0-9._-]{1,64}$/.test(serverId) || !isRecord(policy) ||
-          Object.keys(policy).some(key => !['url', 'tokenEnvName', 'headers', 'allowedTools', 'bindingScopes', 'startupTimeoutMs'].includes(key)) ||
+          Object.keys(policy).some(key => !['url', 'tokenEnvName', 'headers', 'allowedTools', 'bindingScopes', 'startupTimeoutMs', 'policyVersion', 'catalogueVersion'].includes(key)) ||
           !isRemoteMcpUrl(policy.url) || typeof policy.tokenEnvName !== 'string' ||
           !/^RUNNER_MCP_[A-Z0-9_]{1,48}$/.test(policy.tokenEnvName) || tokenNames.has(policy.tokenEnvName) ||
           !isRecord(policy.headers) || !isRecord(policy.bindingScopes) || Object.keys(policy.bindingScopes).length === 0 ||
@@ -249,7 +301,9 @@ export function parseRemoteMcpServerPolicies(raw: string | undefined): Record<st
           !Object.entries(policy.bindingScopes).every(([ref, scope]) => ref.length > 0 && ref.length <= 300 && typeof scope === 'string' && scope.length > 0 && scope.length <= 300) || !Array.isArray(policy.allowedTools) ||
           policy.allowedTools.length === 0 || policy.allowedTools.length > 50 ||
           !policy.allowedTools.every(tool => typeof tool === 'string' && MCP_TOOL_NAME.test(tool)) ||
-          new Set(policy.allowedTools).size !== policy.allowedTools.length) throw new Error();
+          new Set(policy.allowedTools).size !== policy.allowedTools.length ||
+          (policy.policyVersion !== undefined && (typeof policy.policyVersion !== 'string' || !/^[A-Za-z0-9._-]{1,200}$/.test(policy.policyVersion))) ||
+          (policy.catalogueVersion !== undefined && (typeof policy.catalogueVersion !== 'string' || !/^[A-Za-z0-9._-]{1,200}$/.test(policy.catalogueVersion)))) throw new Error();
       const headers: Record<string, string> = Object.create(null);
       const entries = Object.entries(policy.headers);
       if (entries.length === 0 || entries.length > 8 || new Set(entries.map(([name]) => name.toLowerCase())).size !== entries.length ||
@@ -260,7 +314,7 @@ export function parseRemoteMcpServerPolicies(raw: string | undefined): Record<st
         headers[name] = template;
       }
       tokenNames.add(policy.tokenEnvName);
-      servers[serverId] = { url: policy.url, tokenEnvName: policy.tokenEnvName, headers, allowedTools: [...policy.allowedTools], bindingScopes: { ...policy.bindingScopes } as Record<string, string>, startupTimeoutMs: Number(policy.startupTimeoutMs) };
+      servers[serverId] = { url: policy.url, tokenEnvName: policy.tokenEnvName, headers, allowedTools: [...policy.allowedTools], bindingScopes: { ...policy.bindingScopes } as Record<string, string>, startupTimeoutMs: Number(policy.startupTimeoutMs), ...(typeof policy.policyVersion === 'string' ? { policyVersion: policy.policyVersion } : {}), ...(typeof policy.catalogueVersion === 'string' ? { catalogueVersion: policy.catalogueVersion } : {}) };
     }
     return servers;
   } catch {
@@ -307,6 +361,11 @@ export async function resolveRemoteMcpAttachment(
     if (!policy || policy.url !== server.url) refuse('MCP_ENDPOINT_NOT_ALLOWED');
     if (policy.startupTimeoutMs + spec.limits.timeoutMs + 60000 > 86400000 || !Number.isFinite(Date.parse(admittedAt))) refuse('MCP_BINDING_EXPIRED');
     if (!server.allowedTools.every(tool => policy.allowedTools.includes(tool))) refuse('MCP_TOOL_NOT_ALLOWED');
+    const isTestProfile = spec.profileId === TEST_PROFILE;
+    if (isTestProfile && (server.serverId !== TEST_SERVER || server.bindingRef !== TEST_REF || server.allowedTools.length !== 1 ||
+        server.allowedTools[0] !== TEST_TOOL || server.policyVersion !== TEST_POLICY || !server.catalogueVersion ||
+        policy.policyVersion !== TEST_POLICY || policy.catalogueVersion !== server.catalogueVersion ||
+        !host.resolveBinding)) refuse('MCP_BINDING_SCOPE_MISMATCH');
     const scope = Object.hasOwn(policy.bindingScopes, server.bindingRef) ? policy.bindingScopes[server.bindingRef] : undefined;
     if (!scope || signal?.aborted) refuse('MCP_BINDING_MISSING');
     const declared = spec.credentialBindings?.find(binding => binding.ref === server.bindingRef);
@@ -318,6 +377,8 @@ export async function resolveRemoteMcpAttachment(
       conversationId: spec.conversationId, ownerGeneration: spec.ownerGeneration,
       operationId: spec.operationId, engine: spec.engine.name,
       serverId: server.serverId, url: policy.url, allowedTools: [...server.allowedTools],
+      ...(server.policyVersion ? { policyVersion: server.policyVersion } : {}),
+      ...(server.catalogueVersion ? { catalogueVersion: server.catalogueVersion } : {}),
     };
     let binding: RemoteMcpBinding | null;
     try {
@@ -326,6 +387,7 @@ export async function resolveRemoteMcpAttachment(
       refuse('MCP_BINDING_UNAVAILABLE');
     }
     if (!binding || typeof binding !== 'object') refuse('MCP_BINDING_UNAVAILABLE');
+    if (isTestProfile && (!binding.runnerProof || server.catalogueVersion === undefined)) refuse('MCP_BINDING_UNAVAILABLE');
     for (const key of ['runId', 'profileId', 'userTaskId', 'conversationId', 'ownerGeneration', 'engine', 'serverId', 'url'] as const) {
       if (binding[key] !== context[key]) refuse('MCP_BINDING_SCOPE_MISMATCH');
     }
@@ -343,6 +405,7 @@ export async function resolveRemoteMcpAttachment(
     headers['X-MCP-User-Task-Id'] = context.userTaskId;
     headers['X-MCP-Profile'] = context.profileId;
     headers['X-MCP-Run-Id'] = context.runId;
+    if (isTestProfile) headers['X-MCP-Run-Binding'] = binding.runnerProof!;
     if (Object.values(headers).some(value => /[\r\n]/.test(value))) refuse('MCP_BINDING_SCOPE_MISMATCH');
     attachment.mcp.servers[server.serverId] = { type: 'remote', url: policy.url, headers, enabled: true };
     attachment.mcpSecrets[policy.tokenEnvName] = binding.token;

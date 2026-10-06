@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest';
+import { generateKeyPairSync, verify } from 'node:crypto';
 import { createExternalWorkers, loadAgentApiConfig } from '../src/api/config.js';
+import { AgentApi } from '../src/api/service.js';
+import type { Principal } from '../src/api/auth.js';
 import type { RunSpec } from '../src/contracts/run-spec.js';
 import { makeRunSpec } from './helpers.js';
 import { startMockWorker } from './external-worker-harness.js';
@@ -16,6 +19,59 @@ const base = {
 };
 
 describe('конфигурация воркеров', () => {
+  it('process config resolves the pinned test binding after receipt runId creation and signs that runId', async () => {
+    const mock = await startMockWorker({ autoDeliver: false });
+    const { privateKey, publicKey } = generateKeyPairSync('ed25519');
+    const privateKeyPem = privateKey.export({ type: 'pkcs8', format: 'pem' }).toString();
+    try {
+      const policy = {
+        'trained-assist-registry-test': {
+          url: 'https://registry.test.example/mcp', tokenEnvName: 'RUNNER_MCP_REGISTRY_TEST',
+          headers: { Authorization: 'Bearer {env:RUNNER_MCP_REGISTRY_TEST}' },
+          allowedTools: ['registry.fixture_read'], bindingScopes: { 'registry-mcp-test-160-read': 'registry:fixture:read' },
+          startupTimeoutMs: 1000, policyVersion: 'registry-fixture-policy-v1', catalogueVersion: 'catalogue-v1',
+        },
+      };
+      const config = loadAgentApiConfig({
+        ...base, EXTERNAL_WORKER_URL: mock.baseUrl, AGENT_API_PUBLIC_URL: 'https://runner.example',
+        AGENT_API_REMOTE_MCP_SERVERS: JSON.stringify(policy),
+        AGENT_API_TEST_MCP_BEARER: 'opaque-test-bearer-token-123',
+        AGENT_API_TEST_MCP_ED25519_PRIVATE_KEY: privateKeyPem,
+        AGENT_API_TEST_MCP_CATALOGUE_VERSION: 'catalogue-v1',
+        AGENT_API_TEST_MCP_REGISTRY_DIGEST: '129ab5033964c3ed5be47414711026cc2469b3d9af90ce83ee071cba7f005ea9',
+      });
+      const worker = createExternalWorkers(config)[0]!;
+      const logs: Record<string, unknown>[] = [];
+      const api = new AgentApi({ workers: [worker], logger: entry => logs.push(entry), resultGraceMs: 5 });
+      const principal: Principal = { principalId: 'integration-telegram-ux-v1', profileId: 'integration-telegram-ux-v1', scopes: ['runs:read', 'runs:write'] };
+      const receipt = api.submit(principal, 'test-registry-run-1', {
+        engine: { name: worker.name, adapterVersion: '1' }, limits: { timeoutMs: 15000 }, envAllowlist: [], input: { inlinePrompt: 'Read the registry fixture.' },
+        credentialBindings: [{ ref: 'registry-mcp-test-160-read', scope: 'registry:fixture:read' }],
+        mcp: { servers: [{ serverId: 'trained-assist-registry-test', transport: 'remote', url: 'https://registry.test.example/mcp', bindingRef: 'registry-mcp-test-160-read', allowedTools: ['registry.fixture_read'], policyVersion: 'registry-fixture-policy-v1', catalogueVersion: 'catalogue-v1' }] },
+      });
+      for (let i = 0; i < 50 && mock.launches.length === 0; i += 1) await new Promise(resolve => setTimeout(resolve, 10));
+      expect(JSON.stringify(logs)).not.toContain('opaque-test-bearer-token-123');
+      expect(JSON.stringify(logs)).not.toContain(privateKeyPem);
+      expect(mock.launches, JSON.stringify(logs)).toHaveLength(1);
+      const launch = mock.launches[0]!;
+      const attachment = launch.mcp as { servers: Record<string, { headers: Record<string, string> }> };
+      const proof = attachment.servers['trained-assist-registry-test']!.headers['X-MCP-Run-Binding']!;
+      const [header, payload, signature] = proof.split('.');
+      const decoded = JSON.parse(Buffer.from(payload!, 'base64url').toString('utf8')) as Record<string, unknown>;
+      expect(JSON.parse(Buffer.from(header!, 'base64url').toString('utf8'))).toEqual({ alg: 'EdDSA', typ: 'JWT' });
+      expect(decoded).toMatchObject({ runId: receipt.runId, sub: receipt.runId, profileId: 'integration-telegram-ux-v1', userTaskId: receipt.userTaskId, policyVersion: 'registry-fixture-policy-v1', catalogueVersion: 'catalogue-v1', registryDigest: '129ab5033964c3ed5be47414711026cc2469b3d9af90ce83ee071cba7f005ea9' });
+      expect(verify(null, Buffer.from(`${header}.${payload}`), publicKey, Buffer.from(signature!, 'base64url'))).toBe(true);
+      expect(launch.mcpSecrets).toEqual({ RUNNER_MCP_REGISTRY_TEST: 'opaque-test-bearer-token-123' });
+      expect(JSON.stringify(api['opts'] ?? {})).not.toContain(privateKeyPem);
+      await api.dispose();
+    } finally { await mock.close(); }
+  });
+
+  it('rejects incomplete or mismatched trusted test binding configuration without echoing secrets', () => {
+    expect(() => loadAgentApiConfig({ ...base, EXTERNAL_WORKER_URL: 'https://worker.example', AGENT_API_TEST_MCP_BEARER: 'secret' })).toThrow(/requires bearer, Ed25519 key/);
+    expect(() => loadAgentApiConfig({ ...base, EXTERNAL_WORKER_URL: 'https://worker.example', AGENT_API_TEST_MCP_BEARER: 'opaque-test-bearer-token-123', AGENT_API_TEST_MCP_ED25519_PRIVATE_KEY: 'not-a-key', AGENT_API_TEST_MCP_CATALOGUE_VERSION: 'catalogue-v1', AGENT_API_TEST_MCP_REGISTRY_DIGEST: 'bad-digest' })).toThrow(/configuration is invalid/);
+  });
+
   it('forwards only allowed host pool values to the actual launch request', async () => {
     const mock = await startMockWorker({ autoDeliver: false });
     try {
