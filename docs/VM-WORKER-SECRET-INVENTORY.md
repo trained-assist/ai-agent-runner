@@ -22,6 +22,34 @@ rotation date produces warnings; a missing required binding makes readiness fail
 | `LLM_LADDER_TOKEN` | OpenCode provider credential | The central Agent API passes it in the authenticated per-run launch env when allowlisted. It is runtime task input to the worker process and must not be copied into inventory or logged. Record its source and owner in the central API's own binding inventory. |
 | `RUNNER_CONTROL_PLANE_URL`, `RUNNER_CONTROL_PLANE_PRINCIPAL`, `RUNNER_CONTROL_PLANE_PRINCIPAL_SECRET` | Resolve task-scoped ingress manifests and artifact bytes | Configure as one group in the VM worker's systemd environment when the central API sends `ingressManifest`; secret value belongs in the approved host secret store. Without the group, ingress-manifest runs fail closed before the agent starts. |
 
+## Worker authentication and model credentials
+
+`VM_WORKER_TOKEN` and `LLM_LADDER_TOKEN` serve different trust boundaries:
+
+- `VM_WORKER_TOKEN` is a random, long-lived bearer shared only by one VM Worker and
+  the central Agent API. The VM reads it from `/etc/ai-agent-runner/worker.env`;
+  the API reads the matching value from `AGENT_API_WORKERS` in
+  `/etc/agent-runner/agent-runner-api.env`. It authenticates API → Worker HTTP calls.
+- `LLM_LADDER_TOKEN` authenticates the agent to the model/provider ladder. The API
+  passes it as an allowlisted runtime variable to the agent process. It does not
+  authenticate the API to the Worker and must never be reused as `VM_WORKER_TOKEN`.
+
+For initial bootstrap, generate a distinct random Worker token for each VM on the
+central API host, transfer it to that VM over authenticated SSH stdin, and write it to
+both protected service configurations. Do not put it in command arguments, shell
+history, GitHub Actions logs, issue/chat messages, or run input. Keep the VM file
+root-owned with mode 0600 and the API env file restricted to its service owner (mode
+0600). Restart and verify the Worker before enabling its matching API entry; then
+verify the API health and a canary launch. Rotate both copies as one operation after
+draining new submissions because the current contract accepts one token per worker.
+
+This repository currently has no automated cross-host token provisioning command and
+no verified France/Russia/API SSH targets. `scripts/install-vm-worker.sh` and
+`scripts/deploy-api-service.sh` install service configuration but do not create and
+securely distribute a shared token. Treat the binding as unprovisioned until both
+stores and an authenticated canary have been verified. The model ladder token is not a
+workaround for this missing setup.
+
 This document is a registry template, not evidence that any production secret is already
 stored at the intended location. The release drift workflow reports worker configuration
 presence and GitHub Actions reports missing worker probe secrets; it cannot inspect
