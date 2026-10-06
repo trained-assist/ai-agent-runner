@@ -86,6 +86,8 @@ function parseRecord(value: unknown, index: number): KeyRecord {
 
 export class KeyRegistry {
   private readonly byHash = new Map<string, Principal>();
+  private readonly profileTenants = new Map<string, string>();
+  private readonly principalBindings = new Map<string, string>();
 
   static fromRecords(records: KeyRecord[]): KeyRegistry {
     const registry = new KeyRegistry();
@@ -103,6 +105,15 @@ export class KeyRegistry {
   }
 
   add(record: KeyRecord): void {
+    if (record.tenantId) {
+      const priorTenant = this.profileTenants.get(record.profileId);
+      if (priorTenant && priorTenant !== record.tenantId) throw new Error(`key registry: profileId ${record.profileId} is bound to multiple tenants`);
+      const binding = `${record.tenantId}\0${record.profileId}`;
+      const priorBinding = this.principalBindings.get(record.principalId);
+      if (priorBinding && priorBinding !== binding) throw new Error(`key registry: principalId ${record.principalId} is bound to multiple profiles`);
+      this.profileTenants.set(record.profileId, record.tenantId);
+      this.principalBindings.set(record.principalId, binding);
+    }
     const principal: Principal = {
       principalId: record.principalId,
       ...(record.tenantId ? { tenantId: record.tenantId } : {}),

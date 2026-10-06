@@ -1086,7 +1086,8 @@ private buildSpec(
 
   private requireRun(principal: Principal, runId: string): AdmissionRecord {
     const record = this.store.getByRun(runId);
-    if (!record || record.principalId !== principal.principalId) {
+    if (!record || record.principalId !== principal.principalId ||
+        (this.opts.profileWorkspace && (record.tenantId !== principal.tenantId || record.profileId !== principal.profileId))) {
       throw new ApiError('NOT_FOUND', `unknown run ${runId}`);
     }
     return record;

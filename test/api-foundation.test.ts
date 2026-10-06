@@ -54,6 +54,14 @@ describe('api key registry', () => {
     expect(registry.authenticate('')).toBeNull();
   });
 
+  it('refuses ambiguous tenant and profile bindings for trusted profile keys', () => {
+    const first = keyRecordFor(generateApiKey(), { principalId: 'p-a', tenantId: 'tenant-a', profileId: 'profile-a', scopes: ['runs:write'] });
+    const sameProfile = keyRecordFor(generateApiKey(), { principalId: 'p-b', tenantId: 'tenant-b', profileId: 'profile-a', scopes: ['runs:write'] });
+    const samePrincipal = keyRecordFor(generateApiKey(), { principalId: 'p-a', tenantId: 'tenant-a', profileId: 'profile-b', scopes: ['runs:write'] });
+    expect(() => KeyRegistry.fromRecords([first, sameProfile])).toThrow(/multiple tenants/);
+    expect(() => KeyRegistry.fromRecords([first, samePrincipal])).toThrow(/multiple profiles/);
+  });
+
   it('loads a hashed key file and fails fast on a malformed one', () => {
     const dir = tempDir();
     try {

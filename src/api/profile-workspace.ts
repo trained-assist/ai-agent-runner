@@ -84,6 +84,9 @@ export function createProfileWorkspaceCoordinator(options: ProfileWorkspaceRunti
   return {
     async prepare(principal, runId) {
       const { tenantId, profileId } = identity(principal);
+      if ((await bindings.list()).some((binding) => binding.profileId === profileId && binding.tenantId !== tenantId)) {
+        throw new WorkspaceError('WORKSPACE_FORBIDDEN', 'profileId is already bound to another tenant');
+      }
       const profileKey = createHash('sha256').update(`${tenantId}\0${profileId}`).digest('hex').slice(0, 32);
       const ensured = await workspace.ensureProfileRepository({
         operationId: `ensure:${profileKey}`,
