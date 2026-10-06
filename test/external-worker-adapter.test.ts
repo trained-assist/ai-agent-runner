@@ -48,7 +48,19 @@ function launchResult(over: Partial<LaunchResult> = {}): LaunchResult {
 
 describe('launch request: RunSpec → LaunchRequest (issue #73)', () => {
   it('промпт, лимиты, репозиторий и изоляция уезжают в воркер как есть', () => {
+    const ingressManifest = {
+      contractVersion: 1 as const,
+      manifestRef: 'manifest-task-1',
+      manifestVersion: 'a'.repeat(64),
+      userTaskId: 'task-ingress-1',
+      profileId: 'profile-a',
+      runId: 'run-ingress-1',
+      ownerGeneration: 1,
+    };
     const spec = makeRunSpec({
+      runId: ingressManifest.runId,
+      userTaskId: ingressManifest.userTaskId,
+      ingressManifest,
       engine: { name: EXTERNAL_WORKER_ENGINE, adapterVersion: '1', modelSettings: { model: 'free' } },
       input: { inlinePrompt: 'сделай отчёт' },
       envAllowlist: ['PATH', 'HOME'],
@@ -60,6 +72,7 @@ describe('launch request: RunSpec → LaunchRequest (issue #73)', () => {
     const request = launchRequestFromSpec(spec, {
       env: { PATH: '/usr/bin', HOME: '/home/runner', SECRET: 'nope' },
       resultUrl: 'http://api.local/v1/worker/launches/run_x/result',
+      supportsIngressManifest: true,
     });
 
     expect(request.engine).toEqual({ name: EXTERNAL_WORKER_ENGINE, adapterVersion: '1', modelSettings: { model: 'free' } });
@@ -70,9 +83,48 @@ describe('launch request: RunSpec → LaunchRequest (issue #73)', () => {
     expect(request.repository.branch).toBe(`agent-run/${spec.runId}`);
     expect(request.isolation.mode).toBe('per_run_unix_identity');
     expect(request.outputs).toEqual([{ path: 'report.md', name: 'report.md', mime: 'text/markdown' }]);
+    expect(request.ingressManifest).toEqual(ingressManifest);
     // В процесс агента уходят только переменные из envAllowlist; секрет хоста остаётся здесь.
     expect(request.env).toEqual({ PATH: '/usr/bin', HOME: '/home/runner' });
     expect(JSON.stringify(request)).not.toContain('nope');
+  });
+
+  it('routes ingress-manifest pins only to VM workers with the trusted CP resolver', async () => {
+    const worker = await startMockWorker();
+    try {
+      const pin = {
+        contractVersion: 1 as const,
+        manifestRef: 'manifest-vm-route',
+        manifestVersion: 'c'.repeat(64),
+        userTaskId: 'task-vm-route',
+        profileId: 'profile-a',
+        runId: 'run-vm-route',
+        ownerGeneration: 1,
+      };
+      const spec = makeRunSpec({
+        runId: pin.runId,
+        userTaskId: pin.userTaskId,
+        engine: { name: 'eu-vm-agent-run', adapterVersion: '1' },
+        input: { inlinePrompt: 'run' },
+        ingressManifest: pin,
+      });
+      const vm = new ExternalWorkerAdapter({ engineName: 'eu-vm-agent-run', baseUrl: worker.baseUrl, baseUrlForResult: 'https://api.test' });
+      await vm.launch(spec);
+      expect(worker.launches[0]?.['ingressManifest']).toEqual(pin);
+
+      const gha = new ExternalWorkerAdapter({ engineName: 'azure-dynamic-ip-agent-run', baseUrl: worker.baseUrl, baseUrlForResult: 'https://api.test' });
+      await expect(gha.launch({ ...spec, engine: { name: 'azure-dynamic-ip-agent-run', adapterVersion: '1' } }))
+        .rejects.toMatchObject({ code: 'INGRESS_MANIFEST_UNSUPPORTED' });
+      expect(worker.launches).toHaveLength(1);
+    } finally {
+      await worker.close();
+    }
+  });
+
+  it('подставляет положительные лимиты, когда клиент их не задал', () => {
+    const spec = makeRunSpec({ input: { inlinePrompt: 'проверка' }, limits: { timeoutMs: 300_000 } });
+    const request = launchRequestFromSpec(spec);
+    expect(request.limits).toEqual({ timeoutMs: 300_000, maxOutputBytes: 5_000_000, maxLogBytes: 5_000_000 });
   });
 
   it('input.refs — preflight-отказ: stateless API нечего материализовать', () => {
@@ -572,6 +624,16 @@ describe('ExternalWorkerAdapter по HTTP', () => {
       await expect(adapterFor(worker).launch(makeRunSpec({ runId: 'run-http-3', input: { inlinePrompt: 'сделай отчёт' } }))).rejects.toMatchObject({
         code: 'WORKER_HTTP_ERROR',
       });
+    } finally {
+      await worker.close();
+    }
+  });
+
+  it('structured unsupported-workspace refusal is a definitive no-start and can advance the engine chain', async () => {
+    const worker = await startMockWorker({ httpStatus: 501, admissionRefusal: 'WORKER_PROFILE_WORKSPACE_UNSUPPORTED' });
+    try {
+      await expect(adapterFor(worker).launch(makeRunSpec({ runId: 'run-profile-refused', input: { inlinePrompt: 'run' } })))
+        .rejects.toMatchObject({ code: 'WORKER_PROFILE_WORKSPACE_UNSUPPORTED', retryable: true });
     } finally {
       await worker.close();
     }

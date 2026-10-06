@@ -24,6 +24,7 @@ import { RunExportStore, type PlannedOutput } from '../storage/export.js';
 import type { UploadSessionStore } from '../storage/upload-session.js';
 import type { WorkspaceSnapshotStore } from '../storage/workspace-snapshot.js';
 import { InputMaterializer, type MaterializeReceipt } from '../storage/input-materializer.js';
+import { materializeIngressManifest, type IngressArtifactResolver } from '../storage/ingress-artifact.js';
 import { artifactNameFor, mimeForName } from '../storage/export-manifest.js';
 import type { RunExportManifest } from '../storage/export-manifest.js';
 import { isRegularFile, resolveExistingInsideRoot } from '../storage/local-paths.js';
@@ -43,6 +44,7 @@ import type { CapabilityRegistry } from '../mcp/capabilities.js';
 import { bridgeSocketPath, newBridgeToken } from '../mcp/bridge.js';
 import { McpRunSession, McpStartupError, type EngineMcpConfig, type McpLogFields, type McpLogLevel } from '../mcp/session.js';
 import { McpRunScope, McpScopeError, type BindingValueResolver } from '../mcp/scope.js';
+import type { RunBranchWorker } from '../workspace/run-branch-worker.js';
 
 
 export interface RunnerHostInfo {
@@ -110,6 +112,10 @@ export interface RunnerOptions {
    * а ран получает отказ с причиной и признаком повторяемости.
    */
   inputs?: InputMaterializer;
+  /** Private task-scoped Control Plane resolver. Credentials belong to deployment config only. */
+  ingressResolver?: IngressArtifactResolver;
+  /** Profile workspace checkout/publication lifecycle; tokens remain memory-only. */
+  profileWorkspace?: RunBranchWorker;
   /**
    * Реестр capability handler'ов хоста (P13). Один и тот же реестр обслуживает вызовы MCP
    * ран'а и внутренний API control plane — бизнес-логика домена не дублируется в транспортах.
@@ -137,6 +143,8 @@ export interface RunnerOptions {
   bindingResolver?: BindingValueResolver;
   /** Команда broker'а MCP для движка; по умолчанию — per-run прокси из репозитория. */
   mcpBrokerCommand?: { command: string; args: string[] };
+  /** If false, a queued run recovered after a process restart is failed closed instead of relaunched. */
+  resumeQueuedRuns?: boolean;
 }
 
 export interface StartReceipt {
@@ -255,6 +263,13 @@ interface InternalRun {
    * содержимое не попадает — только источник и размер.
    */
   answerTail: string[];
+  /** Launch-only credentials. Deliberately memory-only and never written to RunStore. */
+  runtimeEnv: Record<string, string>;
+  /** Allowlisted secret values used to scrub engine output before it reaches durable logs. */
+  runtimeSecrets: string[];
+  workspaceToken: string | null;
+  repositoryCommit: string | null;
+  workspacePublishFailed: boolean;
 }
 
 /**
@@ -373,6 +388,14 @@ function formatMcpFields(fields: McpLogFields): string {
     .join(' ');
 }
 
+function redactRunSecrets(text: string, secrets: readonly string[]): string {
+  let result = text;
+  for (const secret of secrets) {
+    if (secret.length >= 4 && result.includes(secret)) result = result.split(secret).join('[redacted]');
+  }
+  return result;
+}
+
 export class Runner {
   private readonly opts: RunnerOptions;
   private readonly store: RunStore;
@@ -417,6 +440,11 @@ export class Runner {
         mcpConfigPath: null,
         room: null,
         answerTail: [],
+        runtimeEnv: {},
+        runtimeSecrets: [],
+        workspaceToken: null,
+        repositoryCommit: state.profileWorkspaceCommit ?? state.result?.repositoryCommit ?? null,
+        workspacePublishFailed: false,
       });
     }
   }
@@ -474,6 +502,23 @@ export class Runner {
     };
   }
 
+  /** Internal worker adapter view; repository credentials are removed from the returned copy. */
+  getRunSpec(runId: string): RunSpec | null {
+    const run = this.runs.get(runId);
+    if (!run) return null;
+    const spec = structuredClone(run.state.spec);
+    stripRepositoryToken(spec);
+    return spec;
+  }
+
+  /** Commit confirmed on the profile run branch. */
+  profileWorkspaceCommit(runId: string): string | null {
+    const run = this.runs.get(runId);
+    return run?.repositoryCommit ?? run?.state.profileWorkspaceCommit ?? run?.state.result?.repositoryCommit ?? null;
+  }
+
+  supportsProfileWorkspace(): boolean { return this.opts.profileWorkspace !== undefined; }
+
   events(runId: string, afterSequence = 0): RunnerEvent[] {
     const run = this.runs.get(runId);
     if (!run) return [];
@@ -496,7 +541,7 @@ export class Runner {
     return this.runExport(run.state, { force: true });
   }
 
-  start(input: unknown, operationIdArg?: string): StartReceipt {
+  start(input: unknown, operationIdArg?: string, runtimeEnv: Record<string, string> = {}): StartReceipt {
     const validated = validateRunSpec(input);
     if (!validated.ok) throw new SpecValidationError(validated.errors);
     const spec = validated.value;
@@ -582,6 +627,11 @@ export class Runner {
       mcpConfigPath: null,
       room: null,
       answerTail: [],
+      runtimeEnv: { ...runtimeEnv },
+      runtimeSecrets: [],
+      workspaceToken: spec.profileWorkspace ? spec.repository?.token ?? null : null,
+      repositoryCommit: null,
+      workspacePublishFailed: false,
     });
     this.emit(state, 'claimed', { operationId });
     void this.execute(spec.runId).catch(() => undefined);
@@ -681,10 +731,24 @@ export class Runner {
     const run = this.runs.get(runId);
     if (!run) throw new Error(`unknown run: ${runId}`);
     const st = run.state;
-    if (st.finalized && st.result) return st.result;
+    if (st.finalized && st.result && !['pending', 'failed'].includes(st.result.persistence)) return st.result;
     if (run.finalizePromise) return run.finalizePromise;
     const promise = this.doFinalize(st).finally(() => {
       run.finalizePromise = null;
+      const exportManifest = this.exportManifest(runId);
+      if (st.result?.persistence === 'pending' && (exportManifest?.attempts ?? 0) < 8) {
+        const delayMs = Math.min(60_000, 2_000 * 2 ** Math.min(exportManifest?.attempts ?? 0, 5));
+        const timer = setTimeout(() => { void this.finalize(runId).catch(() => undefined); }, delayMs);
+        run.timers.push(timer);
+      } else if (st.result?.persistence === 'pending' && (exportManifest?.attempts ?? 0) >= 8) {
+        const attention: RunResult = { ...st.result, persistence: 'failed',
+          persistenceReason: 'bounded persistence retries exhausted; source copies were retained for operator replay',
+          cleanup: 'pending', cleanupReason: 'cleanup is blocked until remote custody is verified' };
+        this.persistResult(st, attention);
+        this.writeCheckpoint(st, attention, exportManifest, null, null, 'cleanup_pending', {
+          status: 'blocked', reason: 'persistence retries exhausted; source copies retained', intentAt: this.nowIso(), finishedAt: null,
+        }, { silent: true });
+      }
     });
     run.finalizePromise = promise;
     return promise;
@@ -693,7 +757,7 @@ export class Runner {
   async waitFor(runId: string, timeoutMs = 30000): Promise<RunResult> {
     const run = this.runs.get(runId);
     if (!run) throw new Error(`unknown run: ${runId}`);
-    if (run.state.finalized && run.state.result) return run.state.result;
+    if (run.state.finalized && run.state.result && !run.finalizePromise && run.state.result.persistence !== 'pending') return run.state.result;
     return new Promise<RunResult>((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error(`timeout waiting for run ${runId}`)), timeoutMs);
       run.waiters.push((result) => {
@@ -740,8 +804,18 @@ export class Runner {
       }
       switch (st.state) {
         case 'queued':
-          report.resumedQueued += 1;
-          void this.execute(st.runId).catch(() => undefined);
+          if (this.opts.resumeQueuedRuns === false) {
+            this.completeWithoutEngine(st, 'failed', 'worker_crash', {
+              code: 'WORKER_RESTARTED_BEFORE_ENGINE_START',
+              failureClass: 'runtime',
+              safeSummary: 'worker restarted before the engine was confirmed; run was not relaunched',
+              retryable: true,
+            });
+            report.lost += 1;
+          } else {
+            report.resumedQueued += 1;
+            void this.execute(st.runId).catch(() => undefined);
+          }
           break;
         case 'starting':
           report.orphanedMcp += await this.reapOrphanedMcp(run);
@@ -808,6 +882,7 @@ export class Runner {
 
   dispose(): void {
     this.disposed = true;
+    for (const run of this.runs.values()) { run.runtimeEnv = {}; run.runtimeSecrets = []; }
     for (const controller of this.cloneControllers.values()) controller.abort();
     this.cloneControllers.clear();
     for (const run of this.runs.values()) {
@@ -1070,6 +1145,12 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
 
   private preflight(st: PersistedRunState): void {
     const spec = st.spec;
+    if (spec.profileWorkspace && !this.opts.profileWorkspace) {
+      throw new PreflightError('WORKER_PROFILE_WORKSPACE_UNSUPPORTED', 'this Runner has no profile workspace checkout/publication lifecycle');
+    }
+    if (spec.profileWorkspace && (!spec.repository?.revision || !spec.repository.token)) {
+      throw new PreflightError('CREDENTIALS_UNAVAILABLE', 'profile workspace requires a pinned base revision and publication token');
+    }
     if (spec.budget && !spec.budget.approved) {
       throw new PreflightError('BUDGET_UNAVAILABLE', spec.budget.reason ?? 'no approved budget for this run', { retryable: true });
     }
@@ -1123,13 +1204,18 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
       this.cloneControllers.set(st.runId, controller);
       if (this.disposed) controller.abort();
       await cloneRepository(source, st.spec.cwd, { signal: controller.signal });
+      const run = this.runs.get(st.runId);
+      if (st.spec.profileWorkspace && this.opts.profileWorkspace) {
+        if (!run?.workspaceToken) throw new PreflightError('CREDENTIALS_UNAVAILABLE', 'profile workspace publication credential is unavailable');
+        await this.opts.profileWorkspace.prepare(st.spec, st.spec.cwd, run.workspaceToken);
+      }
     } finally {
       this.cloneControllers.delete(st.runId);
       // токен живёт только до попытки clone: в движок, env и журналы он не уходит
       stripRepositoryToken(st.spec);
     }
     await this.materializeInputs(st);
-    this.emit(st, 'materialized', { inputs: st.spec.input?.refs?.length ?? 0 });
+    this.emit(st, 'materialized', { inputs: (st.spec.input?.refs?.length ?? 0) + (st.spec.ingressManifest ? 1 : 0) });
   }
 
   /**
@@ -1144,7 +1230,72 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
   private async materializeInputs(st: PersistedRunState): Promise<void> {
     const refs = st.spec.input?.refs ?? [];
     const materializer = this.opts.inputs;
-    if (refs.every((ref) => ref.snapshotId === undefined)) {
+    const ingress = st.spec.ingressManifest;
+    if (ingress) {
+      if (refs.length > 0) throw new PreflightError('INGRESS_INPUT_INVALID', 'ingress manifests cannot be combined with workspace snapshots');
+      if (!this.opts.ingressResolver) {
+        const reason = 'run requests a task-scoped ingress manifest, but this worker has no Control Plane resolver configured';
+        this.emit(st, 'inputs_materialized', { status: 'refused', declared: 1, requested: 1, files: 0, bytes: 0, entries: [], reason });
+        throw new PreflightError('INGRESS_INPUT_INVALID', reason, { retryable: false });
+      }
+      try {
+        const receipt = await materializeIngressManifest(this.opts.ingressResolver, ingress, {
+          runId: st.runId,
+          userTaskId: st.userTaskId,
+          profileId: st.profileId,
+          ownerGeneration: st.ownerGeneration,
+          cwd: st.spec.cwd,
+        });
+        this.emit(st, 'inputs_materialized', {
+          status: 'materialized', declared: receipt.artifactCount, requested: receipt.artifactCount,
+          files: receipt.files, bytes: receipt.bytes,
+          entries: receipt.artifacts.map((artifact) => ({ ref: artifact.ref, status: 'materialized' as const, code: null, files: 1, bytes: artifact.bytes, reason: null })), reason: null,
+        });
+        this.emit(st, 'log', {
+          stream: 'runner', level: 'info',
+          message: `inputs.ingress_materialized runId=${st.runId} artifacts=${receipt.artifactCount} files=${receipt.files} bytes=${receipt.bytes}`,
+        });
+        return;
+      } catch (error) {
+        const code = error instanceof PreflightError ? error.code : 'INGRESS_INPUT_UNAVAILABLE';
+        const retryable = error instanceof PreflightError ? error.retryable : true;
+        const reason = error instanceof Error ? error.message : 'Control Plane ingress materialization failed';
+        const status = retryable ? 'unavailable' : 'refused';
+        this.emit(st, 'inputs_materialized', { status, declared: 1, requested: 1, files: 0, bytes: 0, entries: [], reason });
+        this.emit(st, 'log', {
+          stream: 'runner', level: 'error',
+          message: `inputs.ingress_${status} runId=${st.runId} code=${code} retryable=${retryable} reason=${truncateLine(redactSecrets(reason), 300)}`,
+        });
+        throw error instanceof PreflightError ? error : new PreflightError(code, reason, { retryable });
+      }
+    }
+    const unresolved = refs.filter((ref) => ref.snapshotId === undefined);
+    if (unresolved.length > 0) {
+      const reason = `run ${st.runId} requests input refs that this worker cannot resolve: [${unresolved.map((ref) => ref.ref).join(', ')}]`;
+      this.emit(st, 'inputs_materialized', {
+        status: 'refused',
+        declared: refs.length,
+        requested: refs.length,
+        files: 0,
+        bytes: 0,
+        entries: unresolved.map((ref) => ({
+          ref: ref.ref,
+          status: 'refused',
+          code: 'MATERIALIZE_REF_INVALID',
+          files: 0,
+          bytes: 0,
+          reason,
+        })),
+        reason,
+      });
+      this.emit(st, 'log', {
+        stream: 'runner',
+        level: 'error',
+        message: `inputs.materialize_refused runId=${st.runId} status=refused retryable=false reason=${truncateLine(redactSecrets(reason), 300)}`,
+      });
+      throw new PreflightError('MATERIALIZE_REF_INVALID', reason, { retryable: false });
+    }
+    if (refs.length === 0) {
       if (materializer) {
         this.emit(st, 'inputs_materialized', emptyInputReceipt(st, refs.length));
       }
@@ -1384,6 +1535,10 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
    */
   private buildEngineEnv(run: InternalRun, spec: RunSpec): Record<string, string> {
     const env = this.buildEnv(spec);
+    for (const name of spec.envAllowlist) {
+      if (Object.prototype.hasOwnProperty.call(run.runtimeEnv, name)) env[name] = run.runtimeEnv[name]!;
+    }
+    run.runtimeSecrets = spec.envAllowlist.map((name) => env[name]).filter((value): value is string => typeof value === 'string' && value.length >= 4);
     const room = run.room;
     if (room) {
       // run-scoped HOME/config/cache/tmp: движок не видит и не пишет пользовательский
@@ -1592,7 +1747,7 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
     const st = run.state;
     if (isTerminalState(st.state)) return;
     const limit = st.spec.limits.maxOutputBytes ?? st.spec.limits.maxLogBytes ?? DEFAULT_MAX_LOG_LINE;
-    const sanitized = redactSecrets(truncateLine(rawLine, limit)).replace(/[\x00-\x1f]/g, ' ');
+    const sanitized = redactRunSecrets(redactSecrets(truncateLine(rawLine, limit)), run.runtimeSecrets).replace(/[\x00-\x1f]/g, ' ');
     if (sanitized.length === 0) return;
     if (stream === 'stdout') this.rememberAnswerLine(run, sanitized);
     this.emit(st, 'log', { stream, level: 'info', message: sanitized });
@@ -1615,6 +1770,8 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
     const st = run.state;
     if (isTerminalState(st.state)) return;
     run.exitReceived = true;
+    run.runtimeEnv = {};
+    run.runtimeSecrets = [];
     this.clearTimers(run);
     // P13: MCP-процессы рана живут дольше движка только до его выхода; дальше — cleanup.
     // Причина берётся из состояния рана: отмена/таймаут двигателя гасят MCP с той же причиной.
@@ -1652,6 +1809,8 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
     exitReason: 'cancelled' | 'preflight_refused' | 'worker_crash' | 'startup_failure',
     failure?: RunResult['failure'],
   ): void {
+    const internalRun = this.runs.get(st.runId);
+    if (internalRun) { internalRun.runtimeEnv = {}; internalRun.runtimeSecrets = []; }
     const result: RunResult = {
       schemaVersion: 1,
       runId: st.runId,
@@ -1733,9 +1892,48 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
     // Выход определяется здесь: объявленные выходы плюс явный манифест агента, а текст
     // ответа сохраняется отдельным выходом до того, как начнётся экспорт (issue #52).
     const run = this.runs.get(st.runId);
+    if (st.spec.profileWorkspace && this.opts.profileWorkspace) {
+      try {
+        if (st.profileWorkspaceCommit) {
+          if (run) run.repositoryCommit = st.profileWorkspaceCommit;
+        } else {
+          if (!run?.workspaceToken) throw new Error('profile workspace publication credential is unavailable');
+          run.repositoryCommit = await this.opts.profileWorkspace.publish(st.spec, st.spec.cwd, run.workspaceToken);
+          st.profileWorkspaceCommit = run.repositoryCommit;
+          this.store.saveState(st);
+          run.workspaceToken = null;
+        }
+      } catch (error) {
+        if (run) { run.workspacePublishFailed = true; run.workspaceToken = null; }
+        const detail = truncateLine(redactSecrets(error instanceof Error ? error.message : String(error)), 300);
+        this.emit(st, 'log', { stream: 'runner', level: 'error', message: `profile_workspace.publish_failed runId=${st.runId} detail=${detail}; workspace retained` });
+      }
+    }
     const exit = run ? this.resolveExit(run, st) : null;
-    // Ответ агента уходит в хранилище до экспорта объявленных выходов: сбой экспорта
-    // не должен стоить клиенту текста ответа.
+    // Fast result boundary: persist the engine outcome and answer before any declared
+    // output upload. The checkpoint + result are durable on the Runner host; the clean
+    // room remains leased until recover() verifies remote custody and completes cleanup.
+    const existingExport = this.exportManifest(st.runId);
+    const captured: RunResult = {
+      ...this.computeResult(st, existingExport),
+      ...((exit?.answer.present ?? false) ? { text: exit!.answer.text } : {}),
+      ...(exit && exit.plan.length > 0 && existingExport === null ? {
+        persistence: 'pending' as const,
+        persistenceReason: 'engine result captured; artifact persistence is pending',
+      } : {}),
+      cleanup: 'pending',
+      cleanupReason: 'cleanup is blocked until remote custody is verified',
+    };
+    const engineCheckpoint = this.writeCheckpoint(st, captured, existingExport, exit, null, 'engine_terminal', {
+      status: 'pending', reason: 'engine result captured; artifact persistence is pending', intentAt: this.nowIso(), finishedAt: null,
+    });
+    // Store the captured engine result without transitioning Run lifecycle or
+    // emitting its terminal event. Consumers may read this result independently.
+    const durableCaptured = { ...captured, persistence: engineCheckpoint.persistence };
+    st.result = durableCaptured;
+    this.store.saveResult(st.runId, durableCaptured);
+    // The captured answer is already durable in result.json + checkpoint. Its small
+    // object-store copy can be retried without delaying delivery of that result.
     const answerArtifactId = await this.saveAnswerArtifact(st, exit?.answer ?? { present: false, source: null, chars: 0, text: '' });
     const exportManifest = await this.runExport(st, exit ? { plan: exit.plan } : {});
     const soleCopies = this.soleCopiesOnDisk(st, exportManifest);
@@ -1756,12 +1954,18 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
     // Единственная копия выхода остаётся на диске: слот не отдаём, переиспользование
     // открыло бы прежние данные рана.
     const cleanup = await this.sweepRunEnvironment(run, soleCopies.length > 0 ? 'sole_copy_retained' : `finalized_${st.exit ? 'engine_exit' : 'startup_failure'}`, {
-      keepWorkspace: soleCopies.length > 0,
+      keepWorkspace: soleCopies.length > 0 || run?.workspacePublishFailed === true,
     });
 
-    const result = this.computeResult(st, exportManifest, cleanup);
+    const result: RunResult = {
+      ...this.computeResult(st, exportManifest, cleanup),
+      ...((exit?.answer.present ?? false) ? { text: exit!.answer.text } : {}),
+    };
     await this.appendProfileTrace(st, result);
-    this.persistResult(st, result);
+    // The engine result may already have been delivered while persistence ran.
+    // Refresh the durable result without emitting a second terminal event.
+    if (st.finalized) this.updateTerminalResult(st, result);
+    else this.persistResult(st, result);
     // Финальный checkpoint несёт проверенный факт уборки: аренда снята или слот остался
     // занят с причиной. Именно его читает восстановление, не перезапуская движок.
     if (run) this.finishCheckpointAfterCleanup(run, st, result, exportManifest, exit, answerArtifactId, cleanup, { silent: true });
@@ -2333,6 +2537,7 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
       cleanup: cleanupStatus.status,
       cleanupReason: cleanupStatus.reason,
       logPath: this.store.relLogPath(st.runId),
+      ...(this.runs.get(st.runId)?.repositoryCommit ? { repositoryCommit: this.runs.get(st.runId)!.repositoryCommit! } : {}),
     };
     if (failure) result.failure = failure;
     return result;
@@ -2585,6 +2790,13 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
   private updateTerminalResult(st: PersistedRunState, result: RunResult): RunResult {
     st.result = result;
     this.store.saveResult(st.runId, result);
+    if (result.persistence !== 'pending') {
+      const run = this.runs.get(st.runId);
+      if (run) {
+        const waiters = run.waiters.splice(0);
+        for (const waiter of waiters) waiter(result);
+      }
+    }
     return result;
   }
 

@@ -2,7 +2,7 @@ import { randomUUID, timingSafeEqual } from 'node:crypto';
 import { RUNNER_EVENT_SCHEMA_VERSION, type RunnerEvent } from '../contracts/events.js';
 import { RUN_RESULT_SCHEMA_VERSION, type ExitReason, type FailureClass, type RunFailure, type RunOutcome, type RunResult } from '../contracts/result.js';
 import { validateRunResult } from '../contracts/result.js';
-import type { OutputSpec, RunSpec } from '../contracts/run-spec.js';
+import type { IngressManifestRef, OutputSpec, RunSpec } from '../contracts/run-spec.js';
 import {
   ErrorCollector,
   PreflightError,
@@ -15,6 +15,7 @@ import {
   type ValidationResult,
 } from '../contracts/validate.js';
 import { redactSecrets, truncateLine } from '../redact.js';
+import { parseRemoteMcpServerPolicies, resolveRemoteMcpAttachment, type RemoteMcpAttachment, type RemoteMcpHostOptions } from './remote-mcp.js';
 
 /**
  * Адаптер внешнего воркера (issue #73, epic #74 шаг 2). Единственный способ запустить агента:
@@ -68,6 +69,7 @@ export interface LaunchArtifact {
   mime: string;
   sha256: string;
   size: number;
+  objectKey?: string;
 }
 
 export interface LaunchRepo {
@@ -117,6 +119,8 @@ export interface LaunchFailure {
 export type LaunchAnswerSource = 'engine_stdout' | 'agent_file' | null;
 
 export interface LaunchRequest {
+  mcp?: RemoteMcpAttachment['mcp'];
+  mcpSecrets?: RemoteMcpAttachment['mcpSecrets'];
   runId: string;
   jobId: string;
   userTaskId: string;
@@ -130,7 +134,10 @@ export interface LaunchRequest {
   envAllowlist: string[];
   env: Record<string, string>;
   limits: { timeoutMs: number; maxOutputBytes: number; maxLogBytes: number };
-  repository: { fullName: string; branch: string };
+  repository: { fullName: string; branch: string; revision?: string };
+  profileWorkspace?: { bindingId: string; objectBucket?: string; artifacts: Array<{ path: string; key: string; sha256: string; size: number }>; excludedPatterns: string[] };
+  /** Trusted CP input manifest pin. Artifact bytes are resolved by the worker, not supplied by the caller. */
+  ingressManifest?: IngressManifestRef;
   /**
    * Токен публикации: клон `repository.fullName` и коммит выходов в его ветку.
    *
@@ -217,11 +224,16 @@ export interface WorkerCancelResult {
 
 /** Порт, который использует stateless-ядро API. Реализация — `ExternalWorkerAdapter`. */
 export interface ExternalWorker {
+  dispose?(): Promise<void>;
+  readonly remoteMcpEnabled?: boolean;
   readonly name: string;
   readonly baseUrl: string | null;
   /** Квитанция запуска, а не финальный результат (асинхронный контракт, #73). */
-  launch(spec: RunSpec): Promise<LaunchReceipt>;
+  launch(spec: RunSpec, admittedAt?: string): Promise<LaunchReceipt>;
+  restoreMcp?(spec: RunSpec, admittedAt: string): Promise<void>;
   status(runId: string): Promise<WorkerStatusView>;
+  /** Follow replayable live stdout/stderr logs when a worker exposes its SSE endpoint. */
+  streamLogs?(runId: string, after: number, signal: AbortSignal, onLog: (stream: 'stdout' | 'stderr', message: string, sequence: number) => void): Promise<{ cursor: number; completed: boolean; supported: boolean }>;
   result(runId: string): Promise<LaunchResult>;
   cancel(runId: string): Promise<WorkerCancelResult>;
 }
@@ -249,6 +261,7 @@ function checkText(value: unknown, path: string, collector: ErrorCollector, maxL
 }
 
 export interface ExternalWorkerOptions {
+  remoteMcp?: RemoteMcpHostOptions;
   baseUrl: string;
   /** Публичный адрес нашего API: воркер шлёт результат на callback resultUrl. */
   baseUrlForResult?: string;
@@ -374,8 +387,17 @@ export function mergeUrl(repo: LaunchRepo): string {
  */
 export function launchRequestFromSpec(
   spec: RunSpec,
-  options: { env?: Record<string, string>; resultUrl: string } = { resultUrl: '' },
+  options: { env?: Record<string, string>; resultUrl: string; remoteMcpAttachment?: RemoteMcpAttachment; supportsIngressManifest?: boolean } = { resultUrl: '' },
 ): LaunchRequest {
+  if (spec.ingressManifest && options.supportsIngressManifest !== true) {
+    throw new PreflightError('INGRESS_MANIFEST_UNSUPPORTED', 'this external worker has no trusted Control Plane ingress resolver', {
+      failureClass: 'preflight',
+      retryable: false,
+    });
+  }
+  if (spec.mcp?.servers.length && !options.remoteMcpAttachment) {
+    throw new PreflightError('MCP_HOST_POLICY_MISSING', 'remote MCP requires trusted host resolution', { failureClass: 'preflight', retryable: false });
+  }
   if (spec.input?.refs && spec.input.refs.length > 0) {
     throw new PreflightError('INPUT_REFS_UNSUPPORTED', 'input.refs require a durable workspace; the stateless API passes the prompt inline only', {
       failureClass: 'preflight',
@@ -418,10 +440,16 @@ export function launchRequestFromSpec(
     env,
     limits: {
       timeoutMs: spec.limits.timeoutMs,
-      maxOutputBytes: spec.limits.maxOutputBytes ?? 0,
-      maxLogBytes: spec.limits.maxLogBytes ?? 0,
+      maxOutputBytes: spec.limits.maxOutputBytes ?? 5_000_000,
+      maxLogBytes: spec.limits.maxLogBytes ?? 5_000_000,
     },
-    repository: { fullName: spec.repository?.fullName ?? '', branch: runBranchName(spec.runId) },
+    repository: {
+      fullName: spec.repository?.fullName ?? '',
+      branch: runBranchName(spec.runId),
+      ...(spec.repository?.revision ? { revision: spec.repository.revision } : {}),
+    },
+    ...(spec.profileWorkspace ? { profileWorkspace: spec.profileWorkspace } : {}),
+    ...(spec.ingressManifest ? { ingressManifest: spec.ingressManifest } : {}),
     // Токен публикации: без него джоба клонирует репозиторий задачи и коммитит выходы
     // токеном репозитория кольца, у которого нет прав на чужой репозиторий. На живом
     // замере 05.10.2026 так ушли 15 запусков из 16 как `completed artifacts=0`.
@@ -436,6 +464,7 @@ export function launchRequestFromSpec(
     ...(spec.repository?.token !== undefined ? { publicationToken: spec.repository.token } : {}),
     resultUrl: options.resultUrl,
     isolation: { mode: spec.isolation?.mode ?? 'none' },
+    ...options.remoteMcpAttachment,
     ...(outputs.length > 0 ? { outputs } : {}),
   };
 }
@@ -525,13 +554,16 @@ export function validateLaunchResult(input: unknown, expectedRunId: string): Val
     input['artifacts'].forEach((artifact, index) => {
       const path = `launch.artifacts[${index}]`;
       if (!checkObject(artifact, path, collector)) return;
-      checkKeys(artifact, ['path', 'name', 'mime', 'sha256', 'size'], ['path', 'name', 'mime', 'sha256', 'size'], path, collector);
+      checkKeys(artifact, ['path', 'name', 'mime', 'sha256', 'size', 'objectKey'], ['path', 'name', 'mime', 'sha256', 'size'], path, collector);
       checkString(artifact['path'], `${path}.path`, collector, 512);
       checkString(artifact['name'], `${path}.name`, collector, 200);
       checkString(artifact['mime'], `${path}.mime`, collector, 100);
       checkString(artifact['sha256'], `${path}.sha256`, collector, 64);
       if (typeof artifact['size'] !== 'number' || !Number.isInteger(artifact['size']) || (artifact['size'] as number) < 0) {
         collector.push(`${path}.size: expected non-negative integer`);
+      }
+      if (artifact['objectKey'] !== undefined && (typeof artifact['objectKey'] !== 'string' || !/^profiles\/[A-Za-z0-9._-]+\/workspace\/[A-Za-z0-9._-]+\/[0-9a-f]{64}$/.test(artifact['objectKey']))) {
+        collector.push(`${path}.objectKey: expected scoped profile object key`);
       }
     });
   }
@@ -660,7 +692,9 @@ export function mapLaunchResult(
   // Пустой `logUrl` — «лог не опубликован» (#133), а не «ссылка на пустое»: наружу это
   // `null`, иначе в ответе API ездила бы пустая строка вместо отсутствующей ссылки.
   const logUrl = launch.logUrl.length > 0 ? launch.logUrl : null;
-  const outputRefs = artifacts.map((artifact) => (repo ? artifactUrl(repo, artifact.path) : artifact.path));
+  const outputRefs = artifacts.map((artifact) => artifact.objectKey
+    ? `/v1/runs/${encodeURIComponent(spec.runId)}/artifacts?path=${encodeURIComponent(artifact.path)}`
+    : (repo ? artifactUrl(repo, artifact.path) : artifact.path));
   const persistence = artifacts.length > 0 ? 'persisted' : 'not_required';
   const result: RunResult = {
     schemaVersion: RUN_RESULT_SCHEMA_VERSION,
@@ -885,7 +919,10 @@ export function workerTransportFailure(
  * ничего не дублирует. Всё остальное — отказ на нашей же стороне (нет промпта, refs без
  * workspace, не задан `resultUrl`), где повтор на другом движке бесполезен.
  */
-export const UNACCEPTED_LAUNCH_CODES = ['WORKER_LAUNCH_UNREACHABLE', 'WORKER_HTTP_ERROR', 'WORKER_PROTOCOL_INVALID'] as const;
+export const UNACCEPTED_LAUNCH_CODES = [
+  'WORKER_CAPACITY', 'WORKER_CAPACITY_UNKNOWN', 'WORKER_ADMISSION_UNAVAILABLE', 'WORKER_PROFILE_WORKSPACE_UNSUPPORTED',
+  'WORKER_LAUNCH_UNREACHABLE', 'WORKER_HTTP_ERROR', 'WORKER_PROTOCOL_INVALID',
+] as const;
 
 /** Принял ли воркер ран: квитанция получена, цепочка движков на этом останавливается. */
 export function isUnacceptedLaunchFailure(err: unknown): boolean {
@@ -896,6 +933,20 @@ export function isUnacceptedLaunchFailure(err: unknown): boolean {
 /** Код отказа запуска для журнала и для разбора исхода рана. */
 export function launchFailureCode(err: unknown): string {
   return err instanceof PreflightError ? err.code : 'WORKER_UNREACHABLE';
+}
+
+function definitiveAdmissionRefusal(body: string): 'WORKER_CAPACITY' | 'WORKER_CAPACITY_UNKNOWN' | 'WORKER_ADMISSION_UNAVAILABLE' | 'WORKER_PROFILE_WORKSPACE_UNSUPPORTED' | null {
+  try {
+    const value: unknown = JSON.parse(body);
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) return null;
+    const record = value as Record<string, unknown>;
+    if (record['accepted'] !== false) return null;
+    const code = record['code'];
+    return code === 'WORKER_CAPACITY' || code === 'WORKER_CAPACITY_UNKNOWN' || code === 'WORKER_ADMISSION_UNAVAILABLE'
+      || code === 'WORKER_PROFILE_WORKSPACE_UNSUPPORTED' ? code : null;
+  } catch {
+    return null;
+  }
 }
 
 /** Одна неудачная попытка приёма рана — она и есть содержимое отказа «цепочка исчерпана». */
@@ -926,6 +977,11 @@ export function fleetExhaustedFailure(
 }
 
 export class ExternalWorkerAdapter implements ExternalWorker {
+  async dispose(): Promise<void> {
+    await this.remoteMcp?.resolveBinding.dispose?.();
+  }
+  readonly remoteMcpEnabled: boolean;
+  private readonly remoteMcp: RemoteMcpHostOptions | undefined;
   readonly name: string;
   readonly baseUrl: string | null;
   private readonly token: string | undefined;
@@ -939,6 +995,11 @@ export class ExternalWorkerAdapter implements ExternalWorker {
   private baseUrlForResult: string | undefined;
 
   constructor(options: ExternalWorkerOptions) {
+    this.remoteMcp = options.remoteMcp ? {
+      servers: parseRemoteMcpServerPolicies(JSON.stringify(options.remoteMcp.servers)),
+      resolveBinding: options.remoteMcp.resolveBinding,
+    } : undefined;
+    this.remoteMcpEnabled = Object.keys(this.remoteMcp?.servers ?? {}).length > 0;
     this.name = options.engineName ?? EXTERNAL_WORKER_ENGINE;
     this.baseUrl = options.baseUrl;
     this.token = options.token;
@@ -954,7 +1015,24 @@ export class ExternalWorkerAdapter implements ExternalWorker {
     this.baseUrlForResult = options.baseUrlForResult;
   }
 
-  async launch(spec: RunSpec): Promise<LaunchReceipt> {
+  async restoreMcp(spec: RunSpec, admittedAt: string): Promise<void> {
+    await this.resolveMcp(spec, 'restore', admittedAt);
+  }
+
+  private async resolveMcp(spec: RunSpec, mode: 'launch' | 'restore', admittedAt: string): Promise<RemoteMcpAttachment | undefined> {
+    const bindingController = new AbortController();
+    return withTimeout(
+      resolveRemoteMcpAttachment(spec, this.remoteMcp, this.now(), bindingController.signal, mode, admittedAt),
+      Math.min(this.deadlineMs, spec.limits.timeoutMs),
+      'trusted MCP binding resolution',
+      () => bindingController.abort(),
+    ).catch(error => {
+      if (error instanceof PreflightError) throw error;
+      throw new PreflightError('MCP_BINDING_UNAVAILABLE', 'trusted MCP binding resolution failed', { failureClass: 'preflight', retryable: false });
+    });
+  }
+
+  async launch(spec: RunSpec, admittedAt = this.now().toISOString()): Promise<LaunchReceipt> {
     const base = this.baseUrl;
     if (!base) {
       throw new PreflightError('WORKER_NOT_CONFIGURED', 'no external worker URL is configured for this engine', {
@@ -962,7 +1040,14 @@ export class ExternalWorkerAdapter implements ExternalWorker {
         retryable: false,
       });
     }
-    const request = launchRequestFromSpec(spec, { env: this.env, resultUrl: this.resultUrlFor(spec) });
+    const remoteMcpAttachment = spec.mcp?.servers.length ? await this.resolveMcp(spec, 'launch', admittedAt) : undefined;
+    const request = launchRequestFromSpec(spec, {
+      env: this.env,
+      resultUrl: this.resultUrlFor(spec),
+      remoteMcpAttachment,
+      supportsIngressManifest: this.name === 'eu-vm-agent-run' || this.name === 'rf-vm-agent-run',
+    });
+    const redactAttachment = (value: string): string => Object.values(remoteMcpAttachment?.mcpSecrets ?? {}).reduce((safe, secret) => safe.split(secret).join('[REDACTED]'), value);
     const url = `${trimTrailingSlash(base)}/v1/launch`;
     const headers: Record<string, string> = { 'content-type': 'application/json' };
     if (this.token) headers['authorization'] = `Bearer ${this.token}`;
@@ -985,7 +1070,7 @@ export class ExternalWorkerAdapter implements ExternalWorker {
       // Обрываем запрос только по таймауту: abort после успешного ответа убил бы тело,
       // которое мы ещё не прочитали.
       if (controller.signal.aborted) controller.abort();
-      this.log({ event: 'worker_launch_failed', runId: spec.runId, message: err instanceof Error ? err.message : String(err) });
+      this.log({ event: 'worker_launch_failed', runId: spec.runId, message: redactAttachment(err instanceof Error ? err.message : String(err)) });
       throw new PreflightError('WORKER_LAUNCH_UNREACHABLE', 'the external worker did not accept the run', {
         failureClass: 'runtime',
         // Ран не принят — никто его не выполняет, поэтому повтор не создаст второй.
@@ -993,8 +1078,14 @@ export class ExternalWorkerAdapter implements ExternalWorker {
       });
     }
     if (!response.ok) {
-      const detail = truncateLine(redactSecrets(await readBody(response)), 300);
+      const detail = truncateLine(redactSecrets(redactAttachment(await readBody(response))), 300);
       this.log({ event: 'worker_launch_http_error', runId: spec.runId, status: response.status, detail });
+      const admissionRefusal = definitiveAdmissionRefusal(detail);
+      if (admissionRefusal) {
+        throw new PreflightError(admissionRefusal, `the external worker refused the run before acceptance (${admissionRefusal})`, {
+          failureClass: 'runtime', retryable: true,
+        });
+      }
       throw new PreflightError('WORKER_HTTP_ERROR', `the external worker answered ${response.status} on launch`, {
         failureClass: 'runtime',
         // 4xx — про запрос: тот же запрос получит тот же отказ (битый токен, не тот payload),
@@ -1041,6 +1132,70 @@ export class ExternalWorkerAdapter implements ExternalWorker {
       );
     }
     return validated.value;
+  }
+
+  /** Subscribe to the worker's replayable stdout/stderr SSE. The caller owns reconnects. */
+  async streamLogs(
+    runId: string,
+    after: number,
+    signal: AbortSignal,
+    onLog: (stream: 'stdout' | 'stderr', message: string, sequence: number) => void,
+  ): Promise<{ cursor: number; completed: boolean; supported: boolean }> {
+    const base = this.baseUrl;
+    if (!base) return { cursor: after, completed: false, supported: false };
+    const url = `${trimTrailingSlash(base)}/v1/runs/${encodeURIComponent(runId)}/logs?after=${after}`;
+    const headers: Record<string, string> = { accept: 'text/event-stream' };
+    if (this.token) headers.authorization = `Bearer ${this.token}`;
+    const response = await this.fetchImpl(url, { method: 'GET', headers, signal });
+    if (response.status === 404 || response.status === 405) return { cursor: after, completed: false, supported: false };
+    if (!response.ok) throw new Error(`worker logs returned HTTP ${response.status}`);
+    if (!response.body) throw new Error('worker logs response has no body');
+
+    let cursor = after;
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    try {
+      for (;;) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        buffer += decoder.decode(chunk.value, { stream: true });
+        let boundary = buffer.indexOf('\n\n');
+        while (boundary >= 0) {
+          const block = buffer.slice(0, boundary);
+          buffer = buffer.slice(boundary + 2);
+          let event = '';
+          let id = '';
+          const data: string[] = [];
+          for (const line of block.split(/\r?\n/)) {
+            if (line.startsWith(':')) continue;
+            const colon = line.indexOf(':');
+            if (colon < 0) continue;
+            const field = line.slice(0, colon);
+            const value = line.slice(colon + 1).replace(/^ /, '');
+            if (field === 'event') event = value;
+            else if (field === 'id') id = value;
+            else if (field === 'data') data.push(value);
+          }
+          if (event === 'end') return { cursor, completed: true, supported: true };
+          if ((event === 'stdout' || event === 'stderr') && data.length > 0) {
+            const sequence = Number(id);
+            if (Number.isSafeInteger(sequence) && sequence > cursor) {
+              let message: unknown;
+              try { message = JSON.parse(data.join('\n')); } catch { message = data.join('\n'); }
+              if (typeof message === 'string') {
+                cursor = sequence;
+                onLog(event, message, sequence);
+              }
+            }
+          }
+          boundary = buffer.indexOf('\n\n');
+        }
+      }
+      return { cursor, completed: false, supported: true };
+    } finally {
+      try { await reader.cancel(); } catch { /* the server may have already closed */ }
+    }
   }
 
   /** Финальный результат. Пока ран идёт, воркер отвечает 409 — мы поднимаем `ResultNotReadyError`. */

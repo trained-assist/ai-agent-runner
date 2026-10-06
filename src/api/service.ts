@@ -7,9 +7,12 @@ import {
   EXTERNAL_WORKER_ADAPTER_VERSION,
   fleetExhaustedFailure,
   isUnacceptedLaunchFailure,
+  logMessage,
   launchFailureCode,
   mapLaunchResult,
   mergeUrl,
+  repoHasCommit,
+  runBranchName,
   workerTransportFailure,
   withTimeout,
   DEFAULT_RECONCILE_DEADLINE_MS,
@@ -21,6 +24,7 @@ import {
   ResultNotReadyError,
 } from '../adapters/external-worker-adapter.js';
 import type { RunResult } from '../contracts/result.js';
+import { RUNNER_EVENT_SCHEMA_VERSION, type RunnerEvent } from '../contracts/events.js';
 import { PreflightError } from '../contracts/validate.js';
 import { validateRunSpec, type EngineSpec, type InputSpec, type RunSpec } from '../contracts/run-spec.js';
 import { DEFAULT_STATELESS_LIMITS, isTerminalApiState, STATELESS_STORE_SCHEMA_VERSION, StatelessStore, type AdmissionRecord } from './stateless-store.js';
@@ -41,6 +45,9 @@ import {
 } from './contracts.js';
 import { ApiError } from './errors.js';
 import type { Principal } from './auth.js';
+import type { ProfileWorkspaceCoordinator } from './profile-workspace.js';
+import { WorkspaceError } from '../workspace/contract.js';
+import { compilePolicy, DEFAULT_EXPORT_POLICY, matchRule } from '../workspace/policy.js';
 
 /**
  * Stateless-ядро API (epic #74). Принимает запрос, вызывает внешнего воркера по HTTP и держит
@@ -49,6 +56,31 @@ import type { Principal } from './auth.js';
  */
 
 export type ApiLogger = (entry: Record<string, unknown>) => void;
+
+function isRegionalVmEngine(name: string): boolean {
+  return name === 'eu-vm-agent-run' || name === 'rf-vm-agent-run';
+}
+
+type LiveLogState = {
+  controller: AbortController;
+  drainController: AbortController | null;
+  outputs: Record<'stdout' | 'stderr', string>;
+  initialSourceCursor: number;
+  completed: boolean;
+  stopping: boolean;
+};
+
+function remainingFinalOutput(finalOutput: string, streamedOutput: string): string {
+  if (!finalOutput || !streamedOutput) return finalOutput;
+  if (streamedOutput.includes(finalOutput)) return '';
+  if (finalOutput.startsWith(streamedOutput)) return finalOutput.slice(streamedOutput.length).trim();
+  if (finalOutput.endsWith(streamedOutput)) return finalOutput.slice(0, -streamedOutput.length).trim();
+  return finalOutput;
+}
+
+function isGhaEngine(name: string): boolean {
+  return name === 'dynamic-ip-azure-agent-run' || name === 'azure-dynamic-ip-agent-run';
+}
 
 export type RunCancelStatus = 'stopped' | 'stop_pending' | 'already_terminal' | 'too_late' | 'rejected' | 'unknown_run';
 
@@ -93,6 +125,7 @@ export interface RunArtifactsView {
   artifacts: RunArtifactLink[];
   logUrl: string | null;
   note: string;
+  publication?: import('./stateless-store.js').RunProgress['publication'];
 }
 
 export interface AgentApiOptions {
@@ -131,6 +164,8 @@ export interface AgentApiOptions {
    * Без него — только память процесса (контракт эпика #74, шаг 6).
    */
   admissionLogPath?: string;
+  /** Enables trusted profile binding and canonical publication for every run. */
+  profileWorkspace?: ProfileWorkspaceCoordinator;
 }
 
 /** Пауза между опросами статуса: растёт от базовой до потолка (экспоненциально). */
@@ -168,6 +203,8 @@ export class AgentApi {
   private disposed = false;
   private readonly maxActiveRuns: number;
   private readonly inFlight = new Set<string>();
+  private readonly resuming = new Set<string>();
+  private readonly liveLogStreams = new Map<string, LiveLogState>();
 
   constructor(options: AgentApiOptions) {
     this.opts = options;
@@ -182,7 +219,7 @@ export class AgentApi {
       throw new Error(`engineChain names engines without a worker: ${missing.join(', ')}`);
     }
     this.chain = [...(options.engineChain ?? [])];
-    this.store = options.store ?? new StatelessStore({}, options.admissionLogPath ?? null);
+    this.store = options.store ?? new StatelessStore({}, options.admissionLogPath ?? null, !!options.profileWorkspace);
     this.maxActiveRuns = options.maxActiveRuns ?? DEFAULT_STATELESS_LIMITS.maxActiveRuns;
     this.logger = options.logger ?? defaultLogger;
     this.clock = options.clock ?? (() => new Date());
@@ -210,6 +247,24 @@ export class AgentApi {
       throw new ApiError('INVALID_REQUEST', `invalid submit body: ${bodyResult.errors.join('; ')}`, { errors: bodyResult.errors });
     }
     const request = bodyResult.value;
+    const testRegistryRequested = request.mcp?.servers.some(server => server.transport === 'remote' &&
+      (server.serverId === 'trained-assist-registry-test' || server.bindingRef === 'registry-mcp-test-160-read')) ?? false;
+    if ((testRegistryRequested || principal.profileId === 'integration-telegram-ux-v1') &&
+        (principal.profileId !== 'integration-telegram-ux-v1' || principal.principalId !== 'integration-telegram-ux-v1')) {
+      throw new ApiError('FORBIDDEN', 'test registry MCP requires the pinned integration principal and profile');
+    }
+    if (this.opts.profileWorkspace && request.repository !== undefined) {
+      throw new ApiError('INVALID_REPOSITORY', 'repository is selected by the authenticated profile binding');
+    }
+    if (this.opts.profileWorkspace && !principal.tenantId) {
+      throw new ApiError('FORBIDDEN', 'API key has no trusted tenant binding');
+    }
+    if (this.opts.profileWorkspace) {
+      const policy = compilePolicy(DEFAULT_EXPORT_POLICY);
+      for (const output of request.outputs ?? []) {
+        if (matchRule(policy, output.path).action === 'exclude') throw new ApiError('INVALID_REQUEST', `profile output path is excluded by policy: ${output.path}`);
+      }
+    }
     const payloadHash = submitPayloadHash(request);
 
     const existing = this.store.getByAdmission(principal.principalId, idempotencyKey);
@@ -231,6 +286,11 @@ export class AgentApi {
         ownerGeneration: existing.ownerGeneration,
       });
       return { requestId: existing.requestId, userTaskId: existing.userTaskId, runId: existing.runId, deduplicated: true };
+    }
+    if (this.opts.profileWorkspace) {
+      const active = this.store.listAll().find((record) => record.tenantId === principal.tenantId && record.profileId === principal.profileId &&
+        !isTerminalApiState(this.store.progressOf(record.runId)?.state ?? 'queued'));
+      if (active) throw new ApiError('TASK_ATTEMPT_ACTIVE', `profile has an active run ${active.runId}`, { runId: active.runId });
     }
 
     // Движок рана: назвал клиент — идём ровно на него, не назвал — берёт цепочка (issue #100).
@@ -275,6 +335,7 @@ export class AgentApi {
       userTaskId,
       conversationId: spec.conversationId,
       principalId: principal.principalId,
+      ...(principal.tenantId ? { tenantId: principal.tenantId } : {}),
       profileId: principal.profileId,
       jobId,
       idempotencyKey,
@@ -297,7 +358,10 @@ export class AgentApi {
     }
     this.store.put(record);
     // Ран уходит во внешнего воркера сразу: клиент получает receipt и опрашивает статус.
-    void this.execute(record);
+    void this.execute(record).catch((err: unknown) => {
+      this.log({ event: 'run_dispatch_unknown', runId: record.runId, message: err instanceof Error ? err.message : String(err) });
+      this.markUnknown(record, 'dispatch_state_unavailable');
+    });
     this.log({
       event: 'submit',
       outcome: 'accepted',
@@ -347,6 +411,7 @@ export class AgentApi {
       sequence: run.sequence,
       fencing: { rejected: run.fencing.rejected },
       answer: run.answer,
+      ...(this.opts.profileWorkspace ? { publication: run.publication } : {}),
     };
   }
 
@@ -407,7 +472,9 @@ export class AgentApi {
       mime: artifact.mime,
       sha256: artifact.sha256,
       size: artifact.size,
-      url: repo ? artifactUrl(repo, artifact.path) : artifact.path,
+      url: artifact.objectKey
+        ? `/v1/runs/${encodeURIComponent(runId)}/artifacts?path=${encodeURIComponent(artifact.path)}`
+        : repo ? artifactUrl(repo, artifact.path) : artifact.path,
     }));
     return {
       runId,
@@ -419,8 +486,23 @@ export class AgentApi {
       count: artifacts.length,
       artifacts,
       logUrl: run?.logUrl ?? null,
-      note: 'the worker committed this run into its own branch of the user repository; the API stores no bytes and merges nothing',
+      note: this.opts.profileWorkspace
+        ? 'the run branch is reconciled with the canonical profile revision; check publication status before treating it as saved'
+        : 'the worker committed this run into its own branch of the user repository; the API stores no bytes and merges nothing',
+      ...(this.opts.profileWorkspace ? { publication: run?.publication ?? null } : {}),
     };
+  }
+
+  async downloadArtifact(principal: Principal, runId: string, path: string): Promise<{ bytes: Buffer; mime: string; sha256: string }> {
+    const record = this.requireRun(principal, runId);
+    const artifact = this.store.progressOf(runId)?.artifacts.find((entry) => entry.path === path);
+    if (!artifact?.objectKey || !this.opts.profileWorkspace) throw new ApiError('NOT_FOUND', 'profile object is not available for this run');
+    if (!artifact.objectKey.startsWith(`profiles/${record.profileId}/workspace/${runId}/`)) throw new ApiError('FORBIDDEN', 'artifact object is outside this run');
+    const bytes = await this.opts.profileWorkspace.readObject(principal, artifact.objectKey);
+    if (bytes.length !== artifact.size || createHash('sha256').update(bytes).digest('hex') !== artifact.sha256) {
+      throw new ApiError('INTERNAL', 'stored profile artifact failed checksum verification');
+    }
+    return { bytes, mime: artifact.mime, sha256: artifact.sha256 };
   }
 
   async cancel(principal: Principal, runId: string, rawBody: unknown = {}): Promise<RunCancelReceipt> {
@@ -543,10 +625,10 @@ export class AgentApi {
       cancel: { requestedReceipt: true, terminalConfirmation: true },
       mcp: {
         perRunStdioProxy: false,
-        scopedBindings: false,
+        scopedBindings: this.workers.some(worker => worker.remoteMcpEnabled),
         capabilityHandlersSharedWithMcp: false,
         capabilityInvokeEndpoint: false,
-        remoteTransport: 'absent',
+        remoteTransport: this.workers.some(worker => worker.remoteMcpEnabled) ? 'worker_remote' : 'absent',
         osIsolation: 'not_proven_service_uid_only',
         osIsolationNote: 'the API host runs no agent process: OS isolation is the external worker responsibility, and the worker declares it per run',
       },
@@ -601,9 +683,16 @@ export class AgentApi {
     };
   }
 
-  dispose(): void {
+  async dispose(): Promise<void> {
     this.disposed = true;
     this.inFlight.clear();
+    for (const stream of this.liveLogStreams.values()) {
+      stream.stopping = true;
+      stream.controller.abort();
+      stream.drainController?.abort();
+    }
+    this.liveLogStreams.clear();
+    await Promise.all(this.workers.map(worker => worker.dispose?.()));
   }
 
   /**
@@ -626,6 +715,7 @@ export class AgentApi {
     for (const entry of this.store.dispatchedRuns()) {
       const record = this.store.getByRun(entry.runId);
       if (!record) continue;
+      if (this.resuming.has(record.runId)) continue;
       const progress = this.store.progressOf(entry.runId);
       if (progress && isTerminalApiState(progress.state)) continue;
       // Движок берём из отметки о приёме, а не из заявки: ран мог быть принят вторым
@@ -633,11 +723,36 @@ export class AgentApi {
       const worker = this.workerFor(entry.engine);
       if (!worker) continue;
       this.store.open(record.runId, record.createdAt, entry.engine);
+      this.startWorkerLogStream(record, worker);
       this.log({ event: 'poll_resumed', runId: record.runId, engine: entry.engine, operationId: record.spec.operationId });
-      void this.pollUntilTerminal(record, worker, this.nowIso());
+      this.resuming.add(record.runId);
+      void this.restoreAndPoll(record, worker);
       resumed += 1;
     }
     return resumed;
+  }
+
+  private async restoreAndPoll(record: AdmissionRecord, worker: ExternalWorker): Promise<void> {
+    try {
+      if (record.spec.mcp?.servers.some(server => server.transport === 'remote')) {
+        const status = (await worker.status(record.runId)).status;
+        if (this.disposed) return;
+        if (status === 'succeeded' || status === 'failed' || status === 'cancelled') {
+          await this.collectResult(record, worker, record.createdAt);
+          return;
+        }
+        if (!worker.restoreMcp) throw new Error('MCP_RESTORE_UNSUPPORTED');
+        await worker.restoreMcp(record.spec, record.createdAt);
+      }
+      if (!this.disposed) await this.pollUntilTerminal(record, worker, record.createdAt);
+    } catch {
+      if (!this.disposed) {
+        this.log({ event: 'mcp_restore_refused', runId: record.runId, reason: 'existing_scope_or_domain_unavailable' });
+        this.markUnknown(record, 'mcp_restore_tool_outcome_unknown');
+      }
+    } finally {
+      this.resuming.delete(record.runId);
+    }
   }
 
   private async execute(record: AdmissionRecord): Promise<void> {
@@ -649,6 +764,22 @@ export class AgentApi {
     this.store.append(record.runId, admissionEvents(record.spec, startedAt));
     this.inFlight.add(record.runId);
     try {
+      if (this.opts.profileWorkspace) {
+        try {
+          const prepared = await this.opts.profileWorkspace.prepare(this.principalFor(record), record.runId);
+          record.spec.repository = { fullName: prepared.repository, token: prepared.token, revision: prepared.baseRevision };
+          record.spec.profileWorkspace = { bindingId: prepared.bindingId, ...(prepared.objectBucket ? { objectBucket: prepared.objectBucket } : {}), artifacts: prepared.artifacts, excludedPatterns: prepared.excludedPatterns };
+          this.store.appendPrepared(record.runId, { fullName: prepared.repository, revision: prepared.baseRevision }, record.spec.profileWorkspace);
+          this.log({ event: 'profile_prepared', runId: record.runId, bindingId: prepared.bindingId, baseRevision: prepared.baseRevision });
+        } catch (err) {
+          this.log({ event: 'profile_prepare_failed', runId: record.runId, code: err instanceof WorkspaceError ? err.code : 'WORKSPACE_GIT_FAILED' });
+          this.finalize(record, workerTransportFailure(record.spec, err, { startedAt, finishedAt: this.nowIso() }, { failure: {
+            code: err instanceof WorkspaceError ? err.code : 'WORKSPACE_GIT_FAILED', failureClass: 'preflight',
+            safeSummary: 'profile workspace could not be prepared', retryable: true,
+          } }));
+          return;
+        }
+      }
       const accepted = await this.acceptOnChain(record, startedAt);
       if (!accepted) return;
       if (this.disposed || this.store.progressOf(record.runId) === null) return;
@@ -666,6 +797,7 @@ export class AgentApi {
       // здесь и терминальным состоянием, новый процесс должен поллер перезапустить —
       // иначе результат потерян, а повтор клиента с новым ключом завёл бы второй ран.
       this.store.appendDispatched(record.runId, accepted.engine, this.nowIso());
+      this.startWorkerLogStream(record, accepted.worker);
       void this.pollUntilTerminal(record, accepted.worker, startedAt);
     } finally {
       this.inFlight.delete(record.runId);
@@ -701,11 +833,34 @@ export class AgentApi {
       // Движок попытки виден клиенту сразу: цепочка двигается по ранe, а не молча меняет
       // исполнителя под ногами у того, кто опрашивает статус.
       this.store.setEngine(record.runId, engine);
+      this.store.appendLaunchIntent(record.runId, engine, this.nowIso());
       try {
         const receipt = await worker.launch(this.specForEngine(record, engine));
         return { engine, worker, receipt };
       } catch (err) {
         lastError = err;
+        if (err instanceof PreflightError && err.code === 'WORKER_CAPACITY') {
+          attempts.push({ engine, code: err.code, summary: err.message });
+          // A measured 60% cutoff preserves 40% of each VM for host services. Send
+          // this new operation directly to GHA; do not consume the next regional VM.
+          const ghaIndex = isRegionalVmEngine(engine)
+            ? candidates.findIndex((candidate, candidateIndex) => candidateIndex > index && isGhaEngine(candidate))
+            : -1;
+          const nextIndex = isRegionalVmEngine(engine) ? (ghaIndex >= 0 ? ghaIndex : candidates.length) : index + 1;
+          for (let skipped = index + 1; skipped < nextIndex; skipped += 1) {
+            attempts.push({ engine: candidates[skipped]!, code: 'CAPACITY_CUTOVER', summary: 'skipped regional VM after capacity refusal' });
+          }
+          const next = candidates[nextIndex];
+          this.log({ event: 'engine_chain_advance', runId: record.runId, engine, code: err.code, next: next ?? null, attempts: attempts.length, operationId: record.spec.operationId });
+          index = nextIndex - 1;
+          continue;
+        }
+        if (err instanceof PreflightError && (err.code === 'WORKER_CAPACITY_UNKNOWN' || err.code === 'WORKER_ADMISSION_UNAVAILABLE')) {
+          attempts.push({ engine, code: err.code, summary: err.message });
+          const next = candidates[index + 1];
+          this.log({ event: 'engine_chain_advance', runId: record.runId, engine, code: err.code, next: next ?? null, attempts: attempts.length, operationId: record.spec.operationId });
+          continue;
+        }
         if (!isUnacceptedLaunchFailure(err)) {
           // Отказ на нашей стороне (нет промпта, refs без workspace, не задан resultUrl):
           // другой движок его не обойдёт, поэтому цепочка не тратит на него бюджеты.
@@ -789,8 +944,11 @@ export class AgentApi {
       this.log({ event: 'worker_status', runId: record.runId, status, attempt });
 
       if (status === 'succeeded' || status === 'failed' || status === 'cancelled') {
-        await this.collectResult(record, worker, startedAt);
-        return;
+        if (await this.collectResult(record, worker, startedAt)) return;
+        if (Date.now() >= deadline) return;
+        await this.pollBackoff(attempt);
+        attempt += 1;
+        continue;
       }
       if (status === 'unknown') {
         // Исход неизвестн, но ран мог состояться. Помечаем и продолжаем спрашивать:
@@ -826,12 +984,26 @@ export class AgentApi {
   }
 
   /** Забрать финальный результат у воркера и закрыть ран. */
-  private async collectResult(record: AdmissionRecord, worker: ExternalWorker, startedAt: string): Promise<void> {
-    if (this.disposed || this.store.progressOf(record.runId) === null) return;
+  private async collectResult(record: AdmissionRecord, worker: ExternalWorker, startedAt: string): Promise<boolean> {
+    if (this.disposed || this.store.progressOf(record.runId) === null) return true;
     try {
       const launch = await worker.result(record.runId);
+      await this.drainWorkerLogStream(record, worker);
       const mapping = mapLaunchResult(record.spec, launch, { startedAt, finishedAt: this.nowIso() }, { workerBaseUrl: worker.baseUrl });
-      this.finalize(record, mapping);
+      let publication = null;
+      if (this.opts.profileWorkspace && launch.status === 'started') {
+        if (!mapping.repo || !repoHasCommit(mapping.repo) || mapping.repo.fullName !== record.spec.repository?.fullName || mapping.repo.branch !== runBranchName(record.runId)) {
+          throw new WorkspaceError('WORKSPACE_NOT_FOUND', 'worker did not confirm the expected profile run branch');
+        }
+        publication = await this.opts.profileWorkspace.publish(this.principalFor(record), record.runId, mapping.repo.commit!);
+        mapping.result.persistenceReason = `profile publication ${publication.status}: ${publication.committedRevision ?? publication.publicationId}`;
+        if (publication.status !== 'published') mapping.result.persistence = 'pending';
+        this.log({ event: 'profile_publication', runId: record.runId, publicationId: publication.publicationId, status: publication.status, committedRevision: publication.committedRevision, conflictId: publication.conflictId });
+      }
+      this.finalize(record, mapping, publication ? {
+        status: publication.status, committedRevision: publication.committedRevision,
+        conflictId: publication.conflictId, publicationId: publication.publicationId, reason: publication.reason,
+      } : null);
       this.log({
         event: 'run_finished',
         runId: record.runId,
@@ -842,15 +1014,24 @@ export class AgentApi {
         logUrl: mapping.logUrl,
         repo: mapping.repo?.fullName ?? null,
       });
+      return true;
     } catch (err) {
       if (err instanceof ResultNotReadyError) {
         // Воркер сказал «терминальный», но результата нет: честный отказ, а не успех.
         this.log({ event: 'worker_result_missing', runId: record.runId });
         this.markUnknown(record, 'result_missing');
-        return;
+        return false;
+      }
+      if (this.opts.profileWorkspace) {
+        // The worker has already finished; retrying the engine could duplicate effects.
+        // Reconcile the same run branch/publication after storage or Git recovers.
+        this.log({ event: 'profile_publication_failed', runId: record.runId, code: err instanceof WorkspaceError ? err.code : 'WORKSPACE_GIT_FAILED' });
+        this.markUnknown(record, 'profile_publication_failed');
+        return false;
       }
       this.log({ event: 'run_failed', runId: record.runId, message: err instanceof Error ? err.message : String(err) });
       this.finalize(record, workerTransportFailure(record.spec, err, { startedAt, finishedAt: this.nowIso() }, { workerBaseUrl: worker.baseUrl }));
+      return true;
     }
   }
 
@@ -882,8 +1063,25 @@ export class AgentApi {
   }
 
   /** Единственное место, где ран становится терминальным. */
-  private finalize(record: AdmissionRecord, mapping: LaunchMapping): void {
-    this.store.append(record.runId, mapping.events);
+  private finalize(record: AdmissionRecord, mapping: LaunchMapping, publication: import('./stateless-store.js').RunProgress['publication'] = null): void {
+    const live = this.liveLogStreams.get(record.runId);
+    if (live) {
+      live.stopping = true;
+      live.controller.abort();
+      live.drainController?.abort();
+    }
+    this.liveLogStreams.delete(record.runId);
+    const filtered = mapping.events.flatMap(event => {
+      if (event.type !== 'log' || (event.payload.stream !== 'stdout' && event.payload.stream !== 'stderr') || !live) return [event];
+      const stream = event.payload.stream;
+      if (live.initialSourceCursor === 0 && live.completed && live.outputs[stream].length > 0) return [];
+      const remaining = remainingFinalOutput(event.payload.message, live.outputs[stream]);
+      return remaining.length > 0 ? [{ ...event, payload: { ...event.payload, message: remaining } }] : [];
+    });
+    const progress = this.store.progressOf(record.runId);
+    let sequence = progress?.sequence ?? 0;
+    const sequenced = filtered.map(event => ({ ...event, sequence: ++sequence }));
+    this.store.append(record.runId, sequenced);
     this.store.complete(record.runId, {
       state: mapping.result.outcome,
       result: mapping.result,
@@ -892,7 +1090,110 @@ export class AgentApi {
       logUrl: mapping.logUrl,
       answer: mapping.answer,
       finishedAt: mapping.result.finishedAt,
+      publication,
     });
+  }
+
+  /**
+   * Mirror a VM's replayable log SSE into the central event journal. Reconnect with the
+   * last worker sequence after transport loss; the worker's `end` frame closes the tail.
+   */
+  private startWorkerLogStream(record: AdmissionRecord, worker: ExternalWorker): void {
+    if (!worker.streamLogs || !isRegionalVmEngine(worker.name) || this.liveLogStreams.has(record.runId) || this.disposed) return;
+    const sourceCursor = this.store.workerLogCursor(record.runId).sourceSequence;
+    const state: LiveLogState = {
+      controller: new AbortController(),
+      drainController: null,
+      outputs: { stdout: '', stderr: '' },
+      initialSourceCursor: sourceCursor,
+      completed: false,
+      stopping: false,
+    };
+    this.liveLogStreams.set(record.runId, state);
+    void (async () => {
+      let cursor = sourceCursor;
+      while (!state.controller.signal.aborted && !state.stopping && !this.disposed) {
+        try {
+          const result = await worker.streamLogs!(record.runId, cursor, state.controller.signal,
+            (stream, message, workerSequence) => this.appendWorkerLog(record, state, stream, message, workerSequence));
+          cursor = Math.max(cursor, result.cursor);
+          if (result.completed) state.completed = true;
+          if (!result.supported || result.completed) return;
+        } catch (err) {
+          if (state.controller.signal.aborted || state.stopping || this.disposed) return;
+          this.log({ event: 'worker_log_stream_retry', runId: record.runId, cursor, message: err instanceof Error ? err.message : String(err) });
+        }
+        if (state.controller.signal.aborted || state.stopping || this.disposed) return;
+        await new Promise<void>(resolve => {
+          const done = (): void => {
+            clearTimeout(timer);
+            state.controller.signal.removeEventListener('abort', done);
+            resolve();
+          };
+          const timer = setTimeout(done, 250);
+          state.controller.signal.addEventListener('abort', done, { once: true });
+        });
+      }
+    })();
+  }
+
+  private appendWorkerLog(
+    record: AdmissionRecord,
+    state: LiveLogState,
+    stream: 'stdout' | 'stderr',
+    message: string,
+    sourceSequence: number,
+  ): void {
+    const cursor = this.store.workerLogCursor(record.runId);
+    if (sourceSequence <= cursor.sourceSequence) return;
+    const progress = this.store.progressOf(record.runId);
+    const safeMessage = logMessage(message);
+    let apiSequence = progress?.sequence ?? cursor.apiSequence;
+    if (progress && !isTerminalApiState(progress.state) && safeMessage.length > 0) {
+      const event: RunnerEvent = {
+        schemaVersion: RUNNER_EVENT_SCHEMA_VERSION,
+        eventId: newApiId('evt'),
+        runId: record.runId,
+        jobId: record.jobId,
+        userTaskId: record.userTaskId,
+        profileId: record.profileId,
+        ownerGeneration: record.ownerGeneration,
+        sequence: progress.sequence + 1,
+        timestamp: this.nowIso(),
+        type: 'log',
+        payload: { stream, level: 'info', message: safeMessage },
+      };
+      this.store.append(record.runId, [event]);
+      apiSequence = event.sequence;
+      state.outputs[stream] = `${state.outputs[stream]}${state.outputs[stream] ? ' ' : ''}${safeMessage}`.slice(-20_000);
+    }
+    this.store.recordWorkerLogCursor(record.runId, sourceSequence, apiSequence);
+  }
+
+  /** The terminal status can beat the worker's 250ms log poll; replay once at the terminal cursor before finalizing. */
+  private async drainWorkerLogStream(record: AdmissionRecord, worker: ExternalWorker): Promise<void> {
+    const state = this.liveLogStreams.get(record.runId);
+    if (!state || !worker.streamLogs || state.stopping) return;
+    state.stopping = true;
+    state.controller.abort();
+    const controller = new AbortController();
+    state.drainController = controller;
+    const timer = setTimeout(() => controller.abort(), 3000);
+    try {
+      const cursor = this.store.workerLogCursor(record.runId).sourceSequence;
+      const result = await worker.streamLogs(record.runId, cursor, controller.signal,
+        (stream, message, sourceSequence) => this.appendWorkerLog(record, state, stream, message, sourceSequence));
+      state.completed = result.supported && result.completed;
+    } catch (err) {
+      this.log({ event: 'worker_log_drain_incomplete', runId: record.runId, message: err instanceof Error ? err.message : String(err) });
+    } finally {
+      clearTimeout(timer);
+      state.drainController = null;
+    }
+  }
+
+  private principalFor(record: AdmissionRecord): Principal {
+    return { principalId: record.principalId, profileId: record.profileId, scopes: ['runs:read', 'runs:write'], ...(record.tenantId ? { tenantId: record.tenantId } : {}) };
   }
 
   /**
@@ -975,6 +1276,7 @@ private buildSpec(
     if (request.deadline !== undefined) spec.deadline = request.deadline;
     if (request.regionConstraints !== undefined) spec.regionConstraints = request.regionConstraints;
     if (request.credentialBindings !== undefined) spec.credentialBindings = request.credentialBindings;
+    if (request.mcp !== undefined) spec.mcp = request.mcp;
     if (request.budget !== undefined) spec.budget = request.budget;
     if (request.result !== undefined) spec.result = request.result;
     if (request.outputs !== undefined) spec.outputs = request.outputs;
@@ -982,6 +1284,15 @@ private buildSpec(
     if (request.repository !== undefined) spec.repository = request.repository;
     else if (this.opts.defaultRepository !== undefined) spec.repository = { fullName: this.opts.defaultRepository };
     if (request.isolation !== undefined) spec.isolation = request.isolation;
+    if (request.ingressManifest !== undefined) {
+      spec.ingressManifest = {
+        ...request.ingressManifest,
+        userTaskId: context.userTaskId,
+        profileId: context.principal.profileId,
+        runId,
+        ownerGeneration: context.ownerGeneration,
+      };
+    }
 
     const validated = validateRunSpec(spec);
     if (!validated.ok) {
@@ -992,7 +1303,8 @@ private buildSpec(
 
   private requireRun(principal: Principal, runId: string): AdmissionRecord {
     const record = this.store.getByRun(runId);
-    if (!record || record.principalId !== principal.principalId) {
+    if (!record || record.principalId !== principal.principalId ||
+        (this.opts.profileWorkspace && (record.tenantId !== principal.tenantId || record.profileId !== principal.profileId))) {
       throw new ApiError('NOT_FOUND', `unknown run ${runId}`);
     }
     return record;
@@ -1006,4 +1318,3 @@ private buildSpec(
     this.logger({ ts: this.nowIso(), ...entry });
   }
 }
-

@@ -9,6 +9,7 @@ import {
   type CredentialBinding,
   type EngineSpec,
   type InputSpec,
+  type McpSpec,
   type OutputSpec,
   type RegionConstraints,
   type RepositorySpec,
@@ -53,11 +54,13 @@ export interface SubmitRequest {
    */
   engine?: EngineSpec;
   input?: InputSpec;
+  ingressManifest?: { contractVersion: 1; manifestRef: string; manifestVersion: string };
   envAllowlist: string[];
   limits: RunLimits;
   deadline?: string;
   regionConstraints?: RegionConstraints;
   credentialBindings?: CredentialBinding[];
+  mcp?: McpSpec;
   budget?: BudgetSpec;
   result?: ResultPolicy;
   outputs?: OutputSpec[];
@@ -97,6 +100,7 @@ export interface RunStatusView {
   fencing: { rejected: number };
   /** Текст ответа агента, если воркер его извлёк. */
   answer: string | null;
+  publication?: { status: string; committedRevision: string | null; conflictId: string | null; publicationId: string | null; reason: string | null } | null;
 }
 
 export interface EventsPage {
@@ -205,7 +209,7 @@ export interface ApiCapabilities {
     scopedBindings: boolean;
     capabilityHandlersSharedWithMcp: boolean;
     capabilityInvokeEndpoint: boolean;
-    remoteTransport: 'absent';
+    remoteTransport: 'absent' | 'worker_remote';
     osIsolation: IsolationCapability;
     osIsolationNote: string;
   };
@@ -280,11 +284,13 @@ const SUBMIT_KEYS = [
   'conversationId',
   'engine',
   'input',
+  'ingressManifest',
   'envAllowlist',
   'limits',
   'deadline',
   'regionConstraints',
   'credentialBindings',
+  'mcp',
   'budget',
   'result',
   'outputs',
@@ -317,6 +323,13 @@ export function validateSubmitRequest(input: unknown): ValidationResult<SubmitRe
   if (input['userTaskId'] !== undefined) checkString(input['userTaskId'], 'request.userTaskId', collector, 200);
   if (input['conversationId'] !== undefined) checkString(input['conversationId'], 'request.conversationId', collector, 200);
   if (input['instructions'] !== undefined) checkString(input['instructions'], 'request.instructions', collector, 10_000);
+  if (input['ingressManifest'] !== undefined && checkObject(input['ingressManifest'], 'request.ingressManifest', collector)) {
+    const pin = input['ingressManifest'];
+    checkKeys(pin, ['contractVersion', 'manifestRef', 'manifestVersion'], ['contractVersion', 'manifestRef', 'manifestVersion'], 'request.ingressManifest', collector);
+    if (pin['contractVersion'] !== 1) collector.push('request.ingressManifest.contractVersion: expected 1');
+    checkString(pin['manifestRef'], 'request.ingressManifest.manifestRef', collector, 500);
+    if (typeof pin['manifestVersion'] !== 'string' || !/^[0-9a-f]{64}$/.test(pin['manifestVersion'])) collector.push('request.ingressManifest.manifestVersion: expected lowercase sha256');
+  }
   if (input['isolation'] !== undefined) {
     const isolation = input['isolation'];
     if (checkObject(isolation, 'request.isolation', collector)) {
@@ -344,9 +357,23 @@ export function validateSubmitRequest(input: unknown): ValidationResult<SubmitRe
     envAllowlist: input['envAllowlist'] ?? [],
     limits: input['limits'],
   };
-  for (const key of ['input', 'deadline', 'regionConstraints', 'credentialBindings', 'budget', 'result', 'outputs', 'traceId', 'repository', 'isolation'] as const) {
+  for (const key of ['input', 'deadline', 'regionConstraints', 'credentialBindings', 'mcp', 'budget', 'result', 'outputs', 'traceId', 'repository', 'isolation'] as const) {
     if (input[key] !== undefined) specLike[key] = input[key];
   }
+  if (input['ingressManifest'] !== undefined) {
+    specLike['ingressManifest'] = {
+      ...input['ingressManifest'] as Record<string, unknown>,
+      userTaskId: specLike['userTaskId'],
+      profileId: specLike['profileId'],
+      runId: specLike['runId'],
+      ownerGeneration: specLike['ownerGeneration'],
+    };
+  }
+  if (input['ingressManifest'] !== undefined && specLike['input'] !== undefined) {
+    const inputSpec = specLike['input'] as InputSpec;
+    if (inputSpec.refs?.length) collector.push('request.input.refs: cannot be combined with request.ingressManifest');
+  }
+  if (!collector.ok) return collector.finish(undefined as never);
 
   const specResult = validateRunSpec(specLike);
   if (!specResult.ok) {
@@ -359,11 +386,13 @@ export function validateSubmitRequest(input: unknown): ValidationResult<SubmitRe
     envAllowlist: spec.envAllowlist,
     limits: spec.limits,
   };
+  if (input['ingressManifest'] !== undefined) request.ingressManifest = input['ingressManifest'] as SubmitRequest['ingressManifest'];
   if (input['engine'] !== undefined) request.engine = spec.engine;
   if (spec.input !== undefined) request.input = spec.input;
   if (spec.deadline !== undefined) request.deadline = spec.deadline;
   if (spec.regionConstraints !== undefined) request.regionConstraints = spec.regionConstraints;
   if (spec.credentialBindings !== undefined) request.credentialBindings = spec.credentialBindings;
+  if (spec.mcp !== undefined) request.mcp = spec.mcp;
   if (spec.budget !== undefined) request.budget = spec.budget;
   if (spec.result !== undefined) request.result = spec.result;
   if (spec.outputs !== undefined) request.outputs = spec.outputs;

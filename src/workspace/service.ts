@@ -83,6 +83,8 @@ export interface WorkspaceServiceDeps {
   policy?: ExportPolicy;
   /** Сколько раз пересчитать merge при конкурентной публикации, прежде чем объявить конфликт. */
   mergeAttempts?: number;
+  /** Deterministic publication tie-break; manual conflicts remain available to legacy callers. */
+  conflictPolicy?: 'prefer_larger_final_tree' | 'preserve_conflict';
   /** Сколько попыток разрешения конфликта до `awaiting_user_input` (запрет цикла). */
   resolutionAttempts?: number;
   manifestLimits?: { maxFiles: number; maxBytes: number };
@@ -160,6 +162,8 @@ export interface PublishRunBranchInput {
   runId: string;
   /** Имя ветки рана; по умолчанию `agent-run/<runId>`. */
   branch?: string;
+  /** Worker-reported commit; the remote ref must contain exactly this commit. */
+  expectedCommit?: string;
   credentialTokenRef?: string;
 }
 
@@ -215,6 +219,7 @@ export class WorkspaceService {
   private readonly journal: WorkspaceJournalPort;
   private readonly policy: CompiledPolicy;
   private readonly mergeAttempts: number;
+  private readonly conflictPolicy: NonNullable<WorkspaceServiceDeps['conflictPolicy']>;
   private readonly resolutionAttempts: number;
   private readonly manifestLimits: { maxFiles: number; maxBytes: number };
   private readonly branch: string;
@@ -229,6 +234,7 @@ export class WorkspaceService {
     this.journal = deps.journal;
     this.policy = compilePolicy(deps.policy ?? DEFAULT_EXPORT_POLICY);
     this.mergeAttempts = Math.max(1, deps.mergeAttempts ?? DEFAULT_MERGE_ATTEMPTS);
+    this.conflictPolicy = deps.conflictPolicy ?? 'prefer_larger_final_tree';
     this.resolutionAttempts = Math.max(1, deps.resolutionAttempts ?? DEFAULT_RESOLUTION_ATTEMPTS);
     this.manifestLimits = deps.manifestLimits ?? DEFAULT_MANIFEST_LIMITS;
     this.branch = deps.defaultBranch ?? DEFAULT_BRANCH;
@@ -598,6 +604,10 @@ export class WorkspaceService {
           }
           const declared = artifacts.get(path);
           if (declared) {
+            if (!declared.key.startsWith(`profiles/${principal.profileId}/workspace/`)) {
+              warnings.push(`skipped ${path}: artifact belongs to another profile`);
+              continue;
+            }
             if (!(await this.verifyArtifact(declared))) {
               warnings.push(`skipped ${path}: artifact is unavailable or does not match its checksum`);
               continue;
@@ -622,6 +632,10 @@ export class WorkspaceService {
           if (manifest.some((item) => item.path === path)) continue;
           if (matchRule(this.policy, path).action === 'exclude') {
             warnings.push(`skipped ${path}: excluded by export policy`);
+            continue;
+          }
+          if (!declared.key.startsWith(`profiles/${principal.profileId}/workspace/`)) {
+            warnings.push(`skipped ${path}: artifact belongs to another profile`);
             continue;
           }
           if (!(await this.verifyArtifact(declared))) {
@@ -911,7 +925,7 @@ export class WorkspaceService {
     const { result } = await this.journal.runOperation({
       operationId: input.operationId,
       method: 'publish_run_branch',
-      payload: { tenantId: input.tenantId, profileId: input.profileId, runId: input.runId, branch: input.branch ?? null },
+      payload: { tenantId: input.tenantId, profileId: input.profileId, runId: input.runId, branch: input.branch ?? null, expectedCommit: input.expectedCommit ?? null },
       execute: async () => {
         const principal = this.principal(input.tenantId, input.profileId, input.credentialTokenRef);
         const binding = await this.requireBinding(principal.tenantId, principal.profileId);
@@ -925,6 +939,22 @@ export class WorkspaceService {
             detail: { branch, repository: binding.repository },
           });
         }
+        if (input.expectedCommit && runCommit !== input.expectedCommit) {
+          throw new WorkspaceError('WORKSPACE_HEAD_CHANGED', `run branch "${branch}" does not match the worker-reported commit`, {
+            detail: { branch, expectedCommit: input.expectedCommit, remoteCommit: runCommit },
+          });
+        }
+        await this.assertRepositoryOwnership(mirror, runCommit, principal);
+        for (const [path, artifact] of await this.readArtifactIndex(mirror, runCommit)) {
+          if (!isSafeRelativePath(path) || !artifact.key.startsWith(`profiles/${principal.profileId}/workspace/`) || !/^[0-9a-f]{64}$/.test(artifact.sha256)) {
+            throw new WorkspaceError('WORKSPACE_PATH_DENIED', 'run branch contains an invalid profile artifact reference', { detail: { path, branch } });
+          }
+          if (!(await this.verifyArtifact(artifact))) {
+            throw new WorkspaceError('WORKSPACE_STORAGE_UNAVAILABLE', `run branch has an unverified object at ${artifact.key}`, {
+              retryable: true, detail: { branch, key: artifact.key },
+            });
+          }
+        }
         const head = await this.git.head(mirror, binding.branch);
         // «Что видел ран» = общий предок головы и ветки рана. Так изменения рана отличаются
         // от того, что успела опубликовать основная ветка за время рана.
@@ -934,6 +964,13 @@ export class WorkspaceService {
         const base = toTreeMap(await this.git.listTree(mirror, baseRevision));
         const runTree = toTreeMap(await this.git.listTree(mirror, runCommit));
         const changes = await buildChangeSet(this.git, mirror, { base, candidate: runTree });
+        for (const change of changes) {
+          if (!META_PATHS.has(change.path) && matchRule(this.policy, change.path).action === 'exclude') {
+            throw new WorkspaceError('WORKSPACE_PATH_DENIED', `run branch changes a path excluded by profile policy: "${change.path}"`, {
+              detail: { path: change.path, branch },
+            });
+          }
+        }
 
         const record = this.newPublication({
           publicationId: this.newId('wspub'),
@@ -1117,7 +1154,7 @@ export class WorkspaceService {
     const current = toTreeMap(head === null ? [] : await this.git.listTree(mirror, head));
     const runTree = toTreeMap(await this.git.listTree(mirror, conflict.runRevision));
     const scope = new Set([...base.keys(), ...runTree.keys(), ...current.keys()]);
-    const merged = await mergeTrees(this.git, mirror, { base, run: runTree, current, scope });
+    const merged = await mergeTrees(this.git, mirror, { base, run: runTree, current, scope, conflictPolicy: 'preserve_conflict' });
     const writes = [...merged.writes];
 
     if (source === 'deterministic') {
@@ -1514,7 +1551,7 @@ export class WorkspaceService {
         mainCommit = runCommit;
       } else {
         const current = toTreeMap(await this.git.listTree(mirror, head));
-        const merged = await mergeTrees(this.git, mirror, { base, run: runTree, current, scope });
+        const merged = await mergeTrees(this.git, mirror, { base, run: runTree, current, scope, conflictPolicy: this.conflictPolicy });
         if (!merged.clean) {
           return this.recordConflict(withCandidate, binding, mirror, {
             base,
@@ -1533,7 +1570,8 @@ export class WorkspaceService {
           parents: [head, runCommit],
           message: `merge ${record.branch} into ${binding.branch}`,
           author: COMMIT_AUTHOR,
-          metadata: { publicationId: record.publicationId, baseRevision: record.baseRevision, manifestHash: record.manifestHash, kind: 'merge' },
+          metadata: { publicationId: record.publicationId, baseRevision: record.baseRevision, manifestHash: record.manifestHash, kind: 'merge',
+            conflictPolicy: this.conflictPolicy, resolvedConflicts: JSON.stringify(merged.resolvedByLargerTree) },
         });
       }
 
@@ -1667,6 +1705,7 @@ export class WorkspaceService {
       run: candidate,
       current,
       scope: new Set([...base.keys(), ...candidate.keys(), ...current.keys()]),
+      conflictPolicy: 'preserve_conflict',
     });
     const nextConflict: WorkspaceConflict = {
       ...conflict,

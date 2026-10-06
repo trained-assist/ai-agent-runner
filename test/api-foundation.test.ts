@@ -54,6 +54,14 @@ describe('api key registry', () => {
     expect(registry.authenticate('')).toBeNull();
   });
 
+  it('refuses ambiguous tenant and profile bindings for trusted profile keys', () => {
+    const first = keyRecordFor(generateApiKey(), { principalId: 'p-a', tenantId: 'tenant-a', profileId: 'profile-a', scopes: ['runs:write'] });
+    const sameProfile = keyRecordFor(generateApiKey(), { principalId: 'p-b', tenantId: 'tenant-b', profileId: 'profile-a', scopes: ['runs:write'] });
+    const samePrincipal = keyRecordFor(generateApiKey(), { principalId: 'p-a', tenantId: 'tenant-a', profileId: 'profile-b', scopes: ['runs:write'] });
+    expect(() => KeyRegistry.fromRecords([first, sameProfile])).toThrow(/multiple tenants/);
+    expect(() => KeyRegistry.fromRecords([first, samePrincipal])).toThrow(/multiple profiles/);
+  });
+
   it('loads a hashed key file and fails fast on a malformed one', () => {
     const dir = tempDir();
     try {
@@ -94,6 +102,16 @@ describe('submit contract validation', () => {
     expect(result.value.instructions).toBe('save each step');
     expect(result.value.engine).toEqual({ name: 'fake', adapterVersion: '1' });
     expect(result.value.limits).toEqual({ timeoutMs: 5000 });
+  });
+
+  it('validates only the immutable ingress manifest pin and rejects snapshot-ref mixing', () => {
+    const ingressManifest = { contractVersion: 1, manifestRef: 'cp-input-manifest:task-1', manifestVersion: 'a'.repeat(64) };
+    const accepted = validateSubmitRequest({ ...validBody, ingressManifest });
+    expect(accepted.ok).toBe(true);
+    if (accepted.ok) expect(accepted.value.ingressManifest).toEqual(ingressManifest);
+    expect(validateSubmitRequest({ ...validBody, ingressManifest: { ...ingressManifest, runId: 'client-run' } }).ok).toBe(false);
+    expect(validateSubmitRequest({ ...validBody, ingressManifest: { ...ingressManifest, manifestVersion: 'bad' } }).ok).toBe(false);
+    expect(validateSubmitRequest({ ...validBody, ingressManifest, input: { refs: [{ snapshotRef: 's', snapshotVersion: 'v' }] } }).ok).toBe(false);
   });
 
   it('engine необязателен: без него исполнителя выбирает цепочка движков (#100)', () => {

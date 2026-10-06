@@ -14,6 +14,7 @@ import {
   ExternalWorkerAdapter,
 } from '../adapters/external-worker-adapter.js';
 import { KeyRegistry } from './auth.js';
+import { bindingFileResolver, configuredDocumentsBindingResolver, configuredTestRegistryBindingResolver, parseRemoteMcpServerPolicies, type RemoteMcpHostOptions, type RemoteMcpBindingResolver } from '../adapters/remote-mcp.js';
 
 export const DEFAULT_API_PORT = 8787;
 export const DEFAULT_API_HOST = '0.0.0.0';
@@ -33,6 +34,7 @@ export interface WorkerConfig {
 }
 
 export interface AgentApiProcessConfig {
+  remoteMcp?: RemoteMcpHostOptions;
   host: string;
   port: number;
   keyRegistryPath: string;
@@ -240,6 +242,24 @@ export function loadAgentApiConfig(env: Record<string, string | undefined> = pro
   // Цепочка разбирается после воркеров: её имена обязаны быть среди объявленных движков.
   const engineChain = parseEngineChain(env['AGENT_API_ENGINE_CHAIN'], workers);
 
+  const publicUrl = envValue(env, 'AGENT_API_PUBLIC_URL') ?? null;
+  if (publicUrl !== null) {
+    let parsed: URL;
+    try { parsed = new URL(publicUrl); } catch { throw new Error('AGENT_API_PUBLIC_URL: expected an absolute http(s) URL without credentials, query, or fragment'); }
+    if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password || parsed.search || parsed.hash) throw new Error('AGENT_API_PUBLIC_URL: expected an absolute http(s) URL without credentials, query, or fragment');
+  }
+  const token = envValue(env, 'AGENT_API_TEST_MCP_BEARER');
+  const privateKeyPem = envValue(env, 'AGENT_API_TEST_MCP_ED25519_PRIVATE_KEY');
+  const catalogueVersion = envValue(env, 'AGENT_API_TEST_MCP_CATALOGUE_VERSION');
+  const registryDigest = envValue(env, 'AGENT_API_TEST_MCP_REGISTRY_DIGEST');
+  const testValues = [token, privateKeyPem, catalogueVersion, registryDigest];
+  if (testValues.some(value => value !== undefined) && testValues.some(value => value === undefined)) throw new Error('test registry MCP configuration requires bearer, Ed25519 key, catalogue version and pinned registry digest');
+  const testRegistryResolver = configuredTestRegistryBindingResolver(testValues.every(value => value === undefined) ? undefined : { token: token!, privateKeyPem: privateKeyPem!, catalogueVersion: catalogueVersion!, registryDigest: registryDigest! });
+  const existingResolver = configuredDocumentsBindingResolver(envValue(env, 'AGENT_API_DOCUMENTS_MCP_MODULE'), envValue(env, 'AGENT_API_DOCUMENTS_MCP_REGISTRATIONS')) ?? bindingFileResolver(envValue(env, 'AGENT_API_REMOTE_MCP_BINDINGS_FILE'));
+  const resolveBinding: RemoteMcpBindingResolver = async (bindingRef, context) => context.profileId === 'integration-telegram-ux-v1' || bindingRef === 'registry-mcp-test-160-read'
+    ? context.profileId === 'integration-telegram-ux-v1' ? testRegistryResolver?.(bindingRef, context) ?? null : null
+    : existingResolver?.(bindingRef, context) ?? null;
+
   return {
     host: env['AGENT_API_HOST']?.trim() || DEFAULT_API_HOST,
     port,
@@ -248,8 +268,24 @@ export function loadAgentApiConfig(env: Record<string, string | undefined> = pro
     engineChain,
     env: parseEnvPool(env['AGENT_API_ENV']),
     defaultRepository: env['RUNNER_DEFAULT_REPO']?.trim() || null,
-    publicUrl: env['AGENT_API_PUBLIC_URL']?.trim() || null,
+    publicUrl,
     reconcileDeadlineMs,
+    remoteMcp: { servers: parseRemoteMcpServerPolicies(envValue(env, 'AGENT_API_REMOTE_MCP_SERVERS')), resolveBinding },
   };
 }
 
+/** Compatibility factory used by API composition tests and local embedders. */
+export function createExternalWorkers(config: AgentApiProcessConfig, log?: (entry: Record<string, unknown>) => void, resolveBinding?: RemoteMcpBindingResolver): ExternalWorkerAdapter[] {
+  return config.workers.map(worker => new ExternalWorkerAdapter({
+    engineName: worker.engine,
+    baseUrl: worker.baseUrl,
+    env: config.env,
+    ...(config.publicUrl ? { baseUrlForResult: config.publicUrl } : {}),
+    ...(worker.token ? { token: worker.token } : {}),
+    deadlineMs: worker.launchDeadlineMs,
+    acceptDeadlineMs: worker.acceptDeadlineMs,
+    cancelDeadlineMs: worker.cancelDeadlineMs,
+    log,
+    ...(config.remoteMcp ? { remoteMcp: { ...config.remoteMcp, resolveBinding: resolveBinding ?? config.remoteMcp.resolveBinding } } : {}),
+  }));
+}

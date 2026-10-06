@@ -49,13 +49,16 @@ describe('runner lifecycle', () => {
       'agent_exit_resolved',
       // Намерение уборки записано до самой уборки (issue #52, шаг 4).
       'checkpoint_written',
+      // Результат движка зафиксирован до sweep (issue #181).
+      'checkpoint_written',
       // Сам sweep с числом снятых каталогов — после намерения, до терминального события.
       'log',
       'succeeded',
     ]);
     const resolved = events.find((event) => event.type === 'agent_exit_resolved');
     expect(resolved?.payload).toMatchObject({ manifest: 'absent', declared: 0, fromManifest: 0, answerSource: 'engine_stdout', planned: 0 });
-    const checkpoint = events.find((event) => event.type === 'checkpoint_written');
+    const checkpoint = events.find((event) => event.type === 'checkpoint_written'
+      && (event.payload as Record<string, unknown>)['phase'] === 'cleanup_pending');
     expect(checkpoint?.payload).toMatchObject({ phase: 'cleanup_pending', persistence: 'not_required', cleanup: 'pending' });
     // Текст ответа обязан пережить sweep чистой среды: он в checkpoint, а не в workspace.
     const durable = JSON.parse(readFileSync(join(h.rootDir, 'runs', receipt.runId, 'checkpoint.json'), 'utf8')) as {
@@ -96,7 +99,8 @@ describe('runner lifecycle', () => {
     expect(existsSync(spec.cwd)).toBe(false);
 
     const stored = JSON.parse(readFileSync(join(h.rootDir, 'runs', receipt.runId, 'result.json'), 'utf8')) as unknown;
-    expect(validateRunResult(stored).ok).toBe(true);
+    const validation = validateRunResult(stored);
+    expect(validation.ok).toBe(true);
     const status = stored as { cleanup: string; cleanupReason: string; persistence: string };
     expect(status.cleanup).toBe('completed');
     expect(status.cleanupReason).toContain('workspace');

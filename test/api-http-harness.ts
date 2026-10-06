@@ -27,9 +27,9 @@ export const betaPrincipal: Principal = { principalId: 'p-beta', profileId: 'pro
 export const readerPrincipal: Principal = { principalId: 'p-reader', profileId: 'profile-r', scopes: ['runs:read'] };
 export const noScopePrincipal: Principal = { principalId: 'p-noscope', profileId: 'profile-a', scopes: [] };
 
-export function testKeyRegistry(): KeyRegistry {
+export function testKeyRegistry(alphaEngines = alphaPrincipal.engines): KeyRegistry {
   return KeyRegistry.fromRecords([
-    keyRecordFor(alphaKey, alphaPrincipal),
+    keyRecordFor(alphaKey, { ...alphaPrincipal, ...(alphaEngines ? { engines: [...alphaEngines] } : {}) }),
     keyRecordFor(betaKey, betaPrincipal),
     keyRecordFor(readerKey, readerPrincipal),
     keyRecordFor(noScopeKey, noScopePrincipal),
@@ -59,6 +59,7 @@ export interface HttpHarnessOptions {
   keepaliveMs?: number;
   maxBodyBytes?: number;
   workerToken?: string;
+  workerEngineName?: string;
   env?: Record<string, string>;
   store?: StatelessStore;
 }
@@ -74,6 +75,7 @@ export interface HttpHarness {
 export async function startHttpHarness(options: HttpHarnessOptions = {}): Promise<HttpHarness> {
   const worker = await startMockWorker(options.worker ?? {});
   const adapter = adapterFor(worker, {
+    ...(options.workerEngineName ? { engineName: options.workerEngineName } : {}),
     ...(options.workerToken !== undefined ? { token: options.workerToken } : {}),
     env: options.env ?? {},
   });
@@ -88,7 +90,7 @@ export async function startHttpHarness(options: HttpHarnessOptions = {}): Promis
     ...(options.store ? { store: options.store } : {}),
   });
   const server = createAgentApiServer(service, {
-    keys: testKeyRegistry(),
+    keys: testKeyRegistry(options.workerEngineName ? [options.workerEngineName] : undefined),
     logger,
     streamPollMs: options.streamPollMs ?? 10,
     keepaliveMs: options.keepaliveMs ?? 10_000,

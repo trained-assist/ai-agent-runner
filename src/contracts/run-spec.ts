@@ -47,6 +47,16 @@ export interface InputSpec {
   inlinePrompt?: string;
 }
 
+export interface IngressManifestRef {
+  contractVersion: 1;
+  manifestRef: string;
+  manifestVersion: string;
+  userTaskId: string;
+  profileId: string;
+  runId: string;
+  ownerGeneration: number;
+}
+
 export interface CredentialBinding {
   ref: string;
   scope: string;
@@ -61,7 +71,7 @@ export interface CredentialBinding {
  * `bindingRef` обязан быть объявлен в `credentialBindings` рана; значение binding'а
  * остаётся в процессе хоста и в дочерний процесс не передаётся.
  */
-export interface McpServerSpec {
+export interface McpStdioServerSpec {
   serverId: string;
   transport: 'stdio';
   command: string;
@@ -72,6 +82,19 @@ export interface McpServerSpec {
   readinessTimeoutMs?: number;
   toolTimeoutMs?: number;
 }
+
+export interface McpRemoteServerSpec {
+  serverId: string;
+  transport: 'remote';
+  url: string;
+  bindingRef: string;
+  allowedTools: string[];
+  policyVersion?: string;
+  catalogueVersion?: string;
+  toolTimeoutMs?: number;
+}
+
+export type McpServerSpec = McpStdioServerSpec | McpRemoteServerSpec;
 
 export interface McpSpec {
   servers: McpServerSpec[];
@@ -100,6 +123,22 @@ export interface RegionConstraints {
 export interface RepositorySpec {
   fullName: string;
   token?: string;
+  /** Profile commit prepared before launch; worker checks out this exact revision. */
+  revision?: string;
+}
+
+export interface ProfileObjectSpec {
+  path: string;
+  key: string;
+  sha256: string;
+  size: number;
+}
+
+export interface ProfileWorkspaceSpec {
+  bindingId: string;
+  objectBucket?: string;
+  artifacts: ProfileObjectSpec[];
+  excludedPatterns: string[];
 }
 
 export const REPOSITORY_TOKEN_MAX_LENGTH = 500;
@@ -147,6 +186,7 @@ export interface RunSpec {
   limits: RunLimits;
   deadline?: string;
   input?: InputSpec;
+  ingressManifest?: IngressManifestRef;
   isolation?: { mode: IsolationMode };
   regionConstraints?: RegionConstraints;
   credentialBindings?: CredentialBinding[];
@@ -156,6 +196,7 @@ export interface RunSpec {
   outputs?: OutputSpec[];
   traceId?: string;
   repository?: RepositorySpec;
+  profileWorkspace?: ProfileWorkspaceSpec;
 }
 
 const TOP_LEVEL_KEYS = [
@@ -173,6 +214,7 @@ const TOP_LEVEL_KEYS = [
   'limits',
   'deadline',
   'input',
+  'ingressManifest',
   'isolation',
   'regionConstraints',
   'credentialBindings',
@@ -182,6 +224,7 @@ const TOP_LEVEL_KEYS = [
   'outputs',
   'traceId',
   'repository',
+  'profileWorkspace',
 ] as const;
 
 const TOP_LEVEL_REQUIRED = [
@@ -301,8 +344,16 @@ function validateInput(value: unknown, path: string, collector: ErrorCollector):
     }
   }
   if (value['inlinePrompt'] !== undefined) {
-    checkString(value['inlinePrompt'], `${path}.inlinePrompt`, collector, 100_000);
-    if (typeof value['inlinePrompt'] === 'string') input.inlinePrompt = value['inlinePrompt'];
+    const prompt = value['inlinePrompt'];
+    if (typeof prompt !== 'string' || prompt.length === 0) {
+      collector.push(`${path}.inlinePrompt: expected non-empty string`);
+    } else {
+      if (prompt.length > 100_000) collector.push(`${path}.inlinePrompt: longer than 100000`);
+      if (/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/.test(prompt)) {
+        collector.push(`${path}.inlinePrompt: control characters are not allowed`);
+      }
+      input.inlinePrompt = prompt;
+    }
   }
   return input;
 }
@@ -344,13 +395,17 @@ function validateOutputs(value: unknown, path: string, collector: ErrorCollector
 
 function validateRepository(value: unknown, path: string, collector: ErrorCollector): RepositorySpec | undefined {
   if (!checkObject(value, path, collector)) return undefined;
-  checkKeys(value, ['fullName', 'token'], ['fullName'], path, collector);
+  checkKeys(value, ['fullName', 'token', 'revision'], ['fullName'], path, collector);
   const repository: RepositorySpec = { fullName: '' };
   checkString(value['fullName'], `${path}.fullName`, collector, 200);
   if (typeof value['fullName'] === 'string' && !isFullRepositoryName(value['fullName'])) {
     collector.push(`${path}.fullName: expected "owner/name" (letters, digits, ".", "_", "-")`);
   }
   if (typeof value['fullName'] === 'string') repository.fullName = value['fullName'];
+  if (value['revision'] !== undefined) {
+    if (typeof value['revision'] !== 'string' || !/^[0-9a-f]{40}$/.test(value['revision'])) collector.push(`${path}.revision: expected commit sha`);
+    else repository.revision = value['revision'];
+  }
   if (value['token'] !== undefined) {
     checkString(value['token'], `${path}.token`, collector, REPOSITORY_TOKEN_MAX_LENGTH);
     if (typeof value['token'] === 'string' && value['token'].length > 0 && value['token'].length <= REPOSITORY_TOKEN_MAX_LENGTH) {
@@ -394,28 +449,51 @@ function validateMcpTimeout(value: unknown, path: string, collector: ErrorCollec
   return value;
 }
 
+export function isRemoteMcpUrl(value: unknown): value is string {
+  if (typeof value !== 'string' || value.length > 2000) return false;
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:' && !url.username && !url.password && !url.search && !url.hash;
+  } catch {
+    return false;
+  }
+}
+
 function validateMcpServer(value: unknown, path: string, collector: ErrorCollector): McpServerSpec | undefined {
   if (!checkObject(value, path, collector)) return undefined;
+  const remote = value['transport'] === 'remote';
   checkKeys(
     value,
-    ['serverId', 'transport', 'command', 'args', 'envAllowlist', 'bindingRef', 'allowedTools', 'readinessTimeoutMs', 'toolTimeoutMs'],
-    ['serverId', 'transport', 'command', 'allowedTools'],
+    remote
+      ? ['serverId', 'transport', 'url', 'bindingRef', 'allowedTools', 'policyVersion', 'catalogueVersion', 'toolTimeoutMs']
+      : ['serverId', 'transport', 'command', 'args', 'envAllowlist', 'bindingRef', 'allowedTools', 'readinessTimeoutMs', 'toolTimeoutMs'],
+    remote ? ['serverId', 'transport', 'url', 'bindingRef', 'allowedTools'] : ['serverId', 'transport', 'command', 'allowedTools'],
     path,
     collector,
   );
-  const server: McpServerSpec = { serverId: '', transport: 'stdio', command: '', allowedTools: [] };
+  const server: McpServerSpec = remote
+    ? { serverId: '', transport: 'remote', url: '', bindingRef: '', allowedTools: [] }
+    : { serverId: '', transport: 'stdio', command: '', allowedTools: [] };
 
   checkSafeId(value['serverId'], `${path}.serverId`, collector);
   if (typeof value['serverId'] === 'string') server.serverId = value['serverId'];
 
-  if (value['transport'] !== 'stdio') {
-    collector.push(`${path}.transport: expected "stdio" (remote domain services are shared services, not per-run processes)`);
+  if (server.transport === 'remote') {
+    if (!isRemoteMcpUrl(value['url'])) collector.push(`${path}.url: expected an HTTPS URL without credentials, query or fragment`);
+    else server.url = value['url'];
+    for (const field of ['policyVersion', 'catalogueVersion'] as const) {
+      if (value[field] !== undefined) {
+        checkString(value[field], `${path}.${field}`, collector, 200);
+        if (typeof value[field] === 'string') server[field] = value[field];
+      }
+    }
+  } else {
+    if (value['transport'] !== 'stdio') collector.push(`${path}.transport: expected "stdio" | "remote"`);
+    checkString(value['command'], `${path}.command`, collector, 512);
+    if (typeof value['command'] === 'string') server.command = value['command'];
   }
 
-  checkString(value['command'], `${path}.command`, collector, 512);
-  if (typeof value['command'] === 'string') server.command = value['command'];
-
-  if (value['args'] !== undefined) {
+  if (server.transport === 'stdio' && value['args'] !== undefined) {
     const args = value['args'];
     if (checkArray(args, `${path}.args`, collector)) {
       if (args.length > 32) collector.push(`${path}.args: too many entries`);
@@ -428,7 +506,7 @@ function validateMcpServer(value: unknown, path: string, collector: ErrorCollect
     }
   }
 
-  if (value['envAllowlist'] !== undefined) {
+  if (server.transport === 'stdio' && value['envAllowlist'] !== undefined) {
     const names = value['envAllowlist'];
     if (checkArray(names, `${path}.envAllowlist`, collector)) {
       if (names.length > 50) collector.push(`${path}.envAllowlist: too many entries`);
@@ -444,7 +522,7 @@ function validateMcpServer(value: unknown, path: string, collector: ErrorCollect
     }
   }
 
-  if (value['bindingRef'] !== undefined) {
+  if (remote || value['bindingRef'] !== undefined) {
     checkString(value['bindingRef'], `${path}.bindingRef`, collector, 300);
     if (typeof value['bindingRef'] === 'string') server.bindingRef = value['bindingRef'];
   }
@@ -470,7 +548,8 @@ function validateMcpServer(value: unknown, path: string, collector: ErrorCollect
   for (const key of ['readinessTimeoutMs', 'toolTimeoutMs'] as const) {
     if (value[key] === undefined) continue;
     const timeout = validateMcpTimeout(value[key], `${path}.${key}`, collector);
-    if (timeout !== undefined) server[key] = timeout;
+    if (timeout !== undefined && key === 'toolTimeoutMs') server.toolTimeoutMs = timeout;
+    else if (timeout !== undefined && server.transport === 'stdio') server.readinessTimeoutMs = timeout;
   }
 
   return server;
@@ -626,7 +705,7 @@ export function validateRunSpec(input: unknown): ValidationResult<RunSpec> {
     if (mcp && credentialBindings) {
       const declared = new Set(credentialBindings.filter((binding) => binding.ref !== '').map((binding) => binding.ref));
       mcp.servers.forEach((server, i) => {
-        if (!server.bindingRef) return;
+        if (!server.bindingRef || server.transport === 'remote') return;
         if (!declared.has(server.bindingRef)) {
           collector.push(`spec.mcp.servers[${i}].bindingRef: "${server.bindingRef}" is not declared in spec.credentialBindings`);
         }
@@ -668,6 +747,33 @@ export function validateRunSpec(input: unknown): ValidationResult<RunSpec> {
     }
   }
 
+  let profileWorkspace: ProfileWorkspaceSpec | undefined;
+  if (input['profileWorkspace'] !== undefined) {
+    const value = input['profileWorkspace'];
+    if (checkObject(value, 'spec.profileWorkspace', collector)) {
+      checkKeys(value, ['bindingId', 'objectBucket', 'artifacts', 'excludedPatterns'], ['bindingId', 'artifacts', 'excludedPatterns'], 'spec.profileWorkspace', collector);
+      checkString(value['bindingId'], 'spec.profileWorkspace.bindingId', collector, 200);
+      if (value['objectBucket'] !== undefined) checkString(value['objectBucket'], 'spec.profileWorkspace.objectBucket', collector, 200);
+      if (!Array.isArray(value['artifacts'])) collector.push('spec.profileWorkspace.artifacts: expected array');
+      else {
+        const artifacts: ProfileObjectSpec[] = [];
+        value['artifacts'].forEach((raw, index) => {
+          const path = `spec.profileWorkspace.artifacts[${index}]`;
+          if (!checkObject(raw, path, collector)) return;
+          checkKeys(raw, ['path', 'key', 'sha256', 'size'], ['path', 'key', 'sha256', 'size'], path, collector);
+          if (!isSafeRelativePath(raw['path'])) collector.push(`${path}.path: expected safe relative path`);
+          if (typeof raw['key'] !== 'string' || !/^profiles\/[A-Za-z0-9._-]+\/workspace\/[A-Za-z0-9._-]+\/[0-9a-f]{64}$/.test(raw['key'])) collector.push(`${path}.key: expected profile object key`);
+          if (typeof raw['sha256'] !== 'string' || !/^[0-9a-f]{64}$/.test(raw['sha256'])) collector.push(`${path}.sha256: expected sha256`);
+          if (typeof raw['size'] !== 'number' || !Number.isSafeInteger(raw['size']) || raw['size'] < 0) collector.push(`${path}.size: expected non-negative integer`);
+          artifacts.push(raw as unknown as ProfileObjectSpec);
+        });
+        if (artifacts.length > 0 && !value['objectBucket']) collector.push('spec.profileWorkspace.objectBucket: required for artifacts');
+        if (!Array.isArray(value['excludedPatterns']) || value['excludedPatterns'].some((entry) => typeof entry !== 'string')) collector.push('spec.profileWorkspace.excludedPatterns: expected string array');
+        profileWorkspace = { bindingId: String(value['bindingId'] ?? ''), ...(value['objectBucket'] ? { objectBucket: String(value['objectBucket']) } : {}), artifacts, excludedPatterns: Array.isArray(value['excludedPatterns']) ? value['excludedPatterns'] as string[] : [] };
+      }
+    }
+  }
+
   if (!collector.ok) return collector.finish(undefined as never);
 
   const spec: RunSpec = {
@@ -686,6 +792,25 @@ export function validateRunSpec(input: unknown): ValidationResult<RunSpec> {
   };
   if (input['deadline'] !== undefined) spec.deadline = input['deadline'] as string;
   if (inputSpec !== undefined) spec.input = inputSpec;
+  if (input['ingressManifest'] !== undefined) {
+    const value = input['ingressManifest'];
+    if (checkObject(value, 'spec.ingressManifest', collector)) {
+      checkKeys(value, ['contractVersion', 'manifestRef', 'manifestVersion', 'userTaskId', 'profileId', 'runId', 'ownerGeneration'], ['contractVersion', 'manifestRef', 'manifestVersion', 'userTaskId', 'profileId', 'runId', 'ownerGeneration'], 'spec.ingressManifest', collector);
+      if (value['contractVersion'] !== 1) collector.push('spec.ingressManifest.contractVersion: expected 1');
+      checkString(value['manifestRef'], 'spec.ingressManifest.manifestRef', collector, 500);
+      if (typeof value['manifestVersion'] !== 'string' || !/^[0-9a-f]{64}$/.test(value['manifestVersion'])) collector.push('spec.ingressManifest.manifestVersion: expected lowercase sha256');
+      for (const key of ['userTaskId', 'profileId', 'runId'] as const) {
+        if (!isSafeId(value[key])) collector.push(`spec.ingressManifest.${key}: expected safe id`);
+      }
+      checkPositiveInt(value['ownerGeneration'], 'spec.ingressManifest.ownerGeneration', collector);
+      if (value['userTaskId'] !== input['userTaskId']) collector.push('spec.ingressManifest.userTaskId: must match spec.userTaskId');
+      if (value['profileId'] !== input['profileId']) collector.push('spec.ingressManifest.profileId: must match spec.profileId');
+      if (value['runId'] !== input['runId']) collector.push('spec.ingressManifest.runId: must match spec.runId');
+      if (value['ownerGeneration'] !== input['ownerGeneration']) collector.push('spec.ingressManifest.ownerGeneration: must match spec.ownerGeneration');
+      if (inputSpec?.refs?.length) collector.push('spec.input.refs: cannot be combined with spec.ingressManifest');
+      spec.ingressManifest = value as unknown as IngressManifestRef;
+    }
+  }
   if (isolation !== undefined) spec.isolation = isolation;
   if (regionConstraints !== undefined) spec.regionConstraints = regionConstraints;
   if (credentialBindings !== undefined) spec.credentialBindings = credentialBindings;
@@ -695,6 +820,7 @@ export function validateRunSpec(input: unknown): ValidationResult<RunSpec> {
   if (outputs !== undefined) spec.outputs = outputs;
   if (input['traceId'] !== undefined) spec.traceId = input['traceId'] as string;
   if (repository !== undefined) spec.repository = repository;
+  if (profileWorkspace !== undefined) spec.profileWorkspace = profileWorkspace;
 
   return collector.finish(spec);
 }

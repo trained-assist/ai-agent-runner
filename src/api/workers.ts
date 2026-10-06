@@ -19,12 +19,14 @@ export function createExternalWorkers(config: AgentApiProcessConfig, log: (entry
         // Пул значений окружения рана. Без него `LaunchRequest.env` пуст, и воркер не
         // получает ни ключа LLM, ни иных значений, которые клиент разрешил в envAllowlist.
         env: config.env,
+        ...(config.publicUrl ? { baseUrlForResult: config.publicUrl } : {}),
         deadlineMs: worker.launchDeadlineMs,
         // Бюджет приёма рана — свой у каждого движка (issue #100): не ответил за него,
         // цепочка берёт следующий исполнитель.
         acceptDeadlineMs: worker.acceptDeadlineMs,
         cancelDeadlineMs: worker.cancelDeadlineMs,
         log,
+        ...(config.remoteMcp ? { remoteMcp: config.remoteMcp } : {}),
       }),
   );
 }

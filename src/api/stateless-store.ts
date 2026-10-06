@@ -1,4 +1,4 @@
-import { appendFileSync, readFileSync, renameSync } from 'node:fs';
+import { appendFileSync, closeSync, fsyncSync, openSync, readFileSync, writeSync } from 'node:fs';
 import { TERMINAL_EVENT_TYPES, type RunnerEvent } from '../contracts/events.js';
 import type { RunResult } from '../contracts/result.js';
 import { redactRepositoryToken, type RunSpec } from '../contracts/run-spec.js';
@@ -27,7 +27,11 @@ export const STATELESS_STORE_SCHEMA_VERSION = 2 as const;
  */
 export type JournalLine =
   | { kind: 'admission'; record: AdmissionRecord }
-  | { kind: 'dispatched'; runId: string; engine: string; at: string };
+  | { kind: 'prepared'; runId: string; repository: { fullName: string; revision?: string }; profileWorkspace?: RunSpec['profileWorkspace'] }
+  | { kind: 'launch_intent'; runId: string; engine: string; at: string }
+  | { kind: 'dispatched'; runId: string; engine: string; at: string }
+  | { kind: 'worker_log_cursor'; runId: string; sourceSequence: number; apiSequence: number }
+  | { kind: 'completed'; runId: string; patch: CompletedRunPatch };
 
 export interface AdmissionRecord {
   schemaVersion: typeof STATELESS_STORE_SCHEMA_VERSION;
@@ -35,6 +39,7 @@ export interface AdmissionRecord {
   userTaskId: string;
   conversationId: string;
   principalId: string;
+  tenantId?: string;
   profileId: string;
   jobId: string;
   idempotencyKey: string;
@@ -74,6 +79,18 @@ export interface RunProgress {
    * квитанции — тот, который ран принял. Клиент видит его в `RunStatusView.engine`.
    */
   engine: string;
+  publication: { status: string; committedRevision: string | null; conflictId: string | null; publicationId: string | null; reason: string | null } | null;
+}
+
+export interface CompletedRunPatch {
+  state: ApiRunState;
+  result: RunResult;
+  artifacts: LaunchArtifact[];
+  repo: LaunchRepo | null;
+  logUrl: string | null;
+  answer: string | null;
+  finishedAt: string;
+  publication?: RunProgress['publication'];
 }
 
 export interface StatelessStoreLimits {
@@ -108,12 +125,15 @@ export class StatelessStore {
   private readonly limits: StatelessStoreLimits;
   /** Куда дублируются приёмные записи; null = дедупликация только в памяти процесса. */
   private readonly persistPath: string | null;
+  private readonly strictPersistence: boolean;
   /** Раны, отправленные воркеру: нужны, чтобы поллеры пережили рестарт API. */
   private readonly dispatched = new Map<string, { runId: string; engine: string; at: string }>();
+  private readonly workerLogCursors = new Map<string, { sourceSequence: number; apiSequence: number }>();
 
-  constructor(limits: Partial<StatelessStoreLimits> = {}, persistPath: string | null = null) {
+  constructor(limits: Partial<StatelessStoreLimits> = {}, persistPath: string | null = null, strictPersistence = false) {
     this.limits = { ...DEFAULT_STATELESS_LIMITS, ...limits };
     this.persistPath = persistPath;
+    this.strictPersistence = strictPersistence;
     if (persistPath) this.replay(persistPath);
   }
 
@@ -129,10 +149,34 @@ export class StatelessStore {
     this.write({ kind: 'admission', record: { ...record, spec: redactRepositoryToken(record.spec) } });
   }
 
+  appendPrepared(runId: string, repository: { fullName: string; revision?: string }, profileWorkspace?: RunSpec['profileWorkspace']): void {
+    this.write({ kind: 'prepared', runId, repository, ...(profileWorkspace ? { profileWorkspace } : {}) });
+  }
+
   /** Ран принят воркером: помечаем, чтобы поллер пережил рестарт API. */
   appendDispatched(runId: string, engine: string, at: string): void {
     this.write({ kind: 'dispatched', runId, engine, at });
     this.dispatched.set(runId, { runId, engine, at });
+  }
+
+  appendLaunchIntent(runId: string, engine: string, at: string): void {
+    this.write({ kind: 'launch_intent', runId, engine, at });
+    this.dispatched.set(runId, { runId, engine, at });
+  }
+
+  /** Persist the VM log source cursor alongside the central event cursor for restart-safe tailing. */
+  recordWorkerLogCursor(runId: string, sourceSequence: number, apiSequence: number): void {
+    const prior = this.workerLogCursors.get(runId);
+    if (prior && sourceSequence <= prior.sourceSequence) return;
+    const next = { sourceSequence: Math.max(sourceSequence, prior?.sourceSequence ?? 0), apiSequence: Math.max(apiSequence, prior?.apiSequence ?? 0) };
+    this.workerLogCursors.set(runId, next);
+    const progress = this.progress.get(runId);
+    if (progress) progress.sequence = Math.max(progress.sequence, next.apiSequence);
+    this.write({ kind: 'worker_log_cursor', runId, ...next });
+  }
+
+  workerLogCursor(runId: string): { sourceSequence: number; apiSequence: number } {
+    return this.workerLogCursors.get(runId) ?? { sourceSequence: 0, apiSequence: 0 };
   }
 
   /** Раны, отправленные воркеру. */
@@ -143,8 +187,19 @@ export class StatelessStore {
   private write(line: JournalLine): void {
     if (!this.persistPath) return;
     try {
-      appendFileSync(this.persistPath, `${JSON.stringify(line)}\n`, 'utf8');
+      if (this.strictPersistence) {
+        const fd = openSync(this.persistPath, 'a', 0o600);
+        try {
+          writeSync(fd, `${JSON.stringify(line)}\n`);
+          fsyncSync(fd);
+        } finally {
+          closeSync(fd);
+        }
+      } else {
+        appendFileSync(this.persistPath, `${JSON.stringify(line)}\n`, 'utf8');
+      }
     } catch (err) {
+      if (this.strictPersistence) throw err;
       // Журнал не должен ронять приём задачи: при недоступном журнале дедупликация
       // сохраняется в памяти процесса, а факт отказа виден в логе.
       const what = line.kind === 'admission' ? line.record.requestId : line.runId;
@@ -167,10 +222,37 @@ export class StatelessStore {
       if (!trimmed) continue;
       try {
         const entry = JSON.parse(trimmed) as JournalLine;
-        if (entry.kind === 'dispatched') {
+        if (entry.kind === 'dispatched' || entry.kind === 'launch_intent') {
           if (typeof entry.runId === 'string' && entry.runId.length > 0) {
             this.dispatched.set(entry.runId, { runId: entry.runId, engine: String(entry.engine ?? ''), at: String(entry.at ?? '') });
             resumed += 1;
+          }
+          continue;
+        }
+        if (entry.kind === 'worker_log_cursor') {
+          if (typeof entry.runId === 'string' && Number.isSafeInteger(entry.sourceSequence) && entry.sourceSequence >= 0 &&
+              Number.isSafeInteger(entry.apiSequence) && entry.apiSequence >= 0) {
+            const prior = this.workerLogCursors.get(entry.runId);
+            this.workerLogCursors.set(entry.runId, {
+              sourceSequence: Math.max(prior?.sourceSequence ?? 0, entry.sourceSequence),
+              apiSequence: Math.max(prior?.apiSequence ?? 0, entry.apiSequence),
+            });
+          }
+          continue;
+        }
+        if (entry.kind === 'prepared') {
+          const record = this.byRun.get(entry.runId);
+          if (record) {
+            record.spec.repository = entry.repository;
+            if (entry.profileWorkspace) record.spec.profileWorkspace = entry.profileWorkspace;
+          }
+          continue;
+        }
+        if (entry.kind === 'completed') {
+          const record = this.byRun.get(entry.runId);
+          if (record) {
+            this.open(entry.runId, record.createdAt, record.spec.engine.name);
+            this.complete(entry.runId, entry.patch, false);
           }
           continue;
         }
@@ -200,8 +282,8 @@ export class StatelessStore {
   }
 
   put(record: AdmissionRecord): void {
-    this.index(record);
     this.appendAdmission(record);
+    this.index(record);
     this.evictIfNeeded();
   }
 
@@ -232,7 +314,7 @@ export class StatelessStore {
     if (existing) return existing;
     const created: RunProgress = {
       state: 'queued',
-      sequence: 0,
+      sequence: this.workerLogCursors.get(runId)?.apiSequence ?? 0,
       events: [],
       droppedEvents: 0,
       cancelRequested: null,
@@ -249,6 +331,7 @@ export class StatelessStore {
       // Движок попытки: до приёма рана это первый кандидат цепочки, дальше его двигает
       // `setEngine` по мере отказов (issue #100).
       engine: engine ?? '',
+      publication: null,
     };
     this.progress.set(runId, created);
     return created;
@@ -299,18 +382,7 @@ export class StatelessStore {
     run.updatedAt = events.length > 0 ? events[events.length - 1]!.timestamp : run.updatedAt;
   }
 
-  complete(
-    runId: string,
-    patch: {
-      state: ApiRunState;
-      result: RunResult;
-      artifacts: LaunchArtifact[];
-      repo: LaunchRepo | null;
-      logUrl: string | null;
-      answer: string | null;
-      finishedAt: string;
-    },
-  ): void {
+  complete(runId: string, patch: CompletedRunPatch, persist = true): void {
     const run = this.progress.get(runId);
     if (!run) return;
     run.state = patch.state;
@@ -319,8 +391,10 @@ export class StatelessStore {
     run.repo = patch.repo;
     run.logUrl = patch.logUrl;
     run.answer = patch.answer;
+    run.publication = patch.publication ?? null;
     run.finishedAt = patch.finishedAt;
     run.updatedAt = patch.finishedAt;
+    if (persist) this.write({ kind: 'completed', runId, patch });
   }
 
   markCancelRequested(runId: string, reason: 'cancel' | 'timeout'): void {

@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { CapabilityRegistry, type CapabilityHandler } from '../src/mcp/capabilities.js';
 import { createFakeRemoteDomainCapabilities } from '../src/mcp/demo-capabilities.js';
 import { MCP_FIXTURES, mcpFixturePath } from '../src/mcp/session.js';
-import type { McpServerSpec } from '../src/contracts/run-spec.js';
+import type { McpStdioServerSpec } from '../src/contracts/run-spec.js';
 
 export const FAKE_REMOTE_SCRIPT = fileURLToPath(new URL('../scripts/fake-remote-domain-service.mjs', import.meta.url));
 export const DOMAIN_SERVER_FIXTURE = mcpFixturePath(MCP_FIXTURES.domainServer);
@@ -102,7 +102,7 @@ export function fixtureBindingResolver(values: Record<string, string>) {
   return (ref: string): string | null => values[ref] ?? null;
 }
 
-export function mcpServer(over: Partial<McpServerSpec> & { serverId: string }): McpServerSpec {
+export function mcpServer(over: Partial<McpStdioServerSpec> & { serverId: string }): McpStdioServerSpec {
   return {
     transport: 'stdio',
     command: process.execPath,

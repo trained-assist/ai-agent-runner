@@ -1,8 +1,9 @@
 # Serverless Agent API — деплой, конфигурация, смоук
 
 Статус документа: **05.10.2026, асинхронный контракт запуска (эпик #74, контракт #73).**
-API — оркестратор без своего состояния на диске: он не запускает процессов агента, не
-восстанавливает ран после рестарта и не отдаёт байты. Единственное, что он делает, — стоит
+В базовом режиме API обслуживает ран без локального workspace. Режим постоянного профиля
+включается отдельными bindings: журнал и зеркала хранятся на устойчивом диске API,
+канонические данные — в приватном Git и GCS. API не запускает процесс агента. Он стоит
 между клиентом и внешним воркером: `POST {worker}/v1/launch` даёт квитанцию сразу, дальше
 наш поллер сам читает `status` и `result`.
 
@@ -65,7 +66,12 @@ API больше не используется** и удаляется отде�
 | `AGENT_API_ENGINE_CHAIN` | — | приоритетная цепочка движков через запятую, в порядке проб (issue #100) |
 | `EXTERNAL_WORKER_ACCEPT_DEADLINE_MS` | `30000` | бюджет ожидания квитанции на движок; не ответил — цепочка берёт следующий |
 | `RUNNER_DEFAULT_REPO` | — | `owner/name` для клиентов, не объявивших `repository` |
-| `AGENT_API_ADMISSION_LOG` | — (выключено) | путь файла журнала приёмных записей; **единственное**, что сервис пишет на диск. Без него рестарт API = потеря дедупликации и потерянные результаты уже принятых ранов (§9) |
+| `AGENT_API_ADMISSION_LOG` | — (выключено) | путь журнала приёмных записей; в режиме профиля обязателен, пишет также подготовленную версию, намерение запуска и терминальный результат |
+| `AGENT_API_PROFILE_WORKSPACE_ROOT` | — (выключено) | включает постоянный профиль для каждого Run; устойчивый каталог журнала и bare-зеркал Git |
+| `AGENT_API_PROFILE_OWNER` | — | организация приватных репозиториев профиля; обязательна при включении профиля |
+| `AGENT_API_PROFILE_GITHUB_TOKEN` | — | хостовый токен GitHub для ensure/fetch/publish; не попадает в агентское окружение или журнал |
+| `AGENT_API_PROFILE_OBJECT_BACKEND` | `gcs` | хранилище тяжёлых файлов; `local-fs` только для локального fixture, GCS использует `GCS_BUCKET` и ADC |
+| `GCP_PROJECT` / `GOOGLE_CLOUD_PROJECT` | — | ID проекта GCS; задавайте явно при Workload Identity Federation, чтобы чтение метаданных объекта не запрашивало доступ к Cloud Resource Manager |
 | `AGENT_API_PUBLIC_URL` | `http://<host>:<port>` | публичный адрес API: воркер возвращает результат на `POST {resultUrl}`. Без него запуск падает с `RESULT_URL_UNSET` |
 | `EXTERNAL_WORKER_LAUNCH_DEADLINE_MS` | `600000` | таймаут опроса `status`/`result`; заодно бюджет приёма, если у движка не задан `acceptDeadlineMs` |
 | `EXTERNAL_WORKER_CANCEL_DEADLINE_MS` | `30000` | таймаут ожидания подтверждения отмены |
@@ -74,9 +80,29 @@ API больше не используется** и удаляется отде�
 Журнал приёмных записей пишется построчным JSON рядом с ключом API и адресом воркера, а сам
 путь приходит из `process.env`, а не из `AGENT_API_ENV`: `AGENT_API_ENV` уходит воркеру в
 каждом ране по `envAllowlist`, и путь журнала не должен попасть в процесс агента. Если журнал
-недоступен, процесс не падает: запись уходит в `console.warn` (`persist failed`), дедупликация
-остаётся в памяти процесса. Тишина здесь опаснее падения, поэтому в деплое (§7) выключенный
-журнал — предупреждение, а не молчание.
+недоступен, обычный режим пишет `console.warn` (`persist failed`), а режим профиля отказывает
+в приёме или переходе состояния: подготовка и публикация профиля требуют durable журнал.
+
+В режиме профиля ключ API должен содержать доверенный `tenantId` и `profileId`. Клиентский
+`repository` отклоняется: binding выбирает хост. Перед launch API вызывает
+`prepareProfileWorkspace`, передаёт воркеру закреплённый commit и проверенные ссылки на
+объекты. После результата сверяет repository, branch и remote commit, затем вызывает
+`publishRunBranch` с тем же `operationId` при повторе. `publication.status` и
+`committedRevision` доступны в status/artifacts. Конфликт остаётся явным и блокирует новый
+Run профиля до разрешения. Тяжёлый output воркер кладёт в приватный GCS; Git хранит
+`.trained-assist/artifacts.json` с ref и checksum, байты читаются через авторизованный
+`GET /v1/runs/{runId}/artifacts?path=...`.
+GHA worker сохраняет разрешённые изменения отслеживаемых файлов, новые файлы и удаления
+из рабочего дерева, а также объявленные `outputs`. Исключения политики профиля действуют
+и для не объявленных заранее файлов.
+
+Для включения режима профиля API нужны `AGENT_API_PROFILE_WORKSPACE_ROOT` на постоянном
+томе, `AGENT_API_ADMISSION_LOG` на том же постоянном томе, `AGENT_API_PROFILE_OWNER`,
+`AGENT_API_PROFILE_GITHUB_TOKEN`, `AGENT_API_PROFILE_OBJECT_BACKEND=gcs`, `GCS_BUCKET`
+и `GCP_PROJECT` (либо `GOOGLE_CLOUD_PROJECT`) при WIF.
+Ключи в `AGENT_API_KEY_REGISTRY` должны задавать `tenantId` и `profileId`. У GHA worker
+переменная `GCS_PROFILE_BUCKET` должна совпадать с `GCS_BUCKET` API, а Workload Identity
+service account должен читать и записывать объекты этого приватного bucket.
 
 Переменных данных больше нет: `AGENT_API_DATA_DIR`, `ARTIFACT_SHARE_SECRET`,
 `ARTIFACT_BASE_URL`, `AGENT_API_RELEASE_MANIFEST`, `AGENT_API_FAULTS` сервис не читает.
@@ -96,6 +122,16 @@ API больше не используется** и удаляется отде�
 | `GET /v1/runs/{id}/artifacts` | ветка рана, ссылка на merge, ссылки на файлы по коммиту и `logUrl` |
 | `GET /v1/runs/{id}/log` | `302` на ссылку лога в Google Storage |
 | `POST /v1/runs/{id}/cancel` | пробрасывает отмену воркеру; `202` — принята, `200` — уже терминальный |
+
+Для `eu-vm-agent-run` и `rf-vm-agent-run` центральный `/events` также зеркалит stdout/stderr
+из replayable worker SSE, пока агент работает. Worker cursor переживает разрыв соединения,
+а API cursor (`Last-Event-ID` или `?cursor=`) позволяет клиенту продолжить свой поток. При
+настроенном `AGENT_API_ADMISSION_LOG` worker source cursor и следующий API event ID сохраняются
+в том же журнале, поэтому перезапуск API продолжает tail с последней принятой строки. Перед
+финализацией API повторно читает terminal tail с этого cursor: stdout/stderr, пришедшие на
+границе завершения, не теряются. Уже зеркалированные строки сверяются с полным результатом,
+чтобы не добавлять их повторно. У воркеров без этого VM endpoint stdout/stderr остаются
+доступны в финальных событиях.
 
 Маршрутов ниже больше нет: `/v1/runs/{id}/export`, `/v1/runs/{id}/upload`,
 `/v1/runs/{id}/upload-session/{sid}`, `/v1/runs/{id}/snapshot`,
