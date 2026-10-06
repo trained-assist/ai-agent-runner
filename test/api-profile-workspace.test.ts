@@ -22,14 +22,16 @@ describe('profile workspace lifecycle', () => {
     const worker = await startMockWorker();
     onTestFinished(() => worker.close());
     const calls: Array<{ runId: string; commit: string; tenantId?: string; profileId: string }> = [];
+    let canonicalRevision = 'a'.repeat(40);
     const workspace: ProfileWorkspaceCoordinator = {
       async prepare(auth, runId) {
         expect(auth).toMatchObject({ tenantId: 'tenant-a', profileId: 'profile-a' });
-        return { bindingId: 'binding-a', repository: 'owner/name', baseRevision: 'a'.repeat(40), token: 'github-token-for-profile', artifacts: [], excludedPatterns: [] };
+        return { bindingId: 'binding-a', repository: 'owner/name', baseRevision: canonicalRevision, token: 'github-token-for-profile', artifacts: [], excludedPatterns: [] };
       },
       async publish(auth, runId, commit) {
         calls.push({ runId, commit, tenantId: auth.tenantId, profileId: auth.profileId });
-        return { status: 'published', committedRevision: 'b'.repeat(40), conflictId: null, publicationId: 'pub-a', reason: null } as WorkspacePublication;
+        canonicalRevision = 'b'.repeat(40);
+        return { status: 'published', committedRevision: canonicalRevision, conflictId: null, publicationId: 'pub-a', reason: null } as WorkspacePublication;
       },
       async readObject() { throw new Error('no object in this fixture'); },
     };
@@ -42,6 +44,9 @@ describe('profile workspace lifecycle', () => {
     expect(worker.launches[0]?.['repository']).toMatchObject({ fullName: 'owner/name', revision: 'a'.repeat(40), branch: `agent-run/${receipt.runId}` });
     expect(calls).toEqual([{ runId: receipt.runId, commit: 'abc1234', tenantId: 'tenant-a', profileId: 'profile-a' }]);
     expect(api.status(principal, receipt.runId).publication).toMatchObject({ status: 'published', committedRevision: 'b'.repeat(40) });
+    const next = api.submit(principal, 'profile-run-next', body);
+    await waitFor(api, next.runId, 'succeeded');
+    expect(worker.launches[1]?.['repository']).toMatchObject({ fullName: 'owner/name', revision: 'b'.repeat(40), branch: `agent-run/${next.runId}` });
     expect(() => api.submit(principal, 'foreign-repo', { ...body, repository: { fullName: 'another/repo' } })).toThrowError(expect.objectContaining({ code: 'INVALID_REPOSITORY' }));
   });
 });
