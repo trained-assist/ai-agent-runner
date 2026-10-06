@@ -9,10 +9,10 @@ import {
   REGISTRY_FIXTURE_TOKEN_ENV, REGISTRY_FIXTURE_TOOL, REGISTRY_FIXTURE_URL,
   registryFixtureBindingResolver,
 } from '../../src/adapters/remote-mcp.js';
-import hostWorker from '../../integration-deps/trained-assist-mcp-host/src/worker.mjs';
-import { buildRunSpec, defaultRunSpecPolicy } from '../../integration-deps/trained-assist-control-plane/src/run-spec/run-spec.ts';
-import { RunnerApiAdapter as ControlPlaneRunnerApiAdapter } from '../../integration-deps/trained-assist-control-plane/src/runner-adapter/runner-api-adapter.ts';
-import { registryMcpTest160Descriptor } from '../../integration-deps/trained-assist-control-plane/tests/fixtures/registry-mcp-test-160-descriptor.ts';
+import { existsSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { createServer } from 'vite';
 
 const TEST_TOKEN = 'offline-test-bearer-token-160';
 const RUNNER_PRINCIPAL = {
@@ -23,7 +23,19 @@ const RUNNER_PRINCIPAL = {
 function b64(value: string): string { return Buffer.from(value).toString('base64url'); }
 
 describe('CP serialized submit → Runner admission/proof → Host MCP', () => {
-  it('uses the receipt runId, verifies the Runner proof, and rejects claim/header drift', async () => {
+  it.skipIf(!existsSync(resolve('integration-deps/trained-assist-control-plane/src/run-spec/run-spec.ts'))
+    || !existsSync(resolve('integration-deps/trained-assist-mcp-host/src/worker.mjs')))(
+  'uses the receipt runId, verifies the Runner proof, and rejects claim/header drift', async () => {
+    const moduleLoader = await createServer({ configFile: resolve('vitest.config.ts'), server: { middlewareMode: true }, appType: 'custom', logLevel: 'error' });
+    try {
+    const cpRunSpecModule = await moduleLoader.ssrLoadModule(resolve('integration-deps/trained-assist-control-plane/src/run-spec/run-spec.ts'));
+    const cpAdapterModule = await moduleLoader.ssrLoadModule(resolve('integration-deps/trained-assist-control-plane/src/runner-adapter/runner-api-adapter.ts'));
+    const cpFixtureModule = await moduleLoader.ssrLoadModule(resolve('integration-deps/trained-assist-control-plane/tests/fixtures/registry-mcp-test-160-descriptor.ts'));
+    const hostModule = await import(pathToFileURL(resolve('integration-deps/trained-assist-mcp-host/src/worker.mjs')).href);
+    const { buildRunSpec, defaultRunSpecPolicy } = cpRunSpecModule;
+    const ControlPlaneRunnerApiAdapter = cpAdapterModule.RunnerApiAdapter;
+    const registryMcpTest160Descriptor = cpFixtureModule.registryMcpTest160Descriptor;
+    const hostWorker = hostModule.default;
     const keys = generateKeyPairSync('ed25519');
     const signingKey = keys.privateKey.export({ format: 'der', type: 'pkcs8' }).toString('base64');
     const { sign } = await import('node:crypto');
@@ -184,6 +196,9 @@ describe('CP serialized submit → Runner admission/proof → Host MCP', () => {
       expect(externalLaunchCount).toBe(1);
     } finally {
       await api.dispose();
+    }
+    } finally {
+      await moduleLoader.close();
     }
   }, 20000);
 });
