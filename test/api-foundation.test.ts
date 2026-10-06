@@ -104,6 +104,16 @@ describe('submit contract validation', () => {
     expect(result.value.limits).toEqual({ timeoutMs: 5000 });
   });
 
+  it('validates only the immutable ingress manifest pin and rejects snapshot-ref mixing', () => {
+    const ingressManifest = { contractVersion: 1, manifestRef: 'cp-input-manifest:task-1', manifestVersion: 'a'.repeat(64) };
+    const accepted = validateSubmitRequest({ ...validBody, ingressManifest });
+    expect(accepted.ok).toBe(true);
+    if (accepted.ok) expect(accepted.value.ingressManifest).toEqual(ingressManifest);
+    expect(validateSubmitRequest({ ...validBody, ingressManifest: { ...ingressManifest, runId: 'client-run' } }).ok).toBe(false);
+    expect(validateSubmitRequest({ ...validBody, ingressManifest: { ...ingressManifest, manifestVersion: 'bad' } }).ok).toBe(false);
+    expect(validateSubmitRequest({ ...validBody, ingressManifest, input: { refs: [{ snapshotRef: 's', snapshotVersion: 'v' }] } }).ok).toBe(false);
+  });
+
   it('engine необязателен: без него исполнителя выбирает цепочка движков (#100)', () => {
     const withoutEngine = validateSubmitRequest({ limits: { timeoutMs: 1000 } });
     expect(withoutEngine.ok).toBe(true);

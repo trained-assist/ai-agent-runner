@@ -463,6 +463,12 @@ curl -X POST localhost:8080/v1/runs \
 
 ## Roadmap
 
+### Task-scoped ingress artifacts (issue #156)
+
+The local `Runner` accepts a typed `ingressManifest` pin (separate from workspace snapshot refs) and resolves the immutable task manifest from the Control Plane before engine start. `RUNNER_CONTROL_PLANE_URL`, `RUNNER_CONTROL_PLANE_PRINCIPAL`, and `RUNNER_CONTROL_PLANE_PRINCIPAL_SECRET` are deployment-only settings; inject `createControlPlaneIngressResolverFromEnv()` as `RunnerOptions.ingressResolver`. The principal signature is HMAC-SHA256 over the principal ID. Credentials never enter RunSpec, prompts, events, or logs. The pin binds task, profile, run, generation, and manifest version; materialization verifies the content-addressed manifest, response metadata, exact byte counts, hashes, quotas, and generated paths before atomically publishing the complete input set under `.inputs/ingress/<runId>/`.
+
+The stateless external-worker adapter rejects ingress-manifest runs until that worker implements materialization; it does not silently drop refs. The CP read API contract is tracked in [trained-assist-control-plane#94](https://github.com/trained-assist/trained-assist-control-plane/pull/94). This integration does not enable production media intake by itself.
+
 Remote MCP descriptors and trusted scoped-token attachment: [host contract](docs/REMOTE-MCP.md), including the opt-in test-only registry fixture resolver and required process environment names. Secret values belong only in the runtime secret manager.
 
 1. **Slice 1 (сделано)** — контракты RunSpec/события/результат, fake adapter, lifecycle state machine, scoped logs, fault injection, CI.
