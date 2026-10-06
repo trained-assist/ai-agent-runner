@@ -1,4 +1,5 @@
 import { readFile, stat } from 'node:fs/promises';
+import { createPrivateKey, sign as signBytes, type KeyObject } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { isAbsolute } from 'node:path';
 import { isRemoteMcpUrl, MCP_TOOL_NAME, type McpRemoteServerSpec, type RunSpec } from '../contracts/run-spec.js';
@@ -26,6 +27,7 @@ export interface RemoteMcpBinding {
   allowedTools: string[];
   expiresAt: string;
   token: string;
+  runBinding?: string;
 }
 
 export interface RemoteMcpBindingContext {
@@ -46,6 +48,8 @@ export interface RemoteMcpBindingContext {
   serverId: string;
   url: string;
   allowedTools: string[];
+  catalogueVersion?: string;
+  policyVersion?: string;
 }
 
 export type RemoteMcpBindingResolver = (
@@ -63,6 +67,100 @@ export interface RemoteMcpAttachment {
 export interface RemoteMcpHostOptions {
   servers: Readonly<Record<string, RemoteMcpServerPolicy>>;
   resolveBinding: ManagedRemoteMcpBindingResolver;
+}
+
+export const REGISTRY_FIXTURE_SERVER_ID = 'trained-assist-registry-test';
+export const REGISTRY_FIXTURE_BINDING_REF = 'registry-mcp-test-160-read';
+export const REGISTRY_FIXTURE_URL = 'https://trained-assist-mcp-host-test-160.skillset-apply.workers.dev/mcp';
+export const REGISTRY_FIXTURE_PROFILE_ID = 'integration-telegram-ux-v1';
+export const REGISTRY_FIXTURE_TOOL = 'registry.fixture_read';
+export const REGISTRY_FIXTURE_TOKEN_ENV = 'RUNNER_MCP_REGISTRY_TEST_TOKEN';
+export const REGISTRY_FIXTURE_EXPIRY_ENV = 'RUNNER_MCP_REGISTRY_TEST_EXPIRES_AT';
+export const REGISTRY_FIXTURE_SIGNING_KEY_ENV = 'RUNNER_MCP_REGISTRY_TEST_SIGNING_KEY_B64';
+export const REGISTRY_FIXTURE_PRINCIPAL_ID = 'integration-telegram-ux-v1';
+export const REGISTRY_FIXTURE_POLICY_VERSION = 'registry-fixture-policy-v1';
+export const REGISTRY_FIXTURE_CATALOGUE_VERSION = 'registry-fixture-catalogue-v1';
+export const REGISTRY_FIXTURE_REGISTRY_DIGEST = '129ab5033964c3ed5be47414711026cc2469b3d9af90ce83ee071cba7f005ea9';
+
+function registryFixtureSigningKey(value: string | undefined): KeyObject | undefined {
+  if (!value || !/^[A-Za-z0-9+/]+=*$/.test(value)) return undefined;
+  try {
+    const key = createPrivateKey({ key: Buffer.from(value, 'base64'), format: 'der', type: 'pkcs8' });
+    return key.asymmetricKeyType === 'ed25519' ? key : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function base64url(value: Buffer | string): string {
+  return Buffer.from(value).toString('base64url');
+}
+
+/**
+ * Narrow test-only resolver for the #160 fixture registry. The opaque bearer and expiry
+ * are supplied separately by the host secret store; callers can provide only the public
+ * descriptor. Run/task/conversation identities come from the already validated Runner
+ * context, so this resolver never fabricates a run ID or accepts caller scope headers.
+ */
+export function registryFixtureBindingResolver(
+  servers: Readonly<Record<string, RemoteMcpServerPolicy>>,
+  token: string | undefined,
+  expiresAt: string | undefined,
+  signingKeyValue?: string,
+): RemoteMcpBindingResolver | undefined {
+  const policy = servers[REGISTRY_FIXTURE_SERVER_ID];
+  if (!policy) return undefined;
+  if (policy.url !== REGISTRY_FIXTURE_URL || policy.tokenEnvName !== REGISTRY_FIXTURE_TOKEN_ENV ||
+      policy.allowedTools.length !== 1 || policy.allowedTools[0] !== REGISTRY_FIXTURE_TOOL ||
+      !Object.hasOwn(policy.bindingScopes, REGISTRY_FIXTURE_BINDING_REF)) {
+    throw new Error('registry fixture MCP policy must pin its test endpoint, binding and single read-only tool');
+  }
+  const signingKey = registryFixtureSigningKey(signingKeyValue);
+
+  return async (bindingRef, context) => {
+    if (bindingRef !== REGISTRY_FIXTURE_BINDING_REF || context.serverId !== REGISTRY_FIXTURE_SERVER_ID ||
+        context.url !== REGISTRY_FIXTURE_URL || context.profileId !== REGISTRY_FIXTURE_PROFILE_ID ||
+        context.catalogueVersion !== REGISTRY_FIXTURE_CATALOGUE_VERSION || context.policyVersion !== REGISTRY_FIXTURE_POLICY_VERSION ||
+        context.scope !== policy.bindingScopes[REGISTRY_FIXTURE_BINDING_REF] ||
+        context.allowedTools.length !== 1 || context.allowedTools[0] !== REGISTRY_FIXTURE_TOOL || !signingKey ||
+        context.signal?.aborted || !token || !expiresAt || !/^[A-Za-z0-9._~-]{16,2048}$/.test(token)) return null;
+
+    const expiryMs = Date.parse(expiresAt);
+    const checkedAtMs = Date.parse(context.checkedAt);
+    const deadlineMs = Date.parse(context.admittedAt) + context.startupTimeoutMs + context.timeoutMs;
+    if (!Number.isFinite(expiryMs) || !Number.isFinite(checkedAtMs) || !Number.isFinite(deadlineMs) ||
+        expiryMs <= checkedAtMs || expiryMs < deadlineMs || expiryMs - checkedAtMs > 24 * 60 * 60 * 1000) return null;
+
+    const issuedAt = Math.floor(checkedAtMs / 1000);
+    const expires = Math.floor(expiryMs / 1000);
+    const claims = {
+      iss: 'trained-assist-agent-runner', aud: 'trained-assist:registry-mcp:test',
+      sub: context.runId, runId: context.runId, userTaskId: context.userTaskId,
+      profileId: REGISTRY_FIXTURE_PROFILE_ID, principalId: REGISTRY_FIXTURE_PRINCIPAL_ID,
+      serverId: REGISTRY_FIXTURE_SERVER_ID, bindingRef: REGISTRY_FIXTURE_BINDING_REF,
+      allowedTools: [REGISTRY_FIXTURE_TOOL], policyVersion: REGISTRY_FIXTURE_POLICY_VERSION,
+      catalogueVersion: REGISTRY_FIXTURE_CATALOGUE_VERSION, registryDigest: REGISTRY_FIXTURE_REGISTRY_DIGEST,
+      iat: issuedAt, exp: expires,
+    };
+    const signingInput = `${base64url(JSON.stringify({ alg: 'EdDSA', typ: 'JWT' }))}.${base64url(JSON.stringify(claims))}`;
+    const runBinding = `${signingInput}.${signBytes(null, Buffer.from(signingInput), signingKey).toString('base64url')}`;
+
+    return {
+      runId: context.runId,
+      profileId: context.profileId,
+      userTaskId: context.userTaskId,
+      conversationId: context.conversationId,
+      ownerGeneration: context.ownerGeneration,
+      engine: context.engine,
+      serverId: context.serverId,
+      url: context.url,
+      scope: policy.bindingScopes[REGISTRY_FIXTURE_BINDING_REF]!,
+      allowedTools: [REGISTRY_FIXTURE_TOOL],
+      expiresAt,
+      token,
+      runBinding,
+    };
+  };
 }
 
 export interface DocumentsHttpRegistration {
@@ -318,6 +416,7 @@ export async function resolveRemoteMcpAttachment(
       conversationId: spec.conversationId, ownerGeneration: spec.ownerGeneration,
       operationId: spec.operationId, engine: spec.engine.name,
       serverId: server.serverId, url: policy.url, allowedTools: [...server.allowedTools],
+      catalogueVersion: server.catalogueVersion, policyVersion: server.policyVersion,
     };
     let binding: RemoteMcpBinding | null;
     try {
@@ -343,6 +442,10 @@ export async function resolveRemoteMcpAttachment(
     headers['X-MCP-User-Task-Id'] = context.userTaskId;
     headers['X-MCP-Profile'] = context.profileId;
     headers['X-MCP-Run-Id'] = context.runId;
+    if (binding.runBinding) {
+      headers['X-MCP-Operation'] = 'invocation';
+      headers['X-MCP-Run-Binding'] = binding.runBinding;
+    }
     if (Object.values(headers).some(value => /[\r\n]/.test(value))) refuse('MCP_BINDING_SCOPE_MISMATCH');
     attachment.mcp.servers[server.serverId] = { type: 'remote', url: policy.url, headers, enabled: true };
     attachment.mcpSecrets[policy.tokenEnvName] = binding.token;

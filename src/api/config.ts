@@ -12,7 +12,7 @@ import {
   ExternalWorkerAdapter,
 } from '../adapters/external-worker-adapter.js';
 import { KeyRegistry } from './auth.js';
-import { bindingFileResolver, configuredDocumentsBindingResolver, parseRemoteMcpServerPolicies, type RemoteMcpHostOptions, type RemoteMcpBindingResolver } from '../adapters/remote-mcp.js';
+import { bindingFileResolver, configuredDocumentsBindingResolver, parseRemoteMcpServerPolicies, registryFixtureBindingResolver, REGISTRY_FIXTURE_BINDING_REF, REGISTRY_FIXTURE_EXPIRY_ENV, REGISTRY_FIXTURE_SERVER_ID, REGISTRY_FIXTURE_SIGNING_KEY_ENV, REGISTRY_FIXTURE_TOKEN_ENV, type RemoteMcpHostOptions, type RemoteMcpBindingResolver } from '../adapters/remote-mcp.js';
 
 export const DEFAULT_API_PORT = 8787;
 export const DEFAULT_API_HOST = '0.0.0.0';
@@ -176,6 +176,29 @@ export function loadAgentApiConfig(env: Record<string, string | undefined> = pro
     }
   }
 
+  const remoteMcpServers = parseRemoteMcpServerPolicies(env['AGENT_API_REMOTE_MCP_SERVERS']);
+  const registryFixtureToken = envValue(env, REGISTRY_FIXTURE_TOKEN_ENV);
+  const registryFixtureExpiry = envValue(env, REGISTRY_FIXTURE_EXPIRY_ENV);
+  const registryFixtureSigningKey = envValue(env, REGISTRY_FIXTURE_SIGNING_KEY_ENV);
+  if (Boolean(registryFixtureToken || registryFixtureExpiry || registryFixtureSigningKey) &&
+      !(registryFixtureToken && registryFixtureExpiry && registryFixtureSigningKey)) {
+    throw new Error(`${REGISTRY_FIXTURE_TOKEN_ENV}, ${REGISTRY_FIXTURE_EXPIRY_ENV}, and ${REGISTRY_FIXTURE_SIGNING_KEY_ENV} must be configured together`);
+  }
+  if ((registryFixtureToken || registryFixtureExpiry) && !remoteMcpServers[REGISTRY_FIXTURE_SERVER_ID]) {
+    throw new Error(`${REGISTRY_FIXTURE_SERVER_ID} policy is required when registry fixture credentials are configured`);
+  }
+  const registryFixtureResolver = registryFixtureBindingResolver(remoteMcpServers, registryFixtureToken, registryFixtureExpiry, registryFixtureSigningKey);
+  const existingResolver = configuredDocumentsBindingResolver(envValue(env, 'AGENT_API_DOCUMENTS_MCP_MODULE'), envValue(env, 'AGENT_API_DOCUMENTS_MCP_REGISTRATIONS'))
+    ?? bindingFileResolver(envValue(env, 'AGENT_API_REMOTE_MCP_BINDINGS_FILE'));
+  const resolveBinding: RemoteMcpBindingResolver = async (bindingRef, context) => {
+    // Reserve this reference even while the feature is unconfigured. It must never fall
+    // through to a broader legacy binding file or documents resolver.
+    if (bindingRef === REGISTRY_FIXTURE_BINDING_REF) {
+      return registryFixtureResolver ? registryFixtureResolver(bindingRef, context) : null;
+    }
+    return existingResolver(bindingRef, context);
+  };
+
   return {
     host: env['AGENT_API_HOST']?.trim() || DEFAULT_API_HOST,
     port,
@@ -185,8 +208,8 @@ export function loadAgentApiConfig(env: Record<string, string | undefined> = pro
     env: parseEnvPool(env['AGENT_API_ENV']),
     defaultRepository: env['RUNNER_DEFAULT_REPO']?.trim() || null,
     remoteMcp: {
-      servers: parseRemoteMcpServerPolicies(env['AGENT_API_REMOTE_MCP_SERVERS']),
-      resolveBinding: configuredDocumentsBindingResolver(envValue(env, 'AGENT_API_DOCUMENTS_MCP_MODULE'), envValue(env, 'AGENT_API_DOCUMENTS_MCP_REGISTRATIONS')) ?? bindingFileResolver(envValue(env, 'AGENT_API_REMOTE_MCP_BINDINGS_FILE')),
+      servers: remoteMcpServers,
+      resolveBinding,
     },
   };
 }

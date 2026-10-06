@@ -1,6 +1,6 @@
 import { describe, expect, it, vi, onTestFinished } from 'vitest';
 import { ExternalWorkerAdapter } from '../src/adapters/external-worker-adapter.js';
-import { configuredDocumentsBindingResolver, localDocumentsBindingResolver, parseRemoteMcpServerPolicies, registeredDocumentsBindingResolver, resolveRemoteMcpAttachment, type DocumentsHttpRegistration, type RemoteMcpBinding, type RemoteMcpHostOptions } from '../src/adapters/remote-mcp.js';
+import { configuredDocumentsBindingResolver, localDocumentsBindingResolver, parseRemoteMcpServerPolicies, registeredDocumentsBindingResolver, registryFixtureBindingResolver, REGISTRY_FIXTURE_BINDING_REF, REGISTRY_FIXTURE_EXPIRY_ENV, REGISTRY_FIXTURE_PROFILE_ID, REGISTRY_FIXTURE_SERVER_ID, REGISTRY_FIXTURE_TOKEN_ENV, REGISTRY_FIXTURE_TOOL, REGISTRY_FIXTURE_URL, resolveRemoteMcpAttachment, type DocumentsHttpRegistration, type RemoteMcpBinding, type RemoteMcpBindingContext, type RemoteMcpHostOptions } from '../src/adapters/remote-mcp.js';
 import { validateSubmitRequest } from '../src/api/contracts.js';
 import { validateRunSpec, type RunSpec } from '../src/contracts/run-spec.js';
 import { makeRunSpec } from './helpers.js';
@@ -12,6 +12,7 @@ import { StatelessStore } from '../src/api/stateless-store.js';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { generateKeyPairSync, verify as verifySignature } from 'node:crypto';
 import type { ExternalWorker } from '../src/adapters/external-worker-adapter.js';
 
 const now = new Date('2026-10-05T00:00:00.000Z');
@@ -60,6 +61,130 @@ describe('remote MCP public contract', () => {
   it.each([{ headers: { Authorization: token } }, { mcpSecrets: { token } }, { bindingRef: undefined }, { url: 'https://user:secret@mcp.example.test/mcp' }, { url: 'https://mcp.example.test/mcp?token=secret' }, { url: 'http://mcp.example.test/mcp' }])('rejects unsafe public descriptor %j', change => {
     const { spec } = setup();
     expect(validateRunSpec({ ...spec, mcp: { servers: [{ ...descriptor, ...change }] } }).ok).toBe(false);
+  });
+});
+
+describe('trusted registry fixture binding', () => {
+  const expiry = '2026-10-05T01:00:00.000Z';
+  const fixtureSigningKey = generateKeyPairSync('ed25519').privateKey.export({ format: 'der', type: 'pkcs8' }).toString('base64');
+  const registryPolicy = {
+    [REGISTRY_FIXTURE_SERVER_ID]: {
+      url: REGISTRY_FIXTURE_URL,
+      tokenEnvName: REGISTRY_FIXTURE_TOKEN_ENV,
+      headers: { Authorization: `Bearer {env:${REGISTRY_FIXTURE_TOKEN_ENV}}` },
+      bindingScopes: { [REGISTRY_FIXTURE_BINDING_REF]: 'registry:fixture-read' },
+      allowedTools: [REGISTRY_FIXTURE_TOOL],
+      startupTimeoutMs: 0,
+    },
+  };
+  const context: RemoteMcpBindingContext = {
+    mode: 'launch', admittedAt: now.toISOString(), checkedAt: now.toISOString(), startupTimeoutMs: 0,
+    scope: 'registry:fixture-read', timeoutMs: 30000, runId: 'run_01234567-89ab-cdef-0123-456789abcdef',
+    profileId: REGISTRY_FIXTURE_PROFILE_ID, userTaskId: 'telegram-task-160', conversationId: 'telegram-conversation-160',
+    ownerGeneration: 1, operationId: 'operation-160', engine: 'dynamic-ip-azure-agent-run',
+    serverId: REGISTRY_FIXTURE_SERVER_ID, url: REGISTRY_FIXTURE_URL, allowedTools: [REGISTRY_FIXTURE_TOOL],
+    catalogueVersion: 'registry-fixture-catalogue-v1', policyVersion: 'registry-fixture-policy-v1',
+  };
+
+  it('creates a run-scoped binding only for the pinned test profile/server/tool and shared expiry', async () => {
+    const signing = generateKeyPairSync('ed25519');
+    const signingKey = signing.privateKey.export({ format: 'der', type: 'pkcs8' }).toString('base64');
+    const resolver = registryFixtureBindingResolver(registryPolicy, token, expiry, signingKey);
+    expect(resolver).toBeDefined();
+    const binding = await resolver!(REGISTRY_FIXTURE_BINDING_REF, context);
+    expect(binding).toEqual({
+      runId: context.runId, profileId: context.profileId, userTaskId: context.userTaskId,
+      conversationId: context.conversationId, ownerGeneration: context.ownerGeneration,
+      engine: context.engine, serverId: REGISTRY_FIXTURE_SERVER_ID, url: REGISTRY_FIXTURE_URL,
+      scope: 'registry:fixture-read', allowedTools: [REGISTRY_FIXTURE_TOOL], expiresAt: expiry, token, runBinding: expect.any(String),
+    });
+    const parts = binding!.runBinding!.split('.');
+    expect(JSON.parse(Buffer.from(parts[1]!, 'base64url').toString('utf8'))).toMatchObject({
+      iss: 'trained-assist-agent-runner', aud: 'trained-assist:registry-mcp:test',
+      sub: context.runId, runId: context.runId, userTaskId: context.userTaskId,
+      profileId: REGISTRY_FIXTURE_PROFILE_ID, principalId: 'integration-telegram-ux-v1',
+      serverId: REGISTRY_FIXTURE_SERVER_ID, bindingRef: REGISTRY_FIXTURE_BINDING_REF,
+      allowedTools: [REGISTRY_FIXTURE_TOOL], policyVersion: 'registry-fixture-policy-v1',
+      catalogueVersion: 'registry-fixture-catalogue-v1',
+      registryDigest: '129ab5033964c3ed5be47414711026cc2469b3d9af90ce83ee071cba7f005ea9',
+    });
+    expect(verifySignature(null, Buffer.from(`${parts[0]}.${parts[1]}`), signing.publicKey, Buffer.from(parts[2]!, 'base64url'))).toBe(true);
+  });
+
+  it.each([
+    { label: 'binding ref', ref: 'other-binding', change: {} },
+    { label: 'server id', ref: REGISTRY_FIXTURE_BINDING_REF, change: { serverId: 'other-server' } },
+    { label: 'endpoint', ref: REGISTRY_FIXTURE_BINDING_REF, change: { url: 'https://other.example.test/mcp' } },
+    { label: 'profile', ref: REGISTRY_FIXTURE_BINDING_REF, change: { profileId: 'integration-v1' } },
+    { label: 'catalogue version', ref: REGISTRY_FIXTURE_BINDING_REF, change: { catalogueVersion: 'other-catalogue' } },
+    { label: 'policy version', ref: REGISTRY_FIXTURE_BINDING_REF, change: { policyVersion: 'other-policy' } },
+    { label: 'scope', ref: REGISTRY_FIXTURE_BINDING_REF, change: { scope: 'registry:write' } },
+    { label: 'tool', ref: REGISTRY_FIXTURE_BINDING_REF, change: { allowedTools: ['registry.fixture_write'] } },
+    { label: 'multiple tools', ref: REGISTRY_FIXTURE_BINDING_REF, change: { allowedTools: [REGISTRY_FIXTURE_TOOL, 'registry.fixture_write'] } },
+  ] as Array<{ label: string; ref: string; change: Partial<RemoteMcpBindingContext> }>)('refuses a mismatched $label', async ({ ref, change }) => {
+    const resolver = registryFixtureBindingResolver(registryPolicy, token, expiry, fixtureSigningKey)!;
+    expect(await resolver(ref, { ...context, ...change })).toBeNull();
+  });
+
+  it.each([
+    ['missing token', undefined, expiry],
+    ['missing expiry', token, undefined],
+    ['expired lease', token, '2026-10-04T23:59:59.000Z'],
+    ['short lease', token, '2026-10-05T00:00:20.000Z'],
+    ['lease over 24 hours', token, '2026-10-06T01:00:01.000Z'],
+    ['invalid token', 'contains spaces', expiry],
+  ] as const)('fails closed for %s', async (_label, configuredToken, configuredExpiry) => {
+    const resolver = registryFixtureBindingResolver(registryPolicy, configuredToken, configuredExpiry, fixtureSigningKey)!;
+    expect(await resolver(REGISTRY_FIXTURE_BINDING_REF, context)).toBeNull();
+  });
+
+  it('reserves the test binding ref and fails startup on a broadened endpoint/tool policy', () => {
+    expect(() => registryFixtureBindingResolver({ [REGISTRY_FIXTURE_SERVER_ID]: {
+      ...registryPolicy[REGISTRY_FIXTURE_SERVER_ID], allowedTools: [REGISTRY_FIXTURE_TOOL, 'registry.fixture_write'],
+    } }, token, expiry, fixtureSigningKey)).toThrow(/single read-only tool/);
+    expect(registryFixtureBindingResolver({}, token, expiry)).toBeUndefined();
+  });
+
+  it('attaches the signed run proof only to the isolated fixture invocation', async () => {
+    const spec = makeRunSpec({
+      profileId: REGISTRY_FIXTURE_PROFILE_ID,
+      userTaskId: context.userTaskId,
+      mcp: { servers: [{ serverId: REGISTRY_FIXTURE_SERVER_ID, transport: 'remote', url: REGISTRY_FIXTURE_URL, bindingRef: REGISTRY_FIXTURE_BINDING_REF,
+        allowedTools: [REGISTRY_FIXTURE_TOOL], catalogueVersion: 'registry-fixture-catalogue-v1', policyVersion: 'registry-fixture-policy-v1' }] },
+    });
+    spec.runId = context.runId;
+    const resolver = registryFixtureBindingResolver(registryPolicy, token, expiry, fixtureSigningKey)!;
+    const attachment = await resolveRemoteMcpAttachment(spec, { servers: registryPolicy, resolveBinding: resolver }, now);
+    const headers = attachment!.mcp.servers[REGISTRY_FIXTURE_SERVER_ID]!.headers;
+    expect(headers['X-MCP-Operation']).toBe('invocation');
+    const parts = headers['X-MCP-Run-Binding']!.split('.');
+    const payload = JSON.parse(Buffer.from(parts[1]!, 'base64url').toString('utf8'));
+    expect(payload).toMatchObject({ runId: context.runId, userTaskId: context.userTaskId, allowedTools: [REGISTRY_FIXTURE_TOOL] });
+    expect(headers['X-MCP-Run-Id']).toBe(context.runId);
+    expect(attachment!.mcpSecrets[REGISTRY_FIXTURE_TOKEN_ENV]).toBe(token);
+  });
+
+  it('loads test credentials only from dedicated host env and fails closed when incomplete', async () => {
+    const signingKey = fixtureSigningKey;
+    const config = loadAgentApiConfig({
+      AGENT_API_KEY_REGISTRY: '/private/keys.json',
+      EXTERNAL_WORKER_URL: 'https://worker.example.test',
+      AGENT_API_REMOTE_MCP_SERVERS: JSON.stringify(registryPolicy),
+      [REGISTRY_FIXTURE_TOKEN_ENV]: token,
+      [REGISTRY_FIXTURE_EXPIRY_ENV]: expiry,
+      RUNNER_MCP_REGISTRY_TEST_SIGNING_KEY_B64: signingKey,
+    });
+    const binding = await config.remoteMcp!.resolveBinding(REGISTRY_FIXTURE_BINDING_REF, context);
+    expect(binding?.runId).toBe(context.runId);
+    expect(binding?.token).toBe(token);
+    expect(JSON.stringify(config.env)).not.toContain(token);
+
+    await expect(config.remoteMcp!.resolveBinding(REGISTRY_FIXTURE_BINDING_REF, { ...context, profileId: 'integration-v1' })).resolves.toBeNull();
+    expect(() => loadAgentApiConfig({
+      AGENT_API_KEY_REGISTRY: '/private/keys.json',
+      EXTERNAL_WORKER_URL: 'https://worker.example.test',
+      [REGISTRY_FIXTURE_TOKEN_ENV]: token,
+    })).toThrow(`${REGISTRY_FIXTURE_TOKEN_ENV}, ${REGISTRY_FIXTURE_EXPIRY_ENV}, and RUNNER_MCP_REGISTRY_TEST_SIGNING_KEY_B64 must be configured together`);
   });
 });
 

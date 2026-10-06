@@ -89,6 +89,36 @@ Runner converts the descriptor array to `LaunchRequest.mcp.servers[serverId] = {
 
 The external worker does not implement stdio attachment; stdio descriptors still work in the existing local Runner path, but fail closed in the external HTTP adapter rather than being dropped.
 
+## Isolated registry fixture (#160)
+
+The test-only `trained-assist-registry-test` binding is reserved to the single
+`registry-mcp-test-160-read` ref, the exact host
+`https://trained-assist-mcp-host-test-160.skillset-apply.workers.dev/mcp`, the profile
+`integration-telegram-ux-v1`, and the sole tool `registry.fixture_read`. The trusted host
+policy must use the same server ID, URL, ref, and single-tool allowlist. A broader policy
+fails Runner startup. This binding ref never falls through to a general binding file or
+the documents resolver.
+
+Provide the opaque token and exact shared expiry in the Runner process secret store as
+`RUNNER_MCP_REGISTRY_TEST_TOKEN` and `RUNNER_MCP_REGISTRY_TEST_EXPIRES_AT`; the latter
+must match the test Worker's `MCP_TEST_EXPIRES_AT`. Do not put either value in
+`AGENT_API_ENV`, public descriptors, repositories, or logs. The token is returned only
+in the worker's dedicated `mcpSecrets` field. The resolver constructs the binding from
+the actual validated Runner context, including the generated canonical `run_<UUID>`;
+it does not accept a caller-provided run ID. Store a PKCS#8 DER Ed25519 private key as
+base64 in `RUNNER_MCP_REGISTRY_TEST_SIGNING_KEY_B64` in the same trusted process secret
+store. Configure only its public OKP/Ed25519 JWK in the Worker's
+`MCP_TEST_RUNNER_PUBLIC_JWK`; never put the private key in Cloudflare. Runner signs a
+short-lived `X-MCP-Run-Binding` JWT over that run, task, profile/principal, binding ref,
+single allowed tool, policy/catalogue versions and pinned registry digest. It refuses a
+missing/invalid token or key, wrong profile/server/ref/scope/tool, expired or insufficient
+lease, and any lease over 24h.
+
+This supplies the Runner half only. It does not authorize CP discovery, implement a
+pre-submit discovery run ID, configure Cloudflare secrets, or activate/deploy the host.
+Keep the test bearer stable until any active run using it is terminal; recovery validates
+the same lease and token rather than minting a replacement.
+
 `allowedTools` is a host admission restriction, **not proof of engine-side filtering**. The wrapper endpoint's three-tool whitelist and owner-approved target gate are the actual authorization boundary. The native engine retains its other built-in capabilities. `toolTimeoutMs` is preserved in RunSpec/Submit, but the inspected native worker contract has no timeout field: it is not forwarded or claimed as enforced remotely.
 
 ## Validation boundary
