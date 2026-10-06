@@ -114,13 +114,22 @@ single allowed tool, policy/catalogue versions and pinned registry digest. It re
 missing/invalid token or key, wrong profile/server/ref/scope/tool, expired or insufficient
 lease, and any lease over 24h.
 
-This supplies the Runner half only. It does not authorize CP discovery, implement a
-pre-submit discovery run ID, configure Cloudflare secrets, or activate/deploy the host.
-Keep the test bearer stable until any active run using it is terminal; recovery validates
-the same lease and token rather than minting a replacement.
+The CP catalogue digest and Host `registryDigest` are different values with different
+purposes. CP's `catalogueDigest` hashes the canonical, allowlisted public `tools/list`
+metadata used for selection and revalidation. Host's `registryDigest` is the Host's
+pinned internal catalogue digest, checked by Host and signed into the invocation proof.
+`catalogueVersion` is a stable policy version identifier; CP's random per-request
+`catalogueId` is internal snapshot correlation and must never be sent as that version.
+
+This PR supplies the Runner implementation half. The integrated test stack separately
+has CP discovery wiring and a deployed, provisioned Host Worker. A resolver-signed
+fixture invocation has returned the expected marker, but the active Runner service has
+not yet been shown to launch an agent with this resolver, and a real agent tool call is
+not yet evidenced. Keep the test bearer stable until any active run using it is terminal;
+recovery validates the same lease and token rather than minting a replacement.
 
 `allowedTools` is a host admission restriction, **not proof of engine-side filtering**. The wrapper endpoint's three-tool whitelist and owner-approved target gate are the actual authorization boundary. The native engine retains its other built-in capabilities. `toolTimeoutMs` is preserved in RunSpec/Submit, but the inspected native worker contract has no timeout field: it is not forwarded or claimed as enforced remotely.
 
 ## Validation boundary
 
-`npm run typecheck` and `npm test -- test/remote-mcp.test.ts` validate local contracts, normalization, scoped resolution, refusal before worker contact, wire shape and rejected-token redaction. These are fixtures, not live engine or Sheets evidence. No live Runner job is required or launched by these tests. Deployment, wrapper host-hook wiring, owner target approval and real agent tool execution remain separate integration acceptance steps.
+`npm run typecheck` and `npm test -- test/remote-mcp.test.ts` validate local contracts, normalization, scoped resolution, refusal before worker contact, wire shape and rejected-token redaction. These are fixtures, not live engine evidence. No live Runner job is required or launched by these unit tests. The separate fixture invocation proves that Host accepts a resolver-generated proof; deployment of the Runner implementation to the active Runner service and a real agent tool call remain distinct integration acceptance steps. Documents wrapper host-hook wiring, owner target approval and Sheets access are separate from this registry fixture.
