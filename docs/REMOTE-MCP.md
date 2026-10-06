@@ -83,6 +83,33 @@ The wrapper requires `Authorization` and all three scope headers on every RPC. I
 
 Runner retains `newApiId('run')`: canonical `run_<UUID>` is identical in its receipt, worker request, private binding, owner-target metadata and scope headers. There is no bare-UUID normalization or prefix stripping. Deploy the existing documents host module and Runner resolver on the same VM with a shared private registry; no cross-host mint broker is needed or implemented. Remaining composition requires approved runtime/targets and a TLS route preserving the wrapper's local Host header, followed by live verification. Startup success alone is not proof that the external engine can reach that TLS route or access owner-approved Sheets targets.
 
+## Test-only registry fixture binding
+
+The opt-in process resolver supports only profile `integration-telegram-ux-v1`, server
+`trained-assist-registry-test`, binding `registry-mcp-test-160-read`, and the single tool
+`registry.fixture_read`. Its remote descriptor must include `policyVersion` and
+`catalogueVersion`; both must match the trusted server policy and configured catalogue
+version. The trusted server policy must pin `policyVersion` to
+`registry-fixture-policy-v1` and scope the binding to `registry:fixture:read`. Other
+profiles continue through the configured documents resolver or private binding-file
+fallback. The test profile never falls back to either resolver.
+
+Enable it only through host process configuration using `AGENT_API_TEST_MCP_BEARER`,
+`AGENT_API_TEST_MCP_ED25519_PRIVATE_KEY`, `AGENT_API_TEST_MCP_CATALOGUE_VERSION`, and
+`AGENT_API_TEST_MCP_REGISTRY_DIGEST`. All four are required together. The digest is pinned
+in code to `129ab5033964c3ed5be47414711026cc2469b3d9af90ce83ee071cba7f005ea9`; a fixture
+catalog change requires an explicit policy revision. Supply a secret Bearer and Ed25519
+PKCS#8 private key through the runtime secret manager; do not place their values in source,
+logs, or RunSpec. The matching public JWK belongs in Host configuration.
+
+After API admission assigns the actual `run_<UUID>`, Runner resolves the trusted binding
+and signs a compact EdDSA JWS in `X-MCP-Run-Binding`. Its claims bind the receipt run ID,
+task, profile/principal, server, binding ref, tool, policy/catalog versions and pinned
+catalog digest. The Bearer is still sent for transport, but it does not create this
+run-binding proof. Missing or mismatched config, descriptor, scope, or proof fails closed
+before worker contact. This is an offline contract path; it does not configure a live
+trusted store or establish live endpoint reachability.
+
 ## Existing worker wire contract
 
 Runner converts the descriptor array to `LaunchRequest.mcp.servers[serverId] = {type:'remote',url,headers,enabled:true}`. Only the host-resolved opaque token is passed in `LaunchRequest.mcpSecrets[tokenEnvName]`; it does not enter ordinary `env`, Submit receipts or persisted descriptors. The native worker injects `mcpSecrets` into the engine environment and renders its existing OpenCode remote-server configuration. Service-account material stays exclusively in the documents host wrapper.

@@ -12,7 +12,7 @@ import {
   ExternalWorkerAdapter,
 } from '../adapters/external-worker-adapter.js';
 import { KeyRegistry } from './auth.js';
-import { bindingFileResolver, configuredDocumentsBindingResolver, parseRemoteMcpServerPolicies, type RemoteMcpHostOptions, type RemoteMcpBindingResolver } from '../adapters/remote-mcp.js';
+import { bindingFileResolver, configuredDocumentsBindingResolver, configuredTestRegistryBindingResolver, parseRemoteMcpServerPolicies, type RemoteMcpHostOptions, type RemoteMcpBindingResolver } from '../adapters/remote-mcp.js';
 
 export const DEFAULT_API_PORT = 8787;
 export const DEFAULT_API_HOST = '0.0.0.0';
@@ -176,6 +176,21 @@ export function loadAgentApiConfig(env: Record<string, string | undefined> = pro
     }
   }
 
+  const testRegistryResolver = configuredTestRegistryBindingResolver((() => {
+    const token = envValue(env, 'AGENT_API_TEST_MCP_BEARER');
+    const privateKeyPem = envValue(env, 'AGENT_API_TEST_MCP_ED25519_PRIVATE_KEY');
+    const catalogueVersion = envValue(env, 'AGENT_API_TEST_MCP_CATALOGUE_VERSION');
+    const registryDigest = envValue(env, 'AGENT_API_TEST_MCP_REGISTRY_DIGEST');
+    if ([token, privateKeyPem, catalogueVersion, registryDigest].every(value => value === undefined)) return undefined;
+    if ([token, privateKeyPem, catalogueVersion, registryDigest].some(value => value === undefined)) throw new Error('test registry MCP configuration requires bearer, Ed25519 key, catalogue version and pinned registry digest');
+    return { token: token!, privateKeyPem: privateKeyPem!, catalogueVersion: catalogueVersion!, registryDigest: registryDigest! };
+  })());
+  const existingResolver = configuredDocumentsBindingResolver(envValue(env, 'AGENT_API_DOCUMENTS_MCP_MODULE'), envValue(env, 'AGENT_API_DOCUMENTS_MCP_REGISTRATIONS')) ?? bindingFileResolver(envValue(env, 'AGENT_API_REMOTE_MCP_BINDINGS_FILE'));
+  const resolveBinding: RemoteMcpBindingResolver = async (bindingRef, context) =>
+    context.profileId === 'integration-telegram-ux-v1' || bindingRef === 'registry-mcp-test-160-read'
+      ? context.profileId === 'integration-telegram-ux-v1' ? testRegistryResolver?.(bindingRef, context) ?? null : null
+      : existingResolver?.(bindingRef, context) ?? null;
+
   return {
     host: env['AGENT_API_HOST']?.trim() || DEFAULT_API_HOST,
     port,
@@ -186,7 +201,7 @@ export function loadAgentApiConfig(env: Record<string, string | undefined> = pro
     defaultRepository: env['RUNNER_DEFAULT_REPO']?.trim() || null,
     remoteMcp: {
       servers: parseRemoteMcpServerPolicies(env['AGENT_API_REMOTE_MCP_SERVERS']),
-      resolveBinding: configuredDocumentsBindingResolver(envValue(env, 'AGENT_API_DOCUMENTS_MCP_MODULE'), envValue(env, 'AGENT_API_DOCUMENTS_MCP_REGISTRATIONS')) ?? bindingFileResolver(envValue(env, 'AGENT_API_REMOTE_MCP_BINDINGS_FILE')),
+      resolveBinding,
     },
   };
 }

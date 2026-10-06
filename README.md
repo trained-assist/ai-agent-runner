@@ -462,7 +462,7 @@ curl -X POST localhost:8080/v1/runs \
 
 ## Roadmap
 
-Remote MCP descriptors and trusted scoped-token attachment: [host contract](docs/REMOTE-MCP.md).
+Remote MCP descriptors and trusted scoped-token attachment: [host contract](docs/REMOTE-MCP.md), including the opt-in test-only registry fixture resolver and required process environment names. Secret values belong only in the runtime secret manager.
 
 1. **Slice 1 (сделано)** — контракты RunSpec/события/результат, fake adapter, lifecycle state machine, scoped logs, fault injection, CI.
 2. **Serverless Agent API P04–P06 (сделано)** — admission/result adapter на node:http: auth/keys, idempotent receipt, status/cancel/result/events + SSE replay.

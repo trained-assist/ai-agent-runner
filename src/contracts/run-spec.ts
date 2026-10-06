@@ -79,6 +79,8 @@ export interface McpRemoteServerSpec {
   url: string;
   bindingRef: string;
   allowedTools: string[];
+  policyVersion?: string;
+  catalogueVersion?: string;
   toolTimeoutMs?: number;
 }
 
@@ -429,7 +431,7 @@ function validateMcpServer(value: unknown, path: string, collector: ErrorCollect
   checkKeys(
     value,
     remote
-      ? ['serverId', 'transport', 'url', 'bindingRef', 'allowedTools', 'toolTimeoutMs']
+      ? ['serverId', 'transport', 'url', 'bindingRef', 'allowedTools', 'policyVersion', 'catalogueVersion', 'toolTimeoutMs']
       : ['serverId', 'transport', 'command', 'args', 'envAllowlist', 'bindingRef', 'allowedTools', 'readinessTimeoutMs', 'toolTimeoutMs'],
     remote ? ['serverId', 'transport', 'url', 'bindingRef', 'allowedTools'] : ['serverId', 'transport', 'command', 'allowedTools'],
     path,
@@ -445,6 +447,12 @@ function validateMcpServer(value: unknown, path: string, collector: ErrorCollect
   if (server.transport === 'remote') {
     if (!isRemoteMcpUrl(value['url'])) collector.push(`${path}.url: expected an HTTPS URL without credentials, query or fragment`);
     else server.url = value['url'];
+    for (const field of ['policyVersion', 'catalogueVersion'] as const) {
+      if (value[field] !== undefined) {
+        checkString(value[field], `${path}.${field}`, collector, 200);
+        if (typeof value[field] === 'string') server[field] = value[field];
+      }
+    }
   } else {
     if (value['transport'] !== 'stdio') collector.push(`${path}.transport: expected "stdio" | "remote"`);
     checkString(value['command'], `${path}.command`, collector, 512);
