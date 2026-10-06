@@ -22,6 +22,27 @@ rotation date produces warnings; a missing required binding makes readiness fail
 | `LLM_LADDER_TOKEN` | OpenCode provider credential | The central Agent API passes it in the authenticated per-run launch env when allowlisted. It is runtime task input to the worker process and must not be copied into inventory or logged. Record its source and owner in the central API's own binding inventory. |
 | `RUNNER_CONTROL_PLANE_URL`, `RUNNER_CONTROL_PLANE_PRINCIPAL`, `RUNNER_CONTROL_PLANE_PRINCIPAL_SECRET` | Resolve task-scoped ingress manifests and artifact bytes | Configure as one group in the VM worker's systemd environment when the central API sends `ingressManifest`; secret value belongs in the approved host secret store. Without the group, ingress-manifest runs fail closed before the agent starts. |
 
+## RU test worker: verified locations (2026-10-06)
+
+The test Worker at `ru-worker.178-212-14-192.sslip.io` runs signed release
+`vm-worker-v0.3.1` (`332133113f7618f2779bb1693f5b281720cf8293`). These are test-only
+bindings; this section records presence and location, never secret values.
+
+| Binding | Verified location and scope |
+|---|---|
+| `VM_WORKER_TOKEN` | GCP Secret Manager secret `RU_VM_WORKER_TOKEN`, project `alesa-personal-assistent`, version 1; runtime copy at `/etc/ai-agent-runner/worker.env`, owned by root, mode 0600. The matching central API binding is not configured, so this token does not yet enable routed runs. |
+| WIF signing key | `/opt/ru-wif/private.pem`, root-owned mode 0600; used by `ru-wif-oidc.service`. The issuer listens only on `127.0.0.1:18080`; the public Nginx vhost returns 404 for `/token` and serves only discovery/JWKS. |
+| GCS external-account config | `/etc/ai-agent-runner/gcs-wif-credentials.json`, root-owned and group-readable by `ai-agent` (0640); contains no private key or access token. It exchanges the loopback OIDC subject token through Google STS and impersonates the dedicated test service account. |
+| GCS identity | `ta-ru-vm-worker-test@alesa-personal-assistent.iam.gserviceaccount.com`, federated by pool `ta-vm-workers`, provider `ru-vm-worker-test`, subject `ru-vm-worker`. It has `roles/storage.objectUser` only on `trained-assist-runner-ru-worker-test-731388616698` in `EUROPE-WEST9`; the bucket has uniform access, public access prevention, and versioning enabled. A real upload/download/delete roundtrip passed. |
+| GitHub release verification | `GH_TOKEN` was streamed to the updater through SSH stdin for the installation only. It is not stored in the VM Worker environment or service. |
+
+No service-account key was created. The RU Worker is not configured with a user-data
+bucket, and the central API has not been bound to it. The current WIF issuer's local
+`/token` endpoint is reachable by processes on the VM; because OpenCode and the Worker
+currently share the `ai-agent` Unix identity, an agent process could request a subject
+token. The federated identity is therefore restricted to the isolated test bucket.
+Do not grant it access to user data until per-run credential isolation is in place.
+
 ## Worker authentication and model credentials
 
 `VM_WORKER_TOKEN` and `LLM_LADDER_TOKEN` serve different trust boundaries:
