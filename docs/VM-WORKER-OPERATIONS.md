@@ -57,11 +57,11 @@ through the trusted HTTPS endpoint. Do not put the worker token in command-line 
 Bootstrap from a reviewed checkout and select the immutable release plus region:
 
 ```bash
-sudo scripts/install-vm-worker.sh vm-worker-v0.2.0 france
+sudo scripts/install-vm-worker.sh vm-worker-v0.3.0 france
 sudoedit /etc/ai-agent-runner/worker.env
 sudoedit /etc/ai-agent-runner/worker-bindings.json
 export GH_TOKEN # inject from the operator secret manager, not command history
-sudo --preserve-env=GH_TOKEN /usr/local/sbin/ai-agent-vm-worker-update vm-worker-v0.2.0
+sudo --preserve-env=GH_TOKEN /usr/local/sbin/ai-agent-vm-worker-update vm-worker-v0.3.0
 unset GH_TOKEN
 sudo systemctl enable --now ai-agent-vm-worker
 ```
