@@ -1805,6 +1805,14 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
     // Ответ агента уходит в хранилище до экспорта объявленных выходов: сбой экспорта
     // не должен стоить клиенту текста ответа.
     const answerArtifactId = await this.saveAnswerArtifact(st, exit?.answer ?? { present: false, source: null, chars: 0, text: '' });
+    // Fast result boundary: persist the engine outcome and answer before any declared
+    // output upload. The checkpoint + result are durable on the Runner host; the clean
+    // room remains leased until recover() verifies remote custody and completes cleanup.
+    const captured = this.computeResult(st, this.exportManifest(st.runId));
+    this.writeCheckpoint(st, captured, this.exportManifest(st.runId), exit, answerArtifactId, 'engine_terminal', {
+      status: 'pending', reason: 'engine result captured; artifact persistence is pending', intentAt: this.nowIso(), finishedAt: null,
+    });
+    this.persistResult(st, captured);
     const exportManifest = await this.runExport(st, exit ? { plan: exit.plan } : {});
     const soleCopies = this.soleCopiesOnDisk(st, exportManifest);
     // Намерение уборки фиксируется на диске ДО самой уборки: сбой в момент sweep не
@@ -1829,7 +1837,10 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
 
     const result = this.computeResult(st, exportManifest, cleanup);
     await this.appendProfileTrace(st, result);
-    this.persistResult(st, result);
+    // The engine result may already have been delivered while persistence ran.
+    // Refresh the durable result without emitting a second terminal event.
+    if (st.finalized) this.updateTerminalResult(st, result);
+    else this.persistResult(st, result);
     // Финальный checkpoint несёт проверенный факт уборки: аренда снята или слот остался
     // занят с причиной. Именно его читает восстановление, не перезапуская движок.
     if (run) this.finishCheckpointAfterCleanup(run, st, result, exportManifest, exit, answerArtifactId, cleanup, { silent: true });
