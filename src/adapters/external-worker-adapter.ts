@@ -385,6 +385,12 @@ export function launchRequestFromSpec(
   spec: RunSpec,
   options: { env?: Record<string, string>; resultUrl: string; remoteMcpAttachment?: RemoteMcpAttachment } = { resultUrl: '' },
 ): LaunchRequest {
+  if (spec.ingressManifest) {
+    throw new PreflightError('INGRESS_MANIFEST_UNSUPPORTED', 'the stateless external worker cannot resolve task-scoped ingress manifests', {
+      failureClass: 'preflight',
+      retryable: false,
+    });
+  }
   if (spec.mcp?.servers.length && !options.remoteMcpAttachment) {
     throw new PreflightError('MCP_HOST_POLICY_MISSING', 'remote MCP requires trusted host resolution', { failureClass: 'preflight', retryable: false });
   }

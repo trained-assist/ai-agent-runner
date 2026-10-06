@@ -14,3 +14,4 @@ export * from './share.js';
 export * from './upload-session.js';
 export * from './workspace-snapshot.js';
 export * from './input-materializer.js';
+export * from './ingress-artifact.js';
