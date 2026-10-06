@@ -1092,6 +1092,17 @@ describe('publish_run_branch — merge уже запушенной воркер�
     expect(tree['notes/other.md']).toBe('o\n');
   });
 
+  it('отказывает, когда remote ref не совпадает с коммитом из результата воркера', async () => {
+    const h = harness();
+    await ensureProfile(h, ALICE);
+    const base = runWorkspace({ 'notes/base.md': 'base\n' });
+    const initial = await h.service.publishRunChanges({ operationId: 'pub-base-remote-check', ...ALICE, runId: 'run-base-check', workspacePath: base, baseRevision: EMPTY_TREE });
+    commitToRemoteBranch(h.admin, `${OWNER}/profile-alice`, 'agent-run/run-remote-check', { 'notes/base.md': 'base\n', 'notes/next.md': 'next\n' });
+    await expect(h.service.publishRunBranch({ operationId: 'pub-remote-check', ...ALICE, runId: 'run-remote-check', expectedCommit: initial.committedRevision! }))
+      .rejects.toMatchObject({ code: 'WORKSPACE_HEAD_CHANGED' });
+    expect(remoteTree(h.admin, `${OWNER}/profile-alice`)['notes/next.md']).toBeUndefined();
+  });
+
   it('отказывает, если воркер не запушил ветку', async () => {
     const h = harness();
     await ensureProfile(h, ALICE);

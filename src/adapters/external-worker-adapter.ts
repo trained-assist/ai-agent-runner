@@ -68,6 +68,7 @@ export interface LaunchArtifact {
   mime: string;
   sha256: string;
   size: number;
+  objectKey?: string;
 }
 
 export interface LaunchRepo {
@@ -130,7 +131,8 @@ export interface LaunchRequest {
   envAllowlist: string[];
   env: Record<string, string>;
   limits: { timeoutMs: number; maxOutputBytes: number; maxLogBytes: number };
-  repository: { fullName: string; branch: string };
+  repository: { fullName: string; branch: string; revision?: string };
+  profileWorkspace?: { bindingId: string; objectBucket?: string; artifacts: Array<{ path: string; key: string; sha256: string; size: number }>; excludedPatterns: string[] };
   /**
    * Токен публикации: клон `repository.fullName` и коммит выходов в его ветку.
    *
@@ -421,7 +423,12 @@ export function launchRequestFromSpec(
       maxOutputBytes: spec.limits.maxOutputBytes ?? 0,
       maxLogBytes: spec.limits.maxLogBytes ?? 0,
     },
-    repository: { fullName: spec.repository?.fullName ?? '', branch: runBranchName(spec.runId) },
+    repository: {
+      fullName: spec.repository?.fullName ?? '',
+      branch: runBranchName(spec.runId),
+      ...(spec.repository?.revision ? { revision: spec.repository.revision } : {}),
+    },
+    ...(spec.profileWorkspace ? { profileWorkspace: spec.profileWorkspace } : {}),
     // Токен публикации: без него джоба клонирует репозиторий задачи и коммитит выходы
     // токеном репозитория кольца, у которого нет прав на чужой репозиторий. На живом
     // замере 05.10.2026 так ушли 15 запусков из 16 как `completed artifacts=0`.
@@ -525,13 +532,16 @@ export function validateLaunchResult(input: unknown, expectedRunId: string): Val
     input['artifacts'].forEach((artifact, index) => {
       const path = `launch.artifacts[${index}]`;
       if (!checkObject(artifact, path, collector)) return;
-      checkKeys(artifact, ['path', 'name', 'mime', 'sha256', 'size'], ['path', 'name', 'mime', 'sha256', 'size'], path, collector);
+      checkKeys(artifact, ['path', 'name', 'mime', 'sha256', 'size', 'objectKey'], ['path', 'name', 'mime', 'sha256', 'size'], path, collector);
       checkString(artifact['path'], `${path}.path`, collector, 512);
       checkString(artifact['name'], `${path}.name`, collector, 200);
       checkString(artifact['mime'], `${path}.mime`, collector, 100);
       checkString(artifact['sha256'], `${path}.sha256`, collector, 64);
       if (typeof artifact['size'] !== 'number' || !Number.isInteger(artifact['size']) || (artifact['size'] as number) < 0) {
         collector.push(`${path}.size: expected non-negative integer`);
+      }
+      if (artifact['objectKey'] !== undefined && (typeof artifact['objectKey'] !== 'string' || !/^profiles\/[A-Za-z0-9._-]+\/workspace\/[A-Za-z0-9._-]+\/[0-9a-f]{64}$/.test(artifact['objectKey']))) {
+        collector.push(`${path}.objectKey: expected scoped profile object key`);
       }
     });
   }
@@ -660,7 +670,9 @@ export function mapLaunchResult(
   // Пустой `logUrl` — «лог не опубликован» (#133), а не «ссылка на пустое»: наружу это
   // `null`, иначе в ответе API ездила бы пустая строка вместо отсутствующей ссылки.
   const logUrl = launch.logUrl.length > 0 ? launch.logUrl : null;
-  const outputRefs = artifacts.map((artifact) => (repo ? artifactUrl(repo, artifact.path) : artifact.path));
+  const outputRefs = artifacts.map((artifact) => artifact.objectKey
+    ? `/v1/runs/${encodeURIComponent(spec.runId)}/artifacts?path=${encodeURIComponent(artifact.path)}`
+    : (repo ? artifactUrl(repo, artifact.path) : artifact.path));
   const persistence = artifacts.length > 0 ? 'persisted' : 'not_required';
   const result: RunResult = {
     schemaVersion: RUN_RESULT_SCHEMA_VERSION,

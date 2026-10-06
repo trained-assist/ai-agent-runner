@@ -10,6 +10,8 @@ import {
   launchFailureCode,
   mapLaunchResult,
   mergeUrl,
+  repoHasCommit,
+  runBranchName,
   workerTransportFailure,
   withTimeout,
   DEFAULT_RECONCILE_DEADLINE_MS,
@@ -41,6 +43,9 @@ import {
 } from './contracts.js';
 import { ApiError } from './errors.js';
 import type { Principal } from './auth.js';
+import type { ProfileWorkspaceCoordinator } from './profile-workspace.js';
+import { WorkspaceError } from '../workspace/contract.js';
+import { compilePolicy, DEFAULT_EXPORT_POLICY, matchRule } from '../workspace/policy.js';
 
 /**
  * Stateless-ядро API (epic #74). Принимает запрос, вызывает внешнего воркера по HTTP и держит
@@ -93,6 +98,7 @@ export interface RunArtifactsView {
   artifacts: RunArtifactLink[];
   logUrl: string | null;
   note: string;
+  publication?: import('./stateless-store.js').RunProgress['publication'];
 }
 
 export interface AgentApiOptions {
@@ -131,6 +137,8 @@ export interface AgentApiOptions {
    * Без него — только память процесса (контракт эпика #74, шаг 6).
    */
   admissionLogPath?: string;
+  /** Enables trusted profile binding and canonical publication for every run. */
+  profileWorkspace?: ProfileWorkspaceCoordinator;
 }
 
 /** Пауза между опросами статуса: растёт от базовой до потолка (экспоненциально). */
@@ -182,7 +190,7 @@ export class AgentApi {
       throw new Error(`engineChain names engines without a worker: ${missing.join(', ')}`);
     }
     this.chain = [...(options.engineChain ?? [])];
-    this.store = options.store ?? new StatelessStore({}, options.admissionLogPath ?? null);
+    this.store = options.store ?? new StatelessStore({}, options.admissionLogPath ?? null, !!options.profileWorkspace);
     this.maxActiveRuns = options.maxActiveRuns ?? DEFAULT_STATELESS_LIMITS.maxActiveRuns;
     this.logger = options.logger ?? defaultLogger;
     this.clock = options.clock ?? (() => new Date());
@@ -210,6 +218,18 @@ export class AgentApi {
       throw new ApiError('INVALID_REQUEST', `invalid submit body: ${bodyResult.errors.join('; ')}`, { errors: bodyResult.errors });
     }
     const request = bodyResult.value;
+    if (this.opts.profileWorkspace && request.repository !== undefined) {
+      throw new ApiError('INVALID_REPOSITORY', 'repository is selected by the authenticated profile binding');
+    }
+    if (this.opts.profileWorkspace && !principal.tenantId) {
+      throw new ApiError('FORBIDDEN', 'API key has no trusted tenant binding');
+    }
+    if (this.opts.profileWorkspace) {
+      const policy = compilePolicy(DEFAULT_EXPORT_POLICY);
+      for (const output of request.outputs ?? []) {
+        if (matchRule(policy, output.path).action === 'exclude') throw new ApiError('INVALID_REQUEST', `profile output path is excluded by policy: ${output.path}`);
+      }
+    }
     const payloadHash = submitPayloadHash(request);
 
     const existing = this.store.getByAdmission(principal.principalId, idempotencyKey);
@@ -231,6 +251,11 @@ export class AgentApi {
         ownerGeneration: existing.ownerGeneration,
       });
       return { requestId: existing.requestId, userTaskId: existing.userTaskId, runId: existing.runId, deduplicated: true };
+    }
+    if (this.opts.profileWorkspace) {
+      const active = this.store.listAll().find((record) => record.tenantId === principal.tenantId && record.profileId === principal.profileId &&
+        !isTerminalApiState(this.store.progressOf(record.runId)?.state ?? 'queued'));
+      if (active) throw new ApiError('TASK_ATTEMPT_ACTIVE', `profile has an active run ${active.runId}`, { runId: active.runId });
     }
 
     // Движок рана: назвал клиент — идём ровно на него, не назвал — берёт цепочка (issue #100).
@@ -275,6 +300,7 @@ export class AgentApi {
       userTaskId,
       conversationId: spec.conversationId,
       principalId: principal.principalId,
+      ...(principal.tenantId ? { tenantId: principal.tenantId } : {}),
       profileId: principal.profileId,
       jobId,
       idempotencyKey,
@@ -297,7 +323,10 @@ export class AgentApi {
     }
     this.store.put(record);
     // Ран уходит во внешнего воркера сразу: клиент получает receipt и опрашивает статус.
-    void this.execute(record);
+    void this.execute(record).catch((err: unknown) => {
+      this.log({ event: 'run_dispatch_unknown', runId: record.runId, message: err instanceof Error ? err.message : String(err) });
+      this.markUnknown(record, 'dispatch_state_unavailable');
+    });
     this.log({
       event: 'submit',
       outcome: 'accepted',
@@ -347,6 +376,7 @@ export class AgentApi {
       sequence: run.sequence,
       fencing: { rejected: run.fencing.rejected },
       answer: run.answer,
+      ...(this.opts.profileWorkspace ? { publication: run.publication } : {}),
     };
   }
 
@@ -407,7 +437,9 @@ export class AgentApi {
       mime: artifact.mime,
       sha256: artifact.sha256,
       size: artifact.size,
-      url: repo ? artifactUrl(repo, artifact.path) : artifact.path,
+      url: artifact.objectKey
+        ? `/v1/runs/${encodeURIComponent(runId)}/artifacts?path=${encodeURIComponent(artifact.path)}`
+        : repo ? artifactUrl(repo, artifact.path) : artifact.path,
     }));
     return {
       runId,
@@ -419,8 +451,23 @@ export class AgentApi {
       count: artifacts.length,
       artifacts,
       logUrl: run?.logUrl ?? null,
-      note: 'the worker committed this run into its own branch of the user repository; the API stores no bytes and merges nothing',
+      note: this.opts.profileWorkspace
+        ? 'the run branch is reconciled with the canonical profile revision; check publication status before treating it as saved'
+        : 'the worker committed this run into its own branch of the user repository; the API stores no bytes and merges nothing',
+      ...(this.opts.profileWorkspace ? { publication: run?.publication ?? null } : {}),
     };
+  }
+
+  async downloadArtifact(principal: Principal, runId: string, path: string): Promise<{ bytes: Buffer; mime: string; sha256: string }> {
+    const record = this.requireRun(principal, runId);
+    const artifact = this.store.progressOf(runId)?.artifacts.find((entry) => entry.path === path);
+    if (!artifact?.objectKey || !this.opts.profileWorkspace) throw new ApiError('NOT_FOUND', 'profile object is not available for this run');
+    if (!artifact.objectKey.startsWith(`profiles/${record.profileId}/workspace/${runId}/`)) throw new ApiError('FORBIDDEN', 'artifact object is outside this run');
+    const bytes = await this.opts.profileWorkspace.readObject(principal, artifact.objectKey);
+    if (bytes.length !== artifact.size || createHash('sha256').update(bytes).digest('hex') !== artifact.sha256) {
+      throw new ApiError('INTERNAL', 'stored profile artifact failed checksum verification');
+    }
+    return { bytes, mime: artifact.mime, sha256: artifact.sha256 };
   }
 
   async cancel(principal: Principal, runId: string, rawBody: unknown = {}): Promise<RunCancelReceipt> {
@@ -649,6 +696,22 @@ export class AgentApi {
     this.store.append(record.runId, admissionEvents(record.spec, startedAt));
     this.inFlight.add(record.runId);
     try {
+      if (this.opts.profileWorkspace) {
+        try {
+          const prepared = await this.opts.profileWorkspace.prepare(this.principalFor(record), record.runId);
+          record.spec.repository = { fullName: prepared.repository, token: prepared.token, revision: prepared.baseRevision };
+          record.spec.profileWorkspace = { bindingId: prepared.bindingId, ...(prepared.objectBucket ? { objectBucket: prepared.objectBucket } : {}), artifacts: prepared.artifacts, excludedPatterns: prepared.excludedPatterns };
+          this.store.appendPrepared(record.runId, { fullName: prepared.repository, revision: prepared.baseRevision }, record.spec.profileWorkspace);
+          this.log({ event: 'profile_prepared', runId: record.runId, bindingId: prepared.bindingId, baseRevision: prepared.baseRevision });
+        } catch (err) {
+          this.log({ event: 'profile_prepare_failed', runId: record.runId, code: err instanceof WorkspaceError ? err.code : 'WORKSPACE_GIT_FAILED' });
+          this.finalize(record, workerTransportFailure(record.spec, err, { startedAt, finishedAt: this.nowIso() }, { failure: {
+            code: err instanceof WorkspaceError ? err.code : 'WORKSPACE_GIT_FAILED', failureClass: 'preflight',
+            safeSummary: 'profile workspace could not be prepared', retryable: true,
+          } }));
+          return;
+        }
+      }
       const accepted = await this.acceptOnChain(record, startedAt);
       if (!accepted) return;
       if (this.disposed || this.store.progressOf(record.runId) === null) return;
@@ -701,6 +764,7 @@ export class AgentApi {
       // Движок попытки виден клиенту сразу: цепочка двигается по ранe, а не молча меняет
       // исполнителя под ногами у того, кто опрашивает статус.
       this.store.setEngine(record.runId, engine);
+      this.store.appendLaunchIntent(record.runId, engine, this.nowIso());
       try {
         const receipt = await worker.launch(this.specForEngine(record, engine));
         return { engine, worker, receipt };
@@ -789,8 +853,11 @@ export class AgentApi {
       this.log({ event: 'worker_status', runId: record.runId, status, attempt });
 
       if (status === 'succeeded' || status === 'failed' || status === 'cancelled') {
-        await this.collectResult(record, worker, startedAt);
-        return;
+        if (await this.collectResult(record, worker, startedAt)) return;
+        if (Date.now() >= deadline) return;
+        await this.pollBackoff(attempt);
+        attempt += 1;
+        continue;
       }
       if (status === 'unknown') {
         // Исход неизвестн, но ран мог состояться. Помечаем и продолжаем спрашивать:
@@ -826,12 +893,25 @@ export class AgentApi {
   }
 
   /** Забрать финальный результат у воркера и закрыть ран. */
-  private async collectResult(record: AdmissionRecord, worker: ExternalWorker, startedAt: string): Promise<void> {
-    if (this.disposed || this.store.progressOf(record.runId) === null) return;
+  private async collectResult(record: AdmissionRecord, worker: ExternalWorker, startedAt: string): Promise<boolean> {
+    if (this.disposed || this.store.progressOf(record.runId) === null) return true;
     try {
       const launch = await worker.result(record.runId);
       const mapping = mapLaunchResult(record.spec, launch, { startedAt, finishedAt: this.nowIso() }, { workerBaseUrl: worker.baseUrl });
-      this.finalize(record, mapping);
+      let publication = null;
+      if (this.opts.profileWorkspace && launch.status === 'started') {
+        if (!mapping.repo || !repoHasCommit(mapping.repo) || mapping.repo.fullName !== record.spec.repository?.fullName || mapping.repo.branch !== runBranchName(record.runId)) {
+          throw new WorkspaceError('WORKSPACE_NOT_FOUND', 'worker did not confirm the expected profile run branch');
+        }
+        publication = await this.opts.profileWorkspace.publish(this.principalFor(record), record.runId, mapping.repo.commit!);
+        mapping.result.persistenceReason = `profile publication ${publication.status}: ${publication.committedRevision ?? publication.publicationId}`;
+        if (publication.status !== 'published') mapping.result.persistence = 'pending';
+        this.log({ event: 'profile_publication', runId: record.runId, publicationId: publication.publicationId, status: publication.status, committedRevision: publication.committedRevision, conflictId: publication.conflictId });
+      }
+      this.finalize(record, mapping, publication ? {
+        status: publication.status, committedRevision: publication.committedRevision,
+        conflictId: publication.conflictId, publicationId: publication.publicationId, reason: publication.reason,
+      } : null);
       this.log({
         event: 'run_finished',
         runId: record.runId,
@@ -842,15 +922,24 @@ export class AgentApi {
         logUrl: mapping.logUrl,
         repo: mapping.repo?.fullName ?? null,
       });
+      return true;
     } catch (err) {
       if (err instanceof ResultNotReadyError) {
         // Воркер сказал «терминальный», но результата нет: честный отказ, а не успех.
         this.log({ event: 'worker_result_missing', runId: record.runId });
         this.markUnknown(record, 'result_missing');
-        return;
+        return false;
+      }
+      if (this.opts.profileWorkspace) {
+        // The worker has already finished; retrying the engine could duplicate effects.
+        // Reconcile the same run branch/publication after storage or Git recovers.
+        this.log({ event: 'profile_publication_failed', runId: record.runId, code: err instanceof WorkspaceError ? err.code : 'WORKSPACE_GIT_FAILED' });
+        this.markUnknown(record, 'profile_publication_failed');
+        return false;
       }
       this.log({ event: 'run_failed', runId: record.runId, message: err instanceof Error ? err.message : String(err) });
       this.finalize(record, workerTransportFailure(record.spec, err, { startedAt, finishedAt: this.nowIso() }, { workerBaseUrl: worker.baseUrl }));
+      return true;
     }
   }
 
@@ -882,7 +971,7 @@ export class AgentApi {
   }
 
   /** Единственное место, где ран становится терминальным. */
-  private finalize(record: AdmissionRecord, mapping: LaunchMapping): void {
+  private finalize(record: AdmissionRecord, mapping: LaunchMapping, publication: import('./stateless-store.js').RunProgress['publication'] = null): void {
     this.store.append(record.runId, mapping.events);
     this.store.complete(record.runId, {
       state: mapping.result.outcome,
@@ -892,7 +981,12 @@ export class AgentApi {
       logUrl: mapping.logUrl,
       answer: mapping.answer,
       finishedAt: mapping.result.finishedAt,
+      publication,
     });
+  }
+
+  private principalFor(record: AdmissionRecord): Principal {
+    return { principalId: record.principalId, profileId: record.profileId, scopes: ['runs:read', 'runs:write'], ...(record.tenantId ? { tenantId: record.tenantId } : {}) };
   }
 
   /**
@@ -1006,4 +1100,3 @@ private buildSpec(
     this.logger({ ts: this.nowIso(), ...entry });
   }
 }
-

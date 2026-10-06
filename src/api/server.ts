@@ -111,6 +111,13 @@ export function createAgentApiServer(service: AgentApi, options: AgentApiServerO
       case 'artifacts': {
         if (req.method !== 'GET') throw new ApiError('METHOD_NOT_ALLOWED', 'run artifacts support GET only');
         requireScope(principal, 'runs:read');
+        const objectPath = url.searchParams.get('path');
+        if (objectPath !== null) {
+          const object = await service.downloadArtifact(principal, runId, objectPath);
+          res.writeHead(200, { 'content-type': object.mime, 'content-length': object.bytes.length, 'cache-control': 'private, no-store', 'x-content-sha256': object.sha256 });
+          res.end(object.bytes);
+          return 200;
+        }
         sendJson(res, 200, service.artifacts(principal, runId));
         return 200;
       }
