@@ -76,6 +76,12 @@ jobs:
             echo "- без провайдера/токена: exit=$CODE (ожидаем отказ авторизации — рабочая схема pr-autofix: свой \`opencode.json\` → llm-ladder + \`LLM_LADDER_TOKEN\`, флаг \`-m ladder/<model>\`)"
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
+      - name: "Ladder incremental SSE canary"
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          LLM_LADDER_TOKEN: ${{ secrets.LLM_LADDER_TOKEN }}
+        run: node scripts/probe-ladder-stream.mjs
+
       - name: "opencode через llm-ladder (схема pr-autofix: свой конфиг, free)"
         env:
           LLM_LADDER_TOKEN: ${{ secrets.LLM_LADDER_TOKEN }}
@@ -92,9 +98,28 @@ jobs:
             }
           }
           JSON
-          OUT=$(timeout 180 opencode run --auto -m ladder/free "Reply with exactly one word: pong" 2>&1) || { echo "$OUT" | tail -15; exit 1; }
-          echo "$OUT" | tail -3
-          echo "$OUT" | grep -qi "pong" && echo "opencode через ladder: OK (pong)" | tee -a "$GITHUB_STEP_SUMMARY"
+          set -o pipefail
+          timeout 180 opencode run --auto --format json -m ladder/free "Reply with exactly one word: pong" 2>&1 | tee opencode-ladder.jsonl
+          node --input-type=module <<'NODE'
+          import { readFileSync } from 'node:fs';
+          const events = readFileSync('opencode-ladder.jsonl', 'utf8').split(/\r?\n/).filter(Boolean);
+          let response = '';
+          for (const line of events) {
+            try {
+              const event = JSON.parse(line);
+              if (event.type === 'text' && typeof event.part?.text === 'string') response += event.part.text;
+              if (event.type === 'text' && typeof event.text === 'string') response += event.text;
+            } catch {
+              // Non-JSON diagnostics are allowed in the tee'd job log.
+            }
+          }
+          if (!response.toLowerCase().includes('pong')) {
+            console.error('OpenCode completed, but expected response marker was absent (response content hidden).');
+            process.exit(1);
+          }
+          console.log('OpenCode Ladder response check: passed (response content hidden).');
+          NODE
+          echo "opencode через ladder: OK (response marker; content hidden)" | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: E2E acceptance loop (stateless API + мок внешнего воркера)
         # Драйвер scripts/e2e-loop.sh удалён вместе с дисковой моделью API (epic #74);
