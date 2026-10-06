@@ -79,6 +79,7 @@ describe('clean room isolation (issue #51)', () => {
       // Выход определён и намерение уборки записано до самой уборки (issue #52).
       'agent_exit_resolved',
       'checkpoint_written',
+      'checkpoint_written',
       'succeeded',
     ]);
 

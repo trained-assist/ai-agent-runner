@@ -689,15 +689,15 @@ export class Runner {
     const promise = this.doFinalize(st).finally(() => {
       run.finalizePromise = null;
       const exportManifest = this.exportManifest(runId);
-      if (st.finalized && st.result?.persistence === 'pending' && (exportManifest?.attempts ?? 0) < 8) {
+      if (st.result?.persistence === 'pending' && (exportManifest?.attempts ?? 0) < 8) {
         const delayMs = Math.min(60_000, 2_000 * 2 ** Math.min(exportManifest?.attempts ?? 0, 5));
         const timer = setTimeout(() => { void this.finalize(runId).catch(() => undefined); }, delayMs);
         run.timers.push(timer);
-      } else if (st.finalized && st.result?.persistence === 'pending' && (exportManifest?.attempts ?? 0) >= 8) {
+      } else if (st.result?.persistence === 'pending' && (exportManifest?.attempts ?? 0) >= 8) {
         const attention: RunResult = { ...st.result, persistence: 'failed',
           persistenceReason: 'bounded persistence retries exhausted; source copies were retained for operator replay',
           cleanup: 'pending', cleanupReason: 'cleanup is blocked until remote custody is verified' };
-        this.updateTerminalResult(st, attention);
+        this.persistResult(st, attention);
         this.writeCheckpoint(st, attention, exportManifest, null, null, 'cleanup_pending', {
           status: 'blocked', reason: 'persistence retries exhausted; source copies retained', intentAt: this.nowIso(), finishedAt: null,
         }, { silent: true });
@@ -710,7 +710,7 @@ export class Runner {
   async waitFor(runId: string, timeoutMs = 30000): Promise<RunResult> {
     const run = this.runs.get(runId);
     if (!run) throw new Error(`unknown run: ${runId}`);
-    if (run.state.finalized && run.state.result) return run.state.result;
+    if (run.state.finalized && run.state.result && !run.finalizePromise && run.state.result.persistence !== 'pending') return run.state.result;
     return new Promise<RunResult>((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error(`timeout waiting for run ${runId}`)), timeoutMs);
       run.waiters.push((result) => {
@@ -1830,10 +1830,14 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
       cleanup: 'pending',
       cleanupReason: 'cleanup is blocked until remote custody is verified',
     };
-    this.writeCheckpoint(st, captured, existingExport, exit, null, 'engine_terminal', {
+    const engineCheckpoint = this.writeCheckpoint(st, captured, existingExport, exit, null, 'engine_terminal', {
       status: 'pending', reason: 'engine result captured; artifact persistence is pending', intentAt: this.nowIso(), finishedAt: null,
     });
-    this.persistResult(st, captured);
+    // Store the captured engine result without transitioning Run lifecycle or
+    // emitting its terminal event. Consumers may read this result independently.
+    const durableCaptured = { ...captured, persistence: engineCheckpoint.persistence };
+    st.result = durableCaptured;
+    this.store.saveResult(st.runId, durableCaptured);
     // The captured answer is already durable in result.json + checkpoint. Its small
     // object-store copy can be retried without delaying delivery of that result.
     const answerArtifactId = await this.saveAnswerArtifact(st, exit?.answer ?? { present: false, source: null, chars: 0, text: '' });
@@ -2691,6 +2695,13 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
   private updateTerminalResult(st: PersistedRunState, result: RunResult): RunResult {
     st.result = result;
     this.store.saveResult(st.runId, result);
+    if (result.persistence !== 'pending') {
+      const run = this.runs.get(st.runId);
+      if (run) {
+        const waiters = run.waiters.splice(0);
+        for (const waiter of waiters) waiter(result);
+      }
+    }
     return result;
   }
 

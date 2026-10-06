@@ -142,7 +142,11 @@ export function validateRunResult(input: unknown): ValidationResult<RunResult> {
   if (typeof input['exitObserved'] !== 'boolean') collector.push('result.exitObserved: expected boolean');
   if (!isUtcTimestamp(input['startedAt'])) collector.push('result.startedAt: expected UTC ISO timestamp');
   if (!isUtcTimestamp(input['finishedAt'])) collector.push('result.finishedAt: expected UTC ISO timestamp');
-  if (input['text'] !== undefined) checkString(input['text'], 'result.text', collector, 100_000);
+  // Engine output may contain line breaks and tabs; it is data, not an identifier.
+  if (input['text'] !== undefined) {
+    if (typeof input['text'] !== 'string' || input['text'].length === 0) collector.push('result.text: expected non-empty string');
+    else if (input['text'].length > 100_000) collector.push('result.text: longer than 100000');
+  }
 
   const failure = input['failure'];
   if (outcome === 'failed' && failure === undefined) collector.push('result.failure: required for failed outcome');
