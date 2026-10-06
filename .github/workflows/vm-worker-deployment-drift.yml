@@ -1,0 +1,32 @@
+name: VM worker deployment drift
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '17 */2 * * *'
+
+permissions:
+  contents: read
+
+jobs:
+  check-workers:
+    name: Check France and Russia deployments (warning gate)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve current main revision
+        id: main
+        run: |
+          git fetch --depth=1 origin main
+          echo "sha=$(git rev-parse FETCH_HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Check deployed source, health and bindings
+        env:
+          VM_WORKER_MAIN_SHA: ${{ steps.main.outputs.sha }}
+          EU_VM_WORKER_URL: ${{ secrets.EU_VM_WORKER_URL }}
+          EU_VM_WORKER_TOKEN: ${{ secrets.EU_VM_WORKER_TOKEN }}
+          RU_VM_WORKER_URL: ${{ secrets.RU_VM_WORKER_URL }}
+          RU_VM_WORKER_TOKEN: ${{ secrets.RU_VM_WORKER_TOKEN }}
+        run: node scripts/check-vm-worker-deployments.mjs

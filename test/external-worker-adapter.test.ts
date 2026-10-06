@@ -48,7 +48,19 @@ function launchResult(over: Partial<LaunchResult> = {}): LaunchResult {
 
 describe('launch request: RunSpec → LaunchRequest (issue #73)', () => {
   it('промпт, лимиты, репозиторий и изоляция уезжают в воркер как есть', () => {
+    const ingressManifest = {
+      contractVersion: 1 as const,
+      manifestRef: 'manifest-task-1',
+      manifestVersion: 'a'.repeat(64),
+      userTaskId: 'task-ingress-1',
+      profileId: 'profile-a',
+      runId: 'run-ingress-1',
+      ownerGeneration: 1,
+    };
     const spec = makeRunSpec({
+      runId: ingressManifest.runId,
+      userTaskId: ingressManifest.userTaskId,
+      ingressManifest,
       engine: { name: EXTERNAL_WORKER_ENGINE, adapterVersion: '1', modelSettings: { model: 'free' } },
       input: { inlinePrompt: 'сделай отчёт' },
       envAllowlist: ['PATH', 'HOME'],
@@ -70,6 +82,7 @@ describe('launch request: RunSpec → LaunchRequest (issue #73)', () => {
     expect(request.repository.branch).toBe(`agent-run/${spec.runId}`);
     expect(request.isolation.mode).toBe('per_run_unix_identity');
     expect(request.outputs).toEqual([{ path: 'report.md', name: 'report.md', mime: 'text/markdown' }]);
+    expect(request.ingressManifest).toEqual(ingressManifest);
     // В процесс агента уходят только переменные из envAllowlist; секрет хоста остаётся здесь.
     expect(request.env).toEqual({ PATH: '/usr/bin', HOME: '/home/runner' });
     expect(JSON.stringify(request)).not.toContain('nope');
@@ -578,6 +591,16 @@ describe('ExternalWorkerAdapter по HTTP', () => {
       await expect(adapterFor(worker).launch(makeRunSpec({ runId: 'run-http-3', input: { inlinePrompt: 'сделай отчёт' } }))).rejects.toMatchObject({
         code: 'WORKER_HTTP_ERROR',
       });
+    } finally {
+      await worker.close();
+    }
+  });
+
+  it('structured unsupported-workspace refusal is a definitive no-start and can advance the engine chain', async () => {
+    const worker = await startMockWorker({ httpStatus: 501, admissionRefusal: 'WORKER_PROFILE_WORKSPACE_UNSUPPORTED' });
+    try {
+      await expect(adapterFor(worker).launch(makeRunSpec({ runId: 'run-profile-refused', input: { inlinePrompt: 'run' } })))
+        .rejects.toMatchObject({ code: 'WORKER_PROFILE_WORKSPACE_UNSUPPORTED', retryable: true });
     } finally {
       await worker.close();
     }

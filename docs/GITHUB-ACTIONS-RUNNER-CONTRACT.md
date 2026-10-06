@@ -171,7 +171,7 @@ AGENT_API_WORKERS=[
 ### Приоритетная цепочка движков (issue #100)
 
 ```bash
-AGENT_API_ENGINE_CHAIN=azure-dynamic-ip-agent-run,eu-vm-agent-run,rf-vm-agent-run
+AGENT_API_ENGINE_CHAIN=eu-vm-agent-run,rf-vm-agent-run,azure-dynamic-ip-agent-run
 ```
 
 Ран без `engine` в заявке пробует движки по порядку цепочки. Следующий берётся только если

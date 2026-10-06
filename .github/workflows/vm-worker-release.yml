@@ -1,0 +1,55 @@
+name: Signed VM worker release
+
+on:
+  push:
+    tags: ['vm-worker-v*']
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  build-and-attest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - name: Require the tagged commit to be on main
+        run: |
+          git fetch origin main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+      - run: npm ci
+      - run: npm run build
+      - name: Assemble immutable Linux VM worker bundle
+        id: bundle
+        run: |
+          VERSION="$(node -p "require('./package.json').version")"
+          test "$GITHUB_REF_NAME" = "vm-worker-v$VERSION"
+          STAGE="$RUNNER_TEMP/vm-worker-bundle"
+          mkdir -p "$STAGE"
+          cp package.json package-lock.json "$STAGE/"
+          cp -R dist "$STAGE/dist"
+          mkdir -p "$STAGE/scripts"
+          cp scripts/deploy-vm-worker-release.sh "$STAGE/scripts/"
+          (cd "$STAGE" && npm ci --omit=dev)
+          tar -czf ai-agent-vm-worker-linux-x64.tar.gz -C "$STAGE" .
+          sha256sum ai-agent-vm-worker-linux-x64.tar.gz > ai-agent-vm-worker-linux-x64.tar.gz.sha256
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ai-agent-vm-worker-linux-x64.tar.gz
+      - name: Publish signed release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            ai-agent-vm-worker-linux-x64.tar.gz \
+            ai-agent-vm-worker-linux-x64.tar.gz.sha256 \
+            --title "VM worker ${{ steps.bundle.outputs.version }}" \
+            --generate-notes

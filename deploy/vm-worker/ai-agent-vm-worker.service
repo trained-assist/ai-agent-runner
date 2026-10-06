@@ -1,0 +1,31 @@
+[Unit]
+Description=AI Agent VM Worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ai-agent
+Group=ai-agent
+WorkingDirectory=/opt/ai-agent-vm-worker/current
+EnvironmentFile=/etc/ai-agent-runner/worker.env
+ExecStart=/usr/bin/node /opt/ai-agent-vm-worker/current/dist/vm-worker/main.js
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=15s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/ai-agent-runner
+
+[Install]
+WantedBy=multi-user.target
