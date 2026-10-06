@@ -22,6 +22,9 @@ export interface MockWorkerOptions {
   delayMs?: number;
   /** Ответить HTTP-ошибкой вместо LaunchResult. */
   httpStatus?: number;
+  /** Structured no-start refusal used to test capacity-aware dispatch. */
+  capacityRefusal?: boolean;
+  admissionRefusal?: 'WORKER_CAPACITY_UNKNOWN' | 'WORKER_ADMISSION_UNAVAILABLE';
   /** Задержать регистрацию рана: отмена приходит раньше, чем воркер его «увидел». */
   registerAfterMs?: number;
   /** Отдать тело, не проходящее контракт. */
@@ -103,7 +106,11 @@ export async function startMockWorker(options: MockWorkerOptions = {}): Promise<
         // проверить: он бы всегда находил ран у отказавшего воркера.
         if (settings.httpStatus !== undefined) {
           res.writeHead(settings.httpStatus, { 'content-type': 'application/json' });
-          res.end(JSON.stringify({ error: 'worker is unhappy' }));
+          res.end(settings.capacityRefusal
+            ? JSON.stringify({ accepted: false, code: 'WORKER_CAPACITY', cpuPercent: 60, memoryPercent: 20, sampledAt: new Date().toISOString() })
+            : settings.admissionRefusal
+              ? JSON.stringify({ accepted: false, code: settings.admissionRefusal })
+              : JSON.stringify({ error: 'worker is unhappy' }));
           return;
         }
         // Регистрируем ран сразу, до задержки: отмена может прийти, пока launch ещё «думает».

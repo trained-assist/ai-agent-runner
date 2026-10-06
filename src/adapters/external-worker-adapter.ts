@@ -908,7 +908,10 @@ export function workerTransportFailure(
  * ничего не дублирует. Всё остальное — отказ на нашей же стороне (нет промпта, refs без
  * workspace, не задан `resultUrl`), где повтор на другом движке бесполезен.
  */
-export const UNACCEPTED_LAUNCH_CODES = ['WORKER_LAUNCH_UNREACHABLE', 'WORKER_HTTP_ERROR', 'WORKER_PROTOCOL_INVALID'] as const;
+export const UNACCEPTED_LAUNCH_CODES = [
+  'WORKER_CAPACITY', 'WORKER_CAPACITY_UNKNOWN', 'WORKER_ADMISSION_UNAVAILABLE',
+  'WORKER_LAUNCH_UNREACHABLE', 'WORKER_HTTP_ERROR', 'WORKER_PROTOCOL_INVALID',
+] as const;
 
 /** Принял ли воркер ран: квитанция получена, цепочка движков на этом останавливается. */
 export function isUnacceptedLaunchFailure(err: unknown): boolean {
@@ -919,6 +922,19 @@ export function isUnacceptedLaunchFailure(err: unknown): boolean {
 /** Код отказа запуска для журнала и для разбора исхода рана. */
 export function launchFailureCode(err: unknown): string {
   return err instanceof PreflightError ? err.code : 'WORKER_UNREACHABLE';
+}
+
+function definitiveAdmissionRefusal(body: string): 'WORKER_CAPACITY' | 'WORKER_CAPACITY_UNKNOWN' | 'WORKER_ADMISSION_UNAVAILABLE' | null {
+  try {
+    const value: unknown = JSON.parse(body);
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) return null;
+    const record = value as Record<string, unknown>;
+    if (record['accepted'] !== false) return null;
+    const code = record['code'];
+    return code === 'WORKER_CAPACITY' || code === 'WORKER_CAPACITY_UNKNOWN' || code === 'WORKER_ADMISSION_UNAVAILABLE' ? code : null;
+  } catch {
+    return null;
+  }
 }
 
 /** Одна неудачная попытка приёма рана — она и есть содержимое отказа «цепочка исчерпана». */
@@ -1047,6 +1063,12 @@ export class ExternalWorkerAdapter implements ExternalWorker {
     if (!response.ok) {
       const detail = truncateLine(redactSecrets(redactAttachment(await readBody(response))), 300);
       this.log({ event: 'worker_launch_http_error', runId: spec.runId, status: response.status, detail });
+      const admissionRefusal = response.status === 503 ? definitiveAdmissionRefusal(detail) : null;
+      if (admissionRefusal) {
+        throw new PreflightError(admissionRefusal, `the external worker refused the run before acceptance (${admissionRefusal})`, {
+          failureClass: 'runtime', retryable: true,
+        });
+      }
       throw new PreflightError('WORKER_HTTP_ERROR', `the external worker answered ${response.status} on launch`, {
         failureClass: 'runtime',
         // 4xx — про запрос: тот же запрос получит тот же отказ (битый токен, не тот payload),

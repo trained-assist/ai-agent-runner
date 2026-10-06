@@ -104,6 +104,52 @@ describe('приоритетная цепочка движков (#100)', () => 
     expect(fleet.service.result(fleetPrincipal, runId).outcome).toBe('succeeded');
   }, 20000);
 
+  it('France capacity cutoff skips the Russian VM and sends the next run directly to GHA', async () => {
+    const fleet = await makeFleet({
+      eu: { httpStatus: 503, capacityRefusal: true, statusHttpStatus: 503 },
+      chain: [EU, RF, GHA],
+    });
+    const { runId } = submit(fleet, 'idem-capacity-france-cutover');
+    await waitFor(fleet, runId, 'succeeded');
+
+    expect(fleet.eu.launches).toHaveLength(1);
+    expect(fleet.rf.launches).toHaveLength(0);
+    expect(fleet.gha.launches).toHaveLength(1);
+    expect(fleet.service.status(fleetPrincipal, runId).engine).toBe(GHA);
+  }, 20000);
+
+  it('Russia capacity cutoff sends the next run directly to GHA', async () => {
+    const fleet = await makeFleet({
+      eu: { httpStatus: 503, admissionRefusal: 'WORKER_CAPACITY_UNKNOWN' },
+      rf: { httpStatus: 503, capacityRefusal: true, statusHttpStatus: 503 },
+      chain: [EU, RF, GHA],
+    });
+    const { runId } = submit(fleet, 'idem-capacity-russia-cutover');
+    await waitFor(fleet, runId, 'succeeded');
+
+    expect(fleet.eu.launches).toHaveLength(1);
+    expect(fleet.rf.launches).toHaveLength(1);
+    expect(fleet.gha.launches).toHaveLength(1);
+    expect(fleet.service.status(fleetPrincipal, runId).engine).toBe(GHA);
+  }, 20000);
+
+  it.each(['WORKER_CAPACITY_UNKNOWN', 'WORKER_ADMISSION_UNAVAILABLE'] as const)(
+    '%s preserves France → Russia → GHA order because saturation is unproven', async (code) => {
+      const fleet = await makeFleet({
+        eu: { httpStatus: 503, admissionRefusal: code },
+        rf: { httpStatus: 503, admissionRefusal: code },
+        chain: [EU, RF, GHA],
+      });
+      const { runId } = submit(fleet, `idem-${code.toLowerCase()}`);
+      await waitFor(fleet, runId, 'succeeded');
+
+      expect(fleet.eu.launches).toHaveLength(1);
+      expect(fleet.rf.launches).toHaveLength(1);
+      expect(fleet.gha.launches).toHaveLength(1);
+      expect(fleet.service.status(fleetPrincipal, runId).engine).toBe(GHA);
+    },
+  );
+
   it('GHA принял ран, но квитанция потерялась — бюджет истёк, а перехода нет: дубля нет', async () => {
     // Воркер регистрирует ран до задержки ответа, поэтому reconcile его находит: ран уже
     // идёт на GHA, и второй запуск на EU был бы дублем.

@@ -55,6 +55,14 @@ import { compilePolicy, DEFAULT_EXPORT_POLICY, matchRule } from '../workspace/po
 
 export type ApiLogger = (entry: Record<string, unknown>) => void;
 
+function isRegionalVmEngine(name: string): boolean {
+  return name === 'eu-vm-agent-run' || name === 'rf-vm-agent-run';
+}
+
+function isGhaEngine(name: string): boolean {
+  return name === 'dynamic-ip-azure-agent-run' || name === 'azure-dynamic-ip-agent-run';
+}
+
 export type RunCancelStatus = 'stopped' | 'stop_pending' | 'already_terminal' | 'too_late' | 'rejected' | 'unknown_run';
 
 /** Итог приёма рана по цепочке: воркер, который держит ран, и квитанция, если она была. */
@@ -803,6 +811,28 @@ export class AgentApi {
         return { engine, worker, receipt };
       } catch (err) {
         lastError = err;
+        if (err instanceof PreflightError && err.code === 'WORKER_CAPACITY') {
+          attempts.push({ engine, code: err.code, summary: err.message });
+          // A measured 60% cutoff preserves 40% of each VM for host services. Send
+          // this new operation directly to GHA; do not consume the next regional VM.
+          const ghaIndex = isRegionalVmEngine(engine)
+            ? candidates.findIndex((candidate, candidateIndex) => candidateIndex > index && isGhaEngine(candidate))
+            : -1;
+          const nextIndex = isRegionalVmEngine(engine) ? (ghaIndex >= 0 ? ghaIndex : candidates.length) : index + 1;
+          for (let skipped = index + 1; skipped < nextIndex; skipped += 1) {
+            attempts.push({ engine: candidates[skipped]!, code: 'CAPACITY_CUTOVER', summary: 'skipped regional VM after capacity refusal' });
+          }
+          const next = candidates[nextIndex];
+          this.log({ event: 'engine_chain_advance', runId: record.runId, engine, code: err.code, next: next ?? null, attempts: attempts.length, operationId: record.spec.operationId });
+          index = nextIndex - 1;
+          continue;
+        }
+        if (err instanceof PreflightError && (err.code === 'WORKER_CAPACITY_UNKNOWN' || err.code === 'WORKER_ADMISSION_UNAVAILABLE')) {
+          attempts.push({ engine, code: err.code, summary: err.message });
+          const next = candidates[index + 1];
+          this.log({ event: 'engine_chain_advance', runId: record.runId, engine, code: err.code, next: next ?? null, attempts: attempts.length, operationId: record.spec.operationId });
+          continue;
+        }
         if (!isUnacceptedLaunchFailure(err)) {
           // Отказ на нашей стороне (нет промпта, refs без workspace, не задан resultUrl):
           // другой движок его не обойдёт, поэтому цепочка не тратит на него бюджеты.
