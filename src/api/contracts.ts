@@ -54,6 +54,7 @@ export interface SubmitRequest {
    */
   engine?: EngineSpec;
   input?: InputSpec;
+  ingressManifest?: { contractVersion: 1; manifestRef: string; manifestVersion: string };
   envAllowlist: string[];
   limits: RunLimits;
   deadline?: string;
@@ -283,6 +284,7 @@ const SUBMIT_KEYS = [
   'conversationId',
   'engine',
   'input',
+  'ingressManifest',
   'envAllowlist',
   'limits',
   'deadline',
@@ -321,6 +323,13 @@ export function validateSubmitRequest(input: unknown): ValidationResult<SubmitRe
   if (input['userTaskId'] !== undefined) checkString(input['userTaskId'], 'request.userTaskId', collector, 200);
   if (input['conversationId'] !== undefined) checkString(input['conversationId'], 'request.conversationId', collector, 200);
   if (input['instructions'] !== undefined) checkString(input['instructions'], 'request.instructions', collector, 10_000);
+  if (input['ingressManifest'] !== undefined && checkObject(input['ingressManifest'], 'request.ingressManifest', collector)) {
+    const pin = input['ingressManifest'];
+    checkKeys(pin, ['contractVersion', 'manifestRef', 'manifestVersion'], ['contractVersion', 'manifestRef', 'manifestVersion'], 'request.ingressManifest', collector);
+    if (pin['contractVersion'] !== 1) collector.push('request.ingressManifest.contractVersion: expected 1');
+    checkString(pin['manifestRef'], 'request.ingressManifest.manifestRef', collector, 500);
+    if (typeof pin['manifestVersion'] !== 'string' || !/^[0-9a-f]{64}$/.test(pin['manifestVersion'])) collector.push('request.ingressManifest.manifestVersion: expected lowercase sha256');
+  }
   if (input['isolation'] !== undefined) {
     const isolation = input['isolation'];
     if (checkObject(isolation, 'request.isolation', collector)) {
@@ -351,6 +360,20 @@ export function validateSubmitRequest(input: unknown): ValidationResult<SubmitRe
   for (const key of ['input', 'deadline', 'regionConstraints', 'credentialBindings', 'mcp', 'budget', 'result', 'outputs', 'traceId', 'repository', 'isolation'] as const) {
     if (input[key] !== undefined) specLike[key] = input[key];
   }
+  if (input['ingressManifest'] !== undefined) {
+    specLike['ingressManifest'] = {
+      ...input['ingressManifest'] as Record<string, unknown>,
+      userTaskId: specLike['userTaskId'],
+      profileId: specLike['profileId'],
+      runId: specLike['runId'],
+      ownerGeneration: specLike['ownerGeneration'],
+    };
+  }
+  if (input['ingressManifest'] !== undefined && specLike['input'] !== undefined) {
+    const inputSpec = specLike['input'] as InputSpec;
+    if (inputSpec.refs?.length) collector.push('request.input.refs: cannot be combined with request.ingressManifest');
+  }
+  if (!collector.ok) return collector.finish(undefined as never);
 
   const specResult = validateRunSpec(specLike);
   if (!specResult.ok) {
@@ -363,6 +386,7 @@ export function validateSubmitRequest(input: unknown): ValidationResult<SubmitRe
     envAllowlist: spec.envAllowlist,
     limits: spec.limits,
   };
+  if (input['ingressManifest'] !== undefined) request.ingressManifest = input['ingressManifest'] as SubmitRequest['ingressManifest'];
   if (input['engine'] !== undefined) request.engine = spec.engine;
   if (spec.input !== undefined) request.input = spec.input;
   if (spec.deadline !== undefined) request.deadline = spec.deadline;
