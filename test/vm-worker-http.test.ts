@@ -118,6 +118,19 @@ describe('installable VM HTTP worker', () => {
     expect(fixture.runner.startCalls).toHaveLength(0);
   });
 
+  it('forwards pinned profile workspace, revision and one-run publication token only to an enabled Runner', async () => {
+    const fixture = await startFixture({ profileWorkspaceEnabled: true });
+    cleanups.push(fixture.close);
+    const response = await launch(fixture.base, launchRequest({
+      repository: { fullName: 'trained-assist/ai-agent-runner', branch: `agent-run/${RUN_ID}`, revision: 'b'.repeat(40) },
+      publicationToken: 'profile-publication-token-test',
+      profileWorkspace: { bindingId: 'binding-profile-a', artifacts: [], excludedPatterns: [] },
+    }));
+    expect(response.status).toBe(202);
+    expect(fixture.runner.startCalls[0]!.spec.repository).toMatchObject({ revision: 'b'.repeat(40), token: 'profile-publication-token-test' });
+    expect(fixture.runner.startCalls[0]!.spec.profileWorkspace).toMatchObject({ bindingId: 'binding-profile-a', artifacts: [] });
+  });
+
   it('reports unknown runs without inventing a receipt and rejects a disallowed repository', async () => {
     const fixture = await startFixture({ engineName: 'eu-vm-agent-run' });
     cleanups.push(fixture.close);
@@ -180,7 +193,7 @@ async function launch(base: string, request: LaunchRequest): Promise<Response> {
   return fetch(`${base}/v1/launch`, { method: 'POST', headers: { ...authHeaders(), 'content-type': 'application/json' }, body: JSON.stringify(request) });
 }
 
-async function startFixture(input: { engineName?: string; cpuPercent?: number; bindingsInventory?: VmWorkerBindingsInventory } = {}): Promise<{
+async function startFixture(input: { engineName?: string; cpuPercent?: number; bindingsInventory?: VmWorkerBindingsInventory; profileWorkspaceEnabled?: boolean } = {}): Promise<{
   base: string;
   dataDir: string;
   runner: FakeRunner;
@@ -192,7 +205,7 @@ async function startFixture(input: { engineName?: string; cpuPercent?: number; b
   mkdirSync(join(dataDir, 'capacity'), { mode: 0o700 });
   chmodSync(dataDir, 0o700);
   const store = new FileCapacityReservationStore(join(dataDir, 'capacity', 'reservations.json'));
-  const runner = new FakeRunner(dataDir);
+  const runner = new FakeRunner(dataDir, input.profileWorkspaceEnabled ?? false);
   const sampler: HostUsageSampler = { sample: async (): Promise<HostUsageSample> => ({ cpuPercent: input.cpuPercent ?? 5, memoryPercent: 10, sampledAt: new Date().toISOString() }) };
   const capacity = new CapacityAdmission({ sampler, store });
   const server = createVmWorkerServer({
@@ -235,8 +248,9 @@ class FakeRunner {
   private snapshot: Record<string, any> | null = null;
   private readonly eventList: Array<Record<string, any>> = [];
   private readonly dataDir: string;
+  private readonly profileWorkspaceEnabled: boolean;
 
-  constructor(dataDir: string) { this.dataDir = dataDir; }
+  constructor(dataDir: string, profileWorkspaceEnabled = false) { this.dataDir = dataDir; this.profileWorkspaceEnabled = profileWorkspaceEnabled; }
 
   start(spec: RunSpec, operationId: string, runtimeEnv: Record<string, string>): void {
     this.startCalls.push({ spec, operationId, runtimeEnv });
@@ -262,6 +276,8 @@ class FakeRunner {
 
   getRun(runId: string): Record<string, any> | null { return this.snapshot?.runId === runId ? this.snapshot : null; }
   getRunSpec(runId: string): RunSpec | null { return this.snapshot?.runId === runId ? this.spec : null; }
+  supportsProfileWorkspace(): boolean { return this.profileWorkspaceEnabled; }
+  profileWorkspaceCommit(): string | null { return null; }
   events(runId: string, after = 0): Array<Record<string, any>> { return this.snapshot?.runId === runId ? this.eventList.filter((event) => event.sequence > after) : []; }
   exportManifest(): null { return null; }
   health(): { ready: boolean; droppedLogCount: number; activeRuns: number; runs: number } { return { ready: true, droppedLogCount: 0, activeRuns: this.state === 'running' ? 1 : 0, runs: this.snapshot ? 1 : 0 }; }

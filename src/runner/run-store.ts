@@ -47,6 +47,8 @@ export interface PersistedRunState {
   spec: RunSpec;
   finalized: boolean;
   result: RunResult | null;
+  /** Commit pushed to the profile run branch, checkpointed before later finalization work. */
+  profileWorkspaceCommit?: string;
   fencing: { rejected: number };
   mcp: PersistedMcpState | null;
   /**

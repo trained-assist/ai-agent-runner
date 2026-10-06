@@ -21,22 +21,30 @@ Required missing bindings make `/readyz` return 503; an unassigned secret owner 
 missing rotation date is a warning. The example inventories intentionally show
 `UNASSIGNED` owners until an operator records the real owner and store path.
 
-The slice does **not** yet publish `agent-run/<runId>` to the user's GitHub repository:
-ordinary runs return `repo.commit: null`. For a profile-backed task, the worker rejects
-the launch before admission with `WORKER_PROFILE_WORKSPACE_UNSUPPORTED` so it cannot
-run against an incomplete workspace and silently lose changes. The API may advance to
-the next configured worker after this definitive no-start response. GCS storage wiring
-does not replace Git branch publication or prove that user data was persisted. Do not
-route production user work here until branch creation/push, artifact references, and
-API-side merge/persistence are integrated and tested.
+Profile-backed tasks use the existing durable workspace contract: the API pins a base
+commit and supplies a scoped publication token plus the heavy-artifact manifest. Before
+OpenCode starts, the VM checks out that exact revision on `agent-run/<runId>`, verifies
+and materializes heavy artifacts from GCS, and removes files excluded by the shared
+profile policy. On completion, it publishes allowed small files to the run branch,
+uploads heavy files to GCS with read-back checksum verification, writes the artifact
+index, and returns the confirmed commit in `repo.commit`. The API validates and merges
+that branch through its existing compare-and-swap publication coordinator.
+
+The token is memory-only, passed to Git through a static askpass helper, and never put
+in Git arguments or durable RunSpec state. The publisher resets `origin` to the trusted
+repository URL before fetch/push, verifies the pinned revision and run branch, and uses
+a private Git index so a broad staging command cannot include credentials. If
+publication fails, the VM retains the run workspace and returns no commit; the API
+reports publication as pending/unknown rather than claiming that user data was saved.
+Runs without a profile workspace continue to return `repo.commit: null`.
 
 Task-scoped Control Plane `ingressManifest` pins now pass through the external-worker
 request into Runner. Configure `RUNNER_CONTROL_PLANE_URL`,
 `RUNNER_CONTROL_PLANE_PRINCIPAL`, and `RUNNER_CONTROL_PLANE_PRINCIPAL_SECRET` together
 when using this capability. With all three absent, ordinary runs remain available but
 a run carrying an ingress manifest fails closed before OpenCode starts; a partial
-configuration prevents worker startup. This input-artifact path does not publish the
-user's changed workspace back to GitHub.
+configuration prevents worker startup. Ingress input materialization and profile
+workspace publication are separate capabilities.
 
 ## Install on a Linux VM
 

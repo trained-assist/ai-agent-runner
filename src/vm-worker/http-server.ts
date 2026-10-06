@@ -93,13 +93,13 @@ export function createVmWorkerServer(options: VmWorkerServerOptions): VmWorkerSe
         sendJson(res, 400, { error: 'INVALID_REQUEST', message: error instanceof Error ? error.message : 'invalid request body' });
         return;
       }
-      if (isRecord(raw) && raw['profileWorkspace'] !== undefined) {
-        sendJson(res, 501, { accepted: false, code: 'WORKER_PROFILE_WORKSPACE_UNSUPPORTED' });
-        return;
-      }
       const parsed = parseLaunchRequest(raw, options);
       if (!parsed.ok) { sendJson(res, 400, { error: 'INVALID_REQUEST', details: parsed.errors }); return; }
       const request = parsed.value;
+      if (request.profileWorkspace && options.runner.supportsProfileWorkspace?.() !== true) {
+        sendJson(res, 501, { accepted: false, code: 'WORKER_PROFILE_WORKSPACE_UNSUPPORTED' });
+        return;
+      }
       const spec = toRunSpec(request, options);
       const fingerprint = createHash('sha256').update(JSON.stringify(request)).digest('hex');
       const admission = await options.capacity.start<LaunchReceiptLike>({
@@ -173,7 +173,7 @@ function makeReceipt(request: LaunchRequest, baseUrl: string): LaunchReceiptLike
 
 function toRunSpec(request: LaunchRequest, options: VmWorkerServerOptions): RunSpec {
   const repo = request.repository.fullName;
-  const token = process.env['RUNNER_GIT_TOKEN'];
+  const token = request.publicationToken ?? process.env['RUNNER_GIT_TOKEN'];
   return {
     contractVersion: 1,
     jobId: request.jobId,
@@ -189,7 +189,8 @@ function toRunSpec(request: LaunchRequest, options: VmWorkerServerOptions): RunS
     limits: { timeoutMs: request.limits.timeoutMs, maxOutputBytes: request.limits.maxOutputBytes, maxLogBytes: request.limits.maxLogBytes },
     input: { inlinePrompt: request.input.inlinePrompt },
     isolation: { mode: request.isolation.mode as NonNullable<RunSpec['isolation']>['mode'] },
-    repository: { fullName: repo, ...(token ? { token } : {}) },
+    repository: { fullName: repo, ...(request.repository.revision ? { revision: request.repository.revision } : {}), ...(token ? { token } : {}) },
+    ...(request.profileWorkspace ? { profileWorkspace: request.profileWorkspace } : {}),
     ...(request.ingressManifest ? { ingressManifest: request.ingressManifest } : {}),
     ...(request.outputs ? { outputs: request.outputs.map((output) => ({ ...output })) } : {}),
   };
@@ -289,7 +290,7 @@ function toLaunchResult(options: VmWorkerServerOptions, snapshot: NonNullable<Re
     outputTruncated: stdout.length + stderr.length >= (spec?.limits.maxOutputBytes ?? 1_000_000),
     artifacts,
     logUrl: `local://runs/${encodeURIComponent(snapshot.runId)}/logs`,
-    repo: { fullName: spec?.repository?.fullName ?? '', branch: `agent-run/${snapshot.runId}`, commit: null },
+    repo: { fullName: spec?.repository?.fullName ?? '', branch: `agent-run/${snapshot.runId}`, commit: options.runner.profileWorkspaceCommit?.(snapshot.runId) ?? null },
     ...(result.failure ? { failure: { ...result.failure } } : {}),
   };
   return launch;
