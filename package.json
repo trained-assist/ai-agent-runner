@@ -1,6 +1,6 @@
 {
   "name": "ai-agent-runner",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "description": "Agent Runner \u2014 lifecycle of ai-agent-job runs (RunSpec, engine adapters, scoped events, fault injection) plus external Serverless Agent API (admission/result, idempotent receipts, replayable events) for a single VM",
