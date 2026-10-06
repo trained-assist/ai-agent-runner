@@ -12,6 +12,9 @@ export interface RemoteMcpServerPolicy {
   allowedTools: string[];
   bindingScopes: Record<string, string>;
   startupTimeoutMs: number;
+  policyVersion?: string;
+  catalogueVersion?: string;
+  registryDigest?: string;
 }
 
 export interface RemoteMcpBinding {
@@ -50,6 +53,7 @@ export interface RemoteMcpBindingContext {
   allowedTools: string[];
   catalogueVersion?: string;
   policyVersion?: string;
+  registryDigest?: string;
 }
 
 export type RemoteMcpBindingResolver = (
@@ -81,6 +85,7 @@ export const REGISTRY_FIXTURE_PRINCIPAL_ID = 'integration-telegram-ux-v1';
 export const REGISTRY_FIXTURE_POLICY_VERSION = 'registry-fixture-policy-v1';
 export const REGISTRY_FIXTURE_CATALOGUE_VERSION = 'registry-fixture-catalogue-v1';
 export const REGISTRY_FIXTURE_REGISTRY_DIGEST = '129ab5033964c3ed5be47414711026cc2469b3d9af90ce83ee071cba7f005ea9';
+export const REGISTRY_FIXTURE_SCOPE = 'registry:fixture-read';
 
 function registryFixtureSigningKey(value: string | undefined): KeyObject | undefined {
   if (!value || !/^[A-Za-z0-9+/]+=*$/.test(value)) return undefined;
@@ -112,6 +117,9 @@ export function registryFixtureBindingResolver(
   if (!policy) return undefined;
   if (policy.url !== REGISTRY_FIXTURE_URL || policy.tokenEnvName !== REGISTRY_FIXTURE_TOKEN_ENV ||
       policy.allowedTools.length !== 1 || policy.allowedTools[0] !== REGISTRY_FIXTURE_TOOL ||
+      policy.policyVersion !== REGISTRY_FIXTURE_POLICY_VERSION || policy.catalogueVersion !== REGISTRY_FIXTURE_CATALOGUE_VERSION ||
+      policy.registryDigest !== REGISTRY_FIXTURE_REGISTRY_DIGEST ||
+      policy.bindingScopes[REGISTRY_FIXTURE_BINDING_REF] !== REGISTRY_FIXTURE_SCOPE ||
       !Object.hasOwn(policy.bindingScopes, REGISTRY_FIXTURE_BINDING_REF)) {
     throw new Error('registry fixture MCP policy must pin its test endpoint, binding and single read-only tool');
   }
@@ -121,7 +129,7 @@ export function registryFixtureBindingResolver(
     if (bindingRef !== REGISTRY_FIXTURE_BINDING_REF || context.serverId !== REGISTRY_FIXTURE_SERVER_ID ||
         context.url !== REGISTRY_FIXTURE_URL || context.profileId !== REGISTRY_FIXTURE_PROFILE_ID ||
         context.catalogueVersion !== REGISTRY_FIXTURE_CATALOGUE_VERSION || context.policyVersion !== REGISTRY_FIXTURE_POLICY_VERSION ||
-        context.scope !== policy.bindingScopes[REGISTRY_FIXTURE_BINDING_REF] ||
+        context.registryDigest !== REGISTRY_FIXTURE_REGISTRY_DIGEST || context.scope !== REGISTRY_FIXTURE_SCOPE ||
         context.allowedTools.length !== 1 || context.allowedTools[0] !== REGISTRY_FIXTURE_TOOL || !signingKey ||
         context.signal?.aborted || !token || !expiresAt || !/^[A-Za-z0-9._~-]{16,2048}$/.test(token)) return null;
 
@@ -140,6 +148,7 @@ export function registryFixtureBindingResolver(
       serverId: REGISTRY_FIXTURE_SERVER_ID, bindingRef: REGISTRY_FIXTURE_BINDING_REF,
       allowedTools: [REGISTRY_FIXTURE_TOOL], policyVersion: REGISTRY_FIXTURE_POLICY_VERSION,
       catalogueVersion: REGISTRY_FIXTURE_CATALOGUE_VERSION, registryDigest: REGISTRY_FIXTURE_REGISTRY_DIGEST,
+      scope: REGISTRY_FIXTURE_SCOPE,
       iat: issuedAt, exp: expires,
     };
     const signingInput = `${base64url(JSON.stringify({ alg: 'EdDSA', typ: 'JWT' }))}.${base64url(JSON.stringify(claims))}`;
@@ -339,7 +348,7 @@ export function parseRemoteMcpServerPolicies(raw: string | undefined): Record<st
     const tokenNames = new Set<string>();
     for (const [serverId, policy] of Object.entries(input)) {
       if (!/^[A-Za-z0-9._-]{1,64}$/.test(serverId) || !isRecord(policy) ||
-          Object.keys(policy).some(key => !['url', 'tokenEnvName', 'headers', 'allowedTools', 'bindingScopes', 'startupTimeoutMs'].includes(key)) ||
+          Object.keys(policy).some(key => !['url', 'tokenEnvName', 'headers', 'allowedTools', 'bindingScopes', 'startupTimeoutMs', 'policyVersion', 'catalogueVersion', 'registryDigest'].includes(key)) ||
           !isRemoteMcpUrl(policy.url) || typeof policy.tokenEnvName !== 'string' ||
           !/^RUNNER_MCP_[A-Z0-9_]{1,48}$/.test(policy.tokenEnvName) || tokenNames.has(policy.tokenEnvName) ||
           !isRecord(policy.headers) || !isRecord(policy.bindingScopes) || Object.keys(policy.bindingScopes).length === 0 ||
@@ -347,6 +356,9 @@ export function parseRemoteMcpServerPolicies(raw: string | undefined): Record<st
           !Object.entries(policy.bindingScopes).every(([ref, scope]) => ref.length > 0 && ref.length <= 300 && typeof scope === 'string' && scope.length > 0 && scope.length <= 300) || !Array.isArray(policy.allowedTools) ||
           policy.allowedTools.length === 0 || policy.allowedTools.length > 50 ||
           !policy.allowedTools.every(tool => typeof tool === 'string' && MCP_TOOL_NAME.test(tool)) ||
+          (policy.policyVersion !== undefined && (typeof policy.policyVersion !== 'string' || !/^[A-Za-z0-9._-]{1,200}$/.test(policy.policyVersion))) ||
+          (policy.catalogueVersion !== undefined && (typeof policy.catalogueVersion !== 'string' || !/^[A-Za-z0-9._-]{1,200}$/.test(policy.catalogueVersion))) ||
+          (policy.registryDigest !== undefined && (typeof policy.registryDigest !== 'string' || !/^[a-f0-9]{64}$/.test(policy.registryDigest))) ||
           new Set(policy.allowedTools).size !== policy.allowedTools.length) throw new Error();
       const headers: Record<string, string> = Object.create(null);
       const entries = Object.entries(policy.headers);
@@ -358,7 +370,7 @@ export function parseRemoteMcpServerPolicies(raw: string | undefined): Record<st
         headers[name] = template;
       }
       tokenNames.add(policy.tokenEnvName);
-      servers[serverId] = { url: policy.url, tokenEnvName: policy.tokenEnvName, headers, allowedTools: [...policy.allowedTools], bindingScopes: { ...policy.bindingScopes } as Record<string, string>, startupTimeoutMs: Number(policy.startupTimeoutMs) };
+      servers[serverId] = { url: policy.url, tokenEnvName: policy.tokenEnvName, headers, allowedTools: [...policy.allowedTools], bindingScopes: { ...policy.bindingScopes } as Record<string, string>, startupTimeoutMs: Number(policy.startupTimeoutMs), ...(typeof policy.policyVersion === 'string' ? { policyVersion: policy.policyVersion } : {}), ...(typeof policy.catalogueVersion === 'string' ? { catalogueVersion: policy.catalogueVersion } : {}), ...(typeof policy.registryDigest === 'string' ? { registryDigest: policy.registryDigest } : {}) };
     }
     return servers;
   } catch {
@@ -407,6 +419,16 @@ export async function resolveRemoteMcpAttachment(
     if (!server.allowedTools.every(tool => policy.allowedTools.includes(tool))) refuse('MCP_TOOL_NOT_ALLOWED');
     const scope = Object.hasOwn(policy.bindingScopes, server.bindingRef) ? policy.bindingScopes[server.bindingRef] : undefined;
     if (!scope || signal?.aborted) refuse('MCP_BINDING_MISSING');
+    if ((server.scope !== undefined && server.scope !== scope)
+        || (server.policyVersion !== undefined && server.policyVersion !== policy.policyVersion)
+        || (server.catalogueVersion !== undefined && server.catalogueVersion !== policy.catalogueVersion)
+        || (server.registryDigest !== undefined && server.registryDigest !== policy.registryDigest)) refuse('MCP_BINDING_SCOPE_MISMATCH');
+    if (spec.profileId === REGISTRY_FIXTURE_PROFILE_ID && (server.serverId !== REGISTRY_FIXTURE_SERVER_ID
+        || server.bindingRef !== REGISTRY_FIXTURE_BINDING_REF || scope !== REGISTRY_FIXTURE_SCOPE
+        || server.scope !== REGISTRY_FIXTURE_SCOPE || server.policyVersion !== REGISTRY_FIXTURE_POLICY_VERSION
+        || server.catalogueVersion !== REGISTRY_FIXTURE_CATALOGUE_VERSION
+        || server.registryDigest !== REGISTRY_FIXTURE_REGISTRY_DIGEST
+        || server.allowedTools.length !== 1 || server.allowedTools[0] !== REGISTRY_FIXTURE_TOOL)) refuse('MCP_POLICY_DRIFT');
     const declared = spec.credentialBindings?.find(binding => binding.ref === server.bindingRef);
     if (declared && declared.scope !== scope) refuse('MCP_BINDING_SCOPE_MISMATCH');
     const context: RemoteMcpBindingContext = {
@@ -416,7 +438,7 @@ export async function resolveRemoteMcpAttachment(
       conversationId: spec.conversationId, ownerGeneration: spec.ownerGeneration,
       operationId: spec.operationId, engine: spec.engine.name,
       serverId: server.serverId, url: policy.url, allowedTools: [...server.allowedTools],
-      catalogueVersion: server.catalogueVersion, policyVersion: server.policyVersion,
+      catalogueVersion: server.catalogueVersion, policyVersion: server.policyVersion, registryDigest: server.registryDigest,
     };
     let binding: RemoteMcpBinding | null;
     try {
@@ -443,6 +465,7 @@ export async function resolveRemoteMcpAttachment(
     headers['X-MCP-Profile'] = context.profileId;
     headers['X-MCP-Run-Id'] = context.runId;
     if (binding.runBinding) {
+      headers['X-MCP-Scope'] = scope;
       headers['X-MCP-Operation'] = 'invocation';
       headers['X-MCP-Run-Binding'] = binding.runBinding;
     }

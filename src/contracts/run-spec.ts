@@ -78,10 +78,13 @@ export interface McpRemoteServerSpec {
   transport: 'remote';
   url: string;
   bindingRef: string;
+  /** Trusted Registry execution scope, compared with Runner host policy. */
+  scope?: string;
   allowedTools: string[];
   /** Stable host catalogue metadata copied through RunSpec for the test fixture binding. */
   catalogueVersion?: string;
   policyVersion?: string;
+  registryDigest?: string;
   toolTimeoutMs?: number;
 }
 
@@ -432,7 +435,7 @@ function validateMcpServer(value: unknown, path: string, collector: ErrorCollect
   checkKeys(
     value,
     remote
-      ? ['serverId', 'transport', 'url', 'bindingRef', 'allowedTools', 'catalogueVersion', 'policyVersion', 'toolTimeoutMs']
+      ? ['serverId', 'transport', 'url', 'bindingRef', 'scope', 'allowedTools', 'catalogueVersion', 'policyVersion', 'registryDigest', 'toolTimeoutMs']
       : ['serverId', 'transport', 'command', 'args', 'envAllowlist', 'bindingRef', 'allowedTools', 'readinessTimeoutMs', 'toolTimeoutMs'],
     remote ? ['serverId', 'transport', 'url', 'bindingRef', 'allowedTools'] : ['serverId', 'transport', 'command', 'allowedTools'],
     path,
@@ -448,10 +451,18 @@ function validateMcpServer(value: unknown, path: string, collector: ErrorCollect
   if (server.transport === 'remote') {
     if (!isRemoteMcpUrl(value['url'])) collector.push(`${path}.url: expected an HTTPS URL without credentials, query or fragment`);
     else server.url = value['url'];
+    if (value['scope'] !== undefined) {
+      checkString(value['scope'], `${path}.scope`, collector, 300);
+      if (typeof value['scope'] === 'string') server.scope = value['scope'];
+    }
     for (const key of ['catalogueVersion', 'policyVersion'] as const) {
       if (value[key] === undefined) continue;
       checkSafeId(value[key], `${path}.${key}`, collector);
       if (typeof value[key] === 'string') server[key] = value[key];
+    }
+    if (value['registryDigest'] !== undefined) {
+      if (typeof value['registryDigest'] !== 'string' || !/^[a-f0-9]{64}$/.test(value['registryDigest'])) collector.push(`${path}.registryDigest: expected a lowercase SHA-256 hex digest`);
+      else server.registryDigest = value['registryDigest'];
     }
   } else {
     if (value['transport'] !== 'stdio') collector.push(`${path}.transport: expected "stdio" | "remote"`);

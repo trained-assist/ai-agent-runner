@@ -99,6 +99,16 @@ policy must use the same server ID, URL, ref, and single-tool allowlist. A broad
 fails Runner startup. This binding ref never falls through to a general binding file or
 the documents resolver.
 
+The CP-to-Runner descriptor also pins execution `scope` (`registry:fixture-read`),
+`policyVersion` (`registry-fixture-policy-v1`), `catalogueVersion`
+(`registry-fixture-catalogue-v1`), and the Registry `registryDigest`
+(`129ab5033964c3ed5be47414711026cc2469b3d9af90ce83ee071cba7f005ea9`). These are
+checked against Runner host policy before binding resolution. CP's random `catalogueId`
+is only a snapshot lookup key and is never accepted as a RunSpec catalogue version.
+The resolver includes execution scope and Registry digest in its signed run proof and
+sends scope in `X-MCP-Scope`; the Host compares both to its pinned test policy and the
+actual invocation headers. Discovery remains a separate pre-submit `tools/list` flow.
+
 Provide the opaque token and exact shared expiry in the Runner process secret store as
 `RUNNER_MCP_REGISTRY_TEST_TOKEN` and `RUNNER_MCP_REGISTRY_TEST_EXPIRES_AT`; the latter
 must match the test Worker's `MCP_TEST_EXPIRES_AT`. Do not put either value in
@@ -109,8 +119,9 @@ it does not accept a caller-provided run ID. Store a PKCS#8 DER Ed25519 private 
 base64 in `RUNNER_MCP_REGISTRY_TEST_SIGNING_KEY_B64` in the same trusted process secret
 store. Configure only its public OKP/Ed25519 JWK in the Worker's
 `MCP_TEST_RUNNER_PUBLIC_JWK`; never put the private key in Cloudflare. Runner signs a
-short-lived `X-MCP-Run-Binding` JWT over that run, task, profile/principal, binding ref,
-single allowed tool, policy/catalogue versions and pinned registry digest. It refuses a
+short-lived `X-MCP-Run-Binding` JWT over that admitted run, task, profile/principal,
+server, binding ref, execution scope, single allowed tool, policy/catalogue versions
+and pinned registry digest. It refuses a
 missing/invalid token or key, wrong profile/server/ref/scope/tool, expired or insufficient
 lease, and any lease over 24h.
 
