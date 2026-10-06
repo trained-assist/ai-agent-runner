@@ -48,6 +48,44 @@ workspace publication are separate capabilities.
 
 ## Install on a Linux VM
 
+Release delivery and service lifecycle are separate processes. GitHub Actions builds
+and signs an immutable release; `ai-agent-vm-worker-update <tag>` verifies and installs
+that release, switches the versioned symlink, restarts systemd, and rolls back if the
+new process is not ready. `ai-agent-vm-worker.service` owns the long-running worker.
+`install-vm-worker.sh` is only a one-time bootstrap for the service account, unit,
+configuration templates, and updater. There is currently no automatic VM rollout or
+VM self-deployment: the operator invokes the updater after reviewing a release.
+
+Before enabling a worker, detect and record the full configuration group: region and
+worker ID; `VM_WORKER_PUBLIC_URL`, `VM_WORKER_ENGINE`, `VM_WORKER_TOKEN`; bind address
+and port; CPU/RAM admission limits; GCS bucket and attached workload identity; OpenCode
+binary path; approved repositories and environments; and, when ingress manifests are
+used, all three `RUNNER_CONTROL_PLANE_*` bindings. Check values locally on the host,
+but publish only presence, source/store path, owner, and rotation metadata. Never print
+secret values. The updater requires `VM_WORKER_PUBLIC_URL` to be a valid HTTP(S) origin
+before it changes the active release.
+
+## Start another machine
+
+For a replacement VM, install the same signed release and preserve the existing
+`/var/lib/ai-agent-runner` data disk. Provision the OS, attach that disk at the same
+path, restore `/etc/ai-agent-runner/worker.env` and `worker-bindings.json` from the
+approved secret/config stores, then run the install and updater steps below. Give the
+replacement a unique `VM_WORKER_ID`; keep the regional engine (`eu-vm-agent-run` for
+France or `rf-vm-agent-run` for Russia). Verify `systemctl`, `/healthz`, `/version`,
+`/readyz`, and a small canary run before pointing the central API at the replacement.
+
+The router currently accepts only one `AGENT_API_WORKERS` entry per engine and rejects
+duplicate engine names. Therefore a second VM in the same region cannot yet be attached
+as a concurrent replica to add capacity. For a replacement, update that one engine's
+`baseUrl` and token in central `AGENT_API_WORKERS`; keep
+`AGENT_API_ENGINE_CHAIN=eu-vm-agent-run,rf-vm-agent-run,azure-dynamic-ip-agent-run`.
+The scheduled GitHub drift check also has one URL/token pair per region, so update the
+matching `EU_VM_WORKER_*` or `RU_VM_WORKER_*` repository secrets to the replacement.
+Adding multiple same-region VMs requires a router change that models endpoints under a
+single regional engine and selects among their health/capacity; do not assign a fake
+engine name to bypass the duplicate check.
+
 Prerequisites: Node.js 20+, systemd, GitHub CLI (`gh`), curl, an authenticated
 read-only GitHub token for release/attestation reads, an installed OpenCode binary,
 outbound access to the configured GCS bucket, and a TLS reverse proxy or equivalent
@@ -57,11 +95,11 @@ through the trusted HTTPS endpoint. Do not put the worker token in command-line 
 Bootstrap from a reviewed checkout and select the immutable release plus region:
 
 ```bash
-sudo scripts/install-vm-worker.sh vm-worker-v0.3.0 france
+sudo scripts/install-vm-worker.sh vm-worker-v0.3.1 france
 sudoedit /etc/ai-agent-runner/worker.env
 sudoedit /etc/ai-agent-runner/worker-bindings.json
 export GH_TOKEN # inject from the operator secret manager, not command history
-sudo --preserve-env=GH_TOKEN /usr/local/sbin/ai-agent-vm-worker-update vm-worker-v0.3.0
+sudo --preserve-env=GH_TOKEN /usr/local/sbin/ai-agent-vm-worker-update vm-worker-v0.3.1
 unset GH_TOKEN
 sudo systemctl enable --now ai-agent-vm-worker
 ```
@@ -75,9 +113,10 @@ Each release is built from a tag that must already be reachable from `main`. Git
 Actions publishes a Linux bundle and SHA-256 checksum, then creates a keyless SLSA
 provenance attestation. The updater checks the checksum, verifies the attestation's
 repository, signer workflow and tag ref, unpacks into a commit-specific directory,
-switches the `current` symlink atomically, restarts systemd, and verifies `/version`.
-If liveness or the source SHA is wrong, it restores the previous symlink and restarts
-the previous release. Do not deploy a checkout or manually replace files in `current`.
+switches the `current` symlink atomically, restarts systemd, and verifies `/version`
+matches the exact source SHA and `/readyz` is healthy. A restart, liveness, readiness,
+or source SHA failure restores the previous symlink and restarts the previous release.
+Do not deploy a checkout or manually replace files in `current`.
 
 Set the region-specific `VM_WORKER_ENGINE` to `eu-vm-agent-run` or `rf-vm-agent-run`.
 Set a unique `VM_WORKER_ID`, public HTTPS origin, a random `VM_WORKER_TOKEN` of at
