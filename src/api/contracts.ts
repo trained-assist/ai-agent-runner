@@ -97,6 +97,7 @@ export interface RunStatusView {
   fencing: { rejected: number };
   /** Текст ответа агента, если воркер его извлёк. */
   answer: string | null;
+  publication?: { status: string; committedRevision: string | null; conflictId: string | null; publicationId: string | null; reason: string | null } | null;
 }
 
 export interface EventsPage {

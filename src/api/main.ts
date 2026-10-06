@@ -7,6 +7,7 @@ import { createAgentApiServer } from './server.js';
 import { AgentApi, type ApiLogger } from './service.js';
 import { loadAgentApiConfig, requireKeyRegistry } from './config.js';
 import { createExternalWorkers } from './workers.js';
+import { createProfileWorkspaceCoordinator } from './profile-workspace.js';
 
 /** Путь журнала приёмных записей: явный env, без значения — дедупликация только в памяти. */
 function admissionLogFile(raw: string | undefined): string | null {
@@ -28,6 +29,17 @@ async function main(): Promise<void> {
   // которые уходят ВОРКЕРУ в каждом ране (envAllowlist). Хостовая настройка API не должна
   // лежать в пуле, который видят агенты, — иначе путь к журналу утекает в каждый ран.
   const admissionLogPath = admissionLogFile(process.env['AGENT_API_ADMISSION_LOG']);
+  const profileRoot = process.env['AGENT_API_PROFILE_WORKSPACE_ROOT']?.trim();
+  if (profileRoot && !admissionLogPath) throw new Error('AGENT_API_ADMISSION_LOG is required with profile workspace');
+  const objectBackend = process.env['AGENT_API_PROFILE_OBJECT_BACKEND']?.trim() ?? 'gcs';
+  if (profileRoot && objectBackend !== 'gcs' && objectBackend !== 'local-fs') throw new Error('AGENT_API_PROFILE_OBJECT_BACKEND must be gcs or local-fs');
+  const profileWorkspace = profileRoot ? createProfileWorkspaceCoordinator({
+    rootDir: profileRoot,
+    owner: process.env['AGENT_API_PROFILE_OWNER']?.trim() ?? '',
+    token: process.env['AGENT_API_PROFILE_GITHUB_TOKEN']?.trim() ?? '',
+    objectBackend: objectBackend as 'gcs' | 'local-fs',
+    env: process.env,
+  }) : undefined;
   if (admissionLogPath) {
     try {
       mkdirSync(dirname(admissionLogPath), { recursive: true, mode: 0o700 });
@@ -45,6 +57,7 @@ async function main(): Promise<void> {
     reconcileDeadlineMs: config.reconcileDeadlineMs,
     ...(config.defaultRepository ? { defaultRepository: config.defaultRepository } : {}),
     ...(admissionLogPath ? { admissionLogPath } : {}),
+    ...(profileWorkspace ? { profileWorkspace } : {}),
   });
   // Раны, принятые воркером до рестарта API, снова под опросом: без этого результат
   // потерян, а повтор клиента с новым ключом завёл бы второй ран.

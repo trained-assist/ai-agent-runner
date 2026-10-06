@@ -100,6 +100,22 @@ export interface RegionConstraints {
 export interface RepositorySpec {
   fullName: string;
   token?: string;
+  /** Profile commit prepared before launch; worker checks out this exact revision. */
+  revision?: string;
+}
+
+export interface ProfileObjectSpec {
+  path: string;
+  key: string;
+  sha256: string;
+  size: number;
+}
+
+export interface ProfileWorkspaceSpec {
+  bindingId: string;
+  objectBucket?: string;
+  artifacts: ProfileObjectSpec[];
+  excludedPatterns: string[];
 }
 
 export const REPOSITORY_TOKEN_MAX_LENGTH = 500;
@@ -156,6 +172,7 @@ export interface RunSpec {
   outputs?: OutputSpec[];
   traceId?: string;
   repository?: RepositorySpec;
+  profileWorkspace?: ProfileWorkspaceSpec;
 }
 
 const TOP_LEVEL_KEYS = [
@@ -182,6 +199,7 @@ const TOP_LEVEL_KEYS = [
   'outputs',
   'traceId',
   'repository',
+  'profileWorkspace',
 ] as const;
 
 const TOP_LEVEL_REQUIRED = [
@@ -344,13 +362,17 @@ function validateOutputs(value: unknown, path: string, collector: ErrorCollector
 
 function validateRepository(value: unknown, path: string, collector: ErrorCollector): RepositorySpec | undefined {
   if (!checkObject(value, path, collector)) return undefined;
-  checkKeys(value, ['fullName', 'token'], ['fullName'], path, collector);
+  checkKeys(value, ['fullName', 'token', 'revision'], ['fullName'], path, collector);
   const repository: RepositorySpec = { fullName: '' };
   checkString(value['fullName'], `${path}.fullName`, collector, 200);
   if (typeof value['fullName'] === 'string' && !isFullRepositoryName(value['fullName'])) {
     collector.push(`${path}.fullName: expected "owner/name" (letters, digits, ".", "_", "-")`);
   }
   if (typeof value['fullName'] === 'string') repository.fullName = value['fullName'];
+  if (value['revision'] !== undefined) {
+    if (typeof value['revision'] !== 'string' || !/^[0-9a-f]{40}$/.test(value['revision'])) collector.push(`${path}.revision: expected commit sha`);
+    else repository.revision = value['revision'];
+  }
   if (value['token'] !== undefined) {
     checkString(value['token'], `${path}.token`, collector, REPOSITORY_TOKEN_MAX_LENGTH);
     if (typeof value['token'] === 'string' && value['token'].length > 0 && value['token'].length <= REPOSITORY_TOKEN_MAX_LENGTH) {
@@ -668,6 +690,33 @@ export function validateRunSpec(input: unknown): ValidationResult<RunSpec> {
     }
   }
 
+  let profileWorkspace: ProfileWorkspaceSpec | undefined;
+  if (input['profileWorkspace'] !== undefined) {
+    const value = input['profileWorkspace'];
+    if (checkObject(value, 'spec.profileWorkspace', collector)) {
+      checkKeys(value, ['bindingId', 'objectBucket', 'artifacts', 'excludedPatterns'], ['bindingId', 'artifacts', 'excludedPatterns'], 'spec.profileWorkspace', collector);
+      checkString(value['bindingId'], 'spec.profileWorkspace.bindingId', collector, 200);
+      if (value['objectBucket'] !== undefined) checkString(value['objectBucket'], 'spec.profileWorkspace.objectBucket', collector, 200);
+      if (!Array.isArray(value['artifacts'])) collector.push('spec.profileWorkspace.artifacts: expected array');
+      else {
+        const artifacts: ProfileObjectSpec[] = [];
+        value['artifacts'].forEach((raw, index) => {
+          const path = `spec.profileWorkspace.artifacts[${index}]`;
+          if (!checkObject(raw, path, collector)) return;
+          checkKeys(raw, ['path', 'key', 'sha256', 'size'], ['path', 'key', 'sha256', 'size'], path, collector);
+          if (!isSafeRelativePath(raw['path'])) collector.push(`${path}.path: expected safe relative path`);
+          if (typeof raw['key'] !== 'string' || !/^profiles\/[A-Za-z0-9._-]+\/workspace\/[A-Za-z0-9._-]+\/[0-9a-f]{64}$/.test(raw['key'])) collector.push(`${path}.key: expected profile object key`);
+          if (typeof raw['sha256'] !== 'string' || !/^[0-9a-f]{64}$/.test(raw['sha256'])) collector.push(`${path}.sha256: expected sha256`);
+          if (typeof raw['size'] !== 'number' || !Number.isSafeInteger(raw['size']) || raw['size'] < 0) collector.push(`${path}.size: expected non-negative integer`);
+          artifacts.push(raw as unknown as ProfileObjectSpec);
+        });
+        if (artifacts.length > 0 && !value['objectBucket']) collector.push('spec.profileWorkspace.objectBucket: required for artifacts');
+        if (!Array.isArray(value['excludedPatterns']) || value['excludedPatterns'].some((entry) => typeof entry !== 'string')) collector.push('spec.profileWorkspace.excludedPatterns: expected string array');
+        profileWorkspace = { bindingId: String(value['bindingId'] ?? ''), ...(value['objectBucket'] ? { objectBucket: String(value['objectBucket']) } : {}), artifacts, excludedPatterns: Array.isArray(value['excludedPatterns']) ? value['excludedPatterns'] as string[] : [] };
+      }
+    }
+  }
+
   if (!collector.ok) return collector.finish(undefined as never);
 
   const spec: RunSpec = {
@@ -695,6 +744,7 @@ export function validateRunSpec(input: unknown): ValidationResult<RunSpec> {
   if (outputs !== undefined) spec.outputs = outputs;
   if (input['traceId'] !== undefined) spec.traceId = input['traceId'] as string;
   if (repository !== undefined) spec.repository = repository;
+  if (profileWorkspace !== undefined) spec.profileWorkspace = profileWorkspace;
 
   return collector.finish(spec);
 }

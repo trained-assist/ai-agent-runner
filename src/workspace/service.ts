@@ -160,6 +160,8 @@ export interface PublishRunBranchInput {
   runId: string;
   /** Имя ветки рана; по умолчанию `agent-run/<runId>`. */
   branch?: string;
+  /** Worker-reported commit; the remote ref must contain exactly this commit. */
+  expectedCommit?: string;
   credentialTokenRef?: string;
 }
 
@@ -598,6 +600,10 @@ export class WorkspaceService {
           }
           const declared = artifacts.get(path);
           if (declared) {
+            if (!declared.key.startsWith(`profiles/${principal.profileId}/workspace/`)) {
+              warnings.push(`skipped ${path}: artifact belongs to another profile`);
+              continue;
+            }
             if (!(await this.verifyArtifact(declared))) {
               warnings.push(`skipped ${path}: artifact is unavailable or does not match its checksum`);
               continue;
@@ -622,6 +628,10 @@ export class WorkspaceService {
           if (manifest.some((item) => item.path === path)) continue;
           if (matchRule(this.policy, path).action === 'exclude') {
             warnings.push(`skipped ${path}: excluded by export policy`);
+            continue;
+          }
+          if (!declared.key.startsWith(`profiles/${principal.profileId}/workspace/`)) {
+            warnings.push(`skipped ${path}: artifact belongs to another profile`);
             continue;
           }
           if (!(await this.verifyArtifact(declared))) {
@@ -911,7 +921,7 @@ export class WorkspaceService {
     const { result } = await this.journal.runOperation({
       operationId: input.operationId,
       method: 'publish_run_branch',
-      payload: { tenantId: input.tenantId, profileId: input.profileId, runId: input.runId, branch: input.branch ?? null },
+      payload: { tenantId: input.tenantId, profileId: input.profileId, runId: input.runId, branch: input.branch ?? null, expectedCommit: input.expectedCommit ?? null },
       execute: async () => {
         const principal = this.principal(input.tenantId, input.profileId, input.credentialTokenRef);
         const binding = await this.requireBinding(principal.tenantId, principal.profileId);
@@ -925,6 +935,22 @@ export class WorkspaceService {
             detail: { branch, repository: binding.repository },
           });
         }
+        if (input.expectedCommit && runCommit !== input.expectedCommit) {
+          throw new WorkspaceError('WORKSPACE_HEAD_CHANGED', `run branch "${branch}" does not match the worker-reported commit`, {
+            detail: { branch, expectedCommit: input.expectedCommit, remoteCommit: runCommit },
+          });
+        }
+        await this.assertRepositoryOwnership(mirror, runCommit, principal);
+        for (const [path, artifact] of await this.readArtifactIndex(mirror, runCommit)) {
+          if (!isSafeRelativePath(path) || !artifact.key.startsWith(`profiles/${principal.profileId}/workspace/`) || !/^[0-9a-f]{64}$/.test(artifact.sha256)) {
+            throw new WorkspaceError('WORKSPACE_PATH_DENIED', 'run branch contains an invalid profile artifact reference', { detail: { path, branch } });
+          }
+          if (!(await this.verifyArtifact(artifact))) {
+            throw new WorkspaceError('WORKSPACE_STORAGE_UNAVAILABLE', `run branch has an unverified object at ${artifact.key}`, {
+              retryable: true, detail: { branch, key: artifact.key },
+            });
+          }
+        }
         const head = await this.git.head(mirror, binding.branch);
         // «Что видел ран» = общий предок головы и ветки рана. Так изменения рана отличаются
         // от того, что успела опубликовать основная ветка за время рана.
@@ -934,6 +960,13 @@ export class WorkspaceService {
         const base = toTreeMap(await this.git.listTree(mirror, baseRevision));
         const runTree = toTreeMap(await this.git.listTree(mirror, runCommit));
         const changes = await buildChangeSet(this.git, mirror, { base, candidate: runTree });
+        for (const change of changes) {
+          if (!META_PATHS.has(change.path) && matchRule(this.policy, change.path).action === 'exclude') {
+            throw new WorkspaceError('WORKSPACE_PATH_DENIED', `run branch changes a path excluded by profile policy: "${change.path}"`, {
+              detail: { path: change.path, branch },
+            });
+          }
+        }
 
         const record = this.newPublication({
           publicationId: this.newId('wspub'),
