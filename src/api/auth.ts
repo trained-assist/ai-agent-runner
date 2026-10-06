@@ -1,5 +1,5 @@
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
-import { existsSync, readFileSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 
 export type Scope = 'runs:read' | 'runs:write';
 
@@ -88,6 +88,9 @@ export class KeyRegistry {
   private readonly byHash = new Map<string, Principal>();
   private readonly profileTenants = new Map<string, string>();
   private readonly principalBindings = new Map<string, string>();
+  private filePath: string | null = null;
+  private fileDigest: string | null = null;
+  private fileSnapshot: KeyRegistry | null = null;
 
   static fromRecords(records: KeyRecord[]): KeyRegistry {
     const registry = new KeyRegistry();
@@ -96,12 +99,44 @@ export class KeyRegistry {
   }
 
   static loadFile(path: string): KeyRegistry {
-    if (!existsSync(path)) return KeyRegistry.fromRecords([]);
-    const parsed = JSON.parse(readFileSync(path, 'utf8')) as RegistryFile;
+    const registry = new KeyRegistry();
+    registry.filePath = path;
+    registry.refreshFile();
+    return registry;
+  }
+
+  /** A file-backed registry swaps complete snapshots between requests. */
+  private current(): KeyRegistry {
+    if (this.filePath === null) return this;
+    this.refreshFile();
+    return this.fileSnapshot!;
+  }
+
+  private refreshFile(): void {
+    const path = this.filePath!;
+    let raw: string | null;
+    try {
+      raw = readFileSync(path, 'utf8');
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+      raw = null;
+    }
+    const digest = raw === null ? 'missing' : createHash('sha256').update(raw).digest('hex');
+    if (this.fileSnapshot !== null && digest === this.fileDigest) return;
+
+    // Parse and validate a fresh snapshot before making it visible. A malformed
+    // replacement invalidates the old snapshot, so a revoked key cannot survive
+    // a failed reload. The next request retries after the file is fixed.
+    this.fileSnapshot = null;
+    const parsed = raw === null ? { schemaVersion: 1, principals: [] } : JSON.parse(raw) as RegistryFile;
     if (typeof parsed !== 'object' || parsed === null || !Array.isArray(parsed.principals)) {
       throw new Error('key registry: file must contain a principals array');
     }
-    return KeyRegistry.fromRecords(parsed.principals.map((entry, index) => parseRecord(entry, index)));
+    const next = KeyRegistry.fromRecords(parsed.principals.map((entry, index) => parseRecord(entry, index)));
+    const wasLoaded = this.fileDigest !== null;
+    this.fileSnapshot = next;
+    this.fileDigest = digest;
+    if (wasLoaded) console.warn(JSON.stringify({ event: 'key_registry_reloaded', keys: next.size() }));
   }
 
   add(record: KeyRecord): void {
@@ -125,7 +160,8 @@ export class KeyRegistry {
   }
 
   size(): number {
-    return this.byHash.size;
+    const current = this.current();
+    return current === this ? this.byHash.size : current.size();
   }
 
   authenticate(authorizationHeader: string | undefined): Principal | null {
@@ -134,6 +170,8 @@ export class KeyRegistry {
     if (!match) return null;
     const key = match[1];
     if (!key) return null;
+    const current = this.current();
+    if (current !== this) return current.authenticate(authorizationHeader);
     const presented = Buffer.from(hashApiKey(key), 'hex');
     for (const [storedHash, principal] of this.byHash) {
       const stored = Buffer.from(storedHash, 'hex');
