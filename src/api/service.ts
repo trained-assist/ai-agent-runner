@@ -7,6 +7,7 @@ import {
   EXTERNAL_WORKER_ADAPTER_VERSION,
   fleetExhaustedFailure,
   isUnacceptedLaunchFailure,
+  logMessage,
   launchFailureCode,
   mapLaunchResult,
   mergeUrl,
@@ -23,6 +24,7 @@ import {
   ResultNotReadyError,
 } from '../adapters/external-worker-adapter.js';
 import type { RunResult } from '../contracts/result.js';
+import { RUNNER_EVENT_SCHEMA_VERSION, type RunnerEvent } from '../contracts/events.js';
 import { PreflightError } from '../contracts/validate.js';
 import { validateRunSpec, type EngineSpec, type InputSpec, type RunSpec } from '../contracts/run-spec.js';
 import { DEFAULT_STATELESS_LIMITS, isTerminalApiState, STATELESS_STORE_SCHEMA_VERSION, StatelessStore, type AdmissionRecord } from './stateless-store.js';
@@ -185,6 +187,7 @@ export class AgentApi {
   private readonly maxActiveRuns: number;
   private readonly inFlight = new Set<string>();
   private readonly resuming = new Set<string>();
+  private readonly liveLogStreams = new Map<string, { controller: AbortController; streams: Set<'stdout' | 'stderr'> }>();
 
   constructor(options: AgentApiOptions) {
     this.opts = options;
@@ -666,6 +669,8 @@ export class AgentApi {
   async dispose(): Promise<void> {
     this.disposed = true;
     this.inFlight.clear();
+    for (const stream of this.liveLogStreams.values()) stream.controller.abort();
+    this.liveLogStreams.clear();
     await Promise.all(this.workers.map(worker => worker.dispose?.()));
   }
 
@@ -697,6 +702,7 @@ export class AgentApi {
       const worker = this.workerFor(entry.engine);
       if (!worker) continue;
       this.store.open(record.runId, record.createdAt, entry.engine);
+      this.startWorkerLogStream(record, worker);
       this.log({ event: 'poll_resumed', runId: record.runId, engine: entry.engine, operationId: record.spec.operationId });
       this.resuming.add(record.runId);
       void this.restoreAndPoll(record, worker);
@@ -770,6 +776,7 @@ export class AgentApi {
       // здесь и терминальным состоянием, новый процесс должен поллер перезапустить —
       // иначе результат потерян, а повтор клиента с новым ключом завёл бы второй ран.
       this.store.appendDispatched(record.runId, accepted.engine, this.nowIso());
+      this.startWorkerLogStream(record, accepted.worker);
       void this.pollUntilTerminal(record, accepted.worker, startedAt);
     } finally {
       this.inFlight.delete(record.runId);
@@ -1035,7 +1042,16 @@ export class AgentApi {
 
   /** Единственное место, где ран становится терминальным. */
   private finalize(record: AdmissionRecord, mapping: LaunchMapping, publication: import('./stateless-store.js').RunProgress['publication'] = null): void {
-    this.store.append(record.runId, mapping.events);
+    const live = this.liveLogStreams.get(record.runId);
+    live?.controller.abort();
+    this.liveLogStreams.delete(record.runId);
+    const filtered = live && live.streams.size > 0
+      ? mapping.events.filter(event => event.type !== 'log' || !live.streams.has(event.payload.stream as 'stdout' | 'stderr'))
+      : mapping.events;
+    const progress = this.store.progressOf(record.runId);
+    let sequence = progress?.sequence ?? 0;
+    const sequenced = filtered.map(event => ({ ...event, sequence: ++sequence }));
+    this.store.append(record.runId, sequenced);
     this.store.complete(record.runId, {
       state: mapping.result.outcome,
       result: mapping.result,
@@ -1046,6 +1062,58 @@ export class AgentApi {
       finishedAt: mapping.result.finishedAt,
       publication,
     });
+  }
+
+  /**
+   * Mirror a VM's replayable log SSE into the central event journal. Reconnect with the
+   * last worker sequence after transport loss; the worker's `end` frame closes the tail.
+   */
+  private startWorkerLogStream(record: AdmissionRecord, worker: ExternalWorker): void {
+    if (!worker.streamLogs || !isRegionalVmEngine(worker.name) || this.liveLogStreams.has(record.runId) || this.disposed) return;
+    const state = { controller: new AbortController(), streams: new Set<'stdout' | 'stderr'>() as Set<'stdout' | 'stderr'> };
+    this.liveLogStreams.set(record.runId, state);
+    void (async () => {
+      let cursor = 0;
+      while (!state.controller.signal.aborted && !this.disposed) {
+        try {
+          const result = await worker.streamLogs!(record.runId, cursor, state.controller.signal, (stream, message, workerSequence) => {
+            cursor = Math.max(cursor, workerSequence);
+            const progress = this.store.progressOf(record.runId);
+            const safeMessage = logMessage(message);
+            if (!progress || isTerminalApiState(progress.state) || safeMessage.length === 0) return;
+            state.streams.add(stream);
+            const event: RunnerEvent = {
+              schemaVersion: RUNNER_EVENT_SCHEMA_VERSION,
+              eventId: newApiId('evt'),
+              runId: record.runId,
+              jobId: record.jobId,
+              userTaskId: record.userTaskId,
+              profileId: record.profileId,
+              ownerGeneration: record.ownerGeneration,
+              sequence: progress.sequence + 1,
+              timestamp: this.nowIso(),
+              type: 'log',
+              payload: { stream, level: 'info', message: safeMessage },
+            };
+            this.store.append(record.runId, [event]);
+          });
+          cursor = Math.max(cursor, result.cursor);
+          if (!result.supported || result.completed) return;
+        } catch (err) {
+          if (state.controller.signal.aborted || this.disposed) return;
+          this.log({ event: 'worker_log_stream_retry', runId: record.runId, cursor, message: err instanceof Error ? err.message : String(err) });
+        }
+        await new Promise<void>(resolve => {
+          const done = (): void => {
+            clearTimeout(timer);
+            state.controller.signal.removeEventListener('abort', done);
+            resolve();
+          };
+          const timer = setTimeout(done, 250);
+          state.controller.signal.addEventListener('abort', done, { once: true });
+        });
+      }
+    })();
   }
 
   private principalFor(record: AdmissionRecord): Principal {

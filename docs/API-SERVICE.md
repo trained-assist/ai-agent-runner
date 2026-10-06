@@ -123,6 +123,12 @@ service account должен читать и записывать объекты
 | `GET /v1/runs/{id}/log` | `302` на ссылку лога в Google Storage |
 | `POST /v1/runs/{id}/cancel` | пробрасывает отмену воркеру; `202` — принята, `200` — уже терминальный |
 
+Для `eu-vm-agent-run` и `rf-vm-agent-run` центральный `/events` также зеркалит stdout/stderr
+из replayable worker SSE, пока агент работает. Worker cursor переживает разрыв соединения,
+а API cursor (`Last-Event-ID` или `?cursor=`) позволяет клиенту продолжить свой поток. При
+финализации уже полученные log streams не добавляются повторно из полного результата. У
+воркеров без этого VM endpoint stdout/stderr остаются доступны в финальных событиях.
+
 Маршрутов ниже больше нет: `/v1/runs/{id}/export`, `/v1/runs/{id}/upload`,
 `/v1/runs/{id}/upload-session/{sid}`, `/v1/runs/{id}/snapshot`,
 `/v1/runs/{id}/snapshot-file/{sid}`, `/v1/artifacts/{id}`, `/v1/release`,

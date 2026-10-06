@@ -221,6 +221,8 @@ describe('repository context: stateless API (#74)', () => {
       resultSink: null,
       deliverResult: async () => ({}) as Response,
       options: {},
+      pushLog: () => undefined,
+      finishLogs: () => undefined,
       lastAuthorization: () => undefined,
       close: async () => undefined,
     });
