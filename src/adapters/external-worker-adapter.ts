@@ -15,6 +15,7 @@ import {
   type ValidationResult,
 } from '../contracts/validate.js';
 import { redactSecrets, truncateLine } from '../redact.js';
+import { parseRemoteMcpServerPolicies, resolveRemoteMcpAttachment, type RemoteMcpAttachment, type RemoteMcpHostOptions } from './remote-mcp.js';
 
 /**
  * Адаптер внешнего воркера (issue #73, epic #74 шаг 2). Единственный способ запустить агента:
@@ -118,6 +119,8 @@ export interface LaunchFailure {
 export type LaunchAnswerSource = 'engine_stdout' | 'agent_file' | null;
 
 export interface LaunchRequest {
+  mcp?: RemoteMcpAttachment['mcp'];
+  mcpSecrets?: RemoteMcpAttachment['mcpSecrets'];
   runId: string;
   jobId: string;
   userTaskId: string;
@@ -219,10 +222,13 @@ export interface WorkerCancelResult {
 
 /** Порт, который использует stateless-ядро API. Реализация — `ExternalWorkerAdapter`. */
 export interface ExternalWorker {
+  dispose?(): Promise<void>;
+  readonly remoteMcpEnabled?: boolean;
   readonly name: string;
   readonly baseUrl: string | null;
   /** Квитанция запуска, а не финальный результат (асинхронный контракт, #73). */
-  launch(spec: RunSpec): Promise<LaunchReceipt>;
+  launch(spec: RunSpec, admittedAt?: string): Promise<LaunchReceipt>;
+  restoreMcp?(spec: RunSpec, admittedAt: string): Promise<void>;
   status(runId: string): Promise<WorkerStatusView>;
   result(runId: string): Promise<LaunchResult>;
   cancel(runId: string): Promise<WorkerCancelResult>;
@@ -251,6 +257,7 @@ function checkText(value: unknown, path: string, collector: ErrorCollector, maxL
 }
 
 export interface ExternalWorkerOptions {
+  remoteMcp?: RemoteMcpHostOptions;
   baseUrl: string;
   /** Публичный адрес нашего API: воркер шлёт результат на callback resultUrl. */
   baseUrlForResult?: string;
@@ -376,8 +383,11 @@ export function mergeUrl(repo: LaunchRepo): string {
  */
 export function launchRequestFromSpec(
   spec: RunSpec,
-  options: { env?: Record<string, string>; resultUrl: string } = { resultUrl: '' },
+  options: { env?: Record<string, string>; resultUrl: string; remoteMcpAttachment?: RemoteMcpAttachment } = { resultUrl: '' },
 ): LaunchRequest {
+  if (spec.mcp?.servers.length && !options.remoteMcpAttachment) {
+    throw new PreflightError('MCP_HOST_POLICY_MISSING', 'remote MCP requires trusted host resolution', { failureClass: 'preflight', retryable: false });
+  }
   if (spec.input?.refs && spec.input.refs.length > 0) {
     throw new PreflightError('INPUT_REFS_UNSUPPORTED', 'input.refs require a durable workspace; the stateless API passes the prompt inline only', {
       failureClass: 'preflight',
@@ -443,6 +453,7 @@ export function launchRequestFromSpec(
     ...(spec.repository?.token !== undefined ? { publicationToken: spec.repository.token } : {}),
     resultUrl: options.resultUrl,
     isolation: { mode: spec.isolation?.mode ?? 'none' },
+    ...options.remoteMcpAttachment,
     ...(outputs.length > 0 ? { outputs } : {}),
   };
 }
@@ -938,6 +949,11 @@ export function fleetExhaustedFailure(
 }
 
 export class ExternalWorkerAdapter implements ExternalWorker {
+  async dispose(): Promise<void> {
+    await this.remoteMcp?.resolveBinding.dispose?.();
+  }
+  readonly remoteMcpEnabled: boolean;
+  private readonly remoteMcp: RemoteMcpHostOptions | undefined;
   readonly name: string;
   readonly baseUrl: string | null;
   private readonly token: string | undefined;
@@ -951,6 +967,11 @@ export class ExternalWorkerAdapter implements ExternalWorker {
   private baseUrlForResult: string | undefined;
 
   constructor(options: ExternalWorkerOptions) {
+    this.remoteMcp = options.remoteMcp ? {
+      servers: parseRemoteMcpServerPolicies(JSON.stringify(options.remoteMcp.servers)),
+      resolveBinding: options.remoteMcp.resolveBinding,
+    } : undefined;
+    this.remoteMcpEnabled = Object.keys(this.remoteMcp?.servers ?? {}).length > 0;
     this.name = options.engineName ?? EXTERNAL_WORKER_ENGINE;
     this.baseUrl = options.baseUrl;
     this.token = options.token;
@@ -966,7 +987,24 @@ export class ExternalWorkerAdapter implements ExternalWorker {
     this.baseUrlForResult = options.baseUrlForResult;
   }
 
-  async launch(spec: RunSpec): Promise<LaunchReceipt> {
+  async restoreMcp(spec: RunSpec, admittedAt: string): Promise<void> {
+    await this.resolveMcp(spec, 'restore', admittedAt);
+  }
+
+  private async resolveMcp(spec: RunSpec, mode: 'launch' | 'restore', admittedAt: string): Promise<RemoteMcpAttachment | undefined> {
+    const bindingController = new AbortController();
+    return withTimeout(
+      resolveRemoteMcpAttachment(spec, this.remoteMcp, this.now(), bindingController.signal, mode, admittedAt),
+      Math.min(this.deadlineMs, spec.limits.timeoutMs),
+      'trusted MCP binding resolution',
+      () => bindingController.abort(),
+    ).catch(error => {
+      if (error instanceof PreflightError) throw error;
+      throw new PreflightError('MCP_BINDING_UNAVAILABLE', 'trusted MCP binding resolution failed', { failureClass: 'preflight', retryable: false });
+    });
+  }
+
+  async launch(spec: RunSpec, admittedAt = this.now().toISOString()): Promise<LaunchReceipt> {
     const base = this.baseUrl;
     if (!base) {
       throw new PreflightError('WORKER_NOT_CONFIGURED', 'no external worker URL is configured for this engine', {
@@ -974,7 +1012,9 @@ export class ExternalWorkerAdapter implements ExternalWorker {
         retryable: false,
       });
     }
-    const request = launchRequestFromSpec(spec, { env: this.env, resultUrl: this.resultUrlFor(spec) });
+    const remoteMcpAttachment = spec.mcp?.servers.length ? await this.resolveMcp(spec, 'launch', admittedAt) : undefined;
+    const request = launchRequestFromSpec(spec, { env: this.env, resultUrl: this.resultUrlFor(spec), remoteMcpAttachment });
+    const redactAttachment = (value: string): string => Object.values(remoteMcpAttachment?.mcpSecrets ?? {}).reduce((safe, secret) => safe.split(secret).join('[REDACTED]'), value);
     const url = `${trimTrailingSlash(base)}/v1/launch`;
     const headers: Record<string, string> = { 'content-type': 'application/json' };
     if (this.token) headers['authorization'] = `Bearer ${this.token}`;
@@ -997,7 +1037,7 @@ export class ExternalWorkerAdapter implements ExternalWorker {
       // Обрываем запрос только по таймауту: abort после успешного ответа убил бы тело,
       // которое мы ещё не прочитали.
       if (controller.signal.aborted) controller.abort();
-      this.log({ event: 'worker_launch_failed', runId: spec.runId, message: err instanceof Error ? err.message : String(err) });
+      this.log({ event: 'worker_launch_failed', runId: spec.runId, message: redactAttachment(err instanceof Error ? err.message : String(err)) });
       throw new PreflightError('WORKER_LAUNCH_UNREACHABLE', 'the external worker did not accept the run', {
         failureClass: 'runtime',
         // Ран не принят — никто его не выполняет, поэтому повтор не создаст второй.
@@ -1005,7 +1045,7 @@ export class ExternalWorkerAdapter implements ExternalWorker {
       });
     }
     if (!response.ok) {
-      const detail = truncateLine(redactSecrets(await readBody(response)), 300);
+      const detail = truncateLine(redactSecrets(redactAttachment(await readBody(response))), 300);
       this.log({ event: 'worker_launch_http_error', runId: spec.runId, status: response.status, detail });
       throw new PreflightError('WORKER_HTTP_ERROR', `the external worker answered ${response.status} on launch`, {
         failureClass: 'runtime',

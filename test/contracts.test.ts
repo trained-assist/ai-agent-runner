@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { RUNNER_EVENT_TYPES, validateRunnerEvent, type RunnerEventType } from '../src/contracts/events.js';
 import { validateRunResult } from '../src/contracts/result.js';
 import { validateRunSpec } from '../src/contracts/run-spec.js';
+import { validateSubmitRequest } from '../src/api/contracts.js';
 
 function validSpec(over: Record<string, unknown> = {}): Record<string, unknown> {
   return {
@@ -130,6 +131,32 @@ function validResult(over: Record<string, unknown> = {}): Record<string, unknown
 }
 
 describe('validateRunSpec', () => {
+  it('preserves multiline CSV and context through RunSpec and submit validation', () => {
+    const inlinePrompt = 'Исходные CSV:\r\ncategory,amount\r\nfood,100\nfood,50\n\nContext:\tkeep original rows\rnext line';
+    const spec = validateRunSpec(validSpec({ input: { inlinePrompt } }));
+    expect(spec.ok).toBe(true);
+    if (spec.ok) expect(spec.value.input?.inlinePrompt).toBe(inlinePrompt);
+    const submit = validateSubmitRequest({ engine: { name: 'dynamic-ip-azure-agent-run', adapterVersion: '1' }, limits: { timeoutMs: 5000 }, input: { inlinePrompt } });
+    expect(submit.ok).toBe(true);
+    if (submit.ok) expect(submit.value.input?.inlinePrompt).toBe(inlinePrompt);
+  });
+
+  it.each(Array.from({ length: 160 }, (_, code) => code).filter(code => (code < 32 && ![9, 10, 13].includes(code)) || code >= 127))('rejects other prompt control character %i', (code) => {
+    const result = validateRunSpec(validSpec({ input: { inlinePrompt: `before${String.fromCharCode(code)}after` } }));
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.errors).toContain('spec.input.inlinePrompt: control characters are not allowed');
+  });
+
+  it.each(['', 'text'.repeat(25001), 42, null])('retains prompt type, nonempty, and size checks', (inlinePrompt) => {
+    expect(validateRunSpec(validSpec({ input: { inlinePrompt } })).ok).toBe(false);
+  });
+
+  it.each(['\n', '\r', '\t'])('keeps ID, path, and ref validation strict for %j', (control) => {
+    expect(validateRunSpec(validSpec({ userTaskId: `task${control}id` })).ok).toBe(false);
+    expect(validateRunSpec(validSpec({ outputs: [{ path: `out/${control}file.csv` }] })).ok).toBe(false);
+    expect(validateRunSpec(validSpec({ input: { refs: [{ ref: `blob:${control}ref` }] } })).ok).toBe(false);
+  });
+
   it('accepts a minimal valid spec', () => {
     const result = validateRunSpec(validSpec());
     expect(result.ok).toBe(true);

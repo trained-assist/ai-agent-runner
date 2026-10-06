@@ -75,11 +75,11 @@ async function main(): Promise<void> {
 
   let stopping = false;
   let stopped = false;
-  const finish = (): void => {
+  const finish = async (): Promise<void> => {
     if (stopped) return;
     stopped = true;
     clearInterval(sweeper);
-    service.dispose();
+    await service.dispose();
     log({ event: 'stopped' });
     process.exit(0);
   };

@@ -176,6 +176,7 @@ export class AgentApi {
   private disposed = false;
   private readonly maxActiveRuns: number;
   private readonly inFlight = new Set<string>();
+  private readonly resuming = new Set<string>();
 
   constructor(options: AgentApiOptions) {
     this.opts = options;
@@ -218,6 +219,12 @@ export class AgentApi {
       throw new ApiError('INVALID_REQUEST', `invalid submit body: ${bodyResult.errors.join('; ')}`, { errors: bodyResult.errors });
     }
     const request = bodyResult.value;
+    const testRegistryRequested = request.mcp?.servers.some(server => server.transport === 'remote' &&
+      (server.serverId === 'trained-assist-registry-test' || server.bindingRef === 'registry-mcp-test-160-read')) ?? false;
+    if ((testRegistryRequested || principal.profileId === 'integration-telegram-ux-v1') &&
+        (principal.profileId !== 'integration-telegram-ux-v1' || principal.principalId !== 'integration-telegram-ux-v1')) {
+      throw new ApiError('FORBIDDEN', 'test registry MCP requires the pinned integration principal and profile');
+    }
     if (this.opts.profileWorkspace && request.repository !== undefined) {
       throw new ApiError('INVALID_REPOSITORY', 'repository is selected by the authenticated profile binding');
     }
@@ -590,10 +597,10 @@ export class AgentApi {
       cancel: { requestedReceipt: true, terminalConfirmation: true },
       mcp: {
         perRunStdioProxy: false,
-        scopedBindings: false,
+        scopedBindings: this.workers.some(worker => worker.remoteMcpEnabled),
         capabilityHandlersSharedWithMcp: false,
         capabilityInvokeEndpoint: false,
-        remoteTransport: 'absent',
+        remoteTransport: this.workers.some(worker => worker.remoteMcpEnabled) ? 'worker_remote' : 'absent',
         osIsolation: 'not_proven_service_uid_only',
         osIsolationNote: 'the API host runs no agent process: OS isolation is the external worker responsibility, and the worker declares it per run',
       },
@@ -648,9 +655,10 @@ export class AgentApi {
     };
   }
 
-  dispose(): void {
+  async dispose(): Promise<void> {
     this.disposed = true;
     this.inFlight.clear();
+    await Promise.all(this.workers.map(worker => worker.dispose?.()));
   }
 
   /**
@@ -673,6 +681,7 @@ export class AgentApi {
     for (const entry of this.store.dispatchedRuns()) {
       const record = this.store.getByRun(entry.runId);
       if (!record) continue;
+      if (this.resuming.has(record.runId)) continue;
       const progress = this.store.progressOf(entry.runId);
       if (progress && isTerminalApiState(progress.state)) continue;
       // Движок берём из отметки о приёме, а не из заявки: ран мог быть принят вторым
@@ -681,10 +690,34 @@ export class AgentApi {
       if (!worker) continue;
       this.store.open(record.runId, record.createdAt, entry.engine);
       this.log({ event: 'poll_resumed', runId: record.runId, engine: entry.engine, operationId: record.spec.operationId });
-      void this.pollUntilTerminal(record, worker, this.nowIso());
+      this.resuming.add(record.runId);
+      void this.restoreAndPoll(record, worker);
       resumed += 1;
     }
     return resumed;
+  }
+
+  private async restoreAndPoll(record: AdmissionRecord, worker: ExternalWorker): Promise<void> {
+    try {
+      if (record.spec.mcp?.servers.some(server => server.transport === 'remote')) {
+        const status = (await worker.status(record.runId)).status;
+        if (this.disposed) return;
+        if (status === 'succeeded' || status === 'failed' || status === 'cancelled') {
+          await this.collectResult(record, worker, record.createdAt);
+          return;
+        }
+        if (!worker.restoreMcp) throw new Error('MCP_RESTORE_UNSUPPORTED');
+        await worker.restoreMcp(record.spec, record.createdAt);
+      }
+      if (!this.disposed) await this.pollUntilTerminal(record, worker, record.createdAt);
+    } catch {
+      if (!this.disposed) {
+        this.log({ event: 'mcp_restore_refused', runId: record.runId, reason: 'existing_scope_or_domain_unavailable' });
+        this.markUnknown(record, 'mcp_restore_tool_outcome_unknown');
+      }
+    } finally {
+      this.resuming.delete(record.runId);
+    }
   }
 
   private async execute(record: AdmissionRecord): Promise<void> {
@@ -1069,6 +1102,7 @@ private buildSpec(
     if (request.deadline !== undefined) spec.deadline = request.deadline;
     if (request.regionConstraints !== undefined) spec.regionConstraints = request.regionConstraints;
     if (request.credentialBindings !== undefined) spec.credentialBindings = request.credentialBindings;
+    if (request.mcp !== undefined) spec.mcp = request.mcp;
     if (request.budget !== undefined) spec.budget = request.budget;
     if (request.result !== undefined) spec.result = request.result;
     if (request.outputs !== undefined) spec.outputs = request.outputs;

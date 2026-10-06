@@ -61,7 +61,7 @@ export interface CredentialBinding {
  * `bindingRef` обязан быть объявлен в `credentialBindings` рана; значение binding'а
  * остаётся в процессе хоста и в дочерний процесс не передаётся.
  */
-export interface McpServerSpec {
+export interface McpStdioServerSpec {
   serverId: string;
   transport: 'stdio';
   command: string;
@@ -72,6 +72,19 @@ export interface McpServerSpec {
   readinessTimeoutMs?: number;
   toolTimeoutMs?: number;
 }
+
+export interface McpRemoteServerSpec {
+  serverId: string;
+  transport: 'remote';
+  url: string;
+  bindingRef: string;
+  allowedTools: string[];
+  policyVersion?: string;
+  catalogueVersion?: string;
+  toolTimeoutMs?: number;
+}
+
+export type McpServerSpec = McpStdioServerSpec | McpRemoteServerSpec;
 
 export interface McpSpec {
   servers: McpServerSpec[];
@@ -319,8 +332,16 @@ function validateInput(value: unknown, path: string, collector: ErrorCollector):
     }
   }
   if (value['inlinePrompt'] !== undefined) {
-    checkString(value['inlinePrompt'], `${path}.inlinePrompt`, collector, 100_000);
-    if (typeof value['inlinePrompt'] === 'string') input.inlinePrompt = value['inlinePrompt'];
+    const prompt = value['inlinePrompt'];
+    if (typeof prompt !== 'string' || prompt.length === 0) {
+      collector.push(`${path}.inlinePrompt: expected non-empty string`);
+    } else {
+      if (prompt.length > 100_000) collector.push(`${path}.inlinePrompt: longer than 100000`);
+      if (/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/.test(prompt)) {
+        collector.push(`${path}.inlinePrompt: control characters are not allowed`);
+      }
+      input.inlinePrompt = prompt;
+    }
   }
   return input;
 }
@@ -416,28 +437,51 @@ function validateMcpTimeout(value: unknown, path: string, collector: ErrorCollec
   return value;
 }
 
+export function isRemoteMcpUrl(value: unknown): value is string {
+  if (typeof value !== 'string' || value.length > 2000) return false;
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:' && !url.username && !url.password && !url.search && !url.hash;
+  } catch {
+    return false;
+  }
+}
+
 function validateMcpServer(value: unknown, path: string, collector: ErrorCollector): McpServerSpec | undefined {
   if (!checkObject(value, path, collector)) return undefined;
+  const remote = value['transport'] === 'remote';
   checkKeys(
     value,
-    ['serverId', 'transport', 'command', 'args', 'envAllowlist', 'bindingRef', 'allowedTools', 'readinessTimeoutMs', 'toolTimeoutMs'],
-    ['serverId', 'transport', 'command', 'allowedTools'],
+    remote
+      ? ['serverId', 'transport', 'url', 'bindingRef', 'allowedTools', 'policyVersion', 'catalogueVersion', 'toolTimeoutMs']
+      : ['serverId', 'transport', 'command', 'args', 'envAllowlist', 'bindingRef', 'allowedTools', 'readinessTimeoutMs', 'toolTimeoutMs'],
+    remote ? ['serverId', 'transport', 'url', 'bindingRef', 'allowedTools'] : ['serverId', 'transport', 'command', 'allowedTools'],
     path,
     collector,
   );
-  const server: McpServerSpec = { serverId: '', transport: 'stdio', command: '', allowedTools: [] };
+  const server: McpServerSpec = remote
+    ? { serverId: '', transport: 'remote', url: '', bindingRef: '', allowedTools: [] }
+    : { serverId: '', transport: 'stdio', command: '', allowedTools: [] };
 
   checkSafeId(value['serverId'], `${path}.serverId`, collector);
   if (typeof value['serverId'] === 'string') server.serverId = value['serverId'];
 
-  if (value['transport'] !== 'stdio') {
-    collector.push(`${path}.transport: expected "stdio" (remote domain services are shared services, not per-run processes)`);
+  if (server.transport === 'remote') {
+    if (!isRemoteMcpUrl(value['url'])) collector.push(`${path}.url: expected an HTTPS URL without credentials, query or fragment`);
+    else server.url = value['url'];
+    for (const field of ['policyVersion', 'catalogueVersion'] as const) {
+      if (value[field] !== undefined) {
+        checkString(value[field], `${path}.${field}`, collector, 200);
+        if (typeof value[field] === 'string') server[field] = value[field];
+      }
+    }
+  } else {
+    if (value['transport'] !== 'stdio') collector.push(`${path}.transport: expected "stdio" | "remote"`);
+    checkString(value['command'], `${path}.command`, collector, 512);
+    if (typeof value['command'] === 'string') server.command = value['command'];
   }
 
-  checkString(value['command'], `${path}.command`, collector, 512);
-  if (typeof value['command'] === 'string') server.command = value['command'];
-
-  if (value['args'] !== undefined) {
+  if (server.transport === 'stdio' && value['args'] !== undefined) {
     const args = value['args'];
     if (checkArray(args, `${path}.args`, collector)) {
       if (args.length > 32) collector.push(`${path}.args: too many entries`);
@@ -450,7 +494,7 @@ function validateMcpServer(value: unknown, path: string, collector: ErrorCollect
     }
   }
 
-  if (value['envAllowlist'] !== undefined) {
+  if (server.transport === 'stdio' && value['envAllowlist'] !== undefined) {
     const names = value['envAllowlist'];
     if (checkArray(names, `${path}.envAllowlist`, collector)) {
       if (names.length > 50) collector.push(`${path}.envAllowlist: too many entries`);
@@ -466,7 +510,7 @@ function validateMcpServer(value: unknown, path: string, collector: ErrorCollect
     }
   }
 
-  if (value['bindingRef'] !== undefined) {
+  if (remote || value['bindingRef'] !== undefined) {
     checkString(value['bindingRef'], `${path}.bindingRef`, collector, 300);
     if (typeof value['bindingRef'] === 'string') server.bindingRef = value['bindingRef'];
   }
@@ -492,7 +536,8 @@ function validateMcpServer(value: unknown, path: string, collector: ErrorCollect
   for (const key of ['readinessTimeoutMs', 'toolTimeoutMs'] as const) {
     if (value[key] === undefined) continue;
     const timeout = validateMcpTimeout(value[key], `${path}.${key}`, collector);
-    if (timeout !== undefined) server[key] = timeout;
+    if (timeout !== undefined && key === 'toolTimeoutMs') server.toolTimeoutMs = timeout;
+    else if (timeout !== undefined && server.transport === 'stdio') server.readinessTimeoutMs = timeout;
   }
 
   return server;
@@ -648,7 +693,7 @@ export function validateRunSpec(input: unknown): ValidationResult<RunSpec> {
     if (mcp && credentialBindings) {
       const declared = new Set(credentialBindings.filter((binding) => binding.ref !== '').map((binding) => binding.ref));
       mcp.servers.forEach((server, i) => {
-        if (!server.bindingRef) return;
+        if (!server.bindingRef || server.transport === 'remote') return;
         if (!declared.has(server.bindingRef)) {
           collector.push(`spec.mcp.servers[${i}].bindingRef: "${server.bindingRef}" is not declared in spec.credentialBindings`);
         }

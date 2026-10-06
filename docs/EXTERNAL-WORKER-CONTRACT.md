@@ -139,8 +139,6 @@ GET {worker}/v1/runs/{runId}/result   → LaunchResult | 409 (ещё не гот
 
 `status`: `accepted | running | succeeded | failed | cancelled | unknown`.
 
-<<<<<<< HEAD
-=======
 **Что уже учтено по боевой приёмке (04.10.2026, шлюз 136.65.7.197:8080):**
 
 - `LaunchResult.pid` — **необязателен**: агент в GitHub Actions запущен на другой машине,
@@ -153,7 +151,6 @@ GET {worker}/v1/runs/{runId}/result   → LaunchResult | 409 (ещё не гот
 - `status` в `LaunchResult` — `started | failed` про **запуск движка**, а не про исход рана;
   исход несут `exitReason`/`failure`.
 
->>>>>>> 01d3645 (feat(worker): github-actions-agent-run — дефолтный движок)
 `unknown` — исход, который нельзя установить (обрыв связи, смерть воркера без
 финализации). Это **не** `failed`: задача не теряется, авто-rerun не происходит,
 следующий шаг — reconcile существующего запуска.
