@@ -80,7 +80,7 @@ export interface InputsMaterializedEvent extends EventEnvelope {
     bytes: number;
     entries: Array<{
       ref: string;
-      snapshotId: string;
+      snapshotId?: string;
       status: 'materialized' | 'refused' | 'unavailable';
       code: string | null;
       files: number;
@@ -315,12 +315,12 @@ function validatePayload(type: RunnerEventType, value: unknown, path: string, co
         checkKeys(
           entry,
           ['ref', 'snapshotId', 'status', 'code', 'files', 'bytes', 'reason'],
-          ['ref', 'snapshotId', 'status'],
+          ['ref', 'status'],
           entryPath,
           collector,
         );
         checkString(entry['ref'], `${entryPath}.ref`, collector, 500);
-        checkString(entry['snapshotId'], `${entryPath}.snapshotId`, collector, 200);
+        if (entry['snapshotId'] !== undefined) checkString(entry['snapshotId'], `${entryPath}.snapshotId`, collector, 200);
         if (entry['status'] !== 'materialized' && entry['status'] !== 'refused' && entry['status'] !== 'unavailable') {
           collector.push(`${entryPath}.status: expected materialized | refused | unavailable`);
         }

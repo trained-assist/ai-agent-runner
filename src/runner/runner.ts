@@ -1144,7 +1144,33 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
   private async materializeInputs(st: PersistedRunState): Promise<void> {
     const refs = st.spec.input?.refs ?? [];
     const materializer = this.opts.inputs;
-    if (refs.every((ref) => ref.snapshotId === undefined)) {
+    const unresolved = refs.filter((ref) => ref.snapshotId === undefined);
+    if (unresolved.length > 0) {
+      const reason = `run ${st.runId} requests input refs that this worker cannot resolve: [${unresolved.map((ref) => ref.ref).join(', ')}]`;
+      this.emit(st, 'inputs_materialized', {
+        status: 'refused',
+        declared: refs.length,
+        requested: refs.length,
+        files: 0,
+        bytes: 0,
+        entries: unresolved.map((ref) => ({
+          ref: ref.ref,
+          status: 'refused',
+          code: 'MATERIALIZE_REF_INVALID',
+          files: 0,
+          bytes: 0,
+          reason,
+        })),
+        reason,
+      });
+      this.emit(st, 'log', {
+        stream: 'runner',
+        level: 'error',
+        message: `inputs.materialize_refused runId=${st.runId} status=refused retryable=false reason=${truncateLine(redactSecrets(reason), 300)}`,
+      });
+      throw new PreflightError('MATERIALIZE_REF_INVALID', reason, { retryable: false });
+    }
+    if (refs.length === 0) {
       if (materializer) {
         this.emit(st, 'inputs_materialized', emptyInputReceipt(st, refs.length));
       }
