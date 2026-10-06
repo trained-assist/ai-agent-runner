@@ -75,6 +75,12 @@ describe('launch request: RunSpec → LaunchRequest (issue #73)', () => {
     expect(JSON.stringify(request)).not.toContain('nope');
   });
 
+  it('подставляет положительные лимиты, когда клиент их не задал', () => {
+    const spec = makeRunSpec({ input: { inlinePrompt: 'проверка' }, limits: { timeoutMs: 300_000 } });
+    const request = launchRequestFromSpec(spec);
+    expect(request.limits).toEqual({ timeoutMs: 300_000, maxOutputBytes: 5_000_000, maxLogBytes: 5_000_000 });
+  });
+
   it('input.refs — preflight-отказ: stateless API нечего материализовать', () => {
     const spec = makeRunSpec({ input: { refs: [{ ref: 'snap-1', snapshotId: 'snapshot-1' }] } });
     try {
