@@ -104,6 +104,16 @@ describe('submit contract validation', () => {
     expect(result.value.limits).toEqual({ timeoutMs: 5000 });
   });
 
+  it('accepts multiline instructions while rejecting non-text control characters', () => {
+    const multiline = validateSubmitRequest({ ...validBody, instructions: 'Context:\n- first\r\n- second\tkeep spacing' });
+    expect(multiline.ok).toBe(true);
+    if (multiline.ok) expect(multiline.value.instructions).toBe('Context:\n- first\r\n- second\tkeep spacing');
+
+    const invalid = validateSubmitRequest({ ...validBody, instructions: 'before\u0001after' });
+    expect(invalid.ok).toBe(false);
+    if (!invalid.ok) expect(invalid.errors).toContain('request.instructions: control characters are not allowed');
+  });
+
   it('validates only the immutable ingress manifest pin and rejects snapshot-ref mixing', () => {
     const ingressManifest = { contractVersion: 1, manifestRef: 'cp-input-manifest:task-1', manifestVersion: 'a'.repeat(64) };
     const accepted = validateSubmitRequest({ ...validBody, ingressManifest });

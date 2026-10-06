@@ -117,6 +117,19 @@ export function checkString(value: unknown, path: string, collector: ErrorCollec
   }
 }
 
+export function checkText(value: unknown, path: string, collector: ErrorCollector, maxLen = 400): void {
+  if (typeof value !== 'string' || value.length === 0) {
+    collector.push(`${path}: expected non-empty string`);
+    return;
+  }
+  if (value.length > maxLen) {
+    collector.push(`${path}: longer than ${maxLen}`);
+  }
+  if (/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(value)) {
+    collector.push(`${path}: control characters are not allowed`);
+  }
+}
+
 export function checkSafeId(value: unknown, path: string, collector: ErrorCollector): void {
   if (!isSafeId(value)) {
     collector.push(`${path}: expected id matching ${SAFE_ID.source}`);
