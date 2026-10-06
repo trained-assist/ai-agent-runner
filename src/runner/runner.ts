@@ -24,6 +24,7 @@ import { RunExportStore, type PlannedOutput } from '../storage/export.js';
 import type { UploadSessionStore } from '../storage/upload-session.js';
 import type { WorkspaceSnapshotStore } from '../storage/workspace-snapshot.js';
 import { InputMaterializer, type MaterializeReceipt } from '../storage/input-materializer.js';
+import { materializeIngressManifest, type IngressArtifactResolver } from '../storage/ingress-artifact.js';
 import { artifactNameFor, mimeForName } from '../storage/export-manifest.js';
 import type { RunExportManifest } from '../storage/export-manifest.js';
 import { isRegularFile, resolveExistingInsideRoot } from '../storage/local-paths.js';
@@ -110,6 +111,8 @@ export interface RunnerOptions {
    * а ран получает отказ с причиной и признаком повторяемости.
    */
   inputs?: InputMaterializer;
+  /** Private task-scoped Control Plane resolver. Credentials belong to deployment config only. */
+  ingressResolver?: IngressArtifactResolver;
   /**
    * Реестр capability handler'ов хоста (P13). Один и тот же реестр обслуживает вызовы MCP
    * ран'а и внутренний API control plane — бизнес-логика домена не дублируется в транспортах.
@@ -1167,7 +1170,7 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
       stripRepositoryToken(st.spec);
     }
     await this.materializeInputs(st);
-    this.emit(st, 'materialized', { inputs: st.spec.input?.refs?.length ?? 0 });
+    this.emit(st, 'materialized', { inputs: (st.spec.input?.refs?.length ?? 0) + (st.spec.ingressManifest ? 1 : 0) });
   }
 
   /**
@@ -1182,7 +1185,72 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
   private async materializeInputs(st: PersistedRunState): Promise<void> {
     const refs = st.spec.input?.refs ?? [];
     const materializer = this.opts.inputs;
-    if (refs.every((ref) => ref.snapshotId === undefined)) {
+    const ingress = st.spec.ingressManifest;
+    if (ingress) {
+      if (refs.length > 0) throw new PreflightError('INGRESS_INPUT_INVALID', 'ingress manifests cannot be combined with workspace snapshots');
+      if (!this.opts.ingressResolver) {
+        const reason = 'run requests a task-scoped ingress manifest, but this worker has no Control Plane resolver configured';
+        this.emit(st, 'inputs_materialized', { status: 'refused', declared: 1, requested: 1, files: 0, bytes: 0, entries: [], reason });
+        throw new PreflightError('INGRESS_INPUT_INVALID', reason, { retryable: false });
+      }
+      try {
+        const receipt = await materializeIngressManifest(this.opts.ingressResolver, ingress, {
+          runId: st.runId,
+          userTaskId: st.userTaskId,
+          profileId: st.profileId,
+          ownerGeneration: st.ownerGeneration,
+          cwd: st.spec.cwd,
+        });
+        this.emit(st, 'inputs_materialized', {
+          status: 'materialized', declared: receipt.artifactCount, requested: receipt.artifactCount,
+          files: receipt.files, bytes: receipt.bytes,
+          entries: receipt.artifacts.map((artifact) => ({ ref: artifact.ref, status: 'materialized' as const, code: null, files: 1, bytes: artifact.bytes, reason: null })), reason: null,
+        });
+        this.emit(st, 'log', {
+          stream: 'runner', level: 'info',
+          message: `inputs.ingress_materialized runId=${st.runId} artifacts=${receipt.artifactCount} files=${receipt.files} bytes=${receipt.bytes}`,
+        });
+        return;
+      } catch (error) {
+        const code = error instanceof PreflightError ? error.code : 'INGRESS_INPUT_UNAVAILABLE';
+        const retryable = error instanceof PreflightError ? error.retryable : true;
+        const reason = error instanceof Error ? error.message : 'Control Plane ingress materialization failed';
+        const status = retryable ? 'unavailable' : 'refused';
+        this.emit(st, 'inputs_materialized', { status, declared: 1, requested: 1, files: 0, bytes: 0, entries: [], reason });
+        this.emit(st, 'log', {
+          stream: 'runner', level: 'error',
+          message: `inputs.ingress_${status} runId=${st.runId} code=${code} retryable=${retryable} reason=${truncateLine(redactSecrets(reason), 300)}`,
+        });
+        throw error instanceof PreflightError ? error : new PreflightError(code, reason, { retryable });
+      }
+    }
+    const unresolved = refs.filter((ref) => ref.snapshotId === undefined);
+    if (unresolved.length > 0) {
+      const reason = `run ${st.runId} requests input refs that this worker cannot resolve: [${unresolved.map((ref) => ref.ref).join(', ')}]`;
+      this.emit(st, 'inputs_materialized', {
+        status: 'refused',
+        declared: refs.length,
+        requested: refs.length,
+        files: 0,
+        bytes: 0,
+        entries: unresolved.map((ref) => ({
+          ref: ref.ref,
+          status: 'refused',
+          code: 'MATERIALIZE_REF_INVALID',
+          files: 0,
+          bytes: 0,
+          reason,
+        })),
+        reason,
+      });
+      this.emit(st, 'log', {
+        stream: 'runner',
+        level: 'error',
+        message: `inputs.materialize_refused runId=${st.runId} status=refused retryable=false reason=${truncateLine(redactSecrets(reason), 300)}`,
+      });
+      throw new PreflightError('MATERIALIZE_REF_INVALID', reason, { retryable: false });
+    }
+    if (refs.length === 0) {
       if (materializer) {
         this.emit(st, 'inputs_materialized', emptyInputReceipt(st, refs.length));
       }

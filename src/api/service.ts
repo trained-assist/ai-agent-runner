@@ -1140,6 +1140,15 @@ private buildSpec(
     if (request.repository !== undefined) spec.repository = request.repository;
     else if (this.opts.defaultRepository !== undefined) spec.repository = { fullName: this.opts.defaultRepository };
     if (request.isolation !== undefined) spec.isolation = request.isolation;
+    if (request.ingressManifest !== undefined) {
+      spec.ingressManifest = {
+        ...request.ingressManifest,
+        userTaskId: context.userTaskId,
+        profileId: context.principal.profileId,
+        runId,
+        ownerGeneration: context.ownerGeneration,
+      };
+    }
 
     const validated = validateRunSpec(spec);
     if (!validated.ok) {

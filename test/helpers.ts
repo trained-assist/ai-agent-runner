@@ -21,6 +21,7 @@ import type { CapabilityRegistry } from '../src/mcp/capabilities.js';
 import type { BindingValueResolver } from '../src/mcp/scope.js';
 import type { CleanRoomProvider } from '../src/isolation/contract.js';
 import type { EngineConfigTemplate } from '../src/isolation/engine-config.js';
+import type { IngressArtifactResolver } from '../src/storage/ingress-artifact.js';
 
 let counter = 0;
 
@@ -102,6 +103,7 @@ export interface HarnessOptions {
    * снимка нечего проверять.
    */
   snapshotInputs?: boolean;
+  ingressResolver?: IngressArtifactResolver;
 }
 
 export interface Harness {
@@ -146,6 +148,7 @@ export function createHarness(options: HarnessOptions = {}): Harness {
   if (options.bindingResolver) base.bindingResolver = options.bindingResolver;
   if (options.isolation) base.isolation = typeof options.isolation === 'function' ? options.isolation(rootDir) : options.isolation;
   if (options.engineConfigTemplates) base.engineConfigTemplates = options.engineConfigTemplates;
+  if (options.ingressResolver) base.ingressResolver = options.ingressResolver;
   let exports: RunExportStore | null = null;
   let artifacts: ArtifactStore | null = null;
   let blob: BlobStore | null = options.blob ?? null;

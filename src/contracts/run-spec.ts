@@ -47,6 +47,16 @@ export interface InputSpec {
   inlinePrompt?: string;
 }
 
+export interface IngressManifestRef {
+  contractVersion: 1;
+  manifestRef: string;
+  manifestVersion: string;
+  userTaskId: string;
+  profileId: string;
+  runId: string;
+  ownerGeneration: number;
+}
+
 export interface CredentialBinding {
   ref: string;
   scope: string;
@@ -176,6 +186,7 @@ export interface RunSpec {
   limits: RunLimits;
   deadline?: string;
   input?: InputSpec;
+  ingressManifest?: IngressManifestRef;
   isolation?: { mode: IsolationMode };
   regionConstraints?: RegionConstraints;
   credentialBindings?: CredentialBinding[];
@@ -203,6 +214,7 @@ const TOP_LEVEL_KEYS = [
   'limits',
   'deadline',
   'input',
+  'ingressManifest',
   'isolation',
   'regionConstraints',
   'credentialBindings',
@@ -780,6 +792,25 @@ export function validateRunSpec(input: unknown): ValidationResult<RunSpec> {
   };
   if (input['deadline'] !== undefined) spec.deadline = input['deadline'] as string;
   if (inputSpec !== undefined) spec.input = inputSpec;
+  if (input['ingressManifest'] !== undefined) {
+    const value = input['ingressManifest'];
+    if (checkObject(value, 'spec.ingressManifest', collector)) {
+      checkKeys(value, ['contractVersion', 'manifestRef', 'manifestVersion', 'userTaskId', 'profileId', 'runId', 'ownerGeneration'], ['contractVersion', 'manifestRef', 'manifestVersion', 'userTaskId', 'profileId', 'runId', 'ownerGeneration'], 'spec.ingressManifest', collector);
+      if (value['contractVersion'] !== 1) collector.push('spec.ingressManifest.contractVersion: expected 1');
+      checkString(value['manifestRef'], 'spec.ingressManifest.manifestRef', collector, 500);
+      if (typeof value['manifestVersion'] !== 'string' || !/^[0-9a-f]{64}$/.test(value['manifestVersion'])) collector.push('spec.ingressManifest.manifestVersion: expected lowercase sha256');
+      for (const key of ['userTaskId', 'profileId', 'runId'] as const) {
+        if (!isSafeId(value[key])) collector.push(`spec.ingressManifest.${key}: expected safe id`);
+      }
+      checkPositiveInt(value['ownerGeneration'], 'spec.ingressManifest.ownerGeneration', collector);
+      if (value['userTaskId'] !== input['userTaskId']) collector.push('spec.ingressManifest.userTaskId: must match spec.userTaskId');
+      if (value['profileId'] !== input['profileId']) collector.push('spec.ingressManifest.profileId: must match spec.profileId');
+      if (value['runId'] !== input['runId']) collector.push('spec.ingressManifest.runId: must match spec.runId');
+      if (value['ownerGeneration'] !== input['ownerGeneration']) collector.push('spec.ingressManifest.ownerGeneration: must match spec.ownerGeneration');
+      if (inputSpec?.refs?.length) collector.push('spec.input.refs: cannot be combined with spec.ingressManifest');
+      spec.ingressManifest = value as unknown as IngressManifestRef;
+    }
+  }
   if (isolation !== undefined) spec.isolation = isolation;
   if (regionConstraints !== undefined) spec.regionConstraints = regionConstraints;
   if (credentialBindings !== undefined) spec.credentialBindings = credentialBindings;

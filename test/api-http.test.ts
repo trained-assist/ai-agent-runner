@@ -1,4 +1,7 @@
 import { describe, expect, it } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   SseCollector,
   alphaKey,
@@ -14,6 +17,12 @@ import {
   waitForAsync,
   waitForTerminal,
 } from './api-http-harness.js';
+import { AgentApi } from '../src/api/service.js';
+import { StatelessStore } from '../src/api/stateless-store.js';
+import { KeyRegistry, keyRecordFor } from '../src/api/auth.js';
+import { createAgentApiServer } from '../src/api/server.js';
+import { createHarness, waitFor } from './helpers.js';
+import { createHash } from 'node:crypto';
 
 describe('http auth, scopes and structured refusals', () => {
   it('отказывает без ключа, без scope и на кривых запросах — структурированно и без ключевого материала', async () => {
@@ -85,6 +94,53 @@ describe('http auth, scopes and structured refusals', () => {
 });
 
 describe('http submit, status, result, artifacts, events and cancel', () => {
+  it('accepts an ingress pin over POST /v1/runs and passes a server-bound RunSpec to the worker', async () => {
+    const h = await startHttpHarness();
+    const pin = { contractVersion: 1, manifestRef: 'cp-input-manifest:task-http-ingress', manifestVersion: 'b'.repeat(64) };
+    const response = await postSubmit(h.base, alphaKey, 'idem-http-ingress', submitBody({ userTaskId: 'task-http-ingress', ingressManifest: pin }));
+    expect(response.status).toBe(202);
+    const { runId } = await response.json() as { runId: string };
+    const stored = (h.service as unknown as { store: { getByRun(id: string): { spec: Record<string, unknown> } | null } }).store.getByRun(runId);
+    expect(stored?.spec.ingressManifest).toEqual({ ...pin, userTaskId: 'task-http-ingress', profileId: 'profile-a', runId, ownerGeneration: 1 });
+  });
+
+  it('POST /v1/runs reaches local Runner.start with the same server-bound ingress pin', async () => {
+    const received: import('../src/contracts/run-spec.js').RunSpec[] = [];
+    const key = 'ak_0123456789abcdef0123456789abcdef0123456789abcdef';
+    const principal = { principalId: 'p-alpha', profileId: 'profile-a', scopes: ['runs:read', 'runs:write'] as Array<'runs:read' | 'runs:write'>, engines: ['fake'] };
+    const registry = KeyRegistry.fromRecords([keyRecordFor(key, principal)]);
+    let service!: AgentApi;
+    const worker = {
+      name: 'fake', baseUrl: null,
+      async launch(spec: import('../src/contracts/run-spec.js').RunSpec) {
+        received.push(spec);
+        return { runId: spec.runId, operationId: spec.operationId, status: 'accepted' as const, statusUrl: `http://local/status/${spec.runId}`, resultUrl: `http://local/result/${spec.runId}` };
+      },
+      async status(runId: string) { return { runId, status: 'running' as const }; },
+      async result(runId: string) { throw new Error(`not polled: ${runId}`); },
+      async cancel(runId: string) { return { status: 'unknown_run' as const }; },
+    };
+    service = new AgentApi({ workers: [worker], store: new StatelessStore() });
+    const server = createAgentApiServer(service, { keys: registry });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const address = server.address() as import('node:net').AddressInfo;
+    try {
+      const response = await fetch(`http://127.0.0.1:${address.port}/v1/runs`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json', 'idempotency-key': 'api-runner-ingress' },
+        body: JSON.stringify({ engine: { name: 'fake', adapterVersion: '1' }, limits: { timeoutMs: 5000 }, envAllowlist: [], userTaskId: 'task-e2e-ingress', ingressManifest: { contractVersion: 1, manifestRef: 'cp-input-manifest:task-e2e-ingress', manifestVersion: 'c'.repeat(64) } }),
+      });
+      expect(response.status, JSON.stringify(await response.clone().json())).toBe(202);
+      const { runId } = await response.json() as { runId: string };
+      await waitFor(() => received.length > 0, 2000, 'RunSpec to reach worker launch');
+      expect(received[0]?.ingressManifest).toMatchObject({ manifestRef: 'cp-input-manifest:task-e2e-ingress', manifestVersion: 'c'.repeat(64), userTaskId: 'task-e2e-ingress', profileId: 'profile-a', runId, ownerGeneration: 1 });
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await service.dispose();
+    }
+  });
+
   it('принимает задачу, дедуплицирует по ключу и отдаёт status/result/artifacts/events', async () => {
     const h = await startHttpHarness();
 
