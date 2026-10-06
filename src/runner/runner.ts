@@ -684,10 +684,24 @@ export class Runner {
     const run = this.runs.get(runId);
     if (!run) throw new Error(`unknown run: ${runId}`);
     const st = run.state;
-    if (st.finalized && st.result) return st.result;
+    if (st.finalized && st.result && !['pending', 'failed'].includes(st.result.persistence)) return st.result;
     if (run.finalizePromise) return run.finalizePromise;
     const promise = this.doFinalize(st).finally(() => {
       run.finalizePromise = null;
+      const exportManifest = this.exportManifest(runId);
+      if (st.finalized && st.result?.persistence === 'pending' && (exportManifest?.attempts ?? 0) < 8) {
+        const delayMs = Math.min(60_000, 2_000 * 2 ** Math.min(exportManifest?.attempts ?? 0, 5));
+        const timer = setTimeout(() => { void this.finalize(runId).catch(() => undefined); }, delayMs);
+        run.timers.push(timer);
+      } else if (st.finalized && st.result?.persistence === 'pending' && (exportManifest?.attempts ?? 0) >= 8) {
+        const attention: RunResult = { ...st.result, persistence: 'failed',
+          persistenceReason: 'bounded persistence retries exhausted; source copies were retained for operator replay',
+          cleanup: 'pending', cleanupReason: 'cleanup is blocked until remote custody is verified' };
+        this.updateTerminalResult(st, attention);
+        this.writeCheckpoint(st, attention, exportManifest, null, null, 'cleanup_pending', {
+          status: 'blocked', reason: 'persistence retries exhausted; source copies retained', intentAt: this.nowIso(), finishedAt: null,
+        }, { silent: true });
+      }
     });
     run.finalizePromise = promise;
     return promise;
@@ -1802,17 +1816,27 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
     // ответа сохраняется отдельным выходом до того, как начнётся экспорт (issue #52).
     const run = this.runs.get(st.runId);
     const exit = run ? this.resolveExit(run, st) : null;
-    // Ответ агента уходит в хранилище до экспорта объявленных выходов: сбой экспорта
-    // не должен стоить клиенту текста ответа.
-    const answerArtifactId = await this.saveAnswerArtifact(st, exit?.answer ?? { present: false, source: null, chars: 0, text: '' });
     // Fast result boundary: persist the engine outcome and answer before any declared
     // output upload. The checkpoint + result are durable on the Runner host; the clean
     // room remains leased until recover() verifies remote custody and completes cleanup.
-    const captured = this.computeResult(st, this.exportManifest(st.runId));
-    this.writeCheckpoint(st, captured, this.exportManifest(st.runId), exit, answerArtifactId, 'engine_terminal', {
+    const existingExport = this.exportManifest(st.runId);
+    const captured: RunResult = {
+      ...this.computeResult(st, existingExport),
+      ...((exit?.answer.present ?? false) ? { text: exit!.answer.text } : {}),
+      ...(exit && exit.plan.length > 0 && existingExport === null ? {
+        persistence: 'pending' as const,
+        persistenceReason: 'engine result captured; artifact persistence is pending',
+      } : {}),
+      cleanup: 'pending',
+      cleanupReason: 'cleanup is blocked until remote custody is verified',
+    };
+    this.writeCheckpoint(st, captured, existingExport, exit, null, 'engine_terminal', {
       status: 'pending', reason: 'engine result captured; artifact persistence is pending', intentAt: this.nowIso(), finishedAt: null,
     });
     this.persistResult(st, captured);
+    // The captured answer is already durable in result.json + checkpoint. Its small
+    // object-store copy can be retried without delaying delivery of that result.
+    const answerArtifactId = await this.saveAnswerArtifact(st, exit?.answer ?? { present: false, source: null, chars: 0, text: '' });
     const exportManifest = await this.runExport(st, exit ? { plan: exit.plan } : {});
     const soleCopies = this.soleCopiesOnDisk(st, exportManifest);
     // Намерение уборки фиксируется на диске ДО самой уборки: сбой в момент sweep не
@@ -1835,7 +1859,10 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
       keepWorkspace: soleCopies.length > 0,
     });
 
-    const result = this.computeResult(st, exportManifest, cleanup);
+    const result: RunResult = {
+      ...this.computeResult(st, exportManifest, cleanup),
+      ...((exit?.answer.present ?? false) ? { text: exit!.answer.text } : {}),
+    };
     await this.appendProfileTrace(st, result);
     // The engine result may already have been delivered while persistence ran.
     // Refresh the durable result without emitting a second terminal event.

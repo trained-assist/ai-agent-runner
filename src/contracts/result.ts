@@ -39,6 +39,8 @@ export interface RunResult {
   exitObserved: boolean;
   startedAt: string;
   finishedAt: string;
+  /** Captured engine answer; independent of the asynchronous artifact export phase. */
+  text?: string;
   failure?: RunFailure;
   usage: UsageReport;
   outputRefs: string[];
@@ -88,6 +90,7 @@ const RESULT_KEYS = [
   'exitObserved',
   'startedAt',
   'finishedAt',
+  'text',
   'failure',
   'usage',
   'outputRefs',
@@ -107,7 +110,7 @@ const OUTCOME_EXIT_REASONS: Record<RunOutcome, readonly ExitReason[]> = {
 export function validateRunResult(input: unknown): ValidationResult<RunResult> {
   const collector = new ErrorCollector();
   if (!checkObject(input, 'result', collector)) return collector.finish(undefined as never);
-  const optional = new Set(['failure', 'persistenceReason', 'cleanupReason']);
+  const optional = new Set(['failure', 'persistenceReason', 'cleanupReason', 'text']);
   const required = RESULT_KEYS.filter((key) => !optional.has(key));
   checkKeys(input, RESULT_KEYS, required, 'result', collector);
 
@@ -139,6 +142,7 @@ export function validateRunResult(input: unknown): ValidationResult<RunResult> {
   if (typeof input['exitObserved'] !== 'boolean') collector.push('result.exitObserved: expected boolean');
   if (!isUtcTimestamp(input['startedAt'])) collector.push('result.startedAt: expected UTC ISO timestamp');
   if (!isUtcTimestamp(input['finishedAt'])) collector.push('result.finishedAt: expected UTC ISO timestamp');
+  if (input['text'] !== undefined) checkString(input['text'], 'result.text', collector, 100_000);
 
   const failure = input['failure'];
   if (outcome === 'failed' && failure === undefined) collector.push('result.failure: required for failed outcome');
