@@ -226,3 +226,12 @@ declared и verified. Snapshot/materialize, артефакты, MCP и interacti
 после рестарта API нет второго запуска, пользователь читает ответ и артефакт,
 ephemeral ресурс исчезает только после persist, следующая среда видит сохранённые
 данные. До этого #75/#76 не считаются завершённой serverless-миграцией.
+
+## Task-scoped ingress manifests
+
+`ingressManifest` is forwarded only to the France/Russia VM engines, whose packaged
+Runner wires `ControlPlaneIngressResolver` from the trusted `RUNNER_CONTROL_PLANE_*`
+bindings. The generic Azure/GitHub Actions worker has no configured resolver and is
+refused locally with `INGRESS_MANIFEST_UNSUPPORTED` before submit. Do not drop the pin
+or retry that run as a prompt-only task; configure a trusted resolver on that worker
+before enabling the capability there.

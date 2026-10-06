@@ -72,6 +72,7 @@ describe('launch request: RunSpec → LaunchRequest (issue #73)', () => {
     const request = launchRequestFromSpec(spec, {
       env: { PATH: '/usr/bin', HOME: '/home/runner', SECRET: 'nope' },
       resultUrl: 'http://api.local/v1/worker/launches/run_x/result',
+      supportsIngressManifest: true,
     });
 
     expect(request.engine).toEqual({ name: EXTERNAL_WORKER_ENGINE, adapterVersion: '1', modelSettings: { model: 'free' } });
@@ -86,6 +87,38 @@ describe('launch request: RunSpec → LaunchRequest (issue #73)', () => {
     // В процесс агента уходят только переменные из envAllowlist; секрет хоста остаётся здесь.
     expect(request.env).toEqual({ PATH: '/usr/bin', HOME: '/home/runner' });
     expect(JSON.stringify(request)).not.toContain('nope');
+  });
+
+  it('routes ingress-manifest pins only to VM workers with the trusted CP resolver', async () => {
+    const worker = await startMockWorker();
+    try {
+      const pin = {
+        contractVersion: 1 as const,
+        manifestRef: 'manifest-vm-route',
+        manifestVersion: 'c'.repeat(64),
+        userTaskId: 'task-vm-route',
+        profileId: 'profile-a',
+        runId: 'run-vm-route',
+        ownerGeneration: 1,
+      };
+      const spec = makeRunSpec({
+        runId: pin.runId,
+        userTaskId: pin.userTaskId,
+        engine: { name: 'eu-vm-agent-run', adapterVersion: '1' },
+        input: { inlinePrompt: 'run' },
+        ingressManifest: pin,
+      });
+      const vm = new ExternalWorkerAdapter({ engineName: 'eu-vm-agent-run', baseUrl: worker.baseUrl, baseUrlForResult: 'https://api.test' });
+      await vm.launch(spec);
+      expect(worker.launches[0]?.['ingressManifest']).toEqual(pin);
+
+      const gha = new ExternalWorkerAdapter({ engineName: 'azure-dynamic-ip-agent-run', baseUrl: worker.baseUrl, baseUrlForResult: 'https://api.test' });
+      await expect(gha.launch({ ...spec, engine: { name: 'azure-dynamic-ip-agent-run', adapterVersion: '1' } }))
+        .rejects.toMatchObject({ code: 'INGRESS_MANIFEST_UNSUPPORTED' });
+      expect(worker.launches).toHaveLength(1);
+    } finally {
+      await worker.close();
+    }
   });
 
   it('подставляет положительные лимиты, когда клиент их не задал', () => {
