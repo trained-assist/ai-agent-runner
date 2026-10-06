@@ -385,8 +385,14 @@ export function mergeUrl(repo: LaunchRepo): string {
  */
 export function launchRequestFromSpec(
   spec: RunSpec,
-  options: { env?: Record<string, string>; resultUrl: string; remoteMcpAttachment?: RemoteMcpAttachment } = { resultUrl: '' },
+  options: { env?: Record<string, string>; resultUrl: string; remoteMcpAttachment?: RemoteMcpAttachment; supportsIngressManifest?: boolean } = { resultUrl: '' },
 ): LaunchRequest {
+  if (spec.ingressManifest && options.supportsIngressManifest !== true) {
+    throw new PreflightError('INGRESS_MANIFEST_UNSUPPORTED', 'this external worker has no trusted Control Plane ingress resolver', {
+      failureClass: 'preflight',
+      retryable: false,
+    });
+  }
   if (spec.mcp?.servers.length && !options.remoteMcpAttachment) {
     throw new PreflightError('MCP_HOST_POLICY_MISSING', 'remote MCP requires trusted host resolution', { failureClass: 'preflight', retryable: false });
   }
@@ -1033,7 +1039,12 @@ export class ExternalWorkerAdapter implements ExternalWorker {
       });
     }
     const remoteMcpAttachment = spec.mcp?.servers.length ? await this.resolveMcp(spec, 'launch', admittedAt) : undefined;
-    const request = launchRequestFromSpec(spec, { env: this.env, resultUrl: this.resultUrlFor(spec), remoteMcpAttachment });
+    const request = launchRequestFromSpec(spec, {
+      env: this.env,
+      resultUrl: this.resultUrlFor(spec),
+      remoteMcpAttachment,
+      supportsIngressManifest: this.name === 'eu-vm-agent-run' || this.name === 'rf-vm-agent-run',
+    });
     const redactAttachment = (value: string): string => Object.values(remoteMcpAttachment?.mcpSecrets ?? {}).reduce((safe, secret) => safe.split(secret).join('[REDACTED]'), value);
     const url = `${trimTrailingSlash(base)}/v1/launch`;
     const headers: Record<string, string> = { 'content-type': 'application/json' };

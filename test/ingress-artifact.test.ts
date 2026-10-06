@@ -220,8 +220,13 @@ describe('task-scoped ingress artifacts', () => {
     ]) {
       expect(validateRunSpec({ ...spec, ingressManifest: { ...pin, ...change } }).ok).toBe(false);
     }
-    const request = launchRequestFromSpec({ ...spec, input: { inlinePrompt: 'run' }, ingressManifest: pin }, { resultUrl: 'https://runner.test/result' });
+    const request = launchRequestFromSpec({ ...spec, input: { inlinePrompt: 'run' }, ingressManifest: pin }, {
+      resultUrl: 'https://runner.test/result', supportsIngressManifest: true,
+    });
     expect(request.ingressManifest).toEqual(pin);
+    expect(() => launchRequestFromSpec({ ...spec, input: { inlinePrompt: 'run' }, ingressManifest: pin }, {
+      resultUrl: 'https://gha.test/result',
+    })).toThrow(/no trusted Control Plane ingress resolver/);
   });
 });
 
