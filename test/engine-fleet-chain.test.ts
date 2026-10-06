@@ -89,6 +89,52 @@ async function waitFor(fleet: Fleet, runId: string, state: string): Promise<void
 }
 
 describe('приоритетная цепочка движков (#100)', () => {
+  it('пропускает заранее недоступную France VM и запускает на Russia VM', async () => {
+    const fleet = await makeFleet({ eu: { readinessState: 'unavailable' }, chain: [EU, RF, GHA] });
+    const { runId } = submit(fleet, 'idem-fleet-france-not-ready');
+    await waitFor(fleet, runId, 'succeeded');
+
+    expect(fleet.eu.launches).toHaveLength(0);
+    expect(fleet.rf.launches).toHaveLength(1);
+    expect(fleet.gha.launches).toHaveLength(0);
+    expect(fleet.service.status(fleetPrincipal, runId).engine).toBe(RF);
+  }, 20000);
+
+  it('ограничивает readiness probe и переходит дальше, если France не отвечает', async () => {
+    const fleet = await makeFleet({ eu: { readinessDelayMs: 3000 }, chain: [EU, RF, GHA] });
+    const startedAt = Date.now();
+    const { runId } = submit(fleet, 'idem-fleet-france-readiness-timeout');
+    await waitFor(fleet, runId, 'succeeded');
+
+    expect(Date.now() - startedAt).toBeLessThan(2800);
+    expect(fleet.eu.launches).toHaveLength(0);
+    expect(fleet.rf.launches).toHaveLength(1);
+    expect(fleet.gha.launches).toHaveLength(0);
+    expect(fleet.service.status(fleetPrincipal, runId).engine).toBe(RF);
+  }, 20000);
+
+  it('заранее обнаруженная VM capacity saturation перескакивает Russia и отправляет в GHA', async () => {
+    const fleet = await makeFleet({ eu: { readinessState: 'capacity' }, chain: [EU, RF, GHA] });
+    const { runId } = submit(fleet, 'idem-fleet-france-readiness-capacity');
+    await waitFor(fleet, runId, 'succeeded');
+
+    expect(fleet.eu.launches).toHaveLength(0);
+    expect(fleet.rf.launches).toHaveLength(0);
+    expect(fleet.gha.launches).toHaveLength(1);
+    expect(fleet.service.status(fleetPrincipal, runId).engine).toBe(GHA);
+  }, 20000);
+
+  it('после успешной readiness-проверки неопределённый launch остаётся unknown и не дублируется на Russia', async () => {
+    const fleet = await makeFleet({ eu: { httpStatus: 503, statusHttpStatus: 503 }, chain: [EU, RF, GHA] });
+    const { runId } = submit(fleet, 'idem-fleet-france-launch-ambiguous');
+    await waitFor(fleet, runId, 'unknown');
+
+    expect(fleet.eu.launches).toHaveLength(1);
+    expect(fleet.rf.launches).toHaveLength(0);
+    expect(fleet.gha.launches).toHaveLength(0);
+    expect(fleet.service.status(fleetPrincipal, runId).engine).toBe(EU);
+  }, 20000);
+
   it('GHA не принял ран — ран ушёл на EU VM, клиент видит фактический движок', async () => {
     // 503 на launch: воркер отказал и ран не регистрировал, поэтому reconcile отвечает
     // «не знаю» — доказательство того, что запуск не состоялся и второй ран не дубль.
@@ -285,10 +331,10 @@ describe('приоритетная цепочка движков (#100)', () => 
     // Статус второго — `running`: отмена приходит в полёте.
     const fleet = await makeFleet({ gha: { httpStatus: 503 }, eu: { terminalStatus: 'running' }, chain: [GHA, EU, RF] });
     const { runId } = submit(fleet, 'idem-fleet-cancel');
-    // Ждём, пока цепочка не перешла на EU: до этого ран никем не принят, и отмена ушла бы
-    // в ещё не начавший движок.
+    // Ждём фактического HTTP launch в EU. `status.engine` обновляется раньше квитанции,
+    // поэтому одного переключения статуса недостаточно для отмены принятого рана.
     const deadline = Date.now() + 10_000;
-    while (fleet.service.status(fleetPrincipal, runId).engine !== EU) {
+    while (fleet.eu.launches.length === 0) {
       if (Date.now() > deadline) throw new Error('the chain never advanced to the second engine');
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
