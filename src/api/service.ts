@@ -134,6 +134,7 @@ export class AgentApi {
   private disposed = false;
   private readonly maxActiveRuns: number;
   private readonly inFlight = new Set<string>();
+  private readonly resuming = new Set<string>();
 
   constructor(options: AgentApiOptions) {
     this.opts = options;
@@ -504,10 +505,10 @@ export class AgentApi {
       cancel: { requestedReceipt: true, terminalConfirmation: true },
       mcp: {
         perRunStdioProxy: false,
-        scopedBindings: false,
+        scopedBindings: this.workers.some(worker => worker.remoteMcpEnabled),
         capabilityHandlersSharedWithMcp: false,
         capabilityInvokeEndpoint: false,
-        remoteTransport: 'absent',
+        remoteTransport: this.workers.some(worker => worker.remoteMcpEnabled) ? 'worker_remote' : 'absent',
         osIsolation: 'not_proven_service_uid_only',
         osIsolationNote: 'the API host runs no agent process: OS isolation is the external worker responsibility, and the worker declares it per run',
       },
@@ -553,9 +554,10 @@ export class AgentApi {
     };
   }
 
-  dispose(): void {
+  async dispose(): Promise<void> {
     this.disposed = true;
     this.inFlight.clear();
+    await Promise.all(this.workers.map(worker => worker.dispose?.()));
   }
 
   /**
@@ -578,16 +580,41 @@ export class AgentApi {
     for (const entry of this.store.dispatchedRuns()) {
       const record = this.store.getByRun(entry.runId);
       if (!record) continue;
+      if (this.resuming.has(record.runId)) continue;
       const progress = this.store.progressOf(entry.runId);
       if (progress && isTerminalApiState(progress.state)) continue;
       const worker = this.workerFor(record.spec.engine.name);
       if (!worker) continue;
       this.store.open(record.runId, record.createdAt);
       this.log({ event: 'poll_resumed', runId: record.runId, engine: record.spec.engine.name, operationId: record.spec.operationId });
-      void this.pollUntilTerminal(record, worker, this.nowIso());
+      this.resuming.add(record.runId);
+      void this.restoreAndPoll(record, worker);
       resumed += 1;
     }
     return resumed;
+  }
+
+  private async restoreAndPoll(record: AdmissionRecord, worker: ExternalWorker): Promise<void> {
+    try {
+      if (record.spec.mcp?.servers.some(server => server.transport === 'remote')) {
+        const status = (await worker.status(record.runId)).status;
+        if (this.disposed) return;
+        if (status === 'succeeded' || status === 'failed' || status === 'cancelled') {
+          await this.collectResult(record, worker, record.createdAt);
+          return;
+        }
+        if (!worker.restoreMcp) throw new Error('MCP_RESTORE_UNSUPPORTED');
+        await worker.restoreMcp(record.spec, record.createdAt);
+      }
+      if (!this.disposed) await this.pollUntilTerminal(record, worker, record.createdAt);
+    } catch {
+      if (!this.disposed) {
+        this.log({ event: 'mcp_restore_refused', runId: record.runId, reason: 'existing_scope_or_domain_unavailable' });
+        this.markUnknown(record, 'mcp_restore_tool_outcome_unknown');
+      }
+    } finally {
+      this.resuming.delete(record.runId);
+    }
   }
 
   private async execute(record: AdmissionRecord): Promise<void> {
@@ -604,7 +631,7 @@ export class AgentApi {
     }
     this.inFlight.add(record.runId);
     try {
-      const receipt = await worker.launch(record.spec);
+      const receipt = await worker.launch(record.spec, record.createdAt);
       if (this.disposed || this.store.progressOf(record.runId) === null) return;
       this.log({
         event: 'worker_accepted',
@@ -779,6 +806,7 @@ export class AgentApi {
     if (request.deadline !== undefined) spec.deadline = request.deadline;
     if (request.regionConstraints !== undefined) spec.regionConstraints = request.regionConstraints;
     if (request.credentialBindings !== undefined) spec.credentialBindings = request.credentialBindings;
+    if (request.mcp !== undefined) spec.mcp = request.mcp;
     if (request.budget !== undefined) spec.budget = request.budget;
     if (request.result !== undefined) spec.result = request.result;
     if (request.outputs !== undefined) spec.outputs = request.outputs;
@@ -810,4 +838,3 @@ export class AgentApi {
     this.logger({ ts: this.nowIso(), ...entry });
   }
 }
-

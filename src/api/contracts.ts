@@ -9,6 +9,7 @@ import {
   type CredentialBinding,
   type EngineSpec,
   type InputSpec,
+  type McpSpec,
   type OutputSpec,
   type RegionConstraints,
   type RepositorySpec,
@@ -54,6 +55,7 @@ export interface SubmitRequest {
   deadline?: string;
   regionConstraints?: RegionConstraints;
   credentialBindings?: CredentialBinding[];
+  mcp?: McpSpec;
   budget?: BudgetSpec;
   result?: ResultPolicy;
   outputs?: OutputSpec[];
@@ -196,7 +198,7 @@ export interface ApiCapabilities {
     scopedBindings: boolean;
     capabilityHandlersSharedWithMcp: boolean;
     capabilityInvokeEndpoint: boolean;
-    remoteTransport: 'absent';
+    remoteTransport: 'absent' | 'worker_remote';
     osIsolation: IsolationCapability;
     osIsolationNote: string;
   };
@@ -262,6 +264,7 @@ const SUBMIT_KEYS = [
   'deadline',
   'regionConstraints',
   'credentialBindings',
+  'mcp',
   'budget',
   'result',
   'outputs',
@@ -316,7 +319,7 @@ export function validateSubmitRequest(input: unknown): ValidationResult<SubmitRe
     envAllowlist: input['envAllowlist'] ?? [],
     limits: input['limits'],
   };
-  for (const key of ['input', 'deadline', 'regionConstraints', 'credentialBindings', 'budget', 'result', 'outputs', 'traceId', 'repository', 'isolation'] as const) {
+  for (const key of ['input', 'deadline', 'regionConstraints', 'credentialBindings', 'mcp', 'budget', 'result', 'outputs', 'traceId', 'repository', 'isolation'] as const) {
     if (input[key] !== undefined) specLike[key] = input[key];
   }
 
@@ -336,6 +339,7 @@ export function validateSubmitRequest(input: unknown): ValidationResult<SubmitRe
   if (spec.deadline !== undefined) request.deadline = spec.deadline;
   if (spec.regionConstraints !== undefined) request.regionConstraints = spec.regionConstraints;
   if (spec.credentialBindings !== undefined) request.credentialBindings = spec.credentialBindings;
+  if (spec.mcp !== undefined) request.mcp = spec.mcp;
   if (spec.budget !== undefined) request.budget = spec.budget;
   if (spec.result !== undefined) request.result = spec.result;
   if (spec.outputs !== undefined) request.outputs = spec.outputs;
