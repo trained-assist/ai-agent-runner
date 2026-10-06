@@ -1,4 +1,5 @@
 node_modules/
+integration-deps/
 dist/
 coverage/
 *.log

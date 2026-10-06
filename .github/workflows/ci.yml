@@ -9,6 +9,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: trained-assist/trained-assist-control-plane
+          ref: main
+          path: integration-deps/trained-assist-control-plane
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: trained-assist/trained-assist-mcp-host
+          ref: main
+          path: integration-deps/trained-assist-mcp-host
+          persist-credentials: false
       - uses: actions/setup-node@v4
         with:
           node-version: 20
