@@ -8,6 +8,8 @@ import { CapacityAdmission, LinuxHostUsageSampler } from './capacity-admission.j
 import { FileCapacityReservationStore } from './file-capacity-reservation-store.js';
 import { createVmWorkerServer } from './http-server.js';
 import { Runner } from '../runner/runner.js';
+import { readVmWorkerBindingsInventory } from './bindings-inventory.js';
+import { readVmWorkerBuildInfo } from './build-info.js';
 
 function required(name: string): string {
   const value = process.env[name]?.trim();
@@ -34,6 +36,11 @@ async function main(): Promise<void> {
 
   const engineName = required('VM_WORKER_ENGINE');
   const workerId = process.env['VM_WORKER_ID']?.trim() || `${engineName}-${process.env['HOSTNAME'] ?? 'host'}`;
+  const bindingsInventory = readVmWorkerBindingsInventory(required('VM_WORKER_BINDINGS_INVENTORY'));
+  const expectedRegion = engineName === 'rf-vm-agent-run' ? 'ru' : 'eu';
+  if (bindingsInventory.workerId !== workerId || bindingsInventory.region !== expectedRegion) {
+    throw new Error('worker bindings inventory identity does not match VM_WORKER_ID/VM_WORKER_ENGINE');
+  }
   const binary = process.env['OPENCODE_BIN']?.trim() || undefined;
   const engine = new OpenCodeAdapter(binary ? { binary } : {});
   const token = required('VM_WORKER_TOKEN');
@@ -77,6 +84,8 @@ async function main(): Promise<void> {
     allowedEnvironmentNames,
     allowedCallbackOrigins,
     envelope: { cpuPercent: positivePercent('VM_WORKER_CPU_RESERVATION_PCT'), memoryPercent: positivePercent('VM_WORKER_MEMORY_RESERVATION_PCT') },
+    buildInfo: readVmWorkerBuildInfo(),
+    bindingsInventory,
     engineAvailable: () => engine.isAvailable(),
   });
   const resumedReservations = await server.resumeCapacityMonitors();

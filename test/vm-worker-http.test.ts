@@ -6,6 +6,7 @@ import type { LaunchRequest } from '../src/adapters/external-worker-adapter.js';
 import { CapacityAdmission, type HostUsageSample, type HostUsageSampler } from '../src/vm-worker/capacity-admission.js';
 import { FileCapacityReservationStore } from '../src/vm-worker/file-capacity-reservation-store.js';
 import { createVmWorkerServer } from '../src/vm-worker/http-server.js';
+import type { VmWorkerBindingsInventory } from '../src/vm-worker/bindings-inventory.js';
 import type { Runner } from '../src/runner/runner.js';
 import type { RunSpec } from '../src/contracts/run-spec.js';
 
@@ -94,6 +95,29 @@ describe('installable VM HTTP worker', () => {
     expect(denied.status).toBe(400);
     expect(fixture.runner.startCalls).toHaveLength(0);
   });
+
+  it('exposes build identity and a value-free binding inventory for deployment drift checks', async () => {
+    const envName = 'VM_WORKER_TEST_ONLY_BINDING';
+    const prior = process.env[envName];
+    process.env[envName] = 'never-return-this-secret';
+    const inventory: VmWorkerBindingsInventory = {
+      schemaVersion: 1,
+      workerId: 'eu-test-worker',
+      region: 'eu',
+      bindings: [{ name: envName, required: true, secret: true, source: 'systemd:/etc/ai-agent-runner/worker.env', owner: 'platform' }],
+    };
+    const fixture = await startFixture({ bindingsInventory: inventory });
+    cleanups.push(async () => {
+      if (prior === undefined) delete process.env[envName]; else process.env[envName] = prior;
+      await fixture.close();
+    });
+    const version = await (await fetch(`${fixture.base}/version`)).json() as any;
+    expect(version.build.sourceCommit).toBe('a'.repeat(40));
+    expect(version.worker).toEqual({ workerId: 'eu-test-worker', region: 'eu' });
+    expect(version.bindings.inventory).toEqual([{ ...inventory.bindings[0], configured: true }]);
+    expect(JSON.stringify(version)).not.toContain('never-return-this-secret');
+    expect((await (await fetch(`${fixture.base}/readyz`)).json() as any).checks.bindings.ready).toBe(true);
+  });
 });
 
 function launchRequest(overrides: Partial<LaunchRequest> = {}): LaunchRequest {
@@ -124,7 +148,7 @@ async function launch(base: string, request: LaunchRequest): Promise<Response> {
   return fetch(`${base}/v1/launch`, { method: 'POST', headers: { ...authHeaders(), 'content-type': 'application/json' }, body: JSON.stringify(request) });
 }
 
-async function startFixture(input: { engineName?: string; cpuPercent?: number } = {}): Promise<{
+async function startFixture(input: { engineName?: string; cpuPercent?: number; bindingsInventory?: VmWorkerBindingsInventory } = {}): Promise<{
   base: string;
   dataDir: string;
   runner: FakeRunner;
@@ -152,6 +176,8 @@ async function startFixture(input: { engineName?: string; cpuPercent?: number } 
     allowedEnvironmentNames: ['LLM_LADDER_TOKEN'],
     allowedCallbackOrigins: [API_ORIGIN],
     envelope: { cpuPercent: 10, memoryPercent: 10 },
+    buildInfo: { schemaVersion: 1, version: '0.1.0-test', sourceCommit: 'a'.repeat(40), builtAt: new Date().toISOString() },
+    ...(input.bindingsInventory ? { bindingsInventory: input.bindingsInventory } : {}),
     engineAvailable: () => true,
   });
   await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });

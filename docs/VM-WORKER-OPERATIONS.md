@@ -14,6 +14,13 @@ systemd unit. It supports OpenCode only. The Russia worker rejects model identif
 containing Claude or Codex. It accepts only `isolation.mode=none`; this is a single
 service Unix identity, not per-run OS isolation.
 
+Build identity is served by `GET /version`: semantic version, exact 40-character
+source commit and build timestamp. It also reports the binding inventory by variable
+name, location, owner, rotation date and presence. Secret values are never returned.
+Required missing bindings make `/readyz` return 503; an unassigned secret owner or
+missing rotation date is a warning. The example inventories intentionally show
+`UNASSIGNED` owners until an operator records the real owner and store path.
+
 The slice does **not** yet publish `agent-run/<runId>` to the user's GitHub repository:
 the returned result deliberately has `repo.commit: null`. GCS storage wiring is
 configured, but that does not replace Git branch publication or prove that user data
@@ -22,18 +29,36 @@ artifact references, and API-side merge/persistence are integrated and tested.
 
 ## Install on a Linux VM
 
-Prerequisites: Node.js 20+, npm, Git, an installed OpenCode binary, outbound access to
-the configured GCS bucket, and a TLS reverse proxy or equivalent HTTPS endpoint in
-front of the loopback listener. Keep port 8788 private; expose only through the trusted
-HTTPS endpoint. Do not put the worker token in command-line arguments.
+Prerequisites: Node.js 20+, systemd, GitHub CLI (`gh`), curl, an authenticated
+read-only GitHub token for release/attestation reads, an installed OpenCode binary,
+outbound access to the configured GCS bucket, and a TLS reverse proxy or equivalent
+HTTPS endpoint in front of the loopback listener. Keep port 8788 private; expose only
+through the trusted HTTPS endpoint. Do not put the worker token in command-line arguments.
 
-Place the reviewed checkout at `/opt/ai-agent-runner`, then run:
+Bootstrap from a reviewed checkout and select the immutable release plus region:
 
 ```bash
-sudo /opt/ai-agent-runner/scripts/install-vm-worker.sh
+sudo scripts/install-vm-worker.sh vm-worker-v0.2.0 france
 sudoedit /etc/ai-agent-runner/worker.env
+sudoedit /etc/ai-agent-runner/worker-bindings.json
+export GH_TOKEN # inject from the operator secret manager, not command history
+sudo --preserve-env=GH_TOKEN /usr/local/sbin/ai-agent-vm-worker-update vm-worker-v0.2.0
+unset GH_TOKEN
 sudo systemctl enable --now ai-agent-vm-worker
 ```
+
+Use `russia` for the Russia host. The bootstrap creates separate France/Russia templates,
+installs the systemd unit and updater, and stops before deployment while placeholders
+remain. `GH_TOKEN` is needed only for an update command; keep it in an operator secret
+store or short-lived shell environment, not the worker service env file.
+
+Each release is built from a tag that must already be reachable from `main`. GitHub
+Actions publishes a Linux bundle and SHA-256 checksum, then creates a keyless SLSA
+provenance attestation. The updater checks the checksum, verifies the attestation's
+repository, signer workflow and tag ref, unpacks into a commit-specific directory,
+switches the `current` symlink atomically, restarts systemd, and verifies `/version`.
+If liveness or the source SHA is wrong, it restores the previous symlink and restarts
+the previous release. Do not deploy a checkout or manually replace files in `current`.
 
 Set the region-specific `VM_WORKER_ENGINE` to `eu-vm-agent-run` or `rf-vm-agent-run`.
 Set a unique `VM_WORKER_ID`, public HTTPS origin, a random `VM_WORKER_TOKEN` of at
@@ -43,14 +68,16 @@ per-run CPU and memory envelope must each be positive and below 60%. Keep the en
 root-owned with mode 0600; the service runs as `ai-agent` and cannot read that file
 directly after systemd has loaded it.
 
-The installer builds the checkout, installs the systemd unit, and leaves the service
-stopped while the example env file still contains placeholders. After configuration,
-it can be started with `systemctl`; subsequent code updates require rebuilding and
-restarting the service. Protect `/var/lib/ai-agent-runner` as private persistent disk.
+The installer leaves the service stopped while the example env file still contains
+placeholders. Protect `/var/lib/ai-agent-runner` as private persistent disk. Retain at
+least the current and previous commit directories under `/opt/ai-agent-vm-worker/releases`
+for rollback.
 
 ## Health and run tracking
 
 - `GET /healthz` is unauthenticated liveness only. HTTP 200 means the process answers.
+- `GET /version` reports the deployed version/source commit and the value-free binding
+  inventory for periodic deployment drift checks.
 - `GET /readyz` is unauthenticated readiness. HTTP 200 means Runner, OpenCode, the
   capacity store, and a fresh whole-host sample are available with room under the 60%
   admission threshold. HTTP 503 removes the worker from new-run routing. Its JSON
@@ -79,3 +106,9 @@ recovery, and capacity reservations stay active until terminal state is observed
 
 The API remains responsible for worker ordering and failover. A VM only answers its
 own health/capacity and runs accepted work; it never routes to another VM or GHA.
+
+This drift check is deliberately narrower than product migration acceptance. See
+[VM-WORKER-LEGACY-COMPATIBILITY.md](VM-WORKER-LEGACY-COMPATIBILITY.md) and
+[architecture issue #174](https://github.com/trained-assist/trained-agent-architecture/issues/174):
+legacy Web/Telegram routes and the new CP → Runner → Host contour must be audited and
+accepted separately. A VM version match does not prove no legacy dependency exists.

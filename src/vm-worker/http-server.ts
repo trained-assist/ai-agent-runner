@@ -8,6 +8,8 @@ import { Runner } from '../runner/runner.js';
 import { isTerminalState } from '../runner/state-machine.js';
 import type { CapacityAdmission, CapacityEnvelope, CapacityReservationStore, HostUsageSampler } from './capacity-admission.js';
 import { redactSecrets } from '../redact.js';
+import { checkVmWorkerBindings, type VmWorkerBindingsInventory } from './bindings-inventory.js';
+import type { VmWorkerBuildInfo } from './build-info.js';
 
 const MAX_REQUEST_BYTES = 2 * 1024 * 1024;
 const WORKER_ENGINES = new Set(['eu-vm-agent-run', 'rf-vm-agent-run']);
@@ -25,6 +27,8 @@ export interface VmWorkerServerOptions {
   allowedEnvironmentNames: readonly string[];
   allowedCallbackOrigins: readonly string[];
   envelope: CapacityEnvelope;
+  buildInfo?: VmWorkerBuildInfo;
+  bindingsInventory?: VmWorkerBindingsInventory;
   engineAvailable?: () => boolean;
 }
 
@@ -60,6 +64,18 @@ export function createVmWorkerServer(options: VmWorkerServerOptions): VmWorkerSe
     const url = new URL(req.url ?? '/', 'http://worker.local');
     if (url.pathname === '/healthz' && method === 'GET') {
       sendJson(res, 200, { status: 'ok', service: 'ai-agent-vm-worker' });
+      return;
+    }
+    if (url.pathname === '/version' && method === 'GET') {
+      const bindings = options.bindingsInventory
+        ? checkVmWorkerBindings(options.bindingsInventory, process.env)
+        : { ready: true, bindings: [], missingRequired: [], warnings: [] };
+      sendJson(res, 200, {
+        service: 'ai-agent-vm-worker',
+        build: options.buildInfo ?? { schemaVersion: 1, version: '0.0.0-dev', sourceCommit: 'unknown', builtAt: new Date(0).toISOString() },
+        worker: options.bindingsInventory ? { workerId: options.bindingsInventory.workerId, region: options.bindingsInventory.region } : null,
+        bindings: { ready: bindings.ready, missingRequired: bindings.missingRequired, warnings: bindings.warnings, inventory: bindings.bindings },
+      });
       return;
     }
     if (url.pathname === '/readyz' && method === 'GET') {
@@ -320,9 +336,12 @@ async function readinessView(options: VmWorkerServerOptions): Promise<{ status: 
   } catch { capacity = { state: 'unknown', activeReservations }; }
   const runner = options.runner.health();
   const engineReady = options.engineAvailable?.() ?? true;
-  const checks = { runner: runner.ready, engine: engineReady, capacityStore: storeReady, capacity, activeRuns: runner.activeRuns, runs: runner.runs };
+  const bindings = options.bindingsInventory
+    ? checkVmWorkerBindings(options.bindingsInventory, process.env)
+    : { ready: true, bindings: [], missingRequired: [], warnings: [] };
+  const checks = { runner: runner.ready, engine: engineReady, capacityStore: storeReady, capacity, bindings, activeRuns: runner.activeRuns, runs: runner.runs };
   const capacityState = typeof capacity['state'] === 'string' ? capacity['state'] : 'unknown';
-  const ready = runner.ready && engineReady && storeReady && capacityState === 'available';
+  const ready = runner.ready && engineReady && storeReady && capacityState === 'available' && bindings.ready;
   return { status: ready ? 'ready' : 'not_ready', service: 'ai-agent-vm-worker', ready, checks };
 }
 

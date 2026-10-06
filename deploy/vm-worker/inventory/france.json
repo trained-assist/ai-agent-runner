@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "workerId": "eu-vm-1",
+  "region": "eu",
+  "bindings": [
+    { "name": "VM_WORKER_BINDINGS_INVENTORY", "required": true, "secret": false, "source": "systemd:/etc/ai-agent-runner/worker.env", "owner": "UNASSIGNED — assign named owner" },
+    { "name": "VM_WORKER_ID", "required": true, "secret": false, "source": "systemd:/etc/ai-agent-runner/worker.env", "owner": "UNASSIGNED — assign named owner" },
+    { "name": "VM_WORKER_ENGINE", "required": true, "secret": false, "source": "systemd:/etc/ai-agent-runner/worker.env", "owner": "UNASSIGNED — assign named owner" },
+    { "name": "VM_WORKER_PUBLIC_URL", "required": true, "secret": false, "source": "systemd:/etc/ai-agent-runner/worker.env", "owner": "UNASSIGNED — assign named owner" },
+    { "name": "VM_WORKER_BIND", "required": true, "secret": false, "source": "systemd:/etc/ai-agent-runner/worker.env", "owner": "UNASSIGNED — assign named owner" },
+    { "name": "VM_WORKER_PORT", "required": true, "secret": false, "source": "systemd:/etc/ai-agent-runner/worker.env", "owner": "UNASSIGNED — assign named owner" },
+    { "name": "VM_WORKER_DATA_DIR", "required": true, "secret": false, "source": "systemd:/etc/ai-agent-runner/worker.env", "owner": "UNASSIGNED — assign named owner" },
+    { "name": "VM_WORKER_TOKEN", "required": true, "secret": true, "source": "systemd:/etc/ai-agent-runner/worker.env; provision via approved secret manager", "owner": "UNASSIGNED — assign named owner" },
+    { "name": "VM_WORKER_ALLOWED_REPOSITORIES", "required": true, "secret": false, "source": "systemd:/etc/ai-agent-runner/worker.env", "owner": "UNASSIGNED — assign named owner" },
+    { "name": "VM_WORKER_ALLOWED_ENV", "required": true, "secret": false, "source": "systemd:/etc/ai-agent-runner/worker.env", "owner": "UNASSIGNED — assign named owner" },
+    { "name": "VM_WORKER_ALLOWED_CALLBACK_ORIGINS", "required": true, "secret": false, "source": "systemd:/etc/ai-agent-runner/worker.env", "owner": "UNASSIGNED — assign named owner" },
+    { "name": "VM_WORKER_CPU_RESERVATION_PCT", "required": true, "secret": false, "source": "systemd:/etc/ai-agent-runner/worker.env", "owner": "UNASSIGNED — assign named owner" },
+    { "name": "VM_WORKER_MEMORY_RESERVATION_PCT", "required": true, "secret": false, "source": "systemd:/etc/ai-agent-runner/worker.env", "owner": "UNASSIGNED — assign named owner" },
+    { "name": "STORAGE_BACKEND", "required": true, "secret": false, "source": "systemd:/etc/ai-agent-runner/worker.env", "owner": "UNASSIGNED — assign named owner" },
+    { "name": "GCS_BUCKET", "required": true, "secret": false, "source": "systemd:/etc/ai-agent-runner/worker.env", "owner": "UNASSIGNED — assign named owner" },
+    { "name": "OPENCODE_BIN", "required": true, "secret": false, "source": "systemd:/etc/ai-agent-runner/worker.env", "owner": "UNASSIGNED — assign named owner" },
+    { "name": "RUNNER_GIT_TOKEN", "required": false, "secret": true, "source": "systemd:/etc/ai-agent-runner/worker.env; provision via approved secret manager", "owner": "UNASSIGNED — assign named owner" },
+    { "name": "GCP_PROJECT", "required": false, "secret": false, "source": "systemd:/etc/ai-agent-runner/worker.env or VM workload identity", "owner": "UNASSIGNED — assign named owner" }
+  ]
+}
