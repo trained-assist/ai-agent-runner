@@ -26,7 +26,7 @@ import { parseRemoteMcpServerPolicies, resolveRemoteMcpAttachment, type RemoteMc
  * юзера, сам складывает артефакты в него и сам грузит лог сессии в Google Storage.
  */
 
-export const EXTERNAL_WORKER_ENGINE = 'dynamic-ip-azure-agent-run';
+export const EXTERNAL_WORKER_ENGINE = 'azure-dynamic-ip-agent-run';
 export const EXTERNAL_WORKER_ADAPTER_VERSION = '1';
 
 /** Сколько событий рана API пишет до сетевого вызова: `claimed` + `inputs_materialized`. */
@@ -53,6 +53,14 @@ export const DEFAULT_BRANCH_PREFIX = 'agent-run';
 
 export const DEFAULT_LAUNCH_DEADLINE_MS = 10 * 60 * 1000;
 export const DEFAULT_CANCEL_DEADLINE_MS = 30 * 1000;
+/**
+ * Бюджет приёма рана по умолчанию (issue #100): воркер обязан ответить квитанцией за это время.
+ * Стартовое значение для GitHub Actions — 30 с; у своей VM можно задать больше через
+ * `EXTERNAL_WORKER_ACCEPT_DEADLINE_MS` или поле `acceptDeadlineMs` у движка.
+ */
+export const DEFAULT_ACCEPT_DEADLINE_MS = 30 * 1000;
+/** Бюджет reconcile по умолчанию: один короткий GET, а не таймаут запуска. */
+export const DEFAULT_RECONCILE_DEADLINE_MS = 5 * 1000;
 export const MAX_LOG_EVENT_CHARS = 10_000;
 
 export interface LaunchArtifact {
@@ -61,16 +69,35 @@ export interface LaunchArtifact {
   mime: string;
   sha256: string;
   size: number;
+  objectKey?: string;
 }
 
 export interface LaunchRepo {
   fullName: string;
   /** Ветка рана: воркер создал её, закоммитил в неё `outputs` и запушил. */
   branch: string;
-  /** HEAD этой ветки на момент ответа. */
-  commit: string;
+  /**
+   * HEAD ветки на момент ответа. `null` (или null-SHA) означает «в ветку ничего не
+   * запушено»: ран без выходов заканчивается законно, и это не отказ.
+   */
+  commit: string | null;
   /** Ветка, от которой ответвлялся ран (если воркер её сообщил). */
   baseRef?: string;
+}
+
+const NULL_SHA = /^0{7,64}$/;
+
+/**
+ * Можно ли отдать клиенту лог по этой ссылке. Воркер без бакета держит лог у себя и
+ * возвращает `local://…`: это честный ответ, но не URL, и редиректить на него нельзя.
+ */
+export function isRetrievableLogUrl(logUrl: string | null): boolean {
+  return typeof logUrl === 'string' && /^https?:\/\//.test(logUrl);
+}
+
+/** Есть ли в ветке рана хоть один коммит: null-SHA и пустая строка означают «ничего нет». */
+export function repoHasCommit(repo: LaunchRepo): boolean {
+  return typeof repo.commit === 'string' && repo.commit.length > 0 && !NULL_SHA.test(repo.commit);
 }
 
 /**
@@ -107,7 +134,19 @@ export interface LaunchRequest {
   envAllowlist: string[];
   env: Record<string, string>;
   limits: { timeoutMs: number; maxOutputBytes: number; maxLogBytes: number };
-  repository: { fullName: string; branch: string };
+  repository: { fullName: string; branch: string; revision?: string };
+  profileWorkspace?: { bindingId: string; objectBucket?: string; artifacts: Array<{ path: string; key: string; sha256: string; size: number }>; excludedPatterns: string[] };
+  /**
+   * Токен публикации: клон `repository.fullName` и коммит выходов в его ветку.
+   *
+   * Воркер запускается в чужом репозитории (кольцо), и токен того репозитория не имеет
+   * прав на репозиторий задачи — публикация падала, а рапорт уходил успешным. Не
+   * прислать токен — значит knowingly отдать клиенту ран без выходов, поэтому поле
+   * необязательное только для совместимости, а не «на всякий случай».
+   *
+   * В `workflow_dispatch` не попадает: воркер забирает его по одноразовому claim-токену.
+   */
+  publicationToken?: string;
   /**
    * Куда воркер вернёт `LaunchResult` для этого рана: `POST {resultUrl}` с общим секретом
    * в `Authorization`. Адрес приходит в запросе, поэтому воркеру не нужно знать, где мы.
@@ -166,6 +205,11 @@ export interface LaunchResult {
   timedOut: boolean;
   outputTruncated: boolean;
   artifacts: LaunchArtifact[];
+  /**
+   * Ссылка на лог рана. Ключ обязателен, значение может быть пустым (#133): джобу убили до
+   * загрузки лога (отмена) или до неё дошло отказать (startup_failure). Отсутствие ключа —
+   * расхождение с контрактом; пустая строка — честный ответ «лог не опубликован».
+   */
   logUrl: string;
   repo: LaunchRepo;
   failure?: LaunchFailure;
@@ -191,12 +235,14 @@ export interface ExternalWorker {
 }
 
 /**
- * Гонка отмены с запуском. Контракт воркера синхронный (`launch` = весь ран), поэтому отмена
- * может прийти раньше, чем воркер зарегистрирует ран. `unknown_run` в такой ситуации означает
- * «ещё не вижу», а не «не существует», и API повторяет запрос, пока ран в полёте.
+ * Чистый текст из вывода агента: ANSI-последовательности вырезаются, прочие управляющие
+ * символы (кроме перевода строки и табуляции) заменяются пробелом. Реальный opencode печатает
+ * цветом и курсивом — раньше такой `stderr` отвергал весь результат рана.
  */
-export const CANCEL_UNKNOWN_RUN_RETRIES = 5;
-export const CANCEL_UNKNOWN_RUN_BACKOFF_MS = 40;
+export function stripControlCharacters(value: string): string {
+  // eslint-disable-next-line no-control-regex
+  return value.replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, '').replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, ' ');
+}
 
 /** Проверка текста, который в норме может быть пустым (stderr, stdout без вывода). */
 function checkText(value: unknown, path: string, collector: ErrorCollector, maxLen: number): void {
@@ -216,9 +262,10 @@ export interface ExternalWorkerOptions {
   /** Публичный адрес нашего API: воркер шлёт результат на callback resultUrl. */
   baseUrlForResult?: string;
   /**
-   * Имя движка, которым этот воркер отвечает. По умолчанию — `dynamic-ip-azure-agent-run`
-   * (Azure VM). Второй воркер (например, получатель раннеров на GitHub Actions) объявляет
-   * своё: имя движка — это адрес воркера, а не его внутренняя деталь.
+   * Имя движка, которым этот воркер отвечает. По умолчанию — `azure-dynamic-ip-agent-run`:
+   * агент запускается раннером GitHub Actions на Azure-машине с динамическим IP — это
+   * основной путь и первый в цепочке движков. Наши собственные машины (EU VM, RF VM)
+   * объявляют свои имена: движок — это адрес исполнителя, а не его внутренняя деталь.
    */
   engineName?: string;
   token?: string;
@@ -229,6 +276,12 @@ export interface ExternalWorkerOptions {
   env?: Record<string, string>;
   /** Таймаут ожидания ответа воркера на launch. По умолчанию 10 минут. */
   deadlineMs?: number;
+  /**
+   * Бюджет приёма рана (issue #100): сколько ждём квитанцию `POST /v1/launch`. Это отдельная
+   * величина от `deadlineMs` — «воркер не ответил» и «ран идёт долго» должны иметь разные
+   * таймауты, иначе замена движка в цепочке ждала бы полчаса. Если не задан — `deadlineMs`.
+   */
+  acceptDeadlineMs?: number;
   cancelDeadlineMs?: number;
   fetchImpl?: typeof fetch;
   now?: () => Date;
@@ -274,12 +327,6 @@ export function trimTrailingSlash(value: string): string {
   return value.endsWith('/') ? value.slice(0, -1) : value;
 }
 
-/**
- * Ссылка на лог рана. В serverless-модели это НЕ путь в файловой системе: успешный ран —
- * ссылка GCS, которую вернул воркер; недоступный воркер — его собственный URL рана, где лог
- * лежал бы, если бы воркер успел его написать. `RunResult.logPath` обязан быть непустой
- * строкой, поэтому подставлять сюда пустоту нельзя.
- */
 /** Строка вывода агента в виде, пригодном для события рана: без секретов и управляющих символов. */
 export function logMessage(text: string): string {
   return truncateLine(redactSecrets(text).replace(/[\u0000-\u001f\u007f]/g, ' ').trim(), MAX_LOG_EVENT_CHARS - 32);
@@ -291,6 +338,13 @@ export function safeSummary(message: string): string {
   return truncateLine(redactSecrets(message), 450);
 }
 
+/**
+ * Ссылка на лог рана. В serverless-модели это НЕ путь в файловой системе: успешный ран —
+ * ссылка GCS, которую вернул воркер; недоступный воркер — его собственный URL рана, где лог
+ * лежал бы, если бы воркер успел его написать. Пустой `logUrl` (лог не опубликован, #133) и
+ * отсутствие результата дают одно и то же — адрес рана у воркера: `RunResult.logPath` обязан
+ * быть непустой строкой, иначе результат рана сам станет невалидным.
+ */
 export function runLogRef(launch: LaunchResult | null, workerBaseUrl: string | null, runId: string): string {
   if (launch?.logUrl) return launch.logUrl;
   const base = workerBaseUrl ?? 'worker://unconfigured';
@@ -299,7 +353,11 @@ export function runLogRef(launch: LaunchResult | null, workerBaseUrl: string | n
 
 /** Ссылка на файл в репозитории юзера: воркер коммитит артефакты, мы только адресуем их. */
 export function artifactUrl(repo: LaunchRepo, path: string): string {
-  return `https://github.com/${repo.fullName}/blob/${repo.commit}/${path}`;
+  // Файл адресуем коммитом, но если в ветку ничего не запушено — ссылка на ветку:
+  // `/blob/null/...` был бы битой ссылкой, а не «артефакт без коммита».
+  return repoHasCommit(repo)
+    ? `https://github.com/${repo.fullName}/blob/${repo.commit}/${path}`
+    : `https://github.com/${repo.fullName}/tree/${repo.branch}/${path}`;
 }
 
 /** Страница ветки рана: отсюда видно весь результат и отсюда GitHub предлагает merge/PR. */
@@ -312,7 +370,8 @@ export function branchUrl(repo: LaunchRepo): string {
  * известной базы честнее отдать страницу ветки: GitHub сам предложит merge.
  */
 export function mergeUrl(repo: LaunchRepo): string {
-  return repo.baseRef
+  // Сравнивать нечего, если в ветке нет коммитов: отдаём страницу ветки.
+  return repo.baseRef && repoHasCommit(repo)
     ? `https://github.com/${repo.fullName}/compare/${repo.baseRef}...${repo.branch}`
     : branchUrl(repo);
 }
@@ -371,10 +430,27 @@ export function launchRequestFromSpec(
     env,
     limits: {
       timeoutMs: spec.limits.timeoutMs,
-      maxOutputBytes: spec.limits.maxOutputBytes ?? 0,
-      maxLogBytes: spec.limits.maxLogBytes ?? 0,
+      maxOutputBytes: spec.limits.maxOutputBytes ?? 5_000_000,
+      maxLogBytes: spec.limits.maxLogBytes ?? 5_000_000,
     },
-    repository: { fullName: spec.repository?.fullName ?? '', branch: runBranchName(spec.runId) },
+    repository: {
+      fullName: spec.repository?.fullName ?? '',
+      branch: runBranchName(spec.runId),
+      ...(spec.repository?.revision ? { revision: spec.repository.revision } : {}),
+    },
+    ...(spec.profileWorkspace ? { profileWorkspace: spec.profileWorkspace } : {}),
+    // Токен публикации: без него джоба клонирует репозиторий задачи и коммитит выходы
+    // токеном репозитория кольца, у которого нет прав на чужой репозиторий. На живом
+    // замере 05.10.2026 так ушли 15 запусков из 16 как `completed artifacts=0`.
+    //
+    // Раньше токен не пересылался намеренно («клиентский токен не покидает API»), и это
+    // было верно, пока публиковать было нечем: выходы всегда шли в репозиторий кольца.
+    // Теперь публикация идёт в `repository.fullName` задачи, поэтому токен нужен воркеру.
+    //
+    // Он не попадает в `workflow_dispatch` воркера: воркер получает его по одноразовому
+    // claim-токену, а claim-ответ помечен `no-store`. В диспатч уезжают только runId и
+    // claimToken.
+    ...(spec.repository?.token !== undefined ? { publicationToken: spec.repository.token } : {}),
     resultUrl: options.resultUrl,
     isolation: { mode: spec.isolation?.mode ?? 'none' },
     ...options.remoteMcpAttachment,
@@ -416,7 +492,26 @@ export function validateLaunchResult(input: unknown, expectedRunId: string): Val
   const collector = new ErrorCollector();
   if (!checkObject(input, 'launch', collector)) return collector.finish(undefined as never);
   // `failure` появляется только на отказе воркера (issue #73) — остальное обяза��тельно.
-  checkKeys(input, LAUNCH_RESULT_KEYS, LAUNCH_RESULT_KEYS.filter((key) => key !== 'failure'), 'launch', collector);
+  // `failure` — только на отказе, `pid` — необязателен: агент в GitHub Actions запущен на
+  // другой машине, и локального PID у нашего API нет. Оба поля отклика на этой машине.
+  // Необязательны три поля: `failure` — только на отказе, `pid` — агент в GitHub Actions
+  // запущен на другой машине и локального PID у нас нет, `answer` — извлекает воркер, и
+  // настоящий opencode-шлюз его не присылает вовсе. Отсутствие этих полей — не повод
+  // выбросить результат целого рана: живая проба #100 показала, что реальный ответ
+  // отвергался как WORKER_PROTOCOL_INVALID, и рана с артефактами у клиента не было.
+  const OPTIONAL_RESULT_KEYS = ['failure', 'pid', 'answer'] as const;
+  checkKeys(
+    input,
+    LAUNCH_RESULT_KEYS,
+    LAUNCH_RESULT_KEYS.filter((key) => !(OPTIONAL_RESULT_KEYS as readonly string[]).includes(key)),
+    'launch',
+    collector,
+  );
+  // Управляющие символы и ANSI в выводе агента — норма для реального CLI: вычищаем их
+  // на входе, чтобы в RunResult и в события рана не попал мусор из терминала.
+  for (const key of ['stdout', 'stderr', 'answer'] as const) {
+    if (typeof input[key] === 'string') input[key] = stripControlCharacters(input[key] as string);
+  }
 
   if (input['runId'] !== expectedRunId) collector.push(`launch.runId: expected echo of ${expectedRunId}`);
   if (input['status'] !== 'started' && input['status'] !== 'failed') collector.push('launch.status: expected started | failed');
@@ -448,7 +543,7 @@ export function validateLaunchResult(input: unknown, expectedRunId: string): Val
     input['artifacts'].forEach((artifact, index) => {
       const path = `launch.artifacts[${index}]`;
       if (!checkObject(artifact, path, collector)) return;
-      checkKeys(artifact, ['path', 'name', 'mime', 'sha256', 'size'], ['path', 'name', 'mime', 'sha256', 'size'], path, collector);
+      checkKeys(artifact, ['path', 'name', 'mime', 'sha256', 'size', 'objectKey'], ['path', 'name', 'mime', 'sha256', 'size'], path, collector);
       checkString(artifact['path'], `${path}.path`, collector, 512);
       checkString(artifact['name'], `${path}.name`, collector, 200);
       checkString(artifact['mime'], `${path}.mime`, collector, 100);
@@ -456,16 +551,32 @@ export function validateLaunchResult(input: unknown, expectedRunId: string): Val
       if (typeof artifact['size'] !== 'number' || !Number.isInteger(artifact['size']) || (artifact['size'] as number) < 0) {
         collector.push(`${path}.size: expected non-negative integer`);
       }
+      if (artifact['objectKey'] !== undefined && (typeof artifact['objectKey'] !== 'string' || !/^profiles\/[A-Za-z0-9._-]+\/workspace\/[A-Za-z0-9._-]+\/[0-9a-f]{64}$/.test(artifact['objectKey']))) {
+        collector.push(`${path}.objectKey: expected scoped profile object key`);
+      }
     });
   }
-  checkString(input['logUrl'], 'launch.logUrl', collector, 500);
+  // Ключ `logUrl` обязателен, а значение может быть пустым (#133): отменённый ран и любой
+  // отказ до загрузки лога приходят с `logUrl: ''` — джобу убили, лог в GCS не лежит.
+  // Требовать непустую строку здесь означало отвергнуть весь результат рана как
+  // WORKER_PROTOCOL_INVALID: отмена возвращалась клиенту как `failed`/`worker_crash`,
+  // а реальный отказ воркера — как расхождение с контрактом. Пустую ссылку `runLogRef`
+  // заменяет адресом рана у воркера, а `mapLaunchResult` — на `null`.
+  checkText(input['logUrl'], 'launch.logUrl', collector, 500);
   if (!checkObject(input['repo'], 'launch.repo', collector)) {
     // уже сообщено
   } else {
-    checkKeys(input['repo'], ['fullName', 'branch', 'commit', 'baseRef'], ['fullName', 'branch', 'commit'], 'launch.repo', collector);
+    checkKeys(input['repo'], ['fullName', 'branch', 'commit', 'baseRef'], ['fullName', 'branch'], 'launch.repo', collector);
     checkString(input['repo']['fullName'], 'launch.repo.fullName', collector, 200);
     checkString(input['repo']['branch'], 'launch.repo.branch', collector, 200);
-    checkString(input['repo']['commit'], 'launch.repo.commit', collector, 64);
+    // `commit` может быть null или null-SHA: это «в ветку ничего не запушено», а не отказ.
+    // Требовать непустой SHA нельзя — ран без выходов заканчивается законно.
+    const commit = input['repo']['commit'];
+    if (commit !== null && commit !== undefined) {
+      if (typeof commit !== 'string' || commit.length === 0 || commit.length > 64) {
+        collector.push('launch.repo.commit: expected a sha string, null, or omitted');
+      }
+    }
     if (input['repo']['baseRef'] !== undefined) checkString(input['repo']['baseRef'], 'launch.repo.baseRef', collector, 200);
   }
 
@@ -567,8 +678,12 @@ export function mapLaunchResult(
   const failure = launchFailureFor(spec, launch, outcome);
   const artifacts = launch.artifacts ?? [];
   const repo = launch.repo ?? null;
-  const logUrl = launch.logUrl ?? null;
-  const outputRefs = artifacts.map((artifact) => (repo ? artifactUrl(repo, artifact.path) : artifact.path));
+  // Пустой `logUrl` — «лог не опубликован» (#133), а не «ссылка на пустое»: наружу это
+  // `null`, иначе в ответе API ездила бы пустая строка вместо отсутствующей ссылки.
+  const logUrl = launch.logUrl.length > 0 ? launch.logUrl : null;
+  const outputRefs = artifacts.map((artifact) => artifact.objectKey
+    ? `/v1/runs/${encodeURIComponent(spec.runId)}/artifacts?path=${encodeURIComponent(artifact.path)}`
+    : (repo ? artifactUrl(repo, artifact.path) : artifact.path));
   const persistence = artifacts.length > 0 ? 'persisted' : 'not_required';
   const result: RunResult = {
     schemaVersion: RUN_RESULT_SCHEMA_VERSION,
@@ -737,13 +852,13 @@ export function workerTransportFailure(
   spec: RunSpec,
   err: unknown,
   times: { startedAt: string; finishedAt: string },
-  options: LaunchMappingOptions = {},
+  options: LaunchMappingOptions & { /** Отказ, если он известен вызывающему (например, исчерпанная цепочка движков). */ failure?: RunFailure } = {},
 ): LaunchMapping {
   const message = err instanceof Error ? err.message : String(err);
   // Отказ на границе воркера не всегда «воркер недоступен»: preflight-отказ (нет промпта,
   // refs без workspace) и таймаут launch несут собственный код, класс и retryable.
   const typed = err instanceof PreflightError ? err : null;
-  const failure: RunFailure = {
+  const failure: RunFailure = options.failure ?? {
     code: typed?.code ?? 'WORKER_UNREACHABLE',
     failureClass: typed?.failureClass ?? 'runtime',
     safeSummary: safeSummary(typed ? typed.message : message),
@@ -787,6 +902,52 @@ export function workerTransportFailure(
   return { result, events, artifacts: [], repo: null, logUrl: null, answer: null };
 }
 
+/**
+ * Отказы запуска, при которых ран **не принят** (issue #100). Ровно на них цепочка движков
+ * вправе перейти к следующему исполнителю: квитанции нет, ран нигде не идёт, второй запуск
+ * ничего не дублирует. Всё остальное — отказ на нашей же стороне (нет промпта, refs без
+ * workspace, не задан `resultUrl`), где повтор на другом движке бесполезен.
+ */
+export const UNACCEPTED_LAUNCH_CODES = ['WORKER_LAUNCH_UNREACHABLE', 'WORKER_HTTP_ERROR', 'WORKER_PROTOCOL_INVALID'] as const;
+
+/** Принял ли воркер ран: квитанция получена, цепочка движков на этом останавливается. */
+export function isUnacceptedLaunchFailure(err: unknown): boolean {
+  if (!(err instanceof PreflightError)) return false;
+  return (UNACCEPTED_LAUNCH_CODES as readonly string[]).includes(err.code);
+}
+
+/** Код отказа запуска для журнала и для разбора исхода рана. */
+export function launchFailureCode(err: unknown): string {
+  return err instanceof PreflightError ? err.code : 'WORKER_UNREACHABLE';
+}
+
+/** Одна неудачная попытка приёма рана — она и есть содержимое отказа «цепочка исчерпана». */
+export interface FleetAttempt {
+  engine: string;
+  code: string;
+  summary: string;
+}
+
+/**
+ * Цепочка движков исчерпана (issue #100): ни один воркер не принял ран. Ран терминален
+ * `failed` — выполнять его некому, а `unknown` обещал бы reconcile запуска, которого нет.
+ * Причина перечисляет все попытки, поэтому клиент видит не «машина упала», а кто и почему
+ * отказал; новый `Idempotency-Key` даёт новую попытку.
+ */
+export function fleetExhaustedFailure(
+  spec: RunSpec,
+  attempts: readonly FleetAttempt[],
+  times: { startedAt: string; finishedAt: string },
+  options: LaunchMappingOptions = {},
+): LaunchMapping {
+  const detail = attempts.map((attempt) => `${attempt.engine}: ${attempt.code}`).join('; ');
+  const summary = `no engine accepted the run — ${attempts.length} attempt(s): ${detail}`;
+  return workerTransportFailure(spec, new Error(summary), times, {
+    ...options,
+    failure: { code: 'ENGINE_FLEET_EXHAUSTED', failureClass: 'runtime', safeSummary: safeSummary(summary), retryable: true },
+  });
+}
+
 export class ExternalWorkerAdapter implements ExternalWorker {
   async dispose(): Promise<void> {
     await this.remoteMcp?.resolveBinding.dispose?.();
@@ -798,6 +959,7 @@ export class ExternalWorkerAdapter implements ExternalWorker {
   private readonly token: string | undefined;
   private readonly env: Record<string, string>;
   private readonly deadlineMs: number;
+  private readonly acceptDeadlineMs: number;
   private readonly cancelDeadlineMs: number;
   private readonly fetchImpl: typeof fetch;
   private readonly now: () => Date;
@@ -815,6 +977,9 @@ export class ExternalWorkerAdapter implements ExternalWorker {
     this.token = options.token;
     this.env = options.env ?? {};
     this.deadlineMs = options.deadlineMs ?? DEFAULT_LAUNCH_DEADLINE_MS;
+    // Бюджет приёма по умолчанию равен общему таймауту: без явного accept-бюджета поведение
+    // не меняется, но цепочка движков (#100) задаёт его каждому движку отдельно.
+    this.acceptDeadlineMs = options.acceptDeadlineMs ?? this.deadlineMs;
     this.cancelDeadlineMs = options.cancelDeadlineMs ?? DEFAULT_CANCEL_DEADLINE_MS;
     this.fetchImpl = options.fetchImpl ?? globalThis.fetch;
     this.now = options.now ?? (() => new Date());
@@ -828,7 +993,7 @@ export class ExternalWorkerAdapter implements ExternalWorker {
 
   private async resolveMcp(spec: RunSpec, mode: 'launch' | 'restore', admittedAt: string): Promise<RemoteMcpAttachment | undefined> {
     const bindingController = new AbortController();
-    return withDeadline(
+    return withTimeout(
       resolveRemoteMcpAttachment(spec, this.remoteMcp, this.now(), bindingController.signal, mode, admittedAt),
       Math.min(this.deadlineMs, spec.limits.timeoutMs),
       'trusted MCP binding resolution',
@@ -853,17 +1018,18 @@ export class ExternalWorkerAdapter implements ExternalWorker {
     const url = `${trimTrailingSlash(base)}/v1/launch`;
     const headers: Record<string, string> = { 'content-type': 'application/json' };
     if (this.token) headers['authorization'] = `Bearer ${this.token}`;
-    this.log({ event: 'worker_launch', runId: spec.runId, url, engine: spec.engine.name, timeoutMs: spec.limits.timeoutMs });
+    this.log({ event: 'worker_launch', runId: spec.runId, url, engine: spec.engine.name, timeoutMs: spec.limits.timeoutMs, acceptDeadlineMs: this.acceptDeadlineMs });
 
     // Запрос короткий: воркер отвечает квитанцией сразу и уходит работать. Держать соединение
     // весь ран не нужно — результат читается отдельно, поэтому таймаут здесь честно означает
-    // «воркер не принял задачу», а не «ран идёт долго».
+    // «воркер не принял задачу», а не «ран идёт долго». Бюджет приёма — свой на каждый движок
+    // (#100): не ответил за него — цепочка берёт следующий движок.
     const controller = new AbortController();
     let response: Response;
     try {
-      response = await withDeadline(
+      response = await withTimeout(
         this.fetchImpl(url, { method: 'POST', headers, body: JSON.stringify(request), signal: controller.signal }),
-        this.deadlineMs,
+        this.acceptDeadlineMs,
         'worker launch',
         () => controller.abort(),
       );
@@ -883,7 +1049,9 @@ export class ExternalWorkerAdapter implements ExternalWorker {
       this.log({ event: 'worker_launch_http_error', runId: spec.runId, status: response.status, detail });
       throw new PreflightError('WORKER_HTTP_ERROR', `the external worker answered ${response.status} on launch`, {
         failureClass: 'runtime',
-        retryable: true,
+        // 4xx — про запрос: тот же запрос получит тот же отказ (битый токен, не тот payload),
+        // и повтор станет штормом. 5xx — про состояние воркера, повтор оправдан.
+        retryable: response.status >= 500,
       });
     }
     const validated = validateLaunchReceipt(await readJson(response), spec.runId);
@@ -892,7 +1060,9 @@ export class ExternalWorkerAdapter implements ExternalWorker {
       throw new PreflightError(
         'WORKER_PROTOCOL_INVALID',
         `the external worker answered launch outside the contract: ${validated.errors.join('; ')}`,
-        { failureClass: 'runtime', retryable: true },
+        // Расхождение контракта детерминировано: тот же запрос получит тот же ответ.
+        // Повтор его не исправит и превращается в шторм — это отказ, а не «попробуй ещё».
+        { failureClass: 'runtime', retryable: false },
       );
     }
     this.log({ event: 'worker_launch_accepted', runId: spec.runId, engine: spec.engine.name, statusUrl: validated.value.statusUrl });
@@ -919,7 +1089,7 @@ export class ExternalWorkerAdapter implements ExternalWorker {
       throw new PreflightError(
         'WORKER_PROTOCOL_INVALID',
         `the external worker answered status outside the contract: ${validated.errors.join('; ')}`,
-        { failureClass: 'runtime', retryable: true },
+        { failureClass: 'runtime', retryable: false },
       );
     }
     return validated.value;
@@ -949,7 +1119,7 @@ export class ExternalWorkerAdapter implements ExternalWorker {
       throw new PreflightError(
         'WORKER_PROTOCOL_INVALID',
         `the external worker answered result outside the contract: ${validated.errors.join('; ')}`,
-        { failureClass: 'runtime', retryable: true },
+        { failureClass: 'runtime', retryable: false },
       );
     }
     return validated.value;
@@ -994,7 +1164,7 @@ export class ExternalWorkerAdapter implements ExternalWorker {
     if (this.token) headers['authorization'] = `Bearer ${this.token}`;
     const controller = new AbortController();
     try {
-      return await withDeadline(this.fetchImpl(url, { method: 'GET', headers, signal: controller.signal }), deadlineMs, label, () => controller.abort());
+      return await withTimeout(this.fetchImpl(url, { method: 'GET', headers, signal: controller.signal }), deadlineMs, label, () => controller.abort());
     } catch (err) {
       if (controller.signal.aborted) controller.abort();
       throw err;
@@ -1014,7 +1184,7 @@ export class ExternalWorkerAdapter implements ExternalWorker {
       if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, CANCEL_DELIVERY_BACKOFF_MS));
       let response: Response;
       try {
-        response = await withDeadline(this.fetchImpl(url, { method: 'POST', headers, body: '{}' }), this.cancelDeadlineMs, 'worker cancel');
+        response = await withTimeout(this.fetchImpl(url, { method: 'POST', headers, body: '{}' }), this.cancelDeadlineMs, 'worker cancel');
       } catch (err) {
         last = err instanceof Error ? err.message : String(err);
         continue;
@@ -1054,7 +1224,11 @@ async function readJson(response: Response): Promise<unknown> {
   }
 }
 
-async function withDeadline<T>(promise: Promise<T>, deadlineMs: number, label: string, onTimeout?: () => void): Promise<T> {
+/**
+ * Ожидание с дедлайном. Экспортируется для reconcile в сервисе: у него свой бюджет,
+ * а не таймаут запуска — иначе мёртвый движок вешает проверку на 10 минут.
+ */
+export async function withTimeout<T>(promise: Promise<T>, deadlineMs: number, label: string, onTimeout?: () => void): Promise<T> {
   let timer: NodeJS.Timeout | undefined;
   try {
     return await Promise.race([

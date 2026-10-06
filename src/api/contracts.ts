@@ -48,7 +48,11 @@ export type ApiRunState = (typeof API_RUN_STATES)[number];
 export interface SubmitRequest {
   userTaskId?: string;
   conversationId?: string;
-  engine: EngineSpec;
+  /**
+   * Движок рана. Не объявлен — исполнителя выбирает приоритетная цепочка движков (issue #100);
+   * объявлен — цепочка не применяется, ран идёт ровно на этот движок.
+   */
+  engine?: EngineSpec;
   input?: InputSpec;
   envAllowlist: string[];
   limits: RunLimits;
@@ -83,6 +87,11 @@ export interface RunStatusView {
   runId: string;
   ownerGeneration: number;
   state: ApiRunState;
+  /**
+   * Движок, который отработал ран (issue #100). Пока никто не принял ран — тот, на котором
+   * идёт попытка: цепочка движков двигает его по мере отказов. После приёма он не меняется.
+   */
+  engine: string;
   cancelRequested: boolean;
   connectionLost: boolean;
   observedAt: string;
@@ -90,6 +99,7 @@ export interface RunStatusView {
   fencing: { rejected: number };
   /** Текст ответа агента, если воркер его извлёк. */
   answer: string | null;
+  publication?: { status: string; committedRevision: string | null; conflictId: string | null; publicationId: string | null; reason: string | null } | null;
 }
 
 export interface EventsPage {
@@ -249,6 +259,20 @@ export interface ApiCapabilities {
     } | null;
   };
   engines: string[];
+  /**
+   * Как выбирается исполнитель рана (issue #100). Объявлено честно: цепочка проб, переход
+   * только при отсутствии квитанции и никакого второго запуска после приёма.
+   */
+  engineSelection: {
+    /** Приоритетная цепочка в порядке проб; пустая — цепочка не объявлена. */
+    chain: string[];
+    /** Заявка без `engine` идёт по цепочке; с `engine` — ровно на названный движок. */
+    engineOptional: true;
+    /** Повтор на следующем движке — только если квитанции не было. */
+    retryOnlyWhenUnaccepted: true;
+    /** После квитанции второй запуск невозможен: ран уже идёт, дальше только reconcile. */
+    relaunchAfterReceipt: false;
+  };
 }
 
 export const API_CAPABILITIES_SCHEMA_VERSION = 1 as const;
@@ -274,9 +298,12 @@ const SUBMIT_KEYS = [
   'isolation',
 ] as const;
 
-const SUBMIT_REQUIRED = ['engine', 'limits'] as const;
+const SUBMIT_REQUIRED = ['limits'] as const;
 
 const CANCEL_KEYS = ['ownerGeneration', 'reason'] as const;
+
+/** Имя движка-заглушки на время валидации заявки без `engine`; клиенту не возвращается. */
+const ENGINE_PENDING_PLACEHOLDER = 'engine.pending';
 
 export function newApiId(prefix: string): string {
   return `${prefix}_${randomUUID()}`;
@@ -314,7 +341,9 @@ export function validateSubmitRequest(input: unknown): ValidationResult<SubmitRe
     profileId: 'profile.generated',
     conversationId: typeof input['conversationId'] === 'string' ? input['conversationId'] : 'conv.generated',
     ownerGeneration: 1,
-    engine: input['engine'],
+    // Движок в заявке необязателен (цепочка выбирает), но `RunSpec` его требует — на время
+    // валидации подставляем заглушку и в ответ её не возвращаем.
+    engine: input['engine'] ?? { name: ENGINE_PENDING_PLACEHOLDER, adapterVersion: '1' },
     cwd: '/pending',
     envAllowlist: input['envAllowlist'] ?? [],
     limits: input['limits'],
@@ -331,10 +360,10 @@ export function validateSubmitRequest(input: unknown): ValidationResult<SubmitRe
 
   const spec: RunSpec = specResult.value;
   const request: SubmitRequest = {
-    engine: spec.engine,
     envAllowlist: spec.envAllowlist,
     limits: spec.limits,
   };
+  if (input['engine'] !== undefined) request.engine = spec.engine;
   if (spec.input !== undefined) request.input = spec.input;
   if (spec.deadline !== undefined) request.deadline = spec.deadline;
   if (spec.regionConstraints !== undefined) request.regionConstraints = spec.regionConstraints;

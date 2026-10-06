@@ -6,7 +6,9 @@
 
 import { statSync } from 'node:fs';
 import {
+  DEFAULT_ACCEPT_DEADLINE_MS,
   DEFAULT_CANCEL_DEADLINE_MS,
+  DEFAULT_RECONCILE_DEADLINE_MS,
   DEFAULT_LAUNCH_DEADLINE_MS,
   EXTERNAL_WORKER_ENGINE,
   ExternalWorkerAdapter,
@@ -18,11 +20,16 @@ export const DEFAULT_API_PORT = 8787;
 export const DEFAULT_API_HOST = '0.0.0.0';
 
 export interface WorkerConfig {
-  /** Имя движка, которым этот воркер отвечает: `dynamic-ip-azure-agent-run`, … */
+  /** Имя движка, которым этот воркер отвечает: `azure-dynamic-ip-agent-run`, `eu-vm-agent-run`, … */
   engine: string;
   baseUrl: string;
   token: string;
   launchDeadlineMs: number;
+  /**
+   * Бюджет приёма рана этим движком (issue #100): сколько ждём квитанцию `POST /v1/launch`.
+   * Не ответил за бюджет — цепочка берёт следующий движок, поэтому у GitHub Actions он короткий.
+   */
+  acceptDeadlineMs: number;
   cancelDeadlineMs: number;
 }
 
@@ -31,13 +38,29 @@ export interface AgentApiProcessConfig {
   host: string;
   port: number;
   keyRegistryPath: string;
-  publicUrl: string | null;
   /** Воркеры по движкам. Имя движка — адрес воркера, а не его внутренняя деталь. */
   workers: WorkerConfig[];
+  /**
+   * Приоритетная цепочка движков (issue #100): `AGENT_API_ENGINE_CHAIN`. Порядок проб задаёт
+   * конфиг, а не сортировка имён. `null` — цепочка не объявлена, ран идёт ровно на тот движок,
+   * который назвал клиент.
+   */
+  engineChain: string[] | null;
   /** Пулы значений окружения, которые можно передать воркеру (по envAllowlist рана). */
   env: Record<string, string>;
   /** Репозиторий по умолчанию, когда клиент не объявил `repository` (воркер клонирует его сам). */
   defaultRepository: string | null;
+  /**
+   * Публичный адрес этого API: воркер возвращает результат на `POST {resultUrl}`. Без него
+   * воркер не получает адрес для возврата и не может быть запущен.
+   */
+  publicUrl: string | null;
+  /**
+   * Бюджет reconcile (issue #100): сколько ждём ответа на `GET /v1/runs/{id}/status`, когда
+   * квитанции не было. Отдельно от таймаута запуска: мёртвый движок не должен вешать
+   * проверку на 10 минут, иначе флот встаёт.
+   */
+  reconcileDeadlineMs: number;
 }
 
 function envValue(env: Record<string, string | undefined>, name: string): string | undefined {
@@ -49,11 +72,20 @@ function envValue(env: Record<string, string | undefined>, name: string): string
 
 /** Читает из переданного окружения, а не из `process.env`: иначе аргумент функции не работает. */
 function intEnv(env: Record<string, string | undefined>, name: string, fallback: number): number {
-  const raw = envValue(env, name);
-  if (raw === undefined) return fallback;
-  const value = Number(raw);
+  return positiveInt(envValue(env, name), name, fallback);
+}
+
+/** Положительное целое из строки (env) или из уже разобранного значения (JSON-конфиг). */
+function positiveInt(raw: unknown, name: string, fallback: number): number {
+  if (raw === undefined || raw === null) return fallback;
+  if (typeof raw !== 'string' && typeof raw !== 'number') {
+    throw new Error(`${name}: expected a positive integer`);
+  }
+  const text = typeof raw === 'number' ? String(raw) : raw.trim();
+  if (text === '') return fallback;
+  const value = Number(text);
   if (!Number.isInteger(value) || value < 1) {
-    throw new Error(`${name}: expected a positive integer, got "${raw}"`);
+    throw new Error(`${name}: expected a positive integer, got "${text}"`);
   }
   return value;
 }
@@ -63,7 +95,13 @@ function intEnv(env: Record<string, string | undefined>, name: string, fallback:
  * Формат списком, потому что движков больше одного, а одиночный `EXTERNAL_WORKER_*` больше
  * не выражает «какой воркер какому движку».
  */
-function parseWorkers(env: Record<string, string | undefined>, raw: string | undefined, launchDeadlineMs: number, cancelDeadlineMs: number): WorkerConfig[] {
+function parseWorkers(
+  env: Record<string, string | undefined>,
+  raw: string | undefined,
+  launchDeadlineMs: number,
+  acceptDeadlineMs: number,
+  cancelDeadlineMs: number,
+): WorkerConfig[] {
   if (raw === undefined) {
     // Одиночный конфиг остаётся рабочим: у нас пока один движок.
     const baseUrl = env['EXTERNAL_WORKER_URL']?.trim() || env['DYNAMIC_IP_AZURE_URL']?.trim();
@@ -79,6 +117,7 @@ function parseWorkers(env: Record<string, string | undefined>, raw: string | und
         baseUrl,
         token: env['EXTERNAL_WORKER_TOKEN']?.trim() || env['DYNAMIC_IP_AZURE_TOKEN']?.trim() || '',
         launchDeadlineMs,
+        acceptDeadlineMs,
         cancelDeadlineMs,
       },
     ];
@@ -103,8 +142,43 @@ function parseWorkers(env: Record<string, string | undefined>, raw: string | und
     if (!/^https?:\/\//.test(baseUrl)) throw new Error(`AGENT_API_WORKERS[${index}].baseUrl: expected an http(s) URL`);
     if (seen.has(engine)) throw new Error(`AGENT_API_WORKERS: engine "${engine}" is declared twice`);
     seen.add(engine);
-    return { engine, baseUrl, token, launchDeadlineMs, cancelDeadlineMs };
+    // Бюджет приёма свой у каждого движка (issue #100): не задан — общий из env.
+    return {
+      engine,
+      baseUrl,
+      token,
+      launchDeadlineMs,
+      acceptDeadlineMs: positiveInt(record['acceptDeadlineMs'], `AGENT_API_WORKERS[${index}].acceptDeadlineMs`, acceptDeadlineMs),
+      cancelDeadlineMs,
+    };
   });
+}
+
+/**
+ * Приоритетная цепочка движков: `AGENT_API_ENGINE_CHAIN='gha,eu,rf'`. Порядок в конфиге — это
+ * порядок проб; сортировать имена нельзя, потому что приоритет задаёт владелец, а не алфавит.
+ * Не объявлена — `null`, и ран идёт ровно на названный клиентом движок (прежнее поведение).
+ */
+function parseEngineChain(raw: string | undefined, workers: readonly WorkerConfig[]): string[] | null {
+  const value = raw?.trim();
+  if (!value) return null;
+  const chain = value
+    .split(',')
+    .map((name) => name.trim())
+    .filter((name) => name.length > 0);
+  if (chain.length === 0) throw new Error('AGENT_API_ENGINE_CHAIN: expected a comma-separated list of engine names');
+  const seen = new Set<string>();
+  const configured = new Set(workers.map((worker) => worker.engine));
+  for (const engine of chain) {
+    if (seen.has(engine)) throw new Error(`AGENT_API_ENGINE_CHAIN: engine "${engine}" is listed twice`);
+    // Движок цепочки без воркера — опечатка в конфиге: молча пропустить его нельзя, иначе ран
+    // будет падать на середине цепочки вместо отказа на старте.
+    if (!configured.has(engine)) {
+      throw new Error(`AGENT_API_ENGINE_CHAIN: engine "${engine}" has no worker in AGENT_API_WORKERS (declared: ${[...configured].join(', ')})`);
+    }
+    seen.add(engine);
+  }
+  return chain;
 }
 
 /** `AGENT_API_ENV='{"PATH":"/usr/bin","LANG":"C.UTF-8"}'` — значения, отдаваемые воркеру. */
@@ -157,63 +231,59 @@ export function loadAgentApiConfig(env: Record<string, string | undefined> = pro
   }
 
   const launchDeadlineMs = intEnv(env, 'EXTERNAL_WORKER_LAUNCH_DEADLINE_MS', DEFAULT_LAUNCH_DEADLINE_MS);
+  // Бюджет приёма рана: по умолчанию 30 с, у каждого движка переопределяется полем acceptDeadlineMs.
+  const acceptDeadlineMs = intEnv(env, 'EXTERNAL_WORKER_ACCEPT_DEADLINE_MS', DEFAULT_ACCEPT_DEADLINE_MS);
   const cancelDeadlineMs = intEnv(env, 'EXTERNAL_WORKER_CANCEL_DEADLINE_MS', DEFAULT_CANCEL_DEADLINE_MS);
-  const workers = parseWorkers(env, env['AGENT_API_WORKERS'], launchDeadlineMs, cancelDeadlineMs);
+  const reconcileDeadlineMs = intEnv(env, 'EXTERNAL_WORKER_RECONCILE_DEADLINE_MS', DEFAULT_RECONCILE_DEADLINE_MS);
+  const workers = parseWorkers(env, env['AGENT_API_WORKERS'], launchDeadlineMs, acceptDeadlineMs, cancelDeadlineMs);
   if (workers.length === 0) {
     throw new Error('no external worker configured: set AGENT_API_WORKERS, or EXTERNAL_WORKER_URL for a single default worker');
   }
+  // Цепочка разбирается после воркеров: её имена обязаны быть среди объявленных движков.
+  const engineChain = parseEngineChain(env['AGENT_API_ENGINE_CHAIN'], workers);
 
   const publicUrl = envValue(env, 'AGENT_API_PUBLIC_URL') ?? null;
   if (publicUrl !== null) {
     let parsed: URL;
-    try {
-      parsed = new URL(publicUrl);
-    } catch {
-      throw new Error('AGENT_API_PUBLIC_URL: expected an absolute http(s) URL without credentials, query, or fragment');
-    }
-    if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password || parsed.search || parsed.hash) {
-      throw new Error('AGENT_API_PUBLIC_URL: expected an absolute http(s) URL without credentials, query, or fragment');
-    }
+    try { parsed = new URL(publicUrl); } catch { throw new Error('AGENT_API_PUBLIC_URL: expected an absolute http(s) URL without credentials, query, or fragment'); }
+    if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password || parsed.search || parsed.hash) throw new Error('AGENT_API_PUBLIC_URL: expected an absolute http(s) URL without credentials, query, or fragment');
   }
-
-  const testRegistryResolver = configuredTestRegistryBindingResolver((() => {
-    const token = envValue(env, 'AGENT_API_TEST_MCP_BEARER');
-    const privateKeyPem = envValue(env, 'AGENT_API_TEST_MCP_ED25519_PRIVATE_KEY');
-    const catalogueVersion = envValue(env, 'AGENT_API_TEST_MCP_CATALOGUE_VERSION');
-    const registryDigest = envValue(env, 'AGENT_API_TEST_MCP_REGISTRY_DIGEST');
-    if ([token, privateKeyPem, catalogueVersion, registryDigest].every(value => value === undefined)) return undefined;
-    if ([token, privateKeyPem, catalogueVersion, registryDigest].some(value => value === undefined)) throw new Error('test registry MCP configuration requires bearer, Ed25519 key, catalogue version and pinned registry digest');
-    return { token: token!, privateKeyPem: privateKeyPem!, catalogueVersion: catalogueVersion!, registryDigest: registryDigest! };
-  })());
+  const token = envValue(env, 'AGENT_API_TEST_MCP_BEARER');
+  const privateKeyPem = envValue(env, 'AGENT_API_TEST_MCP_ED25519_PRIVATE_KEY');
+  const catalogueVersion = envValue(env, 'AGENT_API_TEST_MCP_CATALOGUE_VERSION');
+  const registryDigest = envValue(env, 'AGENT_API_TEST_MCP_REGISTRY_DIGEST');
+  const testValues = [token, privateKeyPem, catalogueVersion, registryDigest];
+  if (testValues.some(value => value !== undefined) && testValues.some(value => value === undefined)) throw new Error('test registry MCP configuration requires bearer, Ed25519 key, catalogue version and pinned registry digest');
+  const testRegistryResolver = configuredTestRegistryBindingResolver(testValues.every(value => value === undefined) ? undefined : { token: token!, privateKeyPem: privateKeyPem!, catalogueVersion: catalogueVersion!, registryDigest: registryDigest! });
   const existingResolver = configuredDocumentsBindingResolver(envValue(env, 'AGENT_API_DOCUMENTS_MCP_MODULE'), envValue(env, 'AGENT_API_DOCUMENTS_MCP_REGISTRATIONS')) ?? bindingFileResolver(envValue(env, 'AGENT_API_REMOTE_MCP_BINDINGS_FILE'));
-  const resolveBinding: RemoteMcpBindingResolver = async (bindingRef, context) =>
-    context.profileId === 'integration-telegram-ux-v1' || bindingRef === 'registry-mcp-test-160-read'
-      ? context.profileId === 'integration-telegram-ux-v1' ? testRegistryResolver?.(bindingRef, context) ?? null : null
-      : existingResolver?.(bindingRef, context) ?? null;
+  const resolveBinding: RemoteMcpBindingResolver = async (bindingRef, context) => context.profileId === 'integration-telegram-ux-v1' || bindingRef === 'registry-mcp-test-160-read'
+    ? context.profileId === 'integration-telegram-ux-v1' ? testRegistryResolver?.(bindingRef, context) ?? null : null
+    : existingResolver?.(bindingRef, context) ?? null;
 
   return {
     host: env['AGENT_API_HOST']?.trim() || DEFAULT_API_HOST,
     port,
     keyRegistryPath,
-    publicUrl,
     workers,
+    engineChain,
     env: parseEnvPool(env['AGENT_API_ENV']),
     defaultRepository: env['RUNNER_DEFAULT_REPO']?.trim() || null,
-    remoteMcp: {
-      servers: parseRemoteMcpServerPolicies(env['AGENT_API_REMOTE_MCP_SERVERS']),
-      resolveBinding,
-    },
+    publicUrl,
+    reconcileDeadlineMs,
+    remoteMcp: { servers: parseRemoteMcpServerPolicies(envValue(env, 'AGENT_API_REMOTE_MCP_SERVERS')), resolveBinding },
   };
 }
 
+/** Compatibility factory used by API composition tests and local embedders. */
 export function createExternalWorkers(config: AgentApiProcessConfig, log?: (entry: Record<string, unknown>) => void, resolveBinding?: RemoteMcpBindingResolver): ExternalWorkerAdapter[] {
-  return config.workers.map((worker) => new ExternalWorkerAdapter({
+  return config.workers.map(worker => new ExternalWorkerAdapter({
     engineName: worker.engine,
     baseUrl: worker.baseUrl,
     env: config.env,
     ...(config.publicUrl ? { baseUrlForResult: config.publicUrl } : {}),
     ...(worker.token ? { token: worker.token } : {}),
     deadlineMs: worker.launchDeadlineMs,
+    acceptDeadlineMs: worker.acceptDeadlineMs,
     cancelDeadlineMs: worker.cancelDeadlineMs,
     log,
     ...(config.remoteMcp ? { remoteMcp: { ...config.remoteMcp, resolveBinding: resolveBinding ?? config.remoteMcp.resolveBinding } } : {}),

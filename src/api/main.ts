@@ -1,16 +1,13 @@
 import { mkdirSync, statSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { dirname } from 'node:path';
-import {
-  DEFAULT_CANCEL_DEADLINE_MS,
-  DEFAULT_LAUNCH_DEADLINE_MS,
-  EXTERNAL_WORKER_ENGINE,
-  ExternalWorkerAdapter,
-} from '../adapters/external-worker-adapter.js';
+import { EXTERNAL_WORKER_ENGINE } from '../adapters/external-worker-adapter.js';
 import { KeyRegistry } from './auth.js';
 import { createAgentApiServer } from './server.js';
 import { AgentApi, type ApiLogger } from './service.js';
-import { createExternalWorkers, loadAgentApiConfig, requireKeyRegistry } from './config.js';
+import { loadAgentApiConfig, requireKeyRegistry } from './config.js';
+import { createExternalWorkers } from './workers.js';
+import { createProfileWorkspaceCoordinator } from './profile-workspace.js';
 
 /** Путь журнала приёмных записей: явный env, без значения — дедупликация только в памяти. */
 function admissionLogFile(raw: string | undefined): string | null {
@@ -32,6 +29,17 @@ async function main(): Promise<void> {
   // которые уходят ВОРКЕРУ в каждом ране (envAllowlist). Хостовая настройка API не должна
   // лежать в пуле, который видят агенты, — иначе путь к журналу утекает в каждый ран.
   const admissionLogPath = admissionLogFile(process.env['AGENT_API_ADMISSION_LOG']);
+  const profileRoot = process.env['AGENT_API_PROFILE_WORKSPACE_ROOT']?.trim();
+  if (profileRoot && !admissionLogPath) throw new Error('AGENT_API_ADMISSION_LOG is required with profile workspace');
+  const objectBackend = process.env['AGENT_API_PROFILE_OBJECT_BACKEND']?.trim() ?? 'gcs';
+  if (profileRoot && objectBackend !== 'gcs' && objectBackend !== 'local-fs') throw new Error('AGENT_API_PROFILE_OBJECT_BACKEND must be gcs or local-fs');
+  const profileWorkspace = profileRoot ? createProfileWorkspaceCoordinator({
+    rootDir: profileRoot,
+    owner: process.env['AGENT_API_PROFILE_OWNER']?.trim() ?? '',
+    token: process.env['AGENT_API_PROFILE_GITHUB_TOKEN']?.trim() ?? '',
+    objectBackend: objectBackend as 'gcs' | 'local-fs',
+    env: process.env,
+  }) : undefined;
   if (admissionLogPath) {
     try {
       mkdirSync(dirname(admissionLogPath), { recursive: true, mode: 0o700 });
@@ -43,8 +51,13 @@ async function main(): Promise<void> {
     workers,
     logger: log,
     env: config.env,
+    // Цепочка движков (issue #100): null = ран идёт ровно на названный клиентом движок.
+    engineChain: config.engineChain ?? undefined,
+    // Бюджет reconcile: мёртвый движок не должен вешать проверку на таймаут запуска.
+    reconcileDeadlineMs: config.reconcileDeadlineMs,
     ...(config.defaultRepository ? { defaultRepository: config.defaultRepository } : {}),
     ...(admissionLogPath ? { admissionLogPath } : {}),
+    ...(profileWorkspace ? { profileWorkspace } : {}),
   });
   // Раны, принятые воркером до рестарта API, снова под опросом: без этого результат
   // потерян, а повтор клиента с новым ключом завёл бы второй ран.
@@ -95,13 +108,20 @@ async function main(): Promise<void> {
     process.exit(1);
   });
   server.listen(config.port, config.host, () => {
+    // Воркеру нужен адрес, на который он вернёт результат. Порт известен только после
+    // старта, поэтому адрес задаётся здесь: без него каждый запуск падает с
+    // RESULT_URL_UNSET, а воркер не узнаёт, куда отвечать.
+    const publicUrl = config.publicUrl ?? `http://${config.host}:${config.port}`;
+    for (const worker of workers) worker.setResultBaseUrl(publicUrl);
     log({
       event: 'api_listening',
       host: config.host,
       port: config.port,
+      publicUrl,
       keyRegistry: config.keyRegistryPath,
       keys: keys.size(),
       engines: workers.map((entry) => entry.name),
+      engineChain: config.engineChain,
       workers: workers.map((entry) => ({ engine: entry.name, baseUrl: entry.baseUrl })),
       storage: 'stateless: receipts and run progress live in process memory',
       artifacts: 'github links returned by the worker; the API keeps no bytes',

@@ -16,8 +16,13 @@ ROTATE_KEY=0
 SKIP_UFW=0
 WORKER_URL="${EXTERNAL_WORKER_URL:-}"
 WORKER_TOKEN="${EXTERNAL_WORKER_TOKEN:-}"
+ADMISSION_LOG="${AGENT_API_ADMISSION_LOG:-}"
+JOURNAL_DIR="${JOURNAL_DIR:-/var/lib/agent-runner}"
+WORKERS_JSON="${AGENT_API_WORKERS:-}"
+ENGINE_CHAIN="${AGENT_API_ENGINE_CHAIN:-}"
 
 log() { printf '[deploy-api] %s\n' "$*"; }
+warn() { printf '[deploy-api] WARN: %s\n' "$*" >&2; }
 die() { printf '[deploy-api] ERROR: %s\n' "$*" >&2; exit 1; }
 
 usage() {
@@ -25,29 +30,47 @@ usage() {
 Usage: sudo scripts/deploy-api-service.sh [options]
 
 Runs on the VM from the repo checkout: build -> config dir -> API key -> worker URL/token ->
-systemd unit -> enable+start -> health-check -> auth-check -> ufw (only after auth).
+admission journal -> systemd unit -> enable+start -> health-check -> auth-check -> ufw
+(only after auth).
 
-There is no data directory: the API is stateless (epic #74) and keeps nothing on disk.
+The service itself keeps nothing on disk; the only exception is the admission journal, which
+the worker contract (docs/EXTERNAL-WORKER-CONTRACT.md, p. 2) requires so that dedup by
+Idempotency-Key and polling of already-accepted runs survive a restart of this API.
 
 Options:
   --port <n>                 listen port (default 8787, same as AGENT_API_PORT)
   --worker-url <url>         external worker base URL (default $EXTERNAL_WORKER_URL)
   --worker-token <token>     shared secret for the worker (default $EXTERNAL_WORKER_TOKEN)
+  --admission-log <path>     admission journal file; its directory is created mode 0700 and
+                              owned by $SERVICE_USER (default $AGENT_API_ADMISSION_LOG)
+  --workers '<json>'         fleet: JSON array of {engine, baseUrl, token, acceptDeadlineMs?}
+                             (default $AGENT_API_WORKERS); replaces --worker-url
+  --engine-chain <list>      priority chain, comma separated, in probe order
+                             (default $AGENT_API_ENGINE_CHAIN)
   --rotate-key               generate a fresh API key even if one is installed
   --no-ufw                   never touch the firewall
   -h, --help                 this text
 
-Environment overrides: REPO_DIR, SERVICE_USER, AGENT_API_PORT, CONF_DIR,
-EXTERNAL_WORKER_URL, EXTERNAL_WORKER_TOKEN, RUNNER_DEFAULT_REPO, AGENT_API_ENV.
-Extra KEY=value lines already present in the service env file are kept as they are.
+Environment overrides: REPO_DIR, SERVICE_USER, AGENT_API_PORT, CONF_DIR, JOURNAL_DIR,
+EXTERNAL_WORKER_URL, EXTERNAL_WORKER_TOKEN, AGENT_API_ADMISSION_LOG, AGENT_API_WORKERS,
+AGENT_API_ENGINE_CHAIN, EXTERNAL_WORKER_ACCEPT_DEADLINE_MS, RUNNER_DEFAULT_REPO,
+AGENT_API_ENV. Extra KEY=value lines already present in the service env file are kept as
+they are.
+
+The journal path must be writable by the unit: infra/agent-runner-api.service grants write
+access to $JOURNAL_DIR (the systemd default). A journal elsewhere also needs its own
+ReadWritePaths line in that unit.
 USAGE
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --port) PORT="${2:-}"; shift 2 ;;
-  --worker-url) WORKER_URL="${2:-}"; shift 2 ;;
-  --worker-token) WORKER_TOKEN="${2:-}"; shift 2 ;;
+    --worker-url) WORKER_URL="${2:-}"; shift 2 ;;
+    --worker-token) WORKER_TOKEN="${2:-}"; shift 2 ;;
+    --admission-log) ADMISSION_LOG="${2:-}"; shift 2 ;;
+    --workers) WORKERS_JSON="${2:-}"; shift 2 ;;
+    --engine-chain) ENGINE_CHAIN="${2:-}"; shift 2 ;;
     --rotate-key) ROTATE_KEY=1; shift ;;
     --no-ufw) SKIP_UFW=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -58,6 +81,13 @@ done
 [[ "$PORT" =~ ^[0-9]+$ ]] || die "--port: expected 1..65535, got \"$PORT\""
 PORT=$((10#$PORT))
 (( PORT >= 1 && PORT <= 65535 )) || die "--port: expected 1..65535, got \"$PORT\""
+# Путь журнала задаёт оператор, а не скрипт: пустой или не абсолютный путь означал бы
+# запись в CWD юнита, то есть тихую потерю дедупликации при рестарте.
+if [[ -n "$ADMISSION_LOG" ]]; then
+  [[ "$ADMISSION_LOG" == /* ]] || die "--admission-log: expected an absolute path, got \"$ADMISSION_LOG\""
+  [[ "$ADMISSION_LOG" != */ && "$ADMISSION_LOG" != "/" ]] || die "--admission-log: expected a file path, got \"$ADMISSION_LOG\""
+  [[ ! -d "$ADMISSION_LOG" ]] || die "--admission-log: $ADMISSION_LOG is a directory, expected a file path"
+fi
 [[ $EUID -eq 0 ]] || die "run as root on the VM: the script installs /etc/agent-runner and a systemd unit"
 [[ -f "$REPO_DIR/package.json" ]] || die "no repo checkout at $REPO_DIR"
 command -v node >/dev/null || die "node not found in PATH"
@@ -119,23 +149,80 @@ log "5/7 service environment $ENV_FILE"
 if [[ -f "$ENV_FILE" ]]; then
   [[ -n "$WORKER_URL" ]] || WORKER_URL="$(sed -n 's/^EXTERNAL_WORKER_URL=//p' "$ENV_FILE" | head -n1)"
   [[ -n "$WORKER_TOKEN" ]] || WORKER_TOKEN="$(sed -n 's/^EXTERNAL_WORKER_TOKEN=//p' "$ENV_FILE" | head -n1)"
+  [[ -n "$ADMISSION_LOG" ]] || ADMISSION_LOG="$(sed -n 's/^AGENT_API_ADMISSION_LOG=//p' "$ENV_FILE" | head -n1)"
+  [[ -n "$WORKERS_JSON" ]] || WORKERS_JSON="$(sed -n 's/^AGENT_API_WORKERS=//p' "$ENV_FILE" | head -n1)"
+  [[ -n "$ENGINE_CHAIN" ]] || ENGINE_CHAIN="$(sed -n 's/^AGENT_API_ENGINE_CHAIN=//p' "$ENV_FILE" | head -n1)"
 fi
-[[ -n "$WORKER_URL" ]] || die "external worker URL is required: pass --worker-url or set EXTERNAL_WORKER_URL"
 [[ "$WORKER_URL" =~ ^https?:// ]] || die "--worker-url: expected an http(s) URL, got \"$WORKER_URL\""
+
+# Журнал приёмных записей: единственное, что сервис пишет на диск, и единственное, что нужно
+# его контракту (EXTERNAL-WORKER-CONTRACT.md, п. 2) — без него повтор submit с тем же
+# Idempotency-Key после рестарта API завёл бы второй ран. Каталог создаём здесь, потому что
+# юнит работает с ProtectSystem=full и может писать только в выданный ему ReadWritePaths.
+JOURNAL_DIR_ACTUAL=""
+if [[ -n "$ADMISSION_LOG" ]]; then
+  JOURNAL_DIR_ACTUAL="$(dirname "$ADMISSION_LOG")"
+  install -d -m 0700 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$JOURNAL_DIR_ACTUAL"
+  log "admission journal: $ADMISSION_LOG (directory $JOURNAL_DIR_ACTUAL mode 0700, owner $SERVICE_USER)"
+  case "$JOURNAL_DIR_ACTUAL/" in
+    "$JOURNAL_DIR"/*) ;;
+    *) warn "journal lives in $JOURNAL_DIR_ACTUAL, outside $JOURNAL_DIR; infra/agent-runner-api.service grants write access to $JOURNAL_DIR — add the path to ReadWritePaths there, or the journal will fail to open" ;;
+  esac
+else
+  warn "no admission journal (--admission-log not set, AGENT_API_ADMISSION_LOG empty)"
+  warn "  dedup by Idempotency-Key and polling of accepted runs will NOT survive a restart of this API;"
+  warn "  the worker contract (p. 2) requires that. Re-run this script with --admission-log $JOURNAL_DIR/admissions.jsonl"
+fi
+if [[ -n "$ADMISSION_LOG" ]]; then
+  # `touch`, а не усечение: журнал — это память о дедупликации и о ранах, уже принятых
+  # воркером. Переустановка не должна стирать её и поднимать чужой рап на повторе ключа.
+  touch "$ADMISSION_LOG"
+  chown "$SERVICE_USER:$SERVICE_GROUP" "$ADMISSION_LOG"
+  chmod 0600 "$ADMISSION_LOG"
+fi
+
 EXTRA_ENV=""
 if [[ -f "$ENV_FILE" ]]; then
   EXTRA_ENV="$(grep -E '^[A-Za-z_][A-Za-z0-9_]*=' "$ENV_FILE" \
-    | grep -vE '^(AGENT_API_HOST|AGENT_API_PORT|AGENT_API_KEY_REGISTRY|EXTERNAL_WORKER_URL|EXTERNAL_WORKER_TOKEN)=' \
+    | grep -vE '^(AGENT_API_HOST|AGENT_API_PORT|AGENT_API_KEY_REGISTRY|AGENT_API_ADMISSION_LOG|EXTERNAL_WORKER_URL|EXTERNAL_WORKER_TOKEN|AGENT_API_WORKERS|AGENT_API_ENGINE_CHAIN)=' \
     || true)"
+fi
+# Флот и одиночный воркер — два способа описать одно и то же; флот приоритетнее, потому что
+# цепочка движков (#100) выражается только списком.
+if [[ -n "$WORKERS_JSON" ]]; then
+  WORKERS_JSON="$(node -e '
+    const raw = process.argv[1] ?? "";
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed) || parsed.length === 0) throw new Error("expected a non-empty JSON array");
+    for (const [index, entry] of parsed.entries()) {
+      if (typeof entry !== "object" || entry === null) throw new Error(`[${index}]: expected an object`);
+      if (typeof entry.engine !== "string" || entry.engine.trim() === "") throw new Error(`[${index}].engine: required`);
+      if (!/^https?:\/\//.test(entry.baseUrl ?? "")) throw new Error(`[${index}].baseUrl: expected an http(s) URL`);
+    }
+    process.stdout.write(JSON.stringify(parsed));
+  ' "$WORKERS_JSON")" || die "--workers: expected a JSON array of {engine, baseUrl, token}"
+  [[ -z "$ENGINE_CHAIN" ]] || [[ "$ENGINE_CHAIN" =~ ^[A-Za-z0-9._-]+(,[A-Za-z0-9._-]+)*$ ]] \
+    || die "--engine-chain: expected a comma-separated list of engine names, got \"$ENGINE_CHAIN\""
+  WORKER_SUMMARY="fleet: $(node -e 'const p=JSON.parse(process.argv[1]);process.stdout.write(p.map((e)=>e.engine).join(" -> "))' "$WORKERS_JSON")"
+else
+  [[ -n "$WORKER_URL" ]] || die "external worker URL is required: pass --worker-url/--workers or set EXTERNAL_WORKER_URL/AGENT_API_WORKERS"
+  [[ "$WORKER_URL" =~ ^https?:// ]] || die "--worker-url: expected an http(s) URL, got \"$WORKER_URL\""
+  WORKER_SUMMARY="$WORKER_URL"
 fi
 {
   cat <<ENV
 AGENT_API_HOST=0.0.0.0
 AGENT_API_PORT=$PORT
 AGENT_API_KEY_REGISTRY=$REGISTRY_FILE
-EXTERNAL_WORKER_URL=$WORKER_URL
-EXTERNAL_WORKER_TOKEN=$WORKER_TOKEN
 ENV
+  if [[ -n "$ADMISSION_LOG" ]]; then printf 'AGENT_API_ADMISSION_LOG=%s\n' "$ADMISSION_LOG"; fi
+  if [[ -n "$WORKERS_JSON" ]]; then
+    printf 'AGENT_API_WORKERS=%s\n' "$WORKERS_JSON"
+    [[ -z "$ENGINE_CHAIN" ]] || printf 'AGENT_API_ENGINE_CHAIN=%s\n' "$ENGINE_CHAIN"
+  else
+    printf 'EXTERNAL_WORKER_URL=%s\n' "$WORKER_URL"
+    printf 'EXTERNAL_WORKER_TOKEN=%s\n' "$WORKER_TOKEN"
+  fi
   if [[ -n "$EXTRA_ENV" ]]; then printf '%s\n' "$EXTRA_ENV"; fi
 } > "$CONF_DIR/.env.tmp"
 chown "$SERVICE_USER:$SERVICE_GROUP" "$CONF_DIR/.env.tmp"
@@ -188,8 +275,13 @@ fi
 
 log "--- summary"
 log "unit:    $UNIT_NAME (enabled, $(systemctl is-active "$UNIT_NAME"))"
-log "port:    $PORT   health: $HEALTH_URL   worker: $WORKER_URL"
-log "state:   stateless — receipts and run progress live in process memory, nothing on disk"
+log "port:    $PORT   health: $HEALTH_URL   worker: $WORKER_SUMMARY"
+if [[ -n "$ADMISSION_LOG" ]]; then
+  log "journal: $ADMISSION_LOG (dedup by Idempotency-Key and polling of accepted runs survive a restart)"
+else
+  log "journal: none — dedup and polling do NOT survive a restart; rerun with --admission-log $JOURNAL_DIR/admissions.jsonl"
+fi
+log "state:   stateless beyond that journal — receipts and run progress live in process memory"
 log "key:     $KEY_FILE mode $(stat -c '%a' "$KEY_FILE") owner $(stat -c '%U' "$KEY_FILE")"
 if [[ "$KEY_STATE" == "new" ]]; then
   log "NEW API KEY (printed once here, stored in $KEY_FILE):"

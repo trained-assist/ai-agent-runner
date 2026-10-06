@@ -122,7 +122,7 @@ describe('trusted host attachment', () => {
       if (String(url).endsWith('/result')) return Response.json({ runId: spec.runId, status: 'started', pid: 4242, exitCode: terminalStatus === 'cancelled' ? null : terminalStatus === 'failed' ? 1 : 0, exitSignal: null, exitReason: terminalStatus === 'cancelled' ? 'cancelled' : terminalStatus === 'failed' ? 'nonzero_exit' : 'completed', stdout: 'fixture result', stderr: '', answer: 'fixture answer', answerSource: 'engine_stdout', durationMs: 1000, timedOut: false, outputTruncated: false, artifacts: [], logUrl: 'https://logs.example.test/run.log', repo: { fullName: 'owner/name', branch: `agent-run/${spec.runId}`, commit: 'abc1234' } });
       throw new Error('unexpected worker request');
     });
-    const adapter = new ExternalWorkerAdapter({ baseUrl: 'https://worker.example.test', baseUrlForResult: 'https://api.example.test', remoteMcp: host, now: () => now, fetchImpl });
+    const adapter = new ExternalWorkerAdapter({ engineName: spec.engine.name, baseUrl: 'https://worker.example.test', baseUrlForResult: 'https://api.example.test', remoteMcp: host, now: () => now, fetchImpl });
     const restore = vi.spyOn(adapter, 'restoreMcp');
     const launch = vi.spyOn(adapter, 'launch');
     const restored = journaledRun(spec, now.toISOString());
@@ -140,7 +140,7 @@ describe('trusted host attachment', () => {
     await api.dispose();
 
     const runningFetch = vi.fn(async () => Response.json({ runId: spec.runId, status: 'running' }));
-    const runningAdapter = new ExternalWorkerAdapter({ baseUrl: 'https://worker.example.test', baseUrlForResult: 'https://api.example.test', remoteMcp: { ...host, resolveBinding: localDocumentsBindingResolver(registrations, { readBinding, mintBinding, createHttpHost }) }, now: () => now, fetchImpl: runningFetch });
+    const runningAdapter = new ExternalWorkerAdapter({ engineName: spec.engine.name, baseUrl: 'https://worker.example.test', baseUrlForResult: 'https://api.example.test', remoteMcp: { ...host, resolveBinding: localDocumentsBindingResolver(registrations, { readBinding, mintBinding, createHttpHost }) }, now: () => now, fetchImpl: runningFetch });
     const runningLaunch = vi.spyOn(runningAdapter, 'launch');
     const runningStore = journaledRun(spec, now.toISOString());
     const runningApi = new AgentApi({ workers: [runningAdapter], store: runningStore });
@@ -412,7 +412,7 @@ describe('trusted host attachment', () => {
     const worker = await startMockWorker();
     onTestFinished(() => worker.close());
     const resolved: string[] = [];
-    const config = loadAgentApiConfig({ AGENT_API_KEY_REGISTRY: '/private/keys.json', EXTERNAL_WORKER_URL: worker.baseUrl, AGENT_API_PUBLIC_URL: 'https://api.example.test', AGENT_API_REMOTE_MCP_SERVERS: JSON.stringify(policies) });
+    const config = loadAgentApiConfig({ AGENT_API_KEY_REGISTRY: '/private/keys.json', EXTERNAL_WORKER_URL: worker.baseUrl, EXTERNAL_WORKER_ENGINE: 'dynamic-ip-azure-agent-run', AGENT_API_PUBLIC_URL: 'https://api.example.test', AGENT_API_REMOTE_MCP_SERVERS: JSON.stringify(policies) });
     const workers = createExternalWorkers(config, () => undefined, async (_ref, context) => {
       resolved.push(context.runId);
       return { ...context, scope: 'documents:approved', expiresAt: new Date(Date.now() + 60000).toISOString(), token };

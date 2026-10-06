@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, onTestFinished } from 'vitest';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -229,11 +229,11 @@ describe('repository context: stateless API (#74)', () => {
     principalId: 'p-alpha',
     profileId: 'profile-a',
     scopes: ['runs:read', 'runs:write'],
-    engines: ['dynamic-ip-azure-agent-run'],
+    engines: ['azure-dynamic-ip-agent-run'],
   };
 
   const submitBody = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
-    engine: { name: 'dynamic-ip-azure-agent-run', adapterVersion: '1' },
+    engine: { name: 'azure-dynamic-ip-agent-run', adapterVersion: '1' },
     limits: { timeoutMs: 15000 },
     envAllowlist: [],
     input: { inlinePrompt: 'repository context' },
@@ -256,7 +256,7 @@ describe('repository context: stateless API (#74)', () => {
     }
   });
 
-  it('токен репозитория не покидает API: ни в receipt, ни в статусе, ни в воркере, ни в логах', async () => {
+  it('токен репозитория не попадает в ответы и логи, но уходит воркеру для публикации', async () => {
     const worker = await startMockWorker();
     onTestFinished(() => worker.close());
     const logs: Record<string, unknown>[] = [];
@@ -266,19 +266,58 @@ describe('repository context: stateless API (#74)', () => {
     const receipt = api.submit(alpha, 'idem-repository-secret', submitBody({ repository: { fullName: 'owner/name', token: SECRET_TOKEN } }));
     await waitFor(() => api.status(alpha, receipt.runId).state === 'succeeded', 8000, 'run to finish');
 
-    const dump = JSON.stringify({
+    // Клиенту секрет не показываем: ни в квитанции, ни в статусе, ни в событиях, ни в
+    // логах процесса. Логи видят операторы, и секрет в них переживает ротацию ключей.
+    const clientFacing = JSON.stringify({
       receipt,
       status: api.status(alpha, receipt.runId),
       events: api.events(alpha, receipt.runId),
       result: api.result(alpha, receipt.runId),
       artifacts: api.artifacts(alpha, receipt.runId),
       logs,
-      // Воркеру уходит только fullName: клонирует он сам, секрет через границу не идёт.
-      launch: worker.launches,
     });
-    expect(dump).not.toContain(SECRET_TOKEN);
-    expect(worker.launches[0]!['repository']).toEqual({ fullName: 'owner/name', branch: `agent-run/${receipt.runId}` });
-    expect((worker.launches[0]!['repository'] as Record<string, unknown>)['token']).toBeUndefined();
+    expect(clientFacing).not.toContain(SECRET_TOKEN);
+
+    // Воркеру токен нужен: без него он публикует выходы токеном репозитория кольца,
+    // у которого нет прав на репозиторий задачи, и ран уходит успешным без файлов.
+    // На живом замере 05.10.2026 так ушли 15 запусков из 16.
+    const launch = worker.launches[0]! as Record<string, unknown>;
+    expect(launch['publicationToken']).toBe(SECRET_TOKEN);
+    // Но в саму структуру репозитория он не переезжает: `repository` — это адрес ветки,
+    // и токен там был бы на видном месте в любом дампе запроса.
+    expect(launch['repository']).toEqual({ fullName: 'owner/name', branch: `agent-run/${receipt.runId}` });
+    expect((launch['repository'] as Record<string, unknown>)['token']).toBeUndefined();
+  });
+
+  it('без токена в запросе воркеру уходит запрос без publicationToken', async () => {
+    const worker = await startMockWorker();
+    onTestFinished(() => worker.close());
+    const api = new AgentApi({ workers: [adapterFor(worker)] });
+    onTestFinished(() => api.dispose());
+
+    const receipt = api.submit(alpha, 'idem-no-token', submitBody({ repository: { fullName: 'owner/name' } }));
+    await waitFor(() => api.status(alpha, receipt.runId).state === 'succeeded', 8000, 'run to finish');
+
+    const launch = worker.launches[0]! as Record<string, unknown>;
+    expect(launch['publicationToken']).toBeUndefined();
+  });
+
+  it('токен репозитория не попадает в журнал приёма на диск', async () => {
+    // Журнал — файл на диске, и секрет в нём переживает ротацию ключей. В памяти
+    // процесса токен остаётся: оттуда его берёт адаптер.
+    const dir = mkdtempSync(join(tmpdir(), 'api-journal-'));
+    const journalPath = join(dir, 'admissions.jsonl');
+    onTestFinished(() => rmSync(dir, { recursive: true, force: true }));
+
+    const api = new AgentApi({ workers: [idleWorker()], admissionLogPath: journalPath });
+    onTestFinished(() => api.dispose());
+    api.submit(alpha, 'idem-journal-secret', submitBody({ repository: { fullName: 'owner/name', token: SECRET_TOKEN } }));
+
+    const journal = readFileSync(journalPath, 'utf8');
+    expect(journal.length).toBeGreaterThan(0);
+    expect(journal).not.toContain(SECRET_TOKEN);
+    // В памяти токен остаётся — иначе адаптеру нечего передать воркеру.
+    expect(JSON.stringify(api.store.getByRun(api.store.getByAdmission('p-alpha', 'idem-journal-secret')!.runId)!.spec)).toContain(SECRET_TOKEN);
   });
 
   it('тот же Idempotency-Key с другим токеном = дедуп, а не IDEMPOTENCY_CONFLICT', () => {

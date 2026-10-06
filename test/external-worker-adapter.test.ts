@@ -8,6 +8,8 @@ import {
   mapLaunchResult,
   branchUrl,
   mergeUrl,
+  repoHasCommit,
+  isRetrievableLogUrl,
   runBranchName,
   runLogRef,
   validateLaunchResult,
@@ -73,6 +75,12 @@ describe('launch request: RunSpec → LaunchRequest (issue #73)', () => {
     expect(JSON.stringify(request)).not.toContain('nope');
   });
 
+  it('подставляет положительные лимиты, когда клиент их не задал', () => {
+    const spec = makeRunSpec({ input: { inlinePrompt: 'проверка' }, limits: { timeoutMs: 300_000 } });
+    const request = launchRequestFromSpec(spec);
+    expect(request.limits).toEqual({ timeoutMs: 300_000, maxOutputBytes: 5_000_000, maxLogBytes: 5_000_000 });
+  });
+
   it('input.refs — preflight-отказ: stateless API нечего материализовать', () => {
     const spec = makeRunSpec({ input: { refs: [{ ref: 'snap-1', snapshotId: 'snapshot-1' }] } });
     try {
@@ -102,6 +110,26 @@ describe('валидация LaunchResult', () => {
     expect(validated.ok).toBe(true);
   });
 
+  it('ответ без answer принимается: настоящий opencode-шлюз его не присылает', () => {
+    // Живая проба #100: реальный результат воркера отвергался как WORKER_PROTOCOL_INVALID
+    // только из-за отсутствующего answer — рана с артефактами у клиента не было.
+    const { answer: _answer, ...withoutAnswer } = launchResult();
+    const validated = validateLaunchResult(withoutAnswer, 'run-1');
+    expect(validated.ok).toBe(true);
+  });
+
+  it('ANSI и управляющие символы в stderr вычищаются, а не роняют результат', () => {
+    // Реальный opencode печатает цветом: раньше такой stderr отвергал весь результат.
+    const validated = validateLaunchResult(
+      launchResult({ stderr: '\u001b[0m> build · free\u001b[0m\n\u001b[91m\u001b[1mError:\u001b[0m unauthorized\u001b[0m' }),
+      'run-1',
+    );
+    expect(validated.ok).toBe(true);
+    if (!validated.ok) return;
+    expect(validated.value.stderr).not.toContain('\u001b');
+    expect(validated.value.stderr).toContain('Error:');
+  });
+
   it('чужой runId, отсутствующие logUrl/repo и неизвестный exitReason — отказ', () => {
     const validated = validateLaunchResult({ runId: 'run-other', exitReason: 'exploded' }, 'run-1');
     expect(validated.ok).toBe(false);
@@ -110,6 +138,28 @@ describe('валидация LaunchResult', () => {
     expect(errors.some((entry) => entry.includes('launch.exitReason'))).toBe(true);
     expect(errors.some((entry) => entry.includes('launch.logUrl'))).toBe(true);
     expect(errors.some((entry) => entry.includes('launch.repo'))).toBe(true);
+  });
+
+  it('пустой logUrl — законный ответ «лог не опубликован», а не расхождение с контрактом (#133)', () => {
+    // Боевой воркер отвечает `logUrl: ''` на отменённый ран и на любой отказ до загрузки
+    // лога. Раньше `checkString` отвергал такой результат, и отмена доходила до клиента
+    // как failed + WORKER_PROTOCOL_INVALID + worker_crash, неповторяемый отказ.
+    for (const exitReason of ['cancelled', 'startup_failure'] as const) {
+      const validated = validateLaunchResult(launchResult({ exitCode: null, exitReason, logUrl: '' }), 'run-1');
+      expect(validated.ok, `${exitReason}: ${validated.ok ? '' : validated.errors.join('; ')}`).toBe(true);
+    }
+    // Непустая ссылка по-прежнему принимается и остаётся ссылкой воркера.
+    const withUrl = validateLaunchResult(launchResult({ logUrl: 'https://storage.googleapis.com/b/run-1.log' }), 'run-1');
+    expect(withUrl.ok).toBe(true);
+    // Ключ обязателен: нет ключа — расхождение с контрактом, даже если значение пустое.
+    const { logUrl: _logUrl, ...withoutKey } = launchResult({ logUrl: '' });
+    const missing = validateLaunchResult(withoutKey, 'run-1');
+    expect(missing.ok).toBe(false);
+    expect(missing.ok ? [] : missing.errors.some((entry) => entry.includes('logUrl'))).toBe(true);
+    // Не строка — тоже отказ: пустую строку вправе прислать только воркер.
+    for (const bad of [null, undefined, 42]) {
+      expect(validateLaunchResult(launchResult({ logUrl: bad as unknown as string }), 'run-1').ok).toBe(false);
+    }
   });
 });
 
@@ -166,6 +216,63 @@ describe('маппинг LaunchResult → RunResult + RunnerEvent (epic #74, ш�
     expect(mapping.result.exitObserved).toBe(false);
     expect(mapping.result.failure).toBeUndefined();
     expect(mapping.events[mapping.events.length - 1]!.type).toBe('cancelled');
+  });
+
+  it('отменённый ран без лога: cancelled, без отказа, logPath — адрес рана у воркера (#133)', () => {
+    // Боевой отчёт об отмене: джобу убили (SIGTERM) до загрузки лога, поэтому logUrl пуст.
+    // Отчёт обязан дойти до клиента отменой, а logPath — остаться непустым (runLogRef).
+    const spec = makeRunSpec({ runId: 'run-1', jobId: 'job-1' });
+    const report = launchResult({
+      status: 'failed',
+      pid: null,
+      exitCode: null,
+      exitSignal: 'SIGTERM',
+      exitReason: 'cancelled',
+      answer: null,
+      answerSource: null,
+      artifacts: [],
+      logUrl: '',
+      repo: { fullName: 'owner/name', branch: 'agent-run/run-1', commit: '0000000000000000000000000000000000000000' },
+    });
+    const validated = validateLaunchResult(report, 'run-1');
+    expect(validated.ok, validated.ok ? '' : validated.errors.join('; ')).toBe(true);
+
+    const mapping = mapLaunchResult(spec, validated.ok ? validated.value : report, TIMES, { workerBaseUrl: 'https://worker.example' });
+    expect(validateRunResult(mapping.result).ok).toBe(true);
+    expect(mapping.result.outcome).toBe('cancelled');
+    expect(mapping.result.exitReason).toBe('cancelled');
+    expect(mapping.result.exitSignal).toBe('SIGTERM');
+    expect(mapping.result.failure).toBeUndefined();
+    expect(mapping.result.logPath).toBe('https://worker.example/v1/runs/run-1');
+    // Лога нет — и в наружу это `null`, а не ссылка на пустое и не выдуманное событие.
+    expect(mapping.logUrl).toBeNull();
+    expect(mapping.events.some((event) => event.type === 'log' && String(event.payload['message']).includes('session log'))).toBe(false);
+    for (const event of mapping.events) expect(validateRunnerEvent(event).ok).toBe(true);
+    expect(mapping.events[mapping.events.length - 1]!.type).toBe('cancelled');
+  });
+
+  it('отказ до старта агента (startup_failure) с пустым logUrl доезжает своим кодом (#133)', () => {
+    // Тот же дефект, что и у отмены: `emptyResult` в воркере всегда ставит logUrl: ''.
+    // Раньше реальная причина отказа терялась под WORKER_PROTOCOL_INVALID + worker_crash.
+    const spec = makeRunSpec({ runId: 'run-1' });
+    const report = launchResult({
+      status: 'failed',
+      pid: null,
+      exitCode: null,
+      exitReason: 'startup_failure',
+      artifacts: [],
+      logUrl: '',
+      failure: { code: 'WORKSPACE_CLONE_FAILED', failureClass: 'runtime', safeSummary: 'could not clone the repository', retryable: true },
+    });
+    const validated = validateLaunchResult(report, 'run-1');
+    expect(validated.ok, validated.ok ? '' : validated.errors.join('; ')).toBe(true);
+
+    const mapping = mapLaunchResult(spec, validated.ok ? validated.value : report, TIMES, { workerBaseUrl: 'https://worker.example' });
+    expect(validateRunResult(mapping.result).ok).toBe(true);
+    expect(mapping.result.outcome).toBe('failed');
+    expect(mapping.result.exitReason).toBe('startup_failure');
+    expect(mapping.result.failure?.code).toBe('WORKSPACE_CLONE_FAILED');
+    expect(mapping.result.logPath).toBe('https://worker.example/v1/runs/run-1');
   });
 
   it('код отказа воркера переносится в RunFailure без потерь', () => {
@@ -280,6 +387,15 @@ describe('runLogRef и artifactUrl', () => {
     expect(runLogRef(null, null, 'run-1')).toBe('worker://unconfigured/v1/runs/run-1');
   });
 
+  it('пустой logUrl даёт тот же непустой logPath, что и отсутствие результата (#133)', () => {
+    // `RunResult.logPath` обязан быть непустой строкой, иначе результат рана невалиден.
+    expect(runLogRef(launchResult({ logUrl: '' }), 'https://worker.example/', 'run-1')).toBe(
+      'https://worker.example/v1/runs/run-1',
+    );
+    expect(runLogRef(launchResult({ logUrl: '' }), null, 'run-1')).toBe('worker://unconfigured/v1/runs/run-1');
+    expect(isRetrievableLogUrl('')).toBe(false);
+  });
+
   it('артефакт адресуется коммитом, ветка рана — страницей, результат — ссылкой на merge', () => {
     const repo = { fullName: 'owner/name', branch: 'agent-run/run-1', commit: 'abc1234', baseRef: 'main' };
     expect(artifactUrl(repo, 'docs/report.md')).toBe('https://github.com/owner/name/blob/abc1234/docs/report.md');
@@ -295,6 +411,53 @@ describe('runLogRef и artifactUrl', () => {
   it('имя ветки рана выводится из runId и не путается с ветками юзера', () => {
     expect(runBranchName('run_abc')).toBe('agent-run/run_abc');
     expect(runBranchName('run_abc', 'bots')).toBe('bots/run_abc');
+  });
+});
+
+describe('реальные расхождения с воркером на GitHub Actions', () => {
+  // Эти три случая пришли с боевого воркера: локальные тесты их не видели, потому что
+  // мок всегда отвечал «идеально». Агент в GHA живёт на другой машине и коммитит не всегда.
+
+  it('pid не обязателен: агент в GHA запущен на другой машине, локального PID нет', () => {
+    const spec = makeRunSpec({ runId: 'run-1' });
+    const result = launchResult();
+    delete (result as { pid?: unknown }).pid;
+    const validated = validateLaunchResult(result, 'run-1');
+    expect(validated.ok, validated.ok ? '' : validated.errors.join('; ')).toBe(true);
+    // И `started`-событие без pid не выдумывается: pid нет — значит и утверждать нечего.
+    const mapping = mapLaunchResult(spec, validated.ok ? validated.value : result, TIMES);
+    expect(mapping.events.some((event) => event.type === 'started')).toBe(false);
+  });
+
+  it('repo.commit = null (ничего не запушено) — это не отказ, а ран без выходов', () => {
+    const spec = makeRunSpec({ runId: 'run-1', outputs: [] });
+    const result = launchResult({ artifacts: [], repo: { fullName: 'owner/name', branch: 'agent-run/run-1', commit: null } });
+    const validated = validateLaunchResult(result, 'run-1');
+    expect(validated.ok, validated.ok ? '' : validated.errors.join('; ')).toBe(true);
+
+    const mapping = mapLaunchResult(spec, validated.ok ? validated.value : result, TIMES);
+    expect(mapping.result.outcome).toBe('succeeded');
+    // Ссылка на файл не может быть `/blob/null/…` — она адресует ветку, а не коммит.
+    const repo = { fullName: 'owner/name', branch: 'agent-run/run-1', commit: null };
+    expect(repoHasCommit(repo)).toBe(false);
+    expect(artifactUrl(repo, 'report.md')).toBe('https://github.com/owner/name/tree/agent-run/run-1/report.md');
+    // И сравнивать нечего: merge ведёт на страницу ветки, а не в пустой compare.
+    expect(mergeUrl({ ...repo, baseRef: 'main' })).toBe('https://github.com/owner/name/tree/agent-run/run-1');
+  });
+
+  it('null-SHA тоже означает «ничего не запушено», а не валидный коммит', () => {
+    const zero = { fullName: 'owner/name', branch: 'agent-run/run-1', commit: '0000000000000000000000000000000000000000' };
+    expect(repoHasCommit(zero)).toBe(false);
+    expect(artifactUrl(zero, 'a.md')).toContain('/tree/agent-run/run-1/a.md');
+    const real = { fullName: 'owner/name', branch: 'agent-run/run-1', commit: 'abc1234' };
+    expect(repoHasCommit(real)).toBe(true);
+    expect(artifactUrl(real, 'a.md')).toBe('https://github.com/owner/name/blob/abc1234/a.md');
+  });
+
+  it('logUrl со схемой local:// не превращается в битый редирект', () => {
+    // Воркер без бакета держит лог у себя и отдаёт `local://…`: это честный ответ, но не URL.
+    expect(isRetrievableLogUrl('local://run-1/session.log')).toBe(false);
+    expect(isRetrievableLogUrl('https://storage.googleapis.com/b/runs/1/session.log')).toBe(true);
   });
 });
 
@@ -382,6 +545,28 @@ describe('ExternalWorkerAdapter по HTTP', () => {
     try {
       const receipt = await adapterFor(worker).cancel('run-never-launched');
       expect(receipt.status).toBe('unknown_run');
+    } finally {
+      await worker.close();
+    }
+  });
+
+  it('результат отменённого рана по HTTP читается, а не отвергается контрактом (#133)', async () => {
+    // Мок повторяет боевого воркера: у отменённого рана лога нет, `logUrl` пуст. До #133
+    // такой ответ падал в WORKER_PROTOCOL_INVALID — и отмена выглядела как отказ воркера.
+    const worker = await startMockWorker();
+    try {
+      const adapter = adapterFor(worker);
+      const receipt = await adapter.launch(makeRunSpec({ runId: 'run-http-cancelled', input: { inlinePrompt: 'x' } }));
+      await adapter.cancel(receipt.runId);
+      expect((await adapter.status(receipt.runId)).status).toBe('cancelled');
+
+      const result = await adapter.result(receipt.runId);
+      expect(result.exitReason).toBe('cancelled');
+      expect(result.logUrl).toBe('');
+      const spec = makeRunSpec({ runId: 'run-http-cancelled', input: { inlinePrompt: 'x' } });
+      const mapping = mapLaunchResult(spec, result, TIMES, { workerBaseUrl: worker.baseUrl });
+      expect(mapping.result.outcome).toBe('cancelled');
+      expect(mapping.result.logPath).toBe(`${worker.baseUrl}/v1/runs/run-http-cancelled`);
     } finally {
       await worker.close();
     }

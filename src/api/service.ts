@@ -4,17 +4,27 @@ import {
   admissionEvents,
   artifactUrl,
   branchUrl,
+  EXTERNAL_WORKER_ADAPTER_VERSION,
+  fleetExhaustedFailure,
+  isUnacceptedLaunchFailure,
+  launchFailureCode,
   mapLaunchResult,
   mergeUrl,
+  repoHasCommit,
+  runBranchName,
   workerTransportFailure,
+  withTimeout,
+  DEFAULT_RECONCILE_DEADLINE_MS,
   type ExternalWorker,
+  type FleetAttempt,
   type LaunchMapping,
   type LaunchReceipt,
   type WorkerRunStatus,
   ResultNotReadyError,
 } from '../adapters/external-worker-adapter.js';
 import type { RunResult } from '../contracts/result.js';
-import { validateRunSpec, type InputSpec, type RunSpec } from '../contracts/run-spec.js';
+import { PreflightError } from '../contracts/validate.js';
+import { validateRunSpec, type EngineSpec, type InputSpec, type RunSpec } from '../contracts/run-spec.js';
 import { DEFAULT_STATELESS_LIMITS, isTerminalApiState, STATELESS_STORE_SCHEMA_VERSION, StatelessStore, type AdmissionRecord } from './stateless-store.js';
 import {
   API_CAPABILITIES_SCHEMA_VERSION,
@@ -33,6 +43,9 @@ import {
 } from './contracts.js';
 import { ApiError } from './errors.js';
 import type { Principal } from './auth.js';
+import type { ProfileWorkspaceCoordinator } from './profile-workspace.js';
+import { WorkspaceError } from '../workspace/contract.js';
+import { compilePolicy, DEFAULT_EXPORT_POLICY, matchRule } from '../workspace/policy.js';
 
 /**
  * Stateless-ядро API (epic #74). Принимает запрос, вызывает внешнего воркера по HTTP и держит
@@ -43,6 +56,17 @@ import type { Principal } from './auth.js';
 export type ApiLogger = (entry: Record<string, unknown>) => void;
 
 export type RunCancelStatus = 'stopped' | 'stop_pending' | 'already_terminal' | 'too_late' | 'rejected' | 'unknown_run';
+
+/** Итог приёма рана по цепочке: воркер, который держит ран, и квитанция, если она была. */
+export interface ChainAcceptance {
+  engine: string;
+  worker: ExternalWorker;
+  /**
+   * Квитанция запуска. Её может не быть: ответ потерялся, но reconcile подтвердил, что
+   * воркер знает ран, — тогда ран принимается без квитанции и опрашивается по статусу.
+   */
+  receipt?: LaunchReceipt;
+}
 
 export interface RunCancelReceipt {
   runId: string;
@@ -74,6 +98,7 @@ export interface RunArtifactsView {
   artifacts: RunArtifactLink[];
   logUrl: string | null;
   note: string;
+  publication?: import('./stateless-store.js').RunProgress['publication'];
 }
 
 export interface AgentApiOptions {
@@ -82,6 +107,17 @@ export interface AgentApiOptions {
    * совпало с `engine.name`; неизвестный движок отклоняется до записи в память.
    */
   workers: ExternalWorker[];
+  /**
+   * Приоритетная цепочка движков (issue #100), в порядке проб. Клиент, назвавший конкретный
+   * `engine.name`, цепочкой не пользуется — она включается только для ранов без движка.
+   * Не задана — все раны идут на названный движок, как до появления цепочки.
+   */
+  engineChain?: readonly string[];
+  /**
+   * Бюджет reconcile (issue #100): сколько ждём ответа воркера на вопрос «знаешь ли ты этот
+   * ран». По умолчанию 5 с — это один короткий GET, а не таймаут запуска.
+   */
+  reconcileDeadlineMs?: number;
   logger?: ApiLogger;
   clock?: () => Date;
   /** Запас сверх лимита рана на persist у воркера. По умолчанию минута. */
@@ -101,6 +137,8 @@ export interface AgentApiOptions {
    * Без него — только память процесса (контракт эпика #74, шаг 6).
    */
   admissionLogPath?: string;
+  /** Enables trusted profile binding and canonical publication for every run. */
+  profileWorkspace?: ProfileWorkspaceCoordinator;
 }
 
 /** Пауза между опросами статуса: растёт от базовой до потолка (экспоненциально). */
@@ -127,10 +165,14 @@ export class AgentApi {
   readonly workers: readonly ExternalWorker[];
   readonly store: StatelessStore;
   private readonly opts: AgentApiOptions;
+  /** Приоритетная цепочка движков; пустая — цепочка не объявлена (каждый ран на своём движке). */
+  private readonly chain: readonly string[];
   private readonly logger: ApiLogger;
   private readonly clock: () => Date;
   /** Запас сверх лимита рана: воркер успел выгрузить лог и запушить ветку. */
   private readonly resultGraceMs: number;
+  /** Бюджет reconcile: мёртвый движок не должен вешать проверку на таймаут запуска. */
+  private readonly reconcileDeadlineMs: number;
   private disposed = false;
   private readonly maxActiveRuns: number;
   private readonly inFlight = new Set<string>();
@@ -142,11 +184,19 @@ export class AgentApi {
       throw new Error('AgentApi requires at least one external worker: without it there is no way to launch an agent');
     }
     this.workers = options.workers;
-    this.store = options.store ?? new StatelessStore({}, options.admissionLogPath ?? null);
+    // Цепочка без воркера — опечатка в конфиге: молча выбросить такой шаг нельзя, иначе ран
+    // падал бы на середине цепочки вместо отказа на старте.
+    const missing = (options.engineChain ?? []).filter((engine) => !this.workerFor(engine));
+    if (missing.length > 0) {
+      throw new Error(`engineChain names engines without a worker: ${missing.join(', ')}`);
+    }
+    this.chain = [...(options.engineChain ?? [])];
+    this.store = options.store ?? new StatelessStore({}, options.admissionLogPath ?? null, !!options.profileWorkspace);
     this.maxActiveRuns = options.maxActiveRuns ?? DEFAULT_STATELESS_LIMITS.maxActiveRuns;
     this.logger = options.logger ?? defaultLogger;
     this.clock = options.clock ?? (() => new Date());
     this.resultGraceMs = options.resultGraceMs ?? DEFAULT_RESULT_GRACE_MS;
+    this.reconcileDeadlineMs = options.reconcileDeadlineMs ?? DEFAULT_RECONCILE_DEADLINE_MS;
   }
 
   /**
@@ -175,6 +225,18 @@ export class AgentApi {
         (principal.profileId !== 'integration-telegram-ux-v1' || principal.principalId !== 'integration-telegram-ux-v1')) {
       throw new ApiError('FORBIDDEN', 'test registry MCP requires the pinned integration principal and profile');
     }
+    if (this.opts.profileWorkspace && request.repository !== undefined) {
+      throw new ApiError('INVALID_REPOSITORY', 'repository is selected by the authenticated profile binding');
+    }
+    if (this.opts.profileWorkspace && !principal.tenantId) {
+      throw new ApiError('FORBIDDEN', 'API key has no trusted tenant binding');
+    }
+    if (this.opts.profileWorkspace) {
+      const policy = compilePolicy(DEFAULT_EXPORT_POLICY);
+      for (const output of request.outputs ?? []) {
+        if (matchRule(policy, output.path).action === 'exclude') throw new ApiError('INVALID_REQUEST', `profile output path is excluded by policy: ${output.path}`);
+      }
+    }
     const payloadHash = submitPayloadHash(request);
 
     const existing = this.store.getByAdmission(principal.principalId, idempotencyKey);
@@ -197,21 +259,14 @@ export class AgentApi {
       });
       return { requestId: existing.requestId, userTaskId: existing.userTaskId, runId: existing.runId, deduplicated: true };
     }
+    if (this.opts.profileWorkspace) {
+      const active = this.store.listAll().find((record) => record.tenantId === principal.tenantId && record.profileId === principal.profileId &&
+        !isTerminalApiState(this.store.progressOf(record.runId)?.state ?? 'queued'));
+      if (active) throw new ApiError('TASK_ATTEMPT_ACTIVE', `profile has an active run ${active.runId}`, { runId: active.runId });
+    }
 
-    if (!this.workerFor(request.engine.name)) {
-      throw new ApiError(
-        'ENGINE_NOT_ALLOWED',
-        `this API does not run engine "${request.engine.name}"`,
-        { engines: this.engineNames() },
-      );
-    }
-    if (principal.engines && !principal.engines.includes(request.engine.name)) {
-      throw new ApiError(
-        'ENGINE_NOT_ALLOWED',
-        `principal "${principal.principalId}" is not allowed to run engine "${request.engine.name}"`,
-        { engines: [...principal.engines] },
-      );
-    }
+    // Движок рана: назвал клиент — идём ровно на него, не назвал — берёт цепочка (issue #100).
+    const selection = this.resolveEngines(principal, request.engine);
 
     let requestId: string;
     let userTaskId: string;
@@ -245,13 +300,14 @@ export class AgentApi {
       ownerGeneration = 1;
     }
 
-    const spec = this.buildSpec(request, { principal, requestId, userTaskId, jobId, ownerGeneration });
+    const spec = this.buildSpec(request, { principal, requestId, userTaskId, jobId, ownerGeneration, engine: selection.engine });
     const record: AdmissionRecord = {
       schemaVersion: STATELESS_STORE_SCHEMA_VERSION,
       requestId,
       userTaskId,
       conversationId: spec.conversationId,
       principalId: principal.principalId,
+      ...(principal.tenantId ? { tenantId: principal.tenantId } : {}),
       profileId: principal.profileId,
       jobId,
       idempotencyKey,
@@ -260,6 +316,9 @@ export class AgentApi {
       operationId: spec.operationId,
       ownerGeneration,
       spec,
+      // Кандидаты приёма рана в порядке проб. Хранятся в записи, а не пересобираются в
+      // `execute`: после рестарта API цепочка рана должна быть той же, что была при приёме.
+      engineChain: selection.chain,
       createdAt: this.nowIso(),
     };
     // Незавершённые раны — единственное, что растёт без границы: у процесса память, и
@@ -271,7 +330,10 @@ export class AgentApi {
     }
     this.store.put(record);
     // Ран уходит во внешнего воркера сразу: клиент получает receipt и опрашивает статус.
-    void this.execute(record);
+    void this.execute(record).catch((err: unknown) => {
+      this.log({ event: 'run_dispatch_unknown', runId: record.runId, message: err instanceof Error ? err.message : String(err) });
+      this.markUnknown(record, 'dispatch_state_unavailable');
+    });
     this.log({
       event: 'submit',
       outcome: 'accepted',
@@ -281,6 +343,7 @@ export class AgentApi {
       runId: spec.runId,
       ownerGeneration,
       engine: spec.engine.name,
+      engineChain: selection.chain,
       worker: this.workerFor(spec.engine.name)?.baseUrl ?? null,
     });
     return { requestId, userTaskId, runId: spec.runId, deduplicated: false };
@@ -297,6 +360,7 @@ export class AgentApi {
         runId,
         ownerGeneration: record.ownerGeneration,
         state: 'queued',
+        engine: record.spec.engine.name,
         cancelRequested: false,
         connectionLost: false,
         observedAt: record.createdAt,
@@ -312,12 +376,14 @@ export class AgentApi {
       runId,
       ownerGeneration: record.ownerGeneration,
       state: run.state,
+      engine: run.engine,
       cancelRequested: run.cancelRequested !== null,
       connectionLost: run.connectionLost,
       observedAt: run.updatedAt,
       sequence: run.sequence,
       fencing: { rejected: run.fencing.rejected },
       answer: run.answer,
+      ...(this.opts.profileWorkspace ? { publication: run.publication } : {}),
     };
   }
 
@@ -378,7 +444,9 @@ export class AgentApi {
       mime: artifact.mime,
       sha256: artifact.sha256,
       size: artifact.size,
-      url: repo ? artifactUrl(repo, artifact.path) : artifact.path,
+      url: artifact.objectKey
+        ? `/v1/runs/${encodeURIComponent(runId)}/artifacts?path=${encodeURIComponent(artifact.path)}`
+        : repo ? artifactUrl(repo, artifact.path) : artifact.path,
     }));
     return {
       runId,
@@ -390,8 +458,23 @@ export class AgentApi {
       count: artifacts.length,
       artifacts,
       logUrl: run?.logUrl ?? null,
-      note: 'the worker committed this run into its own branch of the user repository; the API stores no bytes and merges nothing',
+      note: this.opts.profileWorkspace
+        ? 'the run branch is reconciled with the canonical profile revision; check publication status before treating it as saved'
+        : 'the worker committed this run into its own branch of the user repository; the API stores no bytes and merges nothing',
+      ...(this.opts.profileWorkspace ? { publication: run?.publication ?? null } : {}),
     };
+  }
+
+  async downloadArtifact(principal: Principal, runId: string, path: string): Promise<{ bytes: Buffer; mime: string; sha256: string }> {
+    const record = this.requireRun(principal, runId);
+    const artifact = this.store.progressOf(runId)?.artifacts.find((entry) => entry.path === path);
+    if (!artifact?.objectKey || !this.opts.profileWorkspace) throw new ApiError('NOT_FOUND', 'profile object is not available for this run');
+    if (!artifact.objectKey.startsWith(`profiles/${record.profileId}/workspace/${runId}/`)) throw new ApiError('FORBIDDEN', 'artifact object is outside this run');
+    const bytes = await this.opts.profileWorkspace.readObject(principal, artifact.objectKey);
+    if (bytes.length !== artifact.size || createHash('sha256').update(bytes).digest('hex') !== artifact.sha256) {
+      throw new ApiError('INTERNAL', 'stored profile artifact failed checksum verification');
+    }
+    return { bytes, mime: artifact.mime, sha256: artifact.sha256 };
   }
 
   async cancel(principal: Principal, runId: string, rawBody: unknown = {}): Promise<RunCancelReceipt> {
@@ -414,9 +497,12 @@ export class AgentApi {
     if (isTerminalApiState(run.state)) {
       return { runId, status: 'already_terminal', state: run.state };
     }
-    const worker = this.workerFor(record.spec.engine.name);
+    // Отмена уходит тому, кто реально держит ран: при цепочке движков это может быть не тот
+    // движок, который назвал клиент (issue #100).
+    const engine = run.engine || record.spec.engine.name;
+    const worker = this.workerFor(engine);
     if (!worker) {
-      throw new ApiError('INTERNAL', `run ${runId} names engine "${record.spec.engine.name}", which is not configured on this API`);
+      throw new ApiError('INTERNAL', `run ${runId} names engine "${engine}", which is not configured on this API`);
     }
     this.store.markCancelRequested(runId, 'cancel');
     let receipt: WorkerCancelResult;
@@ -542,12 +628,20 @@ export class AgentApi {
         placement: null,
       },
       engines: this.engineNames(),
+      engineSelection: {
+        chain: [...this.chain],
+        engineOptional: true,
+        retryOnlyWhenUnaccepted: true,
+        relaunchAfterReceipt: false,
+      },
     };
   }
 
   health(): {
     status: 'ok';
     workers: Array<{ engine: string; baseUrl: string | null }>;
+    /** Приоритетная цепочка движков в порядке проб; пустая — цепочка не объявлена. */
+    engineChain: string[];
     runs: number;
     admissions: number;
     events: number;
@@ -556,6 +650,7 @@ export class AgentApi {
     return {
       status: 'ok',
       workers: this.workers.map((worker) => ({ engine: worker.name, baseUrl: worker.baseUrl })),
+      engineChain: [...this.chain],
       ...counts,
     };
   }
@@ -589,10 +684,12 @@ export class AgentApi {
       if (this.resuming.has(record.runId)) continue;
       const progress = this.store.progressOf(entry.runId);
       if (progress && isTerminalApiState(progress.state)) continue;
-      const worker = this.workerFor(record.spec.engine.name);
+      // Движок берём из отметки о приёме, а не из заявки: ран мог быть принят вторым
+      // движком цепочки, и поллер обязан спрашивать именно его (issue #100).
+      const worker = this.workerFor(entry.engine);
       if (!worker) continue;
-      this.store.open(record.runId, record.createdAt);
-      this.log({ event: 'poll_resumed', runId: record.runId, engine: record.spec.engine.name, operationId: record.spec.operationId });
+      this.store.open(record.runId, record.createdAt, entry.engine);
+      this.log({ event: 'poll_resumed', runId: record.runId, engine: entry.engine, operationId: record.spec.operationId });
       this.resuming.add(record.runId);
       void this.restoreAndPoll(record, worker);
       resumed += 1;
@@ -624,41 +721,147 @@ export class AgentApi {
   }
 
   private async execute(record: AdmissionRecord): Promise<void> {
-    const run = this.store.open(record.runId, record.createdAt);
+    const run = this.store.open(record.runId, record.createdAt, this.chainOf(record)[0]);
     const startedAt = this.nowIso();
     run.state = 'running';
     run.updatedAt = startedAt;
     // Журнал рана появляется до сетевого вызова: принятый ран виден сразу.
     this.store.append(record.runId, admissionEvents(record.spec, startedAt));
-    const worker = this.workerFor(record.spec.engine.name);
-    if (!worker) {
-      this.finalize(record, workerTransportFailure(record.spec, new Error('worker is not configured'), { startedAt, finishedAt: this.nowIso() }));
-      return;
-    }
     this.inFlight.add(record.runId);
     try {
-      const receipt = await worker.launch(record.spec, record.createdAt);
+      if (this.opts.profileWorkspace) {
+        try {
+          const prepared = await this.opts.profileWorkspace.prepare(this.principalFor(record), record.runId);
+          record.spec.repository = { fullName: prepared.repository, token: prepared.token, revision: prepared.baseRevision };
+          record.spec.profileWorkspace = { bindingId: prepared.bindingId, ...(prepared.objectBucket ? { objectBucket: prepared.objectBucket } : {}), artifacts: prepared.artifacts, excludedPatterns: prepared.excludedPatterns };
+          this.store.appendPrepared(record.runId, { fullName: prepared.repository, revision: prepared.baseRevision }, record.spec.profileWorkspace);
+          this.log({ event: 'profile_prepared', runId: record.runId, bindingId: prepared.bindingId, baseRevision: prepared.baseRevision });
+        } catch (err) {
+          this.log({ event: 'profile_prepare_failed', runId: record.runId, code: err instanceof WorkspaceError ? err.code : 'WORKSPACE_GIT_FAILED' });
+          this.finalize(record, workerTransportFailure(record.spec, err, { startedAt, finishedAt: this.nowIso() }, { failure: {
+            code: err instanceof WorkspaceError ? err.code : 'WORKSPACE_GIT_FAILED', failureClass: 'preflight',
+            safeSummary: 'profile workspace could not be prepared', retryable: true,
+          } }));
+          return;
+        }
+      }
+      const accepted = await this.acceptOnChain(record, startedAt);
+      if (!accepted) return;
       if (this.disposed || this.store.progressOf(record.runId) === null) return;
       this.log({
-        event: 'worker_accepted',
+        // Ран может быть принят без квитанции: ответ потерялся, но воркер его помнит.
+        event: accepted.receipt ? 'worker_accepted' : 'worker_reconciled',
         runId: record.runId,
-        engine: record.spec.engine.name,
-        worker: worker.baseUrl,
-        operationId: receipt.operationId,
-        statusUrl: receipt.statusUrl,
+        engine: accepted.engine,
+        worker: accepted.worker.baseUrl,
+        ...(accepted.receipt
+          ? { operationId: accepted.receipt.operationId, statusUrl: accepted.receipt.statusUrl }
+          : {}),
       });
       // Ран принят воркером. Помечаем ДО старта поллера: если процесс упадёт между
       // здесь и терминальным состоянием, новый процесс должен поллер перезапустить —
       // иначе результат потерян, а повтор клиента с новым ключом завёл бы второй ран.
-      this.store.appendDispatched(record.runId, record.spec.engine.name, this.nowIso());
-      void this.pollUntilTerminal(record, worker, startedAt);
-    } catch (err) {
-      if (this.disposed) return;
-      this.log({ event: 'run_failed', runId: record.runId, message: err instanceof Error ? err.message : String(err) });
-      this.finalize(record, workerTransportFailure(record.spec, err, { startedAt, finishedAt: this.nowIso() }, { workerBaseUrl: worker.baseUrl }));
+      this.store.appendDispatched(record.runId, accepted.engine, this.nowIso());
+      void this.pollUntilTerminal(record, accepted.worker, startedAt);
     } finally {
       this.inFlight.delete(record.runId);
     }
+  }
+
+  /**
+   * Приём рана по приоритетной цепочке движков (issue #100). Следующий движок берётся
+   * **только** если предыдущий не принял ран (квитанции нет): тогда нигде не идёт работа и
+   * повтор ничего не дублирует. Квитанция получена — цепочка окончена, дальше reconcile.
+   *
+   * `operationId` и `runId` при переходе не меняются: если первый движок всё-таки принял
+   * ран (таймаут прошёл ровно на границе), его дедупликация вернёт тот же `runId`, а не
+   * второй запуск.
+   *
+   * Неопределённый отказ (контракт, п. 4) не является доказательством «ран не принят»:
+   * запрос мог дойти, а ответ потеряться. Поэтому перед переходом цепочка спрашивает
+   * текущий движок, знает ли он ран, — и переходит дальше только при отрицательном ответе.
+   */
+  private async acceptOnChain(record: AdmissionRecord, startedAt: string): Promise<ChainAcceptance | null> {
+    const candidates = this.chainOf(record);
+    const attempts: FleetAttempt[] = [];
+    let lastWorker: ExternalWorker | null = null;
+    let lastError: unknown = null;
+    for (let index = 0; index < candidates.length; index += 1) {
+      const engine = candidates[index]!;
+      const worker = this.workerFor(engine);
+      if (!worker) {
+        attempts.push({ engine, code: 'WORKER_NOT_CONFIGURED', summary: 'no worker is configured for this engine' });
+        continue;
+      }
+      lastWorker = worker;
+      // Движок попытки виден клиенту сразу: цепочка двигается по ранe, а не молча меняет
+      // исполнителя под ногами у того, кто опрашивает статус.
+      this.store.setEngine(record.runId, engine);
+      this.store.appendLaunchIntent(record.runId, engine, this.nowIso());
+      try {
+        const receipt = await worker.launch(this.specForEngine(record, engine));
+        return { engine, worker, receipt };
+      } catch (err) {
+        lastError = err;
+        if (!isUnacceptedLaunchFailure(err)) {
+          // Отказ на нашей стороне (нет промпта, refs без workspace, не задан resultUrl):
+          // другой движок его не обойдёт, поэтому цепочка не тратит на него бюджеты.
+          if (!this.disposed) {
+            this.log({ event: 'run_failed', runId: record.runId, engine, message: err instanceof Error ? err.message : String(err) });
+            this.finalize(record, workerTransportFailure(record.spec, err, { startedAt, finishedAt: this.nowIso() }, { workerBaseUrl: worker.baseUrl }));
+          }
+          return null;
+        }
+        // Квитанции нет, но ран мог стартовать. Спрашиваем движок, прежде чем звать следующий:
+        // положительный ответ означает, что второй запуск был бы дублем.
+        const known = await this.workerKnowsRun(record, worker);
+        if (known === true) {
+          this.log({ event: 'launch_reconciled', runId: record.runId, engine, operationId: record.spec.operationId });
+          return { engine, worker };
+        }
+        if (known === null) {
+          // Спросить не удалось: доказать, что запуск не состоялся, нельзя, а второй запуск
+          // без доказательства контракт запрещает. Ран остаётся `unknown` — клиент решает сам.
+          this.log({ event: 'launch_uncertain', runId: record.runId, engine, message: err instanceof Error ? err.message : String(err) });
+          this.markUnknown(record, 'launch_uncertain');
+          return null;
+        }
+        attempts.push({ engine, code: launchFailureCode(err), summary: err instanceof Error ? err.message : String(err) });
+        const next = candidates[index + 1];
+        this.log({
+          event: 'engine_chain_advance',
+          runId: record.runId,
+          engine,
+          code: launchFailureCode(err),
+          next: next ?? null,
+          attempts: attempts.length,
+          operationId: record.spec.operationId,
+        });
+      }
+    }
+    if (this.disposed) return null;
+    // Один кандидат — это не цепочка, а закреплённый клиентом движок: отказ остаётся его
+    // собственным кодом, а не общим «цепочка исчерпана».
+    if (candidates.length === 1) {
+      this.log({ event: 'run_failed', runId: record.runId, engine: candidates[0], message: lastError instanceof Error ? lastError.message : String(lastError) });
+      this.finalize(record, workerTransportFailure(record.spec, lastError, { startedAt, finishedAt: this.nowIso() }, { workerBaseUrl: lastWorker?.baseUrl ?? null }));
+      return null;
+    }
+    // Никто не принял: ран терминален с перечислением попыток. Молчать здесь нельзя — клиент
+    // должен видеть, что задача не выполнена, и новый `Idempotency-Key` даст новую попытку.
+    this.log({ event: 'engine_chain_exhausted', runId: record.runId, attempts });
+    this.finalize(record, fleetExhaustedFailure(record.spec, attempts, { startedAt, finishedAt: this.nowIso() }, { workerBaseUrl: lastWorker?.baseUrl ?? null }));
+    return null;
+  }
+
+  /**
+   * Попытка приёма рана на конкретном движке цепочки. Отличается от приёмной записи только
+   * именем движка: `runId`, `operationId` и всё остальное сохраняются, поэтому дедупликация
+   * воркера по `operationId` работает и после перехода по цепочке.
+   */
+  private specForEngine(record: AdmissionRecord, engine: string): RunSpec {
+    if (engine === record.spec.engine.name) return record.spec;
+    return { ...record.spec, engine: { ...record.spec.engine, name: engine } };
   }
 
   /**
@@ -683,8 +886,11 @@ export class AgentApi {
       this.log({ event: 'worker_status', runId: record.runId, status, attempt });
 
       if (status === 'succeeded' || status === 'failed' || status === 'cancelled') {
-        await this.collectResult(record, worker, startedAt);
-        return;
+        if (await this.collectResult(record, worker, startedAt)) return;
+        if (Date.now() >= deadline) return;
+        await this.pollBackoff(attempt);
+        attempt += 1;
+        continue;
       }
       if (status === 'unknown') {
         // Исход неизвестн, но ран мог состояться. Помечаем и продолжаем спрашивать:
@@ -703,13 +909,42 @@ export class AgentApi {
     }
   }
 
+  /**
+   * Знает ли воркер про этот ран. `true` — виден (ответ потерялся, ран идёт), `false` —
+   * воркер его не видел (запуск не состоялся), `null` — спросить не удалось.
+   */
+  private async workerKnowsRun(record: AdmissionRecord, worker: ExternalWorker): Promise<boolean | null> {
+    try {
+      const status = await withTimeout(worker.status(record.runId), this.reconcileDeadlineMs, 'worker reconcile');
+      // `unknown` от воркера = «запуска не вижу». Всё остальное — ран известен,
+      // даже если исход агента воркеру пока неясен.
+      return status.status !== 'unknown';
+    } catch (err) {
+      this.log({ event: 'launch_reconcile_failed', runId: record.runId, message: err instanceof Error ? err.message : String(err) });
+      return null;
+    }
+  }
+
   /** Забрать финальный результат у воркера и закрыть ран. */
-  private async collectResult(record: AdmissionRecord, worker: ExternalWorker, startedAt: string): Promise<void> {
-    if (this.disposed || this.store.progressOf(record.runId) === null) return;
+  private async collectResult(record: AdmissionRecord, worker: ExternalWorker, startedAt: string): Promise<boolean> {
+    if (this.disposed || this.store.progressOf(record.runId) === null) return true;
     try {
       const launch = await worker.result(record.runId);
       const mapping = mapLaunchResult(record.spec, launch, { startedAt, finishedAt: this.nowIso() }, { workerBaseUrl: worker.baseUrl });
-      this.finalize(record, mapping);
+      let publication = null;
+      if (this.opts.profileWorkspace && launch.status === 'started') {
+        if (!mapping.repo || !repoHasCommit(mapping.repo) || mapping.repo.fullName !== record.spec.repository?.fullName || mapping.repo.branch !== runBranchName(record.runId)) {
+          throw new WorkspaceError('WORKSPACE_NOT_FOUND', 'worker did not confirm the expected profile run branch');
+        }
+        publication = await this.opts.profileWorkspace.publish(this.principalFor(record), record.runId, mapping.repo.commit!);
+        mapping.result.persistenceReason = `profile publication ${publication.status}: ${publication.committedRevision ?? publication.publicationId}`;
+        if (publication.status !== 'published') mapping.result.persistence = 'pending';
+        this.log({ event: 'profile_publication', runId: record.runId, publicationId: publication.publicationId, status: publication.status, committedRevision: publication.committedRevision, conflictId: publication.conflictId });
+      }
+      this.finalize(record, mapping, publication ? {
+        status: publication.status, committedRevision: publication.committedRevision,
+        conflictId: publication.conflictId, publicationId: publication.publicationId, reason: publication.reason,
+      } : null);
       this.log({
         event: 'run_finished',
         runId: record.runId,
@@ -720,15 +955,24 @@ export class AgentApi {
         logUrl: mapping.logUrl,
         repo: mapping.repo?.fullName ?? null,
       });
+      return true;
     } catch (err) {
       if (err instanceof ResultNotReadyError) {
         // Воркер сказал «терминальный», но результата нет: честный отказ, а не успех.
         this.log({ event: 'worker_result_missing', runId: record.runId });
         this.markUnknown(record, 'result_missing');
-        return;
+        return false;
+      }
+      if (this.opts.profileWorkspace) {
+        // The worker has already finished; retrying the engine could duplicate effects.
+        // Reconcile the same run branch/publication after storage or Git recovers.
+        this.log({ event: 'profile_publication_failed', runId: record.runId, code: err instanceof WorkspaceError ? err.code : 'WORKSPACE_GIT_FAILED' });
+        this.markUnknown(record, 'profile_publication_failed');
+        return false;
       }
       this.log({ event: 'run_failed', runId: record.runId, message: err instanceof Error ? err.message : String(err) });
       this.finalize(record, workerTransportFailure(record.spec, err, { startedAt, finishedAt: this.nowIso() }, { workerBaseUrl: worker.baseUrl }));
+      return true;
     }
   }
 
@@ -741,7 +985,7 @@ export class AgentApi {
     if (!run || isTerminalApiState(run.state) || run.state === 'unknown') return;
     run.state = 'unknown';
     run.updatedAt = this.nowIso();
-    this.log({ event: 'run_outcome_unknown', runId: record.runId, reason, engine: record.spec.engine.name });
+    this.log({ event: 'run_outcome_unknown', runId: record.runId, reason, engine: this.store.progressOf(record.runId)?.engine ?? record.spec.engine.name });
   }
 
   /** Экспоненциальная пауза опроса с потолком, чтобы не молотить воркер в пустую. */
@@ -760,7 +1004,7 @@ export class AgentApi {
   }
 
   /** Единственное место, где ран становится терминальным. */
-  private finalize(record: AdmissionRecord, mapping: LaunchMapping): void {
+  private finalize(record: AdmissionRecord, mapping: LaunchMapping, publication: import('./stateless-store.js').RunProgress['publication'] = null): void {
     this.store.append(record.runId, mapping.events);
     this.store.complete(record.runId, {
       state: mapping.result.outcome,
@@ -770,7 +1014,12 @@ export class AgentApi {
       logUrl: mapping.logUrl,
       answer: mapping.answer,
       finishedAt: mapping.result.finishedAt,
+      publication,
     });
+  }
+
+  private principalFor(record: AdmissionRecord): Principal {
+    return { principalId: record.principalId, profileId: record.profileId, scopes: ['runs:read', 'runs:write'], ...(record.tenantId ? { tenantId: record.tenantId } : {}) };
   }
 
   /**
@@ -782,9 +1031,50 @@ export class AgentApi {
    * там, где первый ещё идёт. Ключ попытки — `(userTaskId, ownerGeneration)`: он
    * переживает рестарт и меняется ровно тогда, когда началась новая попытка.
    */
-  private buildSpec(
+  /**
+ * Кандидаты приёма рана в порядке проб. У записей до появления цепочки поля нет — тогда
+ * кандидат один: движок, названный клиентом.
+ */
+private chainOf(record: AdmissionRecord): readonly string[] {
+  return record.engineChain ?? [record.spec.engine.name];
+}
+
+/**
+ * Кто будет исполнять ран (issue #100). Клиент назвал движок — цепочка не применяется,
+ * кандидат ровно один. Не назвал — берём приоритетную цепочку, суженную до движков,
+ * которые разрешены принципалу: иначе ран уехал бы туда, куда клиенту ход запрещён.
+ */
+private resolveEngines(principal: Principal, requested: EngineSpec | undefined): { engine: EngineSpec; chain: string[] } {
+  if (requested) {
+    if (!this.workerFor(requested.name)) {
+      throw new ApiError('ENGINE_NOT_ALLOWED', `this API does not run engine "${requested.name}"`, { engines: this.engineNames() });
+    }
+    if (principal.engines && !principal.engines.includes(requested.name)) {
+      throw new ApiError(
+        'ENGINE_NOT_ALLOWED',
+        `principal "${principal.principalId}" is not allowed to run engine "${requested.name}"`,
+        { engines: [...principal.engines] },
+      );
+    }
+    return { engine: requested, chain: [requested.name] };
+  }
+  const allowed = this.chain.filter((engine) => !principal.engines || principal.engines.includes(engine));
+  if (allowed.length === 0) {
+    if (this.chain.length === 0) {
+      throw new ApiError('ENGINE_REQUIRED', 'the run names no engine and this API has no engine chain to pick one', {
+        engines: this.engineNames(),
+      });
+    }
+    throw new ApiError('ENGINE_NOT_ALLOWED', `principal "${principal.principalId}" is not allowed to run any engine of the chain`, {
+      engines: [...(principal.engines ?? [])],
+    });
+  }
+  return { engine: { name: allowed[0]!, adapterVersion: EXTERNAL_WORKER_ADAPTER_VERSION }, chain: allowed };
+}
+
+private buildSpec(
     request: SubmitRequest,
-    context: { principal: Principal; requestId: string; userTaskId: string; jobId: string; ownerGeneration: number },
+    context: { principal: Principal; requestId: string; userTaskId: string; jobId: string; ownerGeneration: number; engine: EngineSpec },
   ): RunSpec {
     const runId = newApiId('run');
     const input: InputSpec = { ...(request.input ?? {}) };
@@ -802,7 +1092,7 @@ export class AgentApi {
       profileId: context.principal.profileId,
       conversationId: request.conversationId ?? newApiId('conv'),
       ownerGeneration: context.ownerGeneration,
-      engine: request.engine,
+      engine: context.engine,
       // Каталог не создаётся: его материализует воркер на своей эфемерной машине.
       cwd: `/workspace/${runId}`,
       envAllowlist: request.envAllowlist,
@@ -830,7 +1120,8 @@ export class AgentApi {
 
   private requireRun(principal: Principal, runId: string): AdmissionRecord {
     const record = this.store.getByRun(runId);
-    if (!record || record.principalId !== principal.principalId) {
+    if (!record || record.principalId !== principal.principalId ||
+        (this.opts.profileWorkspace && (record.tenantId !== principal.tenantId || record.profileId !== principal.profileId))) {
       throw new ApiError('NOT_FOUND', `unknown run ${runId}`);
     }
     return record;

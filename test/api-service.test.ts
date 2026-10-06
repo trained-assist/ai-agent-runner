@@ -19,12 +19,12 @@ const alpha: Principal = {
   principalId: 'p-alpha',
   profileId: 'profile-a',
   scopes: ['runs:read', 'runs:write'],
-  engines: ['dynamic-ip-azure-agent-run'],
+  engines: ['azure-dynamic-ip-agent-run'],
 };
 
 function body(over: Record<string, unknown> = {}): Record<string, unknown> {
   return {
-    engine: { name: 'dynamic-ip-azure-agent-run', adapterVersion: '1' },
+    engine: { name: 'azure-dynamic-ip-agent-run', adapterVersion: '1' },
     limits: { timeoutMs: 15000 },
     envAllowlist: [],
     input: { inlinePrompt: 'hello agent' },
@@ -65,7 +65,7 @@ describe('stateless AgentApi: приём запроса', () => {
 
   it('кривое тело — INVALID_REQUEST, кривой repository — INVALID_REPOSITORY', async () => {
     const api = await makeApi();
-    expect(() => api.submit(alpha, 'idem-bad-body', { engine: 'dynamic-ip-azure-agent-run' })).toThrowError(
+    expect(() => api.submit(alpha, 'idem-bad-body', { engine: 'azure-dynamic-ip-agent-run' })).toThrowError(
       expect.objectContaining({ code: 'INVALID_REQUEST' }),
     );
     try {
@@ -114,14 +114,14 @@ describe('stateless AgentApi: приём запроса', () => {
       expect.unreachable('an engine the worker does not implement must be refused');
     } catch (err) {
       expect((err as ApiError).code).toBe('ENGINE_NOT_ALLOWED');
-      expect((err as ApiError).details).toMatchObject({ engines: ['dynamic-ip-azure-agent-run'] });
+      expect((err as ApiError).details).toMatchObject({ engines: ['azure-dynamic-ip-agent-run'] });
     }
   });
 
   it('input.refs и ран без промпта — preflight-отказ с retryable=false, а не «воркер недоступен»', async () => {
     const api = await makeApi();
     const refs = api.submit(alpha, 'idem-refs', {
-      engine: { name: 'dynamic-ip-azure-agent-run', adapterVersion: '1' },
+      engine: { name: 'azure-dynamic-ip-agent-run', adapterVersion: '1' },
       limits: { timeoutMs: 5000 },
       envAllowlist: [],
       input: { refs: [{ ref: 'snap-1', snapshotId: 'snapshot-1' }] },
@@ -185,13 +185,42 @@ describe('stateless AgentApi: финализация', () => {
     expect(api.result(alpha, receipt.runId).outcome).toBe('succeeded');
   });
 
-  it('ответ воркера вне контракта не превращается в «успешный» ран', async () => {
+  it('квитанция вне контракта не валит ран вслепую: он reconcile-ится, а не теряется', async () => {
+    // Воркер принял ран, но ответ не разобрался. Ран мог реально идти, поэтому валить его
+    // сразу нельзя — клиент повторил бы submit и завёл второй. Контракт (#73 §4) требует
+    // сначала `unknown` и reconcile: спросить воркер, знает ли он этот ран.
     const api = await makeApi({ malformed: true });
     const receipt = api.submit(alpha, 'idem-malformed', body());
+    // Воркер ран знает → reconcile находит его и доводит до конца, второго запуска нет.
+    await waitForState(api, alpha, receipt.runId, 'succeeded');
+    expect(api.result(alpha, receipt.runId).outcome).toBe('succeeded');
+  });
+
+  it('reconcile не висит на мёртвом воркере: у него свой бюджет, а не таймаут запуска', async () => {
+    // Воркер принял ран, но квитанция не дошла, а на вопрос о статусе он отвечает дольше
+    // бюджета reconcile. Раньше проверка ждала таймаут запуска (10 минут) и флот вставал.
+    const worker = await startMockWorker({ malformed: true, statusDelayMs: 5000 });
+    onTestFinished(() => worker.close());
+    const api = new AgentApi({ workers: [adapterFor(worker)], store: new StatelessStore(), reconcileDeadlineMs: 300 });
+    onTestFinished(() => api.dispose());
+    const startedAt = Date.now();
+    const receipt = api.submit(alpha, 'idem-reconcile-budget', body());
+    await waitForState(api, alpha, receipt.runId, 'unknown');
+    const elapsed = Date.now() - startedAt;
+    expect(elapsed).toBeLessThan(3000);
+  }, 20000);
+
+  it('воркер не знает ран после обрыва launch — только тогда ран считается несостоявшимся', async () => {
+    // 5xx = запуск не принят (мок не регистрирует ран). Reconcile спрашивает статус,
+    // получает «не вижу» и только тогда закрывает ран отказом.
+    const api = await makeApi({ httpStatus: 503 });
+    const receipt = api.submit(alpha, 'idem-lost-launch', body());
     await waitForState(api, alpha, receipt.runId, 'failed');
     const result = api.result(alpha, receipt.runId);
     expect(result.outcome).toBe('failed');
-    expect(result.exitReason).toBe('worker_crash');
+    expect(result.failure?.code).toBe('WORKER_HTTP_ERROR');
+    // Повтор безопасен: ран нигде не остался.
+    expect(result.failure?.retryable).toBe(true);
   });
 
   it('отмена живого рана доходит до воркера и даёт outcome cancelled', async () => {
@@ -248,7 +277,7 @@ describe('stateless AgentApi: capabilities отчитываются честно
     const caps = api.capabilities();
     expect(caps.isolation.mode).toBe('none');
     expect(caps.isolation.launcher).toBeNull();
-    expect(caps.engines).toEqual(['dynamic-ip-azure-agent-run']);
+    expect(caps.engines).toEqual(['azure-dynamic-ip-agent-run']);
     expect(caps.artifacts.export.enabled).toBe(false);
     expect(caps.artifacts.download).toBe(false);
     expect(caps.artifacts.shareLink).toBe(false);
@@ -279,10 +308,11 @@ describe('stateless AgentApi: capabilities отчитываются честно
     onTestFinished(() => actions.close());
     const service = new AgentApi({
       workers: [
+        // Дефолт — Azure GHA; вторая машина объявлена явно, иначе оба воркера были бы одним.
         adapterFor(azure),
         new ExternalWorkerAdapter({
           baseUrl: actions.baseUrl,
-          engineName: 'github-actions-agent-run',
+          engineName: 'eu-vm-agent-run',
           token: 'test-worker-token',
           baseUrlForResult: 'https://api.test',
           deadlineMs: 2000,
@@ -293,22 +323,22 @@ describe('stateless AgentApi: capabilities отчитываются честно
     // Принципал без allowlist движков: проверяем сам реестр, а не ограничение принципала.
     const fleet: Principal = { principalId: 'p-fleet', profileId: 'profile-a', scopes: ['runs:read', 'runs:write'] };
 
-    expect(service.capabilities().engines).toEqual(['dynamic-ip-azure-agent-run', 'github-actions-agent-run']);
-    expect(service.health().workers.map((entry) => entry.engine)).toEqual(['dynamic-ip-azure-agent-run', 'github-actions-agent-run']);
+    expect(service.capabilities().engines).toEqual(['azure-dynamic-ip-agent-run', 'eu-vm-agent-run']);
+    expect(service.health().workers.map((entry) => entry.engine)).toEqual(['azure-dynamic-ip-agent-run', 'eu-vm-agent-run']);
 
     // Каждый движок обслуживает свой воркер: launch ушёл туда, куда просили.
-    const first = service.submit(fleet, 'idem-fleet-azure', body());
+    const first = service.submit(fleet, 'idem-fleet-azure', body({ engine: { name: 'azure-dynamic-ip-agent-run', adapterVersion: '1' } }));
     await waitForState(service, fleet, first.runId, 'succeeded');
     expect(azure.launches).toHaveLength(1);
     expect(actions.launches).toHaveLength(0);
 
-    const second = service.submit(fleet, 'idem-fleet-actions', body({ engine: { name: 'github-actions-agent-run', adapterVersion: '1' } }));
+    const second = service.submit(fleet, 'idem-fleet-eu', body({ engine: { name: 'eu-vm-agent-run', adapterVersion: '1' } }));
     await waitForState(service, fleet, second.runId, 'succeeded');
     expect(actions.launches).toHaveLength(1);
     expect(azure.launches).toHaveLength(1);
 
     // Отмена уходит в воркер своего движка, а не в первый попавшийся.
-    const third = service.submit(fleet, 'idem-fleet-cancel', body({ engine: { name: 'github-actions-agent-run', adapterVersion: '1' } }));
+    const third = service.submit(fleet, 'idem-fleet-cancel', body({ engine: { name: 'eu-vm-agent-run', adapterVersion: '1' } }));
     await service.cancel(fleet, third.runId);
     expect(actions.cancels).toContain(third.runId);
     expect(azure.cancels).not.toContain(third.runId);
@@ -319,7 +349,7 @@ describe('stateless AgentApi: capabilities отчитываются честно
       expect.unreachable('an unregistered engine must be refused');
     } catch (err) {
       expect((err as ApiError).code).toBe('ENGINE_NOT_ALLOWED');
-      expect((err as ApiError).details).toMatchObject({ engines: ['dynamic-ip-azure-agent-run', 'github-actions-agent-run'] });
+      expect((err as ApiError).details).toMatchObject({ engines: ['azure-dynamic-ip-agent-run', 'eu-vm-agent-run'] });
     }
   }, 30000);
 

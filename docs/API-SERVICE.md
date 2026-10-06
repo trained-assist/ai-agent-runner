@@ -1,23 +1,19 @@
 # Serverless Agent API — деплой, конфигурация, смоук
 
-## External-worker callback configuration
+Статус документа: **05.10.2026, асинхронный контракт запуска (эпик #74, контракт #73).**
+В базовом режиме API обслуживает ран без локального workspace. Режим постоянного профиля
+включается отдельными bindings: журнал и зеркала хранятся на устойчивом диске API,
+канонические данные — в приватном Git и GCS. API не запускает процесс агента. Он стоит
+между клиентом и внешним воркером: `POST {worker}/v1/launch` даёт квитанцию сразу, дальше
+наш поллер сам читает `status` и `result`.
 
-`input.inlinePrompt` preserves multiline text, including LF, CR, and tabs, up to 100,000 characters. Other C0/C1 controls and DEL are rejected. ID, path, ref, and other string validators remain strict.
+Одно исключение: **журнал приёмных записей** (`AGENT_API_ADMISSION_LOG`, §2 и §7). Его
+требует контракт воркера (п. 2) — дедупликация по `Idempotency-Key` обязана переживать
+рестарт API. Без него API работает, но после рестарта не помнит ни о принятых задачах, ни о
+ранах, которые воркер уже выполняет.
 
-The entry-point worker factory passes the host-only `AGENT_API_ENV` pool to the adapter. Launch `env` still contains only values named in that run's `envAllowlist`. For the native `opencode-gha-runner` gateway, place only the model credential under `LLM_LADDER_TOKEN` in this pool and authorize `LLM_LADDER_TOKEN` in the run allowlist (CP host policy: `RUN_SPEC_ENV_ALLOWLIST`). The gateway resolves its claim `llmKey` from this named environment value when optional typed `credentials` are absent (`opencode-gha-runner` revision `ed81ae7`, `src/gateway/app.ts`, `handleClaim`). Root/service-account credentials must stay outside the run allowlist. The worker authentication token remains a separate host-only `EXTERNAL_WORKER_TOKEN`.
-
-Set host-only `AGENT_API_PUBLIC_URL` to the externally reachable base URL of this API process. The entry point passes it to every external worker adapter, which appends `/v1/worker/launches/{runId}/result`. HTTP and HTTPS are accepted; credentials, query strings, and fragments are rejected. The setting is not added to the run environment pool. Without it, the existing `RESULT_URL_UNSET` preflight refusal remains.
-
-This wiring change preserves the existing result polling. Revision `8598170` does not expose the callback POST route; workers that require callback delivery rather than a readable status/result endpoint still need that receiver implemented separately.
-
-For an isolated sandbox process, set `AGENT_API_PORT=18878`, use a separate `AGENT_API_ADMISSION_LOG`, and retain the existing host-only key registry and worker configuration. Set `RUNNER_DEFAULT_REPO` to a valid `owner/name`, or provide an explicit repository in submit. Point both the CP Runner binding and `AGENT_API_PUBLIC_URL` at a tunnel or proxy targeting this same process on port 18878. A callback to the active service on port 8787 cannot resolve a run accepted by the isolated process. Keep callback routing available until its runs finish. Do not restart or reconfigure the active service for this experiment.
-
-Статус документа: **04.10.2026, модель epic #74.** API — stateless-оркестратор: он не пишет
-на диск, не запускает процессов и не восстанавливается после рестарта. Единственное, что он
-делает, — ходит по HTTP во внешнего воркера и отдаёт клиенту то, что тот вернул.
-
-Предыдущая версия документа описывала API с durable store `/var/lib/agent-runner`,
-локальным `spawn` движков и recovery после `kill -9`. Этих вещей в сервисе больше нет.
+Предыдущая версия документа описывала API с durable store `/var/lib/agent-runner`, локальным
+`spawn` движков и recovery после `kill -9`. Этих вещей в сервисе больше нет.
 
 ---
 
@@ -25,13 +21,13 @@ For an isolated sandbox process, set `AGENT_API_PORT=18878`, use a separate `AGE
 
 | Модуль | Файл | Роль |
 |---|---|---|
-| HTTP-сервис | `dist/api/main.js` | читает env, поднимает `node:http`, всё состояние — в памяти |
-| Ядро | `src/api/service.ts` | приём запроса, идемпотентность, запуск во внешний воркер, маппинг результата |
-| Память процесса | `src/api/stateless-store.ts` | приёмные записи, прогресс ранов, события, лимиты и TTL |
-| Адаптер воркера | `src/adapters/external-worker-adapter.ts` | `POST {worker}/v1/launch` → `LaunchResult`, отмена через `POST {worker}/v1/runs/{id}/cancel` |
+| HTTP-сервис | `dist/api/main.js` | читает env, поднимает `node:http`, состояние ранов — в памяти |
+| Ядро | `src/api/service.ts` | приём запроса, идемпотентность, launch → квитанция, поллер `status`/`result`, маппинг результата |
+| Память процесса | `src/api/stateless-store.ts` | приёмные записи, прогресс ранов, события, лимиты и TTL; по журналу — восстановление после рестарта |
+| Адаптер воркера | `src/adapters/external-worker-adapter.ts` | `POST {worker}/v1/launch` → `LaunchReceipt`, опрос `GET {worker}/v1/runs/{id}/status`, выдача `GET .../result`, отмена `POST {worker}/v1/runs/{id}/cancel` |
 | Маршруты | `src/api/server.ts` | `/healthz`, `/v1/capabilities`, `/v1/runs…` |
-| Юнит | `infra/agent-runner-api.service` | systemd, `User=sandbox`, **без `ReadWritePaths` и без capabilities** |
-| Деплой | `scripts/deploy-api-service.sh` | build → config dir → API-ключ → адрес воркера → юнит → health → auth → ufw |
+| Юнит | `infra/agent-runner-api.service` | systemd, `User=sandbox`, `ProtectSystem=full` + `ReadWritePaths` только на каталог журнала |
+| Деплой | `scripts/deploy-api-service.sh` | build → config dir → API-ключ → адрес воркера → журнал → юнит → health → auth → ufw |
 | CLI | `scripts/runner-cli.mjs` | `submit/status/events/follow/result/cancel` против живого API |
 
 Библиотечный код (`src/runner/`, `src/isolation/`, `src/storage/`, `src/workspace/`,
@@ -47,8 +43,14 @@ API больше не используется** и удаляется отде�
 | Переменная | Смысл |
 |---|---|
 | `AGENT_API_KEY_REGISTRY` | путь к JSON с `principals` (только sha256 ключей), режим `0600` |
-| `EXTERNAL_WORKER_URL` | базовый URL внешнего воркера (`http(s)://…`) |
+| `EXTERNAL_WORKER_URL` | базовый URL внешнего воркера (`http(s)://…`) — одиночный воркер |
 | `EXTERNAL_WORKER_TOKEN` | общий секрет; уходит в `Authorization: Bearer …` |
+
+Либо реестр движков вместо одиночного воркера:
+
+| Переменная | Смысл |
+|---|---|
+| `AGENT_API_WORKERS` | JSON-список `[{engine, baseUrl, token}]`; `submit` выбирает воркер по `request.engine.name`, неизвестное имя → `ENGINE_NOT_ALLOWED`. Переопределяет `EXTERNAL_WORKER_*` |
 
 Принимаются также имена из ТЗ воркера — `DYNAMIC_IP_AZURE_URL` / `DYNAMIC_IP_AZURE_TOKEN`,
 но `EXTERNAL_WORKER_*` приоритетнее.
@@ -58,11 +60,49 @@ API больше не используется** и удаляется отде�
 | Переменная | По умолчанию | Смысл |
 |---|---|---|
 | `AGENT_API_HOST` / `AGENT_API_PORT` | `0.0.0.0` / `8787` | адрес прослушивания |
-| `AGENT_API_PUBLIC_URL` | — | публичный base URL этого же API instance для callback внешнего воркера; только host configuration |
+| `EXTERNAL_WORKER_ENGINE` | `azure-dynamic-ip-agent-run` | имя движка для одиночного воркера: им API отвечает в `/healthz` и `/v1/capabilities` |
 | `AGENT_API_ENV` | `{}` | JSON-пул значений окружения; в воркер уходят только те, что перечислил клиент в `envAllowlist` |
+| `AGENT_API_WORKERS` | — | JSON-список `[{engine, baseUrl, token, acceptDeadlineMs?}]` — несколько движков |
+| `AGENT_API_ENGINE_CHAIN` | — | приоритетная цепочка движков через запятую, в порядке проб (issue #100) |
+| `EXTERNAL_WORKER_ACCEPT_DEADLINE_MS` | `30000` | бюджет ожидания квитанции на движок; не ответил — цепочка берёт следующий |
 | `RUNNER_DEFAULT_REPO` | — | `owner/name` для клиентов, не объявивших `repository` |
-| `EXTERNAL_WORKER_LAUNCH_DEADLINE_MS` | `600000` | таймаут ожидания `LaunchResult` |
+| `AGENT_API_ADMISSION_LOG` | — (выключено) | путь журнала приёмных записей; в режиме профиля обязателен, пишет также подготовленную версию, намерение запуска и терминальный результат |
+| `AGENT_API_PROFILE_WORKSPACE_ROOT` | — (выключено) | включает постоянный профиль для каждого Run; устойчивый каталог журнала и bare-зеркал Git |
+| `AGENT_API_PROFILE_OWNER` | — | организация приватных репозиториев профиля; обязательна при включении профиля |
+| `AGENT_API_PROFILE_GITHUB_TOKEN` | — | хостовый токен GitHub для ensure/fetch/publish; не попадает в агентское окружение или журнал |
+| `AGENT_API_PROFILE_OBJECT_BACKEND` | `gcs` | хранилище тяжёлых файлов; `local-fs` только для локального fixture, GCS использует `GCS_BUCKET` и ADC |
+| `GCP_PROJECT` / `GOOGLE_CLOUD_PROJECT` | — | ID проекта GCS; задавайте явно при Workload Identity Federation, чтобы чтение метаданных объекта не запрашивало доступ к Cloud Resource Manager |
+| `AGENT_API_PUBLIC_URL` | `http://<host>:<port>` | публичный адрес API: воркер возвращает результат на `POST {resultUrl}`. Без него запуск падает с `RESULT_URL_UNSET` |
+| `EXTERNAL_WORKER_LAUNCH_DEADLINE_MS` | `600000` | таймаут опроса `status`/`result`; заодно бюджет приёма, если у движка не задан `acceptDeadlineMs` |
 | `EXTERNAL_WORKER_CANCEL_DEADLINE_MS` | `30000` | таймаут ожидания подтверждения отмены |
+| `EXTERNAL_WORKER_RECONCILE_DEADLINE_MS` | `5000` | бюджет проверки «знает ли воркер этот ран» перед переходом к следующему движку (#100); мёртвый движок не должен вешать проверку на таймаут запуска |
+
+Журнал приёмных записей пишется построчным JSON рядом с ключом API и адресом воркера, а сам
+путь приходит из `process.env`, а не из `AGENT_API_ENV`: `AGENT_API_ENV` уходит воркеру в
+каждом ране по `envAllowlist`, и путь журнала не должен попасть в процесс агента. Если журнал
+недоступен, обычный режим пишет `console.warn` (`persist failed`), а режим профиля отказывает
+в приёме или переходе состояния: подготовка и публикация профиля требуют durable журнал.
+
+В режиме профиля ключ API должен содержать доверенный `tenantId` и `profileId`. Клиентский
+`repository` отклоняется: binding выбирает хост. Перед launch API вызывает
+`prepareProfileWorkspace`, передаёт воркеру закреплённый commit и проверенные ссылки на
+объекты. После результата сверяет repository, branch и remote commit, затем вызывает
+`publishRunBranch` с тем же `operationId` при повторе. `publication.status` и
+`committedRevision` доступны в status/artifacts. Конфликт остаётся явным и блокирует новый
+Run профиля до разрешения. Тяжёлый output воркер кладёт в приватный GCS; Git хранит
+`.trained-assist/artifacts.json` с ref и checksum, байты читаются через авторизованный
+`GET /v1/runs/{runId}/artifacts?path=...`.
+GHA worker сохраняет разрешённые изменения отслеживаемых файлов, новые файлы и удаления
+из рабочего дерева, а также объявленные `outputs`. Исключения политики профиля действуют
+и для не объявленных заранее файлов.
+
+Для включения режима профиля API нужны `AGENT_API_PROFILE_WORKSPACE_ROOT` на постоянном
+томе, `AGENT_API_ADMISSION_LOG` на том же постоянном томе, `AGENT_API_PROFILE_OWNER`,
+`AGENT_API_PROFILE_GITHUB_TOKEN`, `AGENT_API_PROFILE_OBJECT_BACKEND=gcs`, `GCS_BUCKET`
+и `GCP_PROJECT` (либо `GOOGLE_CLOUD_PROJECT`) при WIF.
+Ключи в `AGENT_API_KEY_REGISTRY` должны задавать `tenantId` и `profileId`. У GHA worker
+переменная `GCS_PROFILE_BUCKET` должна совпадать с `GCS_BUCKET` API, а Workload Identity
+service account должен читать и записывать объекты этого приватного bucket.
 
 Переменных данных больше нет: `AGENT_API_DATA_DIR`, `ARTIFACT_SHARE_SECRET`,
 `ARTIFACT_BASE_URL`, `AGENT_API_RELEASE_MANIFEST`, `AGENT_API_FAULTS` сервис не читает.
@@ -73,7 +113,7 @@ API больше не используется** и удаляется отде�
 
 | Метод и путь | Что делает |
 |---|---|
-| `GET /healthz` | единственный маршрут без ключа: `{status, worker, engine, runs, admissions, events}` |
+| `GET /healthz` | единственный маршрут без ключа: `{status, workers: [{engine, baseUrl}], runs, admissions, events}` |
 | `GET /v1/capabilities` | декларация возможностей (см. §5) |
 | `POST /v1/runs` | приём: `Idempotency-Key` обязателен; `202` — новый receipt, `200` — дедуп |
 | `GET /v1/runs/{id}/status` | состояние рана, курсор событий, `answer` агента |
@@ -93,26 +133,80 @@ API больше не используется** и удаляется отде�
 ## 4. Жизненный цикл рана
 
 ```
-POST /v1/runs  →  202 receipt           память: AdmissionRecord + события claimed/inputs_materialized
-                →  POST {worker}/v1/launch   (воркер сам клонирует репозиторий и запускает агента)
-                →  LaunchResult         маппинг в RunResult + RunnerEvent[]
-                →  память: state terminal, logUrl, artifacts[], repo
+POST /v1/runs   → 202 receipt              память: AdmissionRecord + события claimed/inputs_materialized
+               →  POST {worker}/v1/launch  по приоритетной цепочке движков (§5): воркер клонирует
+                                          репозиторий и запускает агента
+               →  LaunchReceipt             {runId, operationId, status: accepted, statusUrl, resultUrl}
+               →  журнал: строка dispatched  рано: отметка пишется ДО старта поллера
+               →  GET {worker}/v1/runs/{id}/status   поллер нашего API, пауза 500 мс × 2^n, потолок 10 с
+               →  GET {worker}/v1/runs/{id}/result    после терминального статуса (409 → ещё рано)
+               →  память: state terminal, logUrl, artifacts[], repo
 ```
 
-События появляются двумя волнами: `claimed` и `inputs_materialized` пишутся сразу при приёме,
-остальные — когда воркер ответил. Поэтому журнал не пуст, пока воркер думает, и клиент
+Длинного запроса, который надо обрывать, в API нет: `launch` — короткий HTTP-обмен квитанцией,
+всё остальное — наш собственный опрос. Отсюда и смысл его таймаута: воркер не принял задачу.
+
+**События.** `claimed` и `inputs_materialized` пишутся при приёме, до сетевого вызова; остальные
+события приходят с результатом от воркера. Поэтому журнал не пуст, пока воркер думает, и клиент
 отличает «принято» от «потеряно».
 
-**Отмена.** Контракт воркера синхронный: `launch` — это весь ран. Если отмена приходит раньше,
-чем воркер зарегистрировал ран, его `cancel` отвечает `unknown_run`; API повторяет запрос,
-пока ран в полёте (`CANCEL_UNKNOWN_RUN_RETRIES` × `CANCEL_UNKNOWN_RUN_BACKOFF_MS`). Если ран
-так и не появился — отказ (`409`), а не «остановлено».
+**Бюджет и `unknown`.** Поллер живёт `limits.timeoutMs + 60 с` (`resultGraceMs`). Это не
+дедлайн рана, а граница нашего терпения: по её исчерпанию ран переходит в `unknown`, а опрос
+продолжается — воркер помнит `operationId`, поэтому повторный запуск невозможен, а результат
+всё ещё можно забрать. Так же ран уходит в `unknown`, если воркер сам ответил `unknown` или если
+`status` вернул «терминальный», а `result` ответил 409 (`result_missing`). `unknown` — не `failed`:
+задача не потеряна и авто-rerun не происходит.
 
-**Отказ воркера.** Транспортный обрыв, HTTP-ошибка или тело вне контракта дают терминальный
-`failed` с `exitReason: worker_crash` и кодом причины (`WORKER_UNREACHABLE`, `WORKER_HTTP_ERROR`,
-`WORKER_PROTOCOL_INVALID`, `WORKER_LAUNCH_TIMEOUT`). Пре-флайт-отказ клиента (`input.refs`,
-нет промпта) сохраняет свой код и `retryable: false`. Ран никогда не остаётся в `running`
-навсегда.
+**Отмена.** Гонки «отмена раньше регистрации рана» больше нет: квитанция приходит только после
+того, как воркер принял и зарегистрировал ран, поэтому отмена всегда уходит в уже известный
+ран. Внутренние повторы доставки общие для любого HTTP-обрыва (3 попытки, 40 мс). Ответы
+воркера: `cancelled` → `stop_pending`, `unknown_run` → `rejected` («воркер не зарегистрировал
+ран, отмена не доставлена»), `rejected` → `rejected` с причиной. Stale `ownerGeneration` →
+`409 STALE_OWNER_GENERATION`.
+
+**Отказ воркера.** Отказ на границе воркера ран обязан получить, но «запрос не дошёл» и
+«не доказано, что дошёл» — разные вещи. Поэтому ошибка `launch` делится на два класса:
+
+- **Отказ на нашей стороне** (пре-флайт: нет промпта, `input.refs` без workspace, для
+  движка не настроен воркер) — проверять нечего: ран финализируется сразу, и цепочка не
+  тратит на него бюджеты следующих движков.
+- **Неопределённый отказ** (таймаут, обрыв, HTTP-ошибка, тело вне контракта) — запрос мог
+  дойти, а ответ потеряться. Ран переходит в `unknown`, и сервис спрашивает воркер о ране,
+  прежде чем что-то решить (см. ниже).
+
+Коды причины:
+
+| Код | Когда | `retryable` |
+|---|---|---|
+| `WORKER_NOT_CONFIGURED` | для этого движка не настроен адрес воркера | `false` |
+| `WORKER_LAUNCH_UNREACHABLE` | таймаут или обрыв `POST /v1/launch` | `true` |
+| `WORKER_HTTP_ERROR` | воркер ответил не-2xx на launch | `true` |
+| `WORKER_PROTOCOL_INVALID` | тело ответа вне контракта | `true` |
+| `WORKER_UNREACHABLE` | прочие транспортные отказы, в том числе при обрыве опроса или выдачи результата | `true` |
+| `ENGINE_FLEET_EXHAUSTED` | ни один движок цепочки не принял ран; в `details` перечислены все попытки с кодами | `true` |
+
+Пре-флайт-отказ клиента (`input.refs`, нет промпта) сохраняет свой код и `retryable: false`.
+Отдельного кода для таймаута запуска в сервисе нет: таймаут — это
+`WORKER_LAUNCH_UNREACHABLE`.
+
+**Потерянная квитанция ≠ отказ рана.** Таймаут или обрыв `launch` не доказывает, что ран не
+начался: запрос мог дойти, воркер мог зарегистрировать и запустить агента, а ответ
+потеряться по дороге. Порядок по контракту (п. 4):
+
+1. Ран переходит в `unknown` — не в `failed`.
+2. Сервис один раз спрашивает `GET {worker}/v1/runs/{id}/status` по уже отправленному
+   `runId`. Новый `launch` не отправляется никогда: воркер помнит запуски по `operationId`.
+3. Воркер видит ран — отметка `dispatched` пишется в журнал, поллер доводит ран до
+   терминала, результат забирается штатно.
+4. Воркер не видит ран — терминальный `failed` с исходным кодом отказа. В цепочке это
+   разрешение перейти к следующему исполнителю, а не отказ (см. ниже).
+5. Спросить не удалось — ран остаётся `unknown`, клиент решает сам.
+
+Цепочка движков (§5) использует тот же вопрос как разрешение на переход: следующий
+исполнитель вызывается только если текущий подтвердил, что ран ему не известен. `runId` и
+`operationId` при переходе не меняются, поэтому дедупликация воркера работает и после
+перехода; текущая попытка видна клиенту сразу, а не молча подменяет исполнителя под ногами
+у того, кто опрашивает статус.
 
 ## 4.1 Результат рана — ветка
 
@@ -135,7 +229,16 @@ POST /v1/runs  →  202 receipt           память: AdmissionRecord + соб
 
 `GET /v1/capabilities` отчитывается о том, что есть на самом деле:
 
-- `engines: ["dynamic-ip-azure-agent-run"]` — единственный движок, и он внешний;
+- `engines` — отсортированный список имён воркеров из конфига (`AGENT_API_WORKERS` или
+  `EXTERNAL_WORKER_ENGINE`), а не один захардкоженный движок;
+- `engineSelection.chain` — приоритетная цепочка движков в порядке проб
+  (`AGENT_API_ENGINE_CHAIN`, issue #100); пустая — цепочка не объявлена;
+- `engineSelection.engineOptional: true` — клиент может не называть движок, тогда работает
+  цепочка; названный движок — ровно один кандидат, без переходов;
+- `engineSelection.retryOnlyWhenUnaccepted: true` — следующий исполнитель пробуется только
+  когда текущий подтвердил, что ран ему не известен;
+- `engineSelection.relaunchAfterReceipt: false` — повторный `launch` после потери квитанции
+  не отправляется никогда;
 - `isolation.mode: "none"`, `launcher: null` — на хосте API нечего изолировать, агента
   запускает воркер на своей машине и объявляет границу в ответе;
 - `artifacts.export.enabled: false`, `download: false`, `shareLink: false`,
@@ -155,7 +258,9 @@ POST /v1/runs  →  202 receipt           память: AdmissionRecord + соб
 - **Токен репозитория.** В `LaunchRequest` уходит только `repository.fullName`; клонирует
   воркер, поэтому клиентский токен не пересекает границу процесса.
 - **Юнит.** `NoNewPrivileges`, `PrivateTmp`, `ProtectSystem=full`. Capabilities не выдаются:
-  переключать Unix-идентичность больше нечего, писать некуда.
+  переключать Unix-идентичность больше нечего. Единственный путь на запись — каталог журнала
+  (`StateDirectory=agent-runner` + `ReadWritePaths=/var/lib/agent-runner`); всё остальное
+  процесс писать не может.
 - **Firewall.** `deploy-api-service.sh` открывает порт только после успешной auth-пробы
   (анонимный `POST /v1/runs` → 401, с ключом `GET /v1/runs/<unknown>/status` → 404).
 
@@ -164,14 +269,23 @@ POST /v1/runs  →  202 receipt           память: AdmissionRecord + соб
 ## 7. Деплой
 
 ```bash
-sudo scripts/deploy-api-service.sh --worker-url https://worker.example --worker-token "$TOKEN"
+sudo scripts/deploy-api-service.sh --worker-url https://worker.example --worker-token "$TOKEN" \
+  --admission-log /var/lib/agent-runner/admissions.jsonl
 # или с переменными окружения:
-sudo EXTERNAL_WORKER_URL=https://worker.example EXTERNAL_WORKER_TOKEN="$TOKEN" scripts/deploy-api-service.sh
+sudo EXTERNAL_WORKER_URL=https://worker.example EXTERNAL_WORKER_TOKEN="$TOKEN" \
+  AGENT_API_ADMISSION_LOG=/var/lib/agent-runner/admissions.jsonl scripts/deploy-api-service.sh
 ```
 
 Скрипт: `npm ci` → `npm run build` → `/etc/agent-runner` → API-ключ `0600` → env-файл с
-адресом и токеном воркера → юнит → `systemctl enable --restart` → `GET /healthz` →
-auth-проба → ufw. Каталога данных не создаётся.
+адресом и токеном воркера → каталог журнала `0700` на сервисного пользователя → юнит →
+`systemctl enable --restart` → `GET /healthz` → auth-проба → ufw.
+
+Журнал — единственное, что сервис пишет на диск, и его требует контракт воркера (п. 2).
+Без `--admission-log` скрипт печатает предупреждение: дедупликация по `Idempotency-Key` и
+опрос уже принятых ранов не переживут рестарт. Путь журнала по умолчанию —
+`/var/lib/agent-runner/admissions.jsonl` (`JOURNAL_DIR`), и именно этот каталог юнит разрешает
+на запись; другой путь нужно добавить в `ReadWritePaths` в `infra/agent-runner-api.service`,
+иначе журнал не откроется и процесс будет деградировать молча (§2).
 
 ---
 
@@ -180,7 +294,7 @@ auth-проба → ufw. Каталога данных не создаётся.
 ```bash
 export RUNNER_API_URL=http://127.0.0.1:8787 RUNNER_API_KEY_FILE=/etc/agent-runner/api-key
 
-curl -s $RUNNER_API_URL/healthz | jq .                # status, worker, engine
+curl -s $RUNNER_API_URL/healthz | jq .                # status, workers: [{engine, baseUrl}], runs, admissions, events
 node scripts/runner-cli.mjs submit --prompt "напиши отчёт в report.md"   # 202 + receipt
 node scripts/runner-cli.mjs follow <runId>            # SSE до терминального события
 node scripts/runner-cli.mjs result <runId> | jq .     # outcome, outputRefs (ссылки на GitHub), logPath (GCS)
@@ -194,14 +308,18 @@ curl -s -H "Authorization: Bearer $KEY" $RUNNER_API_URL/v1/runs/<runId>/artifact
 
 ## 9. Ограничения (честно)
 
-- **Состояние в памяти.** Рестарт процесса = потеря ранов. Клиент обязан повторять submit с
-  новым `Idempotency-Key`. Это задокументированный контракт, а не авария, но он означает, что
-  retry с тем же ключом после рестарта создаст новый ран.
+- **Состояние в памяти, кроме журнала.** Без `AGENT_API_ADMISSION_LOG` рестарт процесса =
+  потеря ранов: клиент повторяет submit с новым `Idempotency-Key`, а раны, уже принятые
+  воркером, теряют опрос и результат. С журналом дедупликация по ключу переживает рестарт, а
+  раны, отмеченные `dispatched`, снова под опросом при старте. Это задокументированный
+  контракт, а не авария, но он требует настройки из §7.
 - **Лимиты памяти.** `maxRuns` (500), `maxEventsPerRun` (2000), TTL терминальных ранов (1 час);
   при переполнении самые старые терминальные раны выбрасываются. События сверх лимита
   учитываются в `droppedEvents`, а не молча теряются.
-- **Живой прогон длиннее `AGENT_API`-процесса.** Пока воркер думает, запрос `launch` висит;
-  это ограничение платформы, а не API.
+- **Потерянная квитанция видна только в логе API.** Перевод рана в `unknown` при потере ответа
+  на `launch` пишется в журнал процесса, но не в события рана: клиент, читающий только
+  `/events`, не увидит причину. Это оставшаяся часть **#92** (п. 2 приёмки); код готов на
+  ветке `fix/92-reconcile-launch-timeout` (PR #123 закрыт как дубликат).
 - **TLS нет.** На песочнице допустимо, на проде нужен прокси или Cloudflare Worker.
 - **Open question ТЗ §13.1** (CF Worker или тонкий VM) не решена: до решения API разворачивается
   как stateless-процесс на VM, и `infra/agent-runner-api.service` — временная обвязка.

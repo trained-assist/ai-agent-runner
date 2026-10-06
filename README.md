@@ -49,9 +49,9 @@
 |---|---|---|
 | Auth/principals | `src/api/auth.ts` | Реестр ключей на одну VM: ключ хранится только как sha256 `keyHash`, сверка через `timingSafeEqual`, Bearer-схема; файловый реестр `keys.json` (hashes only); scopes `runs:read`/`runs:write` и allowlist engines на principal |
 | Контракты API | `src/api/contracts.ts` | Submit body = подмножество RunSpec (server-owned поля запрещены), `Receipt {requestId, userTaskId, runId}`, статусы включая `awaiting_user` (зарезервировано за control plane), payload hash через canonical JSON |
-| Stateless store | `src/api/stateless-store.ts` | In-memory приёмные записи и прогресс ранов: индексы по idempotency key / runId / userTaskId, лимиты памяти (`maxRuns`, `maxEventsPerRun`, TTL терминальных ранов). Диска нет — после рестарта клиент повторяет submit с новым ключом |
-| Внешний воркер | `src/adapters/external-worker-adapter.ts` | Единственный способ запустить агента: `POST {worker}/v1/launch` → `LaunchResult` (контракт — issue #73). Маппинг `LaunchResult` → `RunResult` + `RunnerEvent`, отмена через `POST {worker}/v1/runs/{runId}/cancel` |
-| Сервис | `src/api/service.ts` | submit → `worker.launch(spec)`; дедуп по (principal, Idempotency-Key) → тот же receipt, другой payload → 409 conflict; вторая живая попытка задачи → 409, после terminal — новый runId при том же userTaskId/requestId (`ownerGeneration+1`); status/cancel/result/events/artifacts поверх памяти. Никакого `recover()`, никакого диска, никакого процесса |
+| Stateless store | `src/api/stateless-store.ts` | In-memory приёмные записи и прогресс ранов: индексы по idempotency key / runId / userTaskId, лимиты памяти (`maxRuns`, `maxEventsPerRun`, TTL терминальных ранов). Диска нет, кроме журнала приёмных записей (`AGENT_API_ADMISSION_LOG`): без него после рестарта клиент повторяет submit с новым ключом, с ним дедупликация и опрос принятых ранов переживают рестарт |
+| Внешний воркер | `src/adapters/external-worker-adapter.ts` | Единственный способ запустить агента: `POST {worker}/v1/launch` → `LaunchReceipt` (квитанция, контракт — issue #73), дальше опрос `GET {worker}/v1/runs/{id}/status` и выдача `GET .../result`; отмена через `POST {worker}/v1/runs/{runId}/cancel` |
+| Сервис | `src/api/service.ts` | submit → `worker.launch(spec)` → квитанция → наш поллер читает `status`/`result` (пауза 500 мс × 2^n, потолок 10 с; бюджет `timeoutMs + 60 с` → `unknown` + reconcile); дедуп по (principal, Idempotency-Key) → тот же receipt, другой payload → 409 conflict; вторая живая попытка задачи → 409, после terminal — новый runId при том же userTaskId/requestId (`ownerGeneration+1`); status/cancel/result/events/artifacts поверх памяти. Никакого `recover()`, никакого процесса агента |
 | HTTP | `src/api/server.ts` | `POST /v1/runs`, `GET /v1/runs/{id}/status`, `POST .../cancel`, `GET .../result`, `GET .../events`, `GET .../artifacts`, `GET .../log` (302 на ссылку GCS), `GET /v1/capabilities` (+`/healthz`); структурированные ошибки `{error:{code,message,details}}`; body cap 413; логи запросов без заголовков и ключей |
 | SSE replay | `src/api/server.ts` | `GET .../events` с `Accept: text/event-stream`: snapshot + `id/event/data`, cursor из `?cursor` или `Last-Event-ID`, keepalive, завершение потока на терминальном событии |
 | Артефакты и логи | `src/api/service.ts` | `artifacts` = адрес файла в коммите репозитория юзера (`https://github.com/<owner>/<name>/blob/<commit>/<path>`) + метаданные; байт в ответе нет. Лог — ссылка GCS, которую вернул воркер (`logUrl`), продублированная в `RunResult.logPath` |
@@ -59,7 +59,8 @@
 Ключевые семантики:
 
 - **Receipt значит «принято», а не «запущено»** (AC-65): успешный ответ202/200 возвращает receipt; запуск агента наблюдается через status/events.
-- **Idempotency**: повтор submit с тем же ключом и payload → тот же receipt и ноль вторых запусков; другой payload с тем же ключом → `IDEMPOTENCY_CONFLICT`. Память процесса не переживает рестарт — тогда клиент повторяет submit с новым ключом (это задокументированный контракт, а не авария).
+- **Idempotency**: повтор submit с тем же ключом и payload → тот же receipt и ноль вторых запусков; другой payload с тем же ключом → `IDEMPOTENCY_CONFLICT`. Без журнала приёмных записей память процесса не переживает рестарт — тогда клиент повторяет submit с новым ключом (это задокумированный контракт, а не авария); с журналом (`AGENT_API_ADMISSION_LOG`) дедупликация и опрос принятых ранов переживают рестарт.
+- **Потерянная квитанция ≠ отказ рана**: таймаут или обрыв `launch` переводит ран в `unknown`, а не в `failed`; сервис один раз спрашивает воркер о ране по уже отправленному `runId` (новый `launch` не отправляется никогда) и только при отрицательном ответе закрывает ран как `failed`. Неопределённый отказ на движке — разрешение для приоритетной цепочки (`AGENT_API_ENGINE_CHAIN`) перейти к следующему исполнителю.
 - **`connection_lost` ≠ `failed`** (AC-66): потеря связи — отдельное поле `connectionLost` в status; состояние остаётся последним наблюдённым; result отвечает `RESULT_NOT_READY`.
 - **Cancel ≠ stopped** (AC-67): `stop_pending` (HTTP 202) отличается от `stopped`; stale `ownerGeneration` → 409 `STALE_OWNER_GENERATION` без изменения статуса (fencing slice-1).
 - **Recovery API-сессии** (P06): после рестарта клиент дочитывает status/events/receipt без rerun; orphan помечается `connection_lost`, погибший worker — `failed` c `WORKER_CRASH`; ни один путь не запускает вторую копию.
@@ -69,7 +70,7 @@
 
 ### Что покрыто тестами
 
-- [x] Duplicate submit = один запуск; после рестарта память пуста и клиент повторяет submit с новым ключом — `test/api-service.test.ts`, `test/e2e-loop.test.ts`
+- [x] Duplicate submit = один запуск; после рестарта память пуста и клиент повторяет submit с новым ключом, а с журналом приёмных записей дедупликация и опрос принятых ранов переживают рестарт — `test/api-service.test.ts`, `test/e2e-loop.test.ts`
 - [x] Несовместимый payload = conflict; без ключа/сcope/разрешённого engine — отказ до запуска — `test/api-service.test.ts`, `test/api-http.test.ts`
 - [x] Секреты/ключи не попадают в логи, ответы и запрос к воркеру — `test/api-http.test.ts`, `test/repository-context.test.ts`
 - [x] Reconnect/replay без rerun: JSON cursor replay + SSE с обрывом потока — `test/api-http.test.ts`, `test/control-plane-compat.test.ts`
@@ -82,15 +83,15 @@
 
 ## E2E acceptance loop — serverless (epic #74)
 
-Замкнутый цикл приёмки один: `submit` → внешний воркер → `result` → артефакты (ссылки на GitHub) → `logUrl` (Google Storage). Всё это — один тест над настоящими сокетами: мок воркера поднимается как HTTP-сервер и отвечает по контракту issue #73.
+Замкнутый цикл приёмки один: `submit` → внешний воркер → `result` → артефакты (ссылки на GitHub) → `logUrl` (Google Storage). Всё это — один тест над настоящими сокетами: мок воркера поднимается как HTTP-сервер и отвечает по контракту issue #73 (квитанция → `status` → `result`).
 
 ```bash
 npm ci
 npx vitest run test/e2e-loop.test.ts         # приёмка serverless API
-npx vitest run test/external-worker-adapter.test.ts   # контракт LaunchRequest/LaunchResult
+npx vitest run test/external-worker-adapter.test.ts   # контракт LaunchRequest/LaunchReceipt/LaunchResult
 ```
 
-Прежний драйвер `scripts/e2e-loop.{mjs,sh}` и его шаги (fault injection, recovery после `kill -9`, reboot, security-пробы на файловой системе хоста) удалены вместе с моделью, в которой они жили: API больше не пишет на диск, не запускает процессы и не восстанавливается. Приёмка этих свойств теперь выглядит иначе — как отсутствие состояния (новый экземпляр сервиса не помнит прошлый ран), а не как «файл на диске оказался цел».
+Прежний драйвер `scripts/e2e-loop.{mjs,sh}` и его шаги (fault injection, recovery после `kill -9`, reboot, security-пробы на файловой системе хоста) удалены вместе с моделью, в которой они жили: API не запускает процессы и не восстанавливается. Приёмка этих свойств теперь выглядит иначе — как отсутствие состояния (новый экземпляр сервиса не помнит прошлый ран), а не как «файл на диске оказался цел». Единственное исключение — журнал приёмных записей: он требуется контрактом воркера (п. 2) и включается `AGENT_API_ADMISSION_LOG`; подробности — `docs/API-SERVICE.md`.
 
 ## Slice D1 — Storage и менеджмент артефактов
 
@@ -187,7 +188,7 @@ RunSpec получил необязательную группу `repository`: �
 
 - **Пустая/отсутствующая группа = дефолтный режим**: клонируется `trained-assist/ai-agent-runner` (константа `DEFAULT_REPOSITORY_FULL_NAME`, env-оверрайд `RUNNER_DEFAULT_REPO` — для тестов: `owner/name` либо готовый источник вида `/tmp/fixture.git`/`file:///…`). Задачи без явной репозитории идут в контексте этого продукта.
 - **Клон делает runner, не движок**: child-процесс `git clone --depth 1` в `src/runner/repository.ts`, таймаут 60 с (`CLONE_TIMEOUT_MS`). Движок получает только `cwd` готового клона; токен в его окружение не передаётся.
-- **Секретность токена**: в stateless API токен репозитория вообще не покидает процесс — воркер получает только `repository.fullName` и клонирует сам, поэтому токен нельзя увидеть ни в `LaunchRequest`, ни в receipt/status/events/result/artifacts, ни в логах (`test/repository-context.test.ts`). У оставшегося Runner'а (библиотека, не обслуживающий путь) токен не попадает в argv git — он уходит в окружение child'а и доходит до git через статический `GIT_ASKPASS`-помошник; `redactRepositoryToken` вычищает поле из `state.json` и из хэшей (`specHash`/`submitPayloadHash` — ротация токена не ломает идемпотентность), `stripRepositoryToken` — из живой структуры после clone; `redactSecrets` дополнительно маскирует `ghp_…`/`github_pat_…`/`x-access-token:…`.
+- **Секретность токена**: в stateless API токен репозитории не показывается клиенту — его нет ни в receipt/status/events/result/artifacts, ни в логах, ни в журнале приёма на диск. Воркеру он уходит в `LaunchRequest.publicationToken` (`external-worker-adapter.ts`), потому что воркер запускается в чужом репозитории и кладёт выходы именно в `repository.fullName` задачи: на живом замере 05.10.2026 без этого артефакты легли в 1 запуск из 16. В `workflow_dispatch` токен не попадает — воркер забирает его по одноразовому claim-токену, а claim-ответ помечен `no-store`; в диспатч уезжают только `runId` и `claimToken`. У оставшегося Runner'а (библиотека, не обслуживающий путь) токен не попадает в argv git — он уходит в окружение child'а и доходит до git через статический `GIT_ASKPASS`-помошник; `redactRepositoryToken` вычищает поле из `state.json` и из хэшей (`specHash`/`submitPayloadHash` — ротация токена не ломает идемпотентность), `stripRepositoryToken` — из живой структуры после clone; `redactSecrets` дополнительно маскирует `ghp_…`/`github_pat_…`/`x-access-token:…`.
 - **Ошибки**: любой сбой clone (404/403/нет сети/нет git/таймаут) — не crash, а структурированный отказ: `failure.code = REPOSITORY_UNAVAILABLE`, состояние `failed`, `exitReason = preflight_refused`, понятное сообщение в `safeSummary` (через redaction). API-валидация кривого `fullName` → **400 `INVALID_REPOSITORY`**.
 - **Переопределения для тестов/гетерогенных стендов**: `RUNNER_DEFAULT_REPO`, `RUNNER_REPOSITORY_BASE_URL` (базовый URL вместо `https://github.com` — локальный git-сервер в тестах, self-hosted GitHub). Тесты офлайновые: `npm test` поднимает локальный фикстурный репозиторий (`test/default-repo-fixture-setup.ts`), интеграционные пробы идут на локальном git-сервере с Basic-auth.
 

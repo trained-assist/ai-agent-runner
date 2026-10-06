@@ -25,7 +25,7 @@ function tempDir(): string {
 }
 
 describe('api key registry', () => {
-  const principal: Principal = { principalId: 'p-alpha', profileId: 'profile-a', scopes: ['runs:read', 'runs:write'], engines: ['dynamic-ip-azure-agent-run'] };
+  const principal: Principal = { principalId: 'p-alpha', profileId: 'profile-a', scopes: ['runs:read', 'runs:write'], engines: ['azure-dynamic-ip-agent-run'] };
 
   it('generates keys that are never the plaintext stored in records', () => {
     const key = generateApiKey();
@@ -42,7 +42,7 @@ describe('api key registry', () => {
     const registry = KeyRegistry.fromRecords([keyRecordFor(key, principal), keyRecordFor(generateApiKey(), { principalId: 'p-beta', profileId: 'profile-b', scopes: ['runs:read'] })]);
 
     const found = registry.authenticate(`Bearer ${key}`);
-    expect(found).toMatchObject({ principalId: 'p-alpha', profileId: 'profile-a', scopes: ['runs:read', 'runs:write'], engines: ['dynamic-ip-azure-agent-run'] });
+    expect(found).toMatchObject({ principalId: 'p-alpha', profileId: 'profile-a', scopes: ['runs:read', 'runs:write'], engines: ['azure-dynamic-ip-agent-run'] });
     found!.scopes.push('runs:read');
     const again = registry.authenticate(`Bearer ${key}`);
     expect(again!.scopes).toEqual(['runs:read', 'runs:write']);
@@ -52,6 +52,14 @@ describe('api key registry', () => {
     expect(registry.authenticate('Bearer ')).toBeNull();
     expect(registry.authenticate(undefined)).toBeNull();
     expect(registry.authenticate('')).toBeNull();
+  });
+
+  it('refuses ambiguous tenant and profile bindings for trusted profile keys', () => {
+    const first = keyRecordFor(generateApiKey(), { principalId: 'p-a', tenantId: 'tenant-a', profileId: 'profile-a', scopes: ['runs:write'] });
+    const sameProfile = keyRecordFor(generateApiKey(), { principalId: 'p-b', tenantId: 'tenant-b', profileId: 'profile-a', scopes: ['runs:write'] });
+    const samePrincipal = keyRecordFor(generateApiKey(), { principalId: 'p-a', tenantId: 'tenant-a', profileId: 'profile-b', scopes: ['runs:write'] });
+    expect(() => KeyRegistry.fromRecords([first, sameProfile])).toThrow(/multiple tenants/);
+    expect(() => KeyRegistry.fromRecords([first, samePrincipal])).toThrow(/multiple profiles/);
   });
 
   it('loads a hashed key file and fails fast on a malformed one', () => {
@@ -96,11 +104,19 @@ describe('submit contract validation', () => {
     expect(result.value.limits).toEqual({ timeoutMs: 5000 });
   });
 
-  it('rejects missing engine, unknown server-owned fields and bad types', () => {
-    expect(validateSubmitRequest({ limits: { timeoutMs: 1000 } })).toMatchObject({ ok: false });
-    const missing = validateSubmitRequest({ limits: { timeoutMs: 1000 } });
-    expect(!missing.ok && missing.errors.join(' ')).toContain('missing required field "engine"');
+  it('engine необязателен: без него исполнителя выбирает цепочка движков (#100)', () => {
+    const withoutEngine = validateSubmitRequest({ limits: { timeoutMs: 1000 } });
+    expect(withoutEngine.ok).toBe(true);
+    if (!withoutEngine.ok) return;
+    expect(withoutEngine.value.engine).toBeUndefined();
 
+    const withEngine = validateSubmitRequest({ ...validBody });
+    expect(withEngine.ok).toBe(true);
+    if (!withEngine.ok) return;
+    expect(withEngine.value.engine).toEqual({ name: 'fake', adapterVersion: '1' });
+  });
+
+  it('rejects unknown server-owned fields and bad types', () => {
     const unknown = validateSubmitRequest({ ...validBody, runId: 'run_hijack', cwd: '/etc' });
     expect(!unknown.ok && unknown.errors.join(' ')).toContain('unknown field "runId"');
     expect(!unknown.ok && unknown.errors.join(' ')).toContain('unknown field "cwd"');

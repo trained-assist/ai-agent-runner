@@ -58,7 +58,7 @@ describe('e2e: serverless API поверх внешнего воркера (#74)
     expect(await waitForTerminal(h.base, alphaKey, receipt.runId)).toBe('succeeded');
     expect(h.worker.launches).toHaveLength(1);
     expect(h.worker.launches[0]!['runId']).toBe(receipt.runId);
-    expect((h.worker.launches[0]!['engine'] as { name: string }).name).toBe('dynamic-ip-azure-agent-run');
+    expect((h.worker.launches[0]!['engine'] as { name: string }).name).toBe('azure-dynamic-ip-agent-run');
     expect((h.worker.launches[0]!['repository'] as { branch: string }).branch).toBe(`agent-run/${receipt.runId}`);
 
     const result = (await (await getResult(h.base, alphaKey, receipt.runId)).json()) as { outcome: string; logPath: string; outputRefs: string[] };
@@ -142,7 +142,7 @@ describe('e2e: serverless API поверх внешнего воркера (#74)
     expect(h.service.store.counts().events).toBeGreaterThan(0);
   }, 30000);
 
-  it('статически: обслуживающий путь API ничего не пишет на диск и не спавнит процессы', () => {
+  it('статически: базовый API не пишет на диск и не спавнит процессы без включённого durable workspace', () => {
     // Критерий приёмки «API не пишет на диск» проверяется по коду, а не по каталогу: иначе
     // проверка зависела бы от того, что в tmpdir не пишет кто-то ещё. Чтение конфига
     // (реестр ключей) допустимо — запрещены запись и порождение процессов.
@@ -168,7 +168,7 @@ describe('e2e: serverless API поверх внешнего воркера (#74)
     // `Idempotency-Key` обязана переживать рестарт API, а память процесса для этого не
     // годится. Он включается флагом `AGENT_API_ADMISSION_LOG` и без флага не пишет
     // ничего, поэтому обслуживающий путь остаётся бездисковым по умолчанию.
-    const journalWriters = new Set(['stateless-store.ts', 'main.ts']);
+    const journalWriters = new Set(['stateless-store.ts', 'main.ts', 'profile-workspace.ts']);
     const offenders: string[] = [];
     for (const file of files) {
       const base = file.slice(file.lastIndexOf('/') + 1);
@@ -198,6 +198,7 @@ describe('e2e: serverless API поверх внешнего воркера (#74)
       'src/api/auth.ts',
       'src/api/config.ts',
       'src/api/main.ts',
+      'src/api/profile-workspace.ts',
       'src/api/stateless-store.ts',
     ]);
   });
