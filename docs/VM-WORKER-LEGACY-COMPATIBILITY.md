@@ -24,3 +24,9 @@ Runner, Host and executor revisions separately and run the #174 acceptance check
 clean environment with sibling/core access denied. Keep old `AGENT_URL` and web
 `AGENT_VERIFY_URL` routes isolated from the new profile. New-profile callbacks must
 fail explicitly when unsupported and must never fall back to a legacy upstream.
+
+The VM worker carries trusted ingress-manifest pins to Runner, but currently refuses
+profile-workspace launches before admission because it cannot yet publish the user's
+run branch. This is an explicit capability refusal, not a legacy fallback; the central
+router may continue to another configured worker only because the VM has not started
+the run.

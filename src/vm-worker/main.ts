@@ -10,6 +10,7 @@ import { createVmWorkerServer } from './http-server.js';
 import { Runner } from '../runner/runner.js';
 import { readVmWorkerBindingsInventory } from './bindings-inventory.js';
 import { readVmWorkerBuildInfo } from './build-info.js';
+import { createControlPlaneIngressResolverFromEnv } from '../storage/ingress-artifact.js';
 
 function required(name: string): string {
   const value = process.env[name]?.trim();
@@ -63,6 +64,7 @@ async function main(): Promise<void> {
     adapters: { opencode: engine },
     host: { workerId, region: engineName === 'rf-vm-agent-run' ? 'ru' : 'eu', environment: 'production', allowedEngines: ['opencode'] },
     exports,
+    ingressResolver: createControlPlaneIngressResolverFromEnv(process.env),
     resumeQueuedRuns: false,
   });
   const recovery = await runner.recover();

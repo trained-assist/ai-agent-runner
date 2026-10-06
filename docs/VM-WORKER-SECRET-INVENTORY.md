@@ -20,6 +20,7 @@ rotation date produces warnings; a missing required binding makes readiness fail
 | `GH_TOKEN` used by updater | Downloads and verifies the public GitHub release/attestation | Operator-only, transient update environment; it is not loaded by the worker service. Use the minimum read permissions and do not persist it in `worker.env`. |
 | `EU_VM_WORKER_URL`, `EU_VM_WORKER_TOKEN`, `RU_VM_WORKER_URL`, `RU_VM_WORKER_TOKEN` | CI drift/health probes | GitHub Actions repository secrets. Names are wired in `.github/workflows/vm-worker-deployment-drift.yml`; verify actual secret presence in GitHub settings without reading values. |
 | `LLM_LADDER_TOKEN` | OpenCode provider credential | The central Agent API passes it in the authenticated per-run launch env when allowlisted. It is runtime task input to the worker process and must not be copied into inventory or logged. Record its source and owner in the central API's own binding inventory. |
+| `RUNNER_CONTROL_PLANE_URL`, `RUNNER_CONTROL_PLANE_PRINCIPAL`, `RUNNER_CONTROL_PLANE_PRINCIPAL_SECRET` | Resolve task-scoped ingress manifests and artifact bytes | Configure as one group in the VM worker's systemd environment when the central API sends `ingressManifest`; secret value belongs in the approved host secret store. Without the group, ingress-manifest runs fail closed before the agent starts. |
 
 This document is a registry template, not evidence that any production secret is already
 stored at the intended location. The release drift workflow reports worker configuration

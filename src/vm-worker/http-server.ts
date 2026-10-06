@@ -93,6 +93,10 @@ export function createVmWorkerServer(options: VmWorkerServerOptions): VmWorkerSe
         sendJson(res, 400, { error: 'INVALID_REQUEST', message: error instanceof Error ? error.message : 'invalid request body' });
         return;
       }
+      if (isRecord(raw) && raw['profileWorkspace'] !== undefined) {
+        sendJson(res, 501, { accepted: false, code: 'WORKER_PROFILE_WORKSPACE_UNSUPPORTED' });
+        return;
+      }
       const parsed = parseLaunchRequest(raw, options);
       if (!parsed.ok) { sendJson(res, 400, { error: 'INVALID_REQUEST', details: parsed.errors }); return; }
       const request = parsed.value;
@@ -186,6 +190,7 @@ function toRunSpec(request: LaunchRequest, options: VmWorkerServerOptions): RunS
     input: { inlinePrompt: request.input.inlinePrompt },
     isolation: { mode: request.isolation.mode as NonNullable<RunSpec['isolation']>['mode'] },
     repository: { fullName: repo, ...(token ? { token } : {}) },
+    ...(request.ingressManifest ? { ingressManifest: request.ingressManifest } : {}),
     ...(request.outputs ? { outputs: request.outputs.map((output) => ({ ...output })) } : {}),
   };
 }
@@ -217,6 +222,15 @@ function parseLaunchRequest(value: unknown, options: VmWorkerServerOptions): { o
   if (typeof value['resultUrl'] === 'string' && !validCallbackUrl(value['resultUrl'], String(value['runId']), options.allowedCallbackOrigins)) errors.push('resultUrl is not an approved central API callback URL');
   if (typeof value['repository'] === 'object' && value['repository'] !== null && typeof (value['repository'] as Record<string, unknown>)['branch'] === 'string'
     && (value['repository'] as Record<string, unknown>)['branch'] !== `agent-run/${String(value['runId'])}`) errors.push('repository.branch must be the run-scoped branch');
+  if (value['ingressManifest'] !== undefined) {
+    const pin = value['ingressManifest'];
+    if (!isRecord(pin) || pin['contractVersion'] !== 1 || typeof pin['manifestRef'] !== 'string' || !pin['manifestRef']
+      || typeof pin['manifestVersion'] !== 'string' || !/^[0-9a-f]{64}$/.test(pin['manifestVersion'])
+      || pin['userTaskId'] !== value['userTaskId'] || pin['profileId'] !== value['profileId']
+      || pin['runId'] !== value['runId'] || pin['ownerGeneration'] !== value['ownerGeneration']) {
+      errors.push('ingressManifest must be pinned to this run, task, profile, and owner generation');
+    }
+  }
   if (Array.isArray(value['outputs']) && value['outputs'].length > 100) errors.push('outputs exceeds the supported limit');
   if (value['outputs'] !== undefined && (!Array.isArray(value['outputs']) || value['outputs'].some((entry) => !isRecord(entry) || typeof entry['path'] !== 'string'))) errors.push('outputs is invalid');
   if (errors.length) return { ok: false, errors };

@@ -2,7 +2,7 @@ import { randomUUID, timingSafeEqual } from 'node:crypto';
 import { RUNNER_EVENT_SCHEMA_VERSION, type RunnerEvent } from '../contracts/events.js';
 import { RUN_RESULT_SCHEMA_VERSION, type ExitReason, type FailureClass, type RunFailure, type RunOutcome, type RunResult } from '../contracts/result.js';
 import { validateRunResult } from '../contracts/result.js';
-import type { OutputSpec, RunSpec } from '../contracts/run-spec.js';
+import type { IngressManifestRef, OutputSpec, RunSpec } from '../contracts/run-spec.js';
 import {
   ErrorCollector,
   PreflightError,
@@ -136,6 +136,8 @@ export interface LaunchRequest {
   limits: { timeoutMs: number; maxOutputBytes: number; maxLogBytes: number };
   repository: { fullName: string; branch: string; revision?: string };
   profileWorkspace?: { bindingId: string; objectBucket?: string; artifacts: Array<{ path: string; key: string; sha256: string; size: number }>; excludedPatterns: string[] };
+  /** Trusted CP input manifest pin. Artifact bytes are resolved by the worker, not supplied by the caller. */
+  ingressManifest?: IngressManifestRef;
   /**
    * Токен публикации: клон `repository.fullName` и коммит выходов в его ветку.
    *
@@ -385,12 +387,6 @@ export function launchRequestFromSpec(
   spec: RunSpec,
   options: { env?: Record<string, string>; resultUrl: string; remoteMcpAttachment?: RemoteMcpAttachment } = { resultUrl: '' },
 ): LaunchRequest {
-  if (spec.ingressManifest) {
-    throw new PreflightError('INGRESS_MANIFEST_UNSUPPORTED', 'the stateless external worker cannot resolve task-scoped ingress manifests', {
-      failureClass: 'preflight',
-      retryable: false,
-    });
-  }
   if (spec.mcp?.servers.length && !options.remoteMcpAttachment) {
     throw new PreflightError('MCP_HOST_POLICY_MISSING', 'remote MCP requires trusted host resolution', { failureClass: 'preflight', retryable: false });
   }
@@ -445,6 +441,7 @@ export function launchRequestFromSpec(
       ...(spec.repository?.revision ? { revision: spec.repository.revision } : {}),
     },
     ...(spec.profileWorkspace ? { profileWorkspace: spec.profileWorkspace } : {}),
+    ...(spec.ingressManifest ? { ingressManifest: spec.ingressManifest } : {}),
     // Токен публикации: без него джоба клонирует репозиторий задачи и коммитит выходы
     // токеном репозитория кольца, у которого нет прав на чужой репозиторий. На живом
     // замере 05.10.2026 так ушли 15 запусков из 16 как `completed artifacts=0`.
@@ -915,7 +912,7 @@ export function workerTransportFailure(
  * workspace, не задан `resultUrl`), где повтор на другом движке бесполезен.
  */
 export const UNACCEPTED_LAUNCH_CODES = [
-  'WORKER_CAPACITY', 'WORKER_CAPACITY_UNKNOWN', 'WORKER_ADMISSION_UNAVAILABLE',
+  'WORKER_CAPACITY', 'WORKER_CAPACITY_UNKNOWN', 'WORKER_ADMISSION_UNAVAILABLE', 'WORKER_PROFILE_WORKSPACE_UNSUPPORTED',
   'WORKER_LAUNCH_UNREACHABLE', 'WORKER_HTTP_ERROR', 'WORKER_PROTOCOL_INVALID',
 ] as const;
 
@@ -930,14 +927,15 @@ export function launchFailureCode(err: unknown): string {
   return err instanceof PreflightError ? err.code : 'WORKER_UNREACHABLE';
 }
 
-function definitiveAdmissionRefusal(body: string): 'WORKER_CAPACITY' | 'WORKER_CAPACITY_UNKNOWN' | 'WORKER_ADMISSION_UNAVAILABLE' | null {
+function definitiveAdmissionRefusal(body: string): 'WORKER_CAPACITY' | 'WORKER_CAPACITY_UNKNOWN' | 'WORKER_ADMISSION_UNAVAILABLE' | 'WORKER_PROFILE_WORKSPACE_UNSUPPORTED' | null {
   try {
     const value: unknown = JSON.parse(body);
     if (typeof value !== 'object' || value === null || Array.isArray(value)) return null;
     const record = value as Record<string, unknown>;
     if (record['accepted'] !== false) return null;
     const code = record['code'];
-    return code === 'WORKER_CAPACITY' || code === 'WORKER_CAPACITY_UNKNOWN' || code === 'WORKER_ADMISSION_UNAVAILABLE' ? code : null;
+    return code === 'WORKER_CAPACITY' || code === 'WORKER_CAPACITY_UNKNOWN' || code === 'WORKER_ADMISSION_UNAVAILABLE'
+      || code === 'WORKER_PROFILE_WORKSPACE_UNSUPPORTED' ? code : null;
   } catch {
     return null;
   }
@@ -1069,7 +1067,7 @@ export class ExternalWorkerAdapter implements ExternalWorker {
     if (!response.ok) {
       const detail = truncateLine(redactSecrets(redactAttachment(await readBody(response))), 300);
       this.log({ event: 'worker_launch_http_error', runId: spec.runId, status: response.status, detail });
-      const admissionRefusal = response.status === 503 ? definitiveAdmissionRefusal(detail) : null;
+      const admissionRefusal = definitiveAdmissionRefusal(detail);
       if (admissionRefusal) {
         throw new PreflightError(admissionRefusal, `the external worker refused the run before acceptance (${admissionRefusal})`, {
           failureClass: 'runtime', retryable: true,

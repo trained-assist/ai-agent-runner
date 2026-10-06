@@ -86,6 +86,38 @@ describe('installable VM HTTP worker', () => {
     expect(fixture.runner.startCalls).toHaveLength(0);
   });
 
+  it('preserves a trusted ingress pin for Runner and rejects a pin bound to another run', async () => {
+    const fixture = await startFixture();
+    cleanups.push(fixture.close);
+    const pin = {
+      contractVersion: 1 as const,
+      manifestRef: 'manifest-task-vm',
+      manifestVersion: 'b'.repeat(64),
+      userTaskId: 'task-vm-worker-test',
+      profileId: 'profile-test',
+      runId: RUN_ID,
+      ownerGeneration: 1,
+    };
+    const accepted = await launch(fixture.base, launchRequest({ ingressManifest: pin }));
+    expect(accepted.status).toBe(202);
+    expect(fixture.runner.startCalls[0]!.spec.ingressManifest).toEqual(pin);
+
+    const mismatched = await launch(fixture.base, launchRequest({ ingressManifest: { ...pin, runId: 'different-run' } }));
+    expect(mismatched.status).toBe(400);
+    expect(fixture.runner.startCalls).toHaveLength(1);
+  });
+
+  it('refuses profile workspace before admission while this worker cannot publish the user branch', async () => {
+    const fixture = await startFixture();
+    cleanups.push(fixture.close);
+    const response = await launch(fixture.base, launchRequest({
+      profileWorkspace: { bindingId: 'binding-profile-a', artifacts: [], excludedPatterns: [] },
+    }));
+    expect(response.status).toBe(501);
+    expect(await response.json()).toEqual({ accepted: false, code: 'WORKER_PROFILE_WORKSPACE_UNSUPPORTED' });
+    expect(fixture.runner.startCalls).toHaveLength(0);
+  });
+
   it('reports unknown runs without inventing a receipt and rejects a disallowed repository', async () => {
     const fixture = await startFixture({ engineName: 'eu-vm-agent-run' });
     cleanups.push(fixture.close);

@@ -220,7 +220,8 @@ describe('task-scoped ingress artifacts', () => {
     ]) {
       expect(validateRunSpec({ ...spec, ingressManifest: { ...pin, ...change } }).ok).toBe(false);
     }
-    expect(() => launchRequestFromSpec({ ...spec, ingressManifest: pin }, { resultUrl: 'https://runner.test/result' })).toThrow(/cannot resolve task-scoped ingress/);
+    const request = launchRequestFromSpec({ ...spec, input: { inlinePrompt: 'run' }, ingressManifest: pin }, { resultUrl: 'https://runner.test/result' });
+    expect(request.ingressManifest).toEqual(pin);
   });
 });
 

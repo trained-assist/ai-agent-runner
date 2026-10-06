@@ -22,10 +22,21 @@ missing rotation date is a warning. The example inventories intentionally show
 `UNASSIGNED` owners until an operator records the real owner and store path.
 
 The slice does **not** yet publish `agent-run/<runId>` to the user's GitHub repository:
-the returned result deliberately has `repo.commit: null`. GCS storage wiring is
-configured, but that does not replace Git branch publication or prove that user data
-was persisted. Do not route production user work here until branch creation/push,
-artifact references, and API-side merge/persistence are integrated and tested.
+ordinary runs return `repo.commit: null`. For a profile-backed task, the worker rejects
+the launch before admission with `WORKER_PROFILE_WORKSPACE_UNSUPPORTED` so it cannot
+run against an incomplete workspace and silently lose changes. The API may advance to
+the next configured worker after this definitive no-start response. GCS storage wiring
+does not replace Git branch publication or prove that user data was persisted. Do not
+route production user work here until branch creation/push, artifact references, and
+API-side merge/persistence are integrated and tested.
+
+Task-scoped Control Plane `ingressManifest` pins now pass through the external-worker
+request into Runner. Configure `RUNNER_CONTROL_PLANE_URL`,
+`RUNNER_CONTROL_PLANE_PRINCIPAL`, and `RUNNER_CONTROL_PLANE_PRINCIPAL_SECRET` together
+when using this capability. With all three absent, ordinary runs remain available but
+a run carrying an ingress manifest fails closed before OpenCode starts; a partial
+configuration prevents worker startup. This input-artifact path does not publish the
+user's changed workspace back to GitHub.
 
 ## Install on a Linux VM
 

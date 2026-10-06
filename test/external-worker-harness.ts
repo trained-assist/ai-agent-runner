@@ -24,7 +24,7 @@ export interface MockWorkerOptions {
   httpStatus?: number;
   /** Structured no-start refusal used to test capacity-aware dispatch. */
   capacityRefusal?: boolean;
-  admissionRefusal?: 'WORKER_CAPACITY_UNKNOWN' | 'WORKER_ADMISSION_UNAVAILABLE';
+  admissionRefusal?: 'WORKER_CAPACITY_UNKNOWN' | 'WORKER_ADMISSION_UNAVAILABLE' | 'WORKER_PROFILE_WORKSPACE_UNSUPPORTED';
   /** Задержать регистрацию рана: отмена приходит раньше, чем воркер его «увидел». */
   registerAfterMs?: number;
   /** Отдать тело, не проходящее контракт. */
