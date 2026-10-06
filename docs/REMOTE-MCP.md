@@ -93,7 +93,7 @@ The external worker does not implement stdio attachment; stdio descriptors still
 
 The test-only `trained-assist-registry-test` binding is reserved to the single
 `registry-mcp-test-160-read` ref, the exact host
-`https://trained-assist-mcp-host-test-160.skillset-apply.workers.dev/mcp`, the profile
+`https://registry-test.trainedassist.store/mcp`, the profile
 `integration-telegram-ux-v1`, and the sole tool `registry.fixture_read`. The trusted host
 policy must use the same server ID, URL, ref, and single-tool allowlist. A broader policy
 fails Runner startup. This binding ref never falls through to a general binding file or

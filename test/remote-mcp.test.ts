@@ -91,6 +91,11 @@ describe('trusted registry fixture binding', () => {
     registryDigest: REGISTRY_FIXTURE_REGISTRY_DIGEST,
   };
 
+  it('pins the isolated Registry fixture to its provisioned Custom Domain', () => {
+    expect(REGISTRY_FIXTURE_URL).toBe('https://registry-test.trainedassist.store/mcp');
+    expect(registryPolicy[REGISTRY_FIXTURE_SERVER_ID]?.url).toBe(REGISTRY_FIXTURE_URL);
+  });
+
   it('creates a run-scoped binding only for the pinned test profile/server/tool and shared expiry', async () => {
     const signing = generateKeyPairSync('ed25519');
     const signingKey = signing.privateKey.export({ format: 'der', type: 'pkcs8' }).toString('base64');

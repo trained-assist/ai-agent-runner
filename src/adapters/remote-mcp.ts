@@ -75,7 +75,7 @@ export interface RemoteMcpHostOptions {
 
 export const REGISTRY_FIXTURE_SERVER_ID = 'trained-assist-registry-test';
 export const REGISTRY_FIXTURE_BINDING_REF = 'registry-mcp-test-160-read';
-export const REGISTRY_FIXTURE_URL = 'https://trained-assist-mcp-host-test-160.skillset-apply.workers.dev/mcp';
+export const REGISTRY_FIXTURE_URL = 'https://registry-test.trainedassist.store/mcp';
 export const REGISTRY_FIXTURE_PROFILE_ID = 'integration-telegram-ux-v1';
 export const REGISTRY_FIXTURE_TOOL = 'registry.fixture_read';
 export const REGISTRY_FIXTURE_TOKEN_ENV = 'RUNNER_MCP_REGISTRY_TEST_TOKEN';
