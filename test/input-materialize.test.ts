@@ -253,6 +253,26 @@ describe('materialize snapshot inputs into a new run workspace', () => {
     expect(String(inputsEvent(h.runner, receipt.runId).reason)).toContain('no snapshot materializer');
   });
 
+  it('неразрешённый versioned ref отказывается до запуска движка, а не считается пустым входом', async () => {
+    const h = harnessWithSnapshots();
+    const { receipt, spec } = h.start({ input: { inlinePrompt: 'process the upload', refs: [{ ref: 'ingress-media-1', version: 'v1' }] } });
+    const result = await terminal(h.runner, receipt.runId);
+
+    expect(result.outcome).toBe('failed');
+    expect(result.failure?.code).toBe('MATERIALIZE_REF_INVALID');
+    expect(result.failure?.retryable).toBe(false);
+    expect(inputsEvent(h.runner, receipt.runId)).toMatchObject({
+      status: 'refused',
+      declared: 1,
+      requested: 1,
+      files: 0,
+      bytes: 0,
+      entries: [{ ref: 'ingress-media-1', status: 'refused', code: 'MATERIALIZE_REF_INVALID' }],
+    });
+    expect(existsSync(join(spec.cwd, '.inputs'))).toBe(false);
+    expect(h.runner.events(receipt.runId).map((event) => event.type)).not.toContain('started');
+  });
+
   it('путь без snapshotId и некорректный snapshotId не проходят контракт', () => {
     const h = harnessWithSnapshots();
     expect(() => h.makeSpec({ input: { refs: [{ ref: 'prior', path: 'notes.md' }] } })).toThrow(/requires snapshotId/);
