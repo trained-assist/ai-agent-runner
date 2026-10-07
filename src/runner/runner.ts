@@ -725,6 +725,7 @@ export class Runner {
       ownerGeneration: input.ownerGeneration,
       sequence: st.sequence + 1,
       timestamp: this.nowIso(),
+      traceId: st.spec.traceId ?? null,
       type: input.type,
       payload: input.payload,
     };
@@ -1011,6 +1012,7 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
       ownerGeneration: st.ownerGeneration,
       sequence: st.sequence + 1,
       timestamp: this.nowIso(),
+      traceId: st.spec.traceId ?? null,
       type,
       payload,
     };

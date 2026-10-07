@@ -1160,6 +1160,7 @@ export class AgentApi {
         ownerGeneration: record.ownerGeneration,
         sequence: progress.sequence + 1,
         timestamp: this.nowIso(),
+        traceId: record.spec.traceId ?? null,
         type: 'log',
         payload: { stream, level: 'info', message: safeMessage },
       };
@@ -1315,6 +1316,8 @@ private buildSpec(
   }
 
   private log(entry: Record<string, unknown>): void {
-    this.logger({ ts: this.nowIso(), ...entry });
+    const runId = entry['runId'];
+    const traceId = typeof runId === 'string' ? this.store.getByRun(runId)?.spec.traceId : undefined;
+    this.logger({ ts: this.nowIso(), ...(traceId !== undefined ? { traceId } : {}), ...entry });
   }
 }

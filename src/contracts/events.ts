@@ -48,6 +48,7 @@ interface EventEnvelope {
   ownerGeneration: number;
   sequence: number;
   timestamp: string;
+  traceId: string | null;
 }
 
 export interface ClaimedEvent extends EventEnvelope {
@@ -251,9 +252,13 @@ const ENVELOPE_KEYS = [
   'ownerGeneration',
   'sequence',
   'timestamp',
+  'traceId',
   'type',
   'payload',
 ] as const;
+
+/** Журналы, записанные до появления traceId, обязаны оставаться читаемыми: поле не обязательно. */
+const REQUIRED_ENVELOPE_KEYS = ENVELOPE_KEYS.filter((key) => key !== 'traceId');
 
 const PAYLOAD_KEYS: Record<RunnerEventType, readonly string[]> = {
   claimed: ['operationId'],
@@ -434,7 +439,7 @@ function validatePayload(type: RunnerEventType, value: unknown, path: string, co
 export function validateRunnerEvent(input: unknown): ValidationResult<RunnerEvent> {
   const collector = new ErrorCollector();
   if (!checkObject(input, 'event', collector)) return collector.finish(undefined as never);
-  checkKeys(input, ENVELOPE_KEYS, ENVELOPE_KEYS, 'event', collector);
+  checkKeys(input, ENVELOPE_KEYS, REQUIRED_ENVELOPE_KEYS, 'event', collector);
 
   if (input['schemaVersion'] !== RUNNER_EVENT_SCHEMA_VERSION) collector.push('event.schemaVersion: expected 1');
   if (!isSafeId(input['eventId'])) collector.push('event.eventId: expected id');
@@ -449,6 +454,9 @@ export function validateRunnerEvent(input: unknown): ValidationResult<RunnerEven
     collector.push('event.sequence: expected non-negative integer');
   }
   if (!isUtcTimestamp(input['timestamp'])) collector.push('event.timestamp: expected UTC ISO timestamp');
+  if (input['traceId'] !== undefined && input['traceId'] !== null) {
+    checkString(input['traceId'], 'event.traceId', collector, 200);
+  }
 
   const type = input['type'];
   if (typeof type !== 'string' || !(RUNNER_EVENT_TYPES as readonly string[]).includes(type)) {
