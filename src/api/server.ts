@@ -4,6 +4,7 @@ import { TERMINAL_EVENT_TYPES } from '../contracts/events.js';
 import type { KeyRegistry, Principal, Scope } from './auth.js';
 import { ApiError } from './errors.js';
 import type { AgentApi, ApiLogger, RunCancelReceipt } from './service.js';
+import { createHash } from 'node:crypto';
 
 /**
  * HTTP-фасад stateless API (epic #74). Маршруты те же, что у приёмника, но за каждым из них
@@ -62,6 +63,23 @@ export function createAgentApiServer(service: AgentApi, options: AgentApiServerO
       if (req.method !== 'GET') throw new ApiError('METHOD_NOT_ALLOWED', 'healthz supports GET only');
       sendJson(res, 200, service.health());
       return 200;
+    }
+
+    // One-run, write-only capability: the worker may upload bytes for this profile run,
+    // but cannot read profiles, choose a profile, or invoke any GitHub operation.
+    const workerUpload = path.match(/^\/v1\/worker\/launches\/([A-Za-z0-9_-]+)\/profile-changes$/);
+    if (workerUpload) {
+      if (req.method !== 'POST') throw new ApiError('METHOD_NOT_ALLOWED', 'profile saveback supports POST only');
+      const token = bearerToken(req.headers['authorization']);
+      if (!token) throw new ApiError('UNAUTHENTICATED', 'a run-scoped Bearer capability is required');
+      const relativePath = url.searchParams.get('path') ?? '';
+      const sha256 = req.headers['x-content-sha256'];
+      if (typeof sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(sha256)) throw new ApiError('INVALID_REQUEST', 'x-content-sha256 must be a lowercase sha256');
+      const bytes = await readRawBody(req, 100_000_000);
+      if (createHash('sha256').update(bytes).digest('hex') !== sha256) throw new ApiError('UPLOAD_HASH_MISMATCH', 'uploaded bytes do not match x-content-sha256');
+      await service.uploadProfileChange(workerUpload[1]!, token, relativePath, bytes, sha256);
+      sendJson(res, 201, { accepted: true, path: relativePath, size: bytes.length, sha256 });
+      return 201;
     }
 
     const principal = options.keys.authenticate(req.headers['authorization']);
@@ -304,6 +322,24 @@ async function readJsonBody(req: IncomingMessage, maxBodyBytes: number): Promise
   } catch {
     throw new ApiError('INVALID_REQUEST', 'request body must be valid JSON');
   }
+}
+
+async function readRawBody(req: IncomingMessage, maxBodyBytes: number): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of req) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+    size += buffer.length;
+    if (size > maxBodyBytes) throw new ApiError('PAYLOAD_TOO_LARGE', `request body exceeds ${maxBodyBytes} bytes`);
+    chunks.push(buffer);
+  }
+  return Buffer.concat(chunks);
+}
+
+function bearerToken(header: string | string[] | undefined): string | null {
+  if (typeof header !== 'string') return null;
+  const match = /^Bearer\s+(.+)$/i.exec(header);
+  return match?.[1]?.trim() || null;
 }
 
 function sendJson(res: ServerResponse, status: number, data: unknown): void {

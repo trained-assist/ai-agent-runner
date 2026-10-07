@@ -85,24 +85,40 @@ API больше не используется** и удаляется отде�
 
 В режиме профиля ключ API должен содержать доверенный `tenantId` и `profileId`. Клиентский
 `repository` отклоняется: binding выбирает хост. Перед launch API вызывает
-`prepareProfileWorkspace`, передаёт воркеру закреплённый commit и проверенные ссылки на
-объекты. После результата сверяет repository, branch и remote commit, затем вызывает
-`publishRunBranch` с тем же `operationId` при повторе. `publication.status` и
-`committedRevision` доступны в status/artifacts. Конфликт остаётся явным и блокирует новый
-Run профиля до разрешения. Тяжёлый output воркер кладёт в приватный GCS; Git хранит
-`.trained-assist/artifacts.json` с ref и checksum, байты читаются через авторизованный
-`GET /v1/runs/{runId}/artifacts?path=...`.
-GHA worker сохраняет разрешённые изменения отслеживаемых файлов, новые файлы и удаления
-из рабочего дерева, а также объявленные `outputs`. Исключения политики профиля действуют
-и для не объявленных заранее файлов.
+`prepareProfileWorkspace`, материализует только export manifest в архив `tar.gz`,
+загружает его в приватный GCS и передаёт воркеру подписанную ссылку с SHA-256 и размером.
+Архив включает также проверенные байты больших объектов; воркеру не нужен общий доступ
+к GCS для чтения профиля.
+
+Воркер не получает GitHub token и не клонирует/пушит репозиторий профиля. Он загружает
+изменённые байты через `POST /v1/worker/launches/{runId}/profile-changes?path=...` с
+одноразовой write-only Bearer capability конкретного run и заголовком
+`x-content-sha256`. API проверяет run/profile binding, безопасный путь, export policy,
+срок действия и checksum, затем принимает итоговый allowlisted `profileChanges` manifest.
+Эта capability может только положить файл в staging своего run: она не читает профиль,
+не выбирает репозиторий и не вызывает GitHub. API-side `WorkspaceService` восстанавливает
+закреплённую базовую ревизию, применяет изменения/удаления и публикует canonical merge
+имеющимся хостовым `AGENT_API_PROFILE_GITHUB_TOKEN`. Статус публикации и конфликты остаются
+явными; конфликт блокирует следующий Run профиля. Большие изменённые файлы проходят ту же
+export policy и сохраняются как object-store artifacts с ref/checksum; байты доступны через
+авторизованный `GET /v1/runs/{runId}/artifacts?path=...`.
+
+Export policy остаётся границей для PII/секретов: исключённые credential/runtime-state пути
+не материализуются и не публикуются. Остальные файлы профиля, привязанного к principal,
+доступны в рамках его запуска. Snapshot URL истекает через два часа; saveback capability —
+через сутки. Capability хранится на API как hash, а подписанный URL и bearer не записываются
+в admission journal. API принимает файлы до 100 MB каждый и не более 256 MB на run.
 
 Для включения режима профиля API нужны `AGENT_API_PROFILE_WORKSPACE_ROOT` на постоянном
 томе, `AGENT_API_ADMISSION_LOG` на том же постоянном томе, `AGENT_API_PROFILE_OWNER`,
 `AGENT_API_PROFILE_GITHUB_TOKEN`, `AGENT_API_PROFILE_OBJECT_BACKEND=gcs`, `GCS_BUCKET`
 и `GCP_PROJECT` (либо `GOOGLE_CLOUD_PROJECT`) при WIF.
-Ключи в `AGENT_API_KEY_REGISTRY` должны задавать `tenantId` и `profileId`. У GHA worker
-переменная `GCS_PROFILE_BUCKET` должна совпадать с `GCS_BUCKET` API, а Workload Identity
-service account должен читать и записывать объекты этого приватного bucket.
+Для внешнего Runner profile snapshot storage должен поддерживать signed HTTPS download
+URL; production-конфигурация — GCS. `local-fs` остаётся только для локальных операций
+WorkspaceService и не может обслужить внешний snapshot.
+Ключи в `AGENT_API_KEY_REGISTRY` должны задавать `tenantId` и `profileId`. GHA worker
+получает snapshot через подписанную ссылку, а saveback отправляет API; profile-run не
+нуждается в GCS Workload Identity.
 
 Переменных данных больше нет: `AGENT_API_DATA_DIR`, `ARTIFACT_SHARE_SECRET`,
 `ARTIFACT_BASE_URL`, `AGENT_API_RELEASE_MANIFEST`, `AGENT_API_FAULTS` сервис не читает.

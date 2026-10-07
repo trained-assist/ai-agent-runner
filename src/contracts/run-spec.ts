@@ -136,6 +136,11 @@ export interface ProfileObjectSpec {
 
 export interface ProfileWorkspaceSpec {
   bindingId: string;
+  snapshotUrl: string;
+  snapshotSha256: string;
+  snapshotSize: number;
+  /** One-run write-only bearer capability. Never a GitHub/API credential. */
+  savebackToken: string;
   objectBucket?: string;
   artifacts: ProfileObjectSpec[];
   excludedPatterns: string[];
@@ -751,8 +756,12 @@ export function validateRunSpec(input: unknown): ValidationResult<RunSpec> {
   if (input['profileWorkspace'] !== undefined) {
     const value = input['profileWorkspace'];
     if (checkObject(value, 'spec.profileWorkspace', collector)) {
-      checkKeys(value, ['bindingId', 'objectBucket', 'artifacts', 'excludedPatterns'], ['bindingId', 'artifacts', 'excludedPatterns'], 'spec.profileWorkspace', collector);
+      checkKeys(value, ['bindingId', 'snapshotUrl', 'snapshotSha256', 'snapshotSize', 'savebackToken', 'objectBucket', 'artifacts', 'excludedPatterns'], ['bindingId', 'snapshotUrl', 'snapshotSha256', 'snapshotSize', 'savebackToken', 'artifacts', 'excludedPatterns'], 'spec.profileWorkspace', collector);
       checkString(value['bindingId'], 'spec.profileWorkspace.bindingId', collector, 200);
+      if (typeof value['snapshotUrl'] !== 'string' || !/^https:\/\//.test(value['snapshotUrl']) || value['snapshotUrl'].length > 4096) collector.push('spec.profileWorkspace.snapshotUrl: expected HTTPS URL');
+      if (typeof value['snapshotSha256'] !== 'string' || !/^[0-9a-f]{64}$/.test(value['snapshotSha256'])) collector.push('spec.profileWorkspace.snapshotSha256: expected sha256');
+      if (typeof value['snapshotSize'] !== 'number' || !Number.isSafeInteger(value['snapshotSize']) || value['snapshotSize'] < 0) collector.push('spec.profileWorkspace.snapshotSize: expected non-negative integer');
+      if (typeof value['savebackToken'] !== 'string' || value['savebackToken'].length < 32 || value['savebackToken'].length > 500) collector.push('spec.profileWorkspace.savebackToken: expected scoped bearer capability');
       if (value['objectBucket'] !== undefined) checkString(value['objectBucket'], 'spec.profileWorkspace.objectBucket', collector, 200);
       if (!Array.isArray(value['artifacts'])) collector.push('spec.profileWorkspace.artifacts: expected array');
       else {
@@ -769,7 +778,7 @@ export function validateRunSpec(input: unknown): ValidationResult<RunSpec> {
         });
         if (artifacts.length > 0 && !value['objectBucket']) collector.push('spec.profileWorkspace.objectBucket: required for artifacts');
         if (!Array.isArray(value['excludedPatterns']) || value['excludedPatterns'].some((entry) => typeof entry !== 'string')) collector.push('spec.profileWorkspace.excludedPatterns: expected string array');
-        profileWorkspace = { bindingId: String(value['bindingId'] ?? ''), ...(value['objectBucket'] ? { objectBucket: String(value['objectBucket']) } : {}), artifacts, excludedPatterns: Array.isArray(value['excludedPatterns']) ? value['excludedPatterns'] as string[] : [] };
+        profileWorkspace = { bindingId: String(value['bindingId'] ?? ''), snapshotUrl: String(value['snapshotUrl'] ?? ''), snapshotSha256: String(value['snapshotSha256'] ?? ''), snapshotSize: Number(value['snapshotSize']), savebackToken: String(value['savebackToken'] ?? ''), ...(value['objectBucket'] ? { objectBucket: String(value['objectBucket']) } : {}), artifacts, excludedPatterns: Array.isArray(value['excludedPatterns']) ? value['excludedPatterns'] as string[] : [] };
       }
     }
   }
