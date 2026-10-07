@@ -252,8 +252,9 @@ describe('gcs backend with an injected client', () => {
     await expect(store.put('runs/run-1/artifacts/art-1', 'x')).rejects.toThrow('save failed');
   });
 
-  it('computes the published crc32c vector used for store verification', () => {
-    expect(crc32cBase64(Buffer.from('123456789'))).toBe('g5IG4w==');
+  it('computes the Cloud Storage CRC32C vector in big-endian byte order', () => {
+    // CRC32C('123456789') = 0xe3069283. GCS metadata is base64(big-endian bytes).
+    expect(crc32cBase64(Buffer.from('123456789'))).toBe('4waSgw==');
   });
 
   it('verifies stored bytes through the crc32c gcs reports for the object', async () => {
