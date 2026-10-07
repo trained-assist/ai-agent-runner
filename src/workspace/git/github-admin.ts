@@ -152,6 +152,34 @@ export function createGitHubRepositoryAdmin(options: GitHubRepositoryAdminOption
       if (existing) return existing;
       return createRepo(input.owner, input.name, input.description);
     },
+    async setDefaultBranch(input) {
+      const parts = input.repository.split('/');
+      if (parts.length !== 2 || parts.some((part) => !/^[A-Za-z0-9_.-]+$/.test(part)) || !/^[A-Za-z0-9._/-]+$/.test(input.branch) || input.branch.startsWith('/') || input.branch.endsWith('/')) {
+        throw new WorkspaceError('WORKSPACE_INVALID', 'GitHub default branch update requires an owner/repository and a valid branch name', { retryable: false });
+      }
+      const [owner, name] = parts as [string, string];
+      const repoPath = `/repos/${owner}/${name}`;
+      const repoResponse = await request(repoPath);
+      if (repoResponse.status !== 200) {
+        throw apiError('GET', repoPath, repoResponse.status, await repoResponse.json());
+      }
+      const repo = (await repoResponse.json()) as { full_name?: unknown; private?: unknown; default_branch?: unknown };
+      if (repo.full_name !== input.repository || repo.private !== true) {
+        throw new WorkspaceError('WORKSPACE_REPOSITORY_NOT_PRIVATE', `repository ${input.repository} is not the expected private profile repository`, { retryable: false });
+      }
+      if (repo.default_branch === input.branch) return;
+
+      const branchPath = `${repoPath}/branches/${encodeURIComponent(input.branch)}`;
+      const branchResponse = await request(branchPath);
+      if (branchResponse.status !== 200) {
+        throw apiError('GET', branchPath, branchResponse.status, await branchResponse.json());
+      }
+
+      const response = await request(repoPath, { method: 'PATCH', body: { default_branch: input.branch } });
+      if (response.status !== 200) {
+        throw apiError('PATCH', repoPath, response.status, await response.json());
+      }
+    },
   };
 }
 

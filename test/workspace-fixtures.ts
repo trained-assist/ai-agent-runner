@@ -73,6 +73,8 @@ export class FakeRepositoryAdmin implements RepositoryAdminPort {
   readonly calls: string[] = [];
   readonly publicRepos = new Set<string>();
   readonly failFor = new Set<string>();
+  readonly defaultBranchCalls: Array<{ repository: string; branch: string }> = [];
+  readonly defaultBranches = new Map<string, string>();
   created = 0;
   /** Репозитории, созданные этой админкой: только их `created` истинно. */
   private readonly owned = new Set<string>();
@@ -103,6 +105,7 @@ export class FakeRepositoryAdmin implements RepositoryAdminPort {
       created = true;
     }
     this.owned.add(fullName);
+    this.defaultBranches.set(fullName, 'main');
     return {
       fullName,
       url: `file://${dir}`,
@@ -111,6 +114,12 @@ export class FakeRepositoryAdmin implements RepositoryAdminPort {
       created: created || !this.owned.has(fullName) ? created : false,
       private: !this.publicRepos.has(fullName),
     };
+  }
+
+  async setDefaultBranch(input: { repository: string; branch: string }): Promise<void> {
+    this.defaultBranchCalls.push(input);
+    if (!this.owned.has(input.repository)) throw new Error(`cannot change default branch of unknown repository ${input.repository}`);
+    this.defaultBranches.set(input.repository, input.branch);
   }
 
   /** Путь bare-репозитория по полному имени (для прямых проверок в тестах). */
