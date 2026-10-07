@@ -45,7 +45,9 @@ export function crc32cBase64(data: Uint8Array): string {
   }
   crc = (crc ^ 0xffffffff) >>> 0;
   const bytes = Buffer.alloc(4);
-  bytes.writeUInt32LE(crc, 0);
+  // Cloud Storage encodes the CRC32C integer as Base64 in big-endian byte order.
+  // Little-endian happens to pass our local mock unless the expected vector is pinned.
+  bytes.writeUInt32BE(crc, 0);
   return bytes.toString('base64');
 }
 
