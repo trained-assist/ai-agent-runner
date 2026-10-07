@@ -125,6 +125,12 @@ per-run CPU and memory envelope must each be positive and below 60%. Keep the en
 root-owned with mode 0600; the service runs as `ai-agent` and cannot read that file
 directly after systemd has loaded it.
 
+`VM_WORKER_ALLOWED_CALLBACK_ORIGINS` allowlists the API origin. Callback URLs may include
+the API's reverse-proxy base path (for example, `/profile-api`); the worker still requires
+the exact run-bound `/v1/worker/launches/{runId}/result` or `/profile-changes` suffix.
+Configure the proxy to forward both paths, preserving the prefix-stripped API route and
+HTTP method. Do not rewrite the run ID or callback endpoint.
+
 The installer leaves the service stopped while the example env file still contains
 placeholders. Protect `/var/lib/ai-agent-runner` as private persistent disk. Retain at
 least the current and previous commit directories under `/opt/ai-agent-vm-worker/releases`

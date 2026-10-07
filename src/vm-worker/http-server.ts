@@ -252,7 +252,7 @@ function validCallbackUrl(raw: string, runId: string, allowedOrigins: readonly s
     return allowedOrigins.includes(url.origin)
       && isSecureOrLoopback(url)
       && !url.username && !url.password && !url.search && !url.hash
-      && url.pathname === `/v1/worker/launches/${encodeURIComponent(runId)}/result`;
+      && hasRunBoundCallbackPath(url.pathname, runId, 'result');
   } catch { return false; }
 }
 
@@ -261,8 +261,14 @@ function validSavebackUrl(raw: string, runId: string, allowedOrigins: readonly s
     const url = new URL(raw);
     return allowedOrigins.includes(url.origin) && isSecureOrLoopback(url)
       && !url.username && !url.password && !url.search && !url.hash
-      && url.pathname === `/v1/worker/launches/${encodeURIComponent(runId)}/profile-changes`;
+      && hasRunBoundCallbackPath(url.pathname, runId, 'profile-changes');
   } catch { return false; }
+}
+
+/** Accept an optional reverse-proxy base path, while keeping the endpoint suffix exact and run-bound. */
+function hasRunBoundCallbackPath(pathname: string, runId: string, endpoint: 'result' | 'profile-changes'): boolean {
+  const suffix = `/v1/worker/launches/${encodeURIComponent(runId)}/${endpoint}`;
+  return pathname.endsWith(suffix);
 }
 
 function isSecureOrLoopback(url: URL): boolean {
