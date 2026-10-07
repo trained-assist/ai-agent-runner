@@ -72,7 +72,7 @@ API больше не используется** и удаляется отде�
 | `AGENT_API_PROFILE_GITHUB_TOKEN` | — | хостовый токен GitHub для ensure/fetch/publish; не попадает в агентское окружение или журнал |
 | `AGENT_API_PROFILE_OBJECT_BACKEND` | `gcs` | хранилище тяжёлых файлов; `local-fs` только для локального fixture, GCS использует `GCS_BUCKET` и ADC |
 | `GCP_PROJECT` / `GOOGLE_CLOUD_PROJECT` | — | ID проекта GCS; задавайте явно при Workload Identity Federation, чтобы чтение метаданных объекта не запрашивало доступ к Cloud Resource Manager |
-| `AGENT_API_PUBLIC_URL` | `http://<host>:<port>` | публичный адрес API: воркер возвращает результат на `POST {resultUrl}`. Без него запуск падает с `RESULT_URL_UNSET` |
+| `AGENT_API_PUBLIC_URL` | `http://<host>:<port>` | публичная база API: воркер возвращает результат на `POST {resultUrl}`. Можно задать префикс reverse proxy (например, `https://runner.example/profile-api`); proxy должен передавать callback-маршруты `/v1/worker/launches/{runId}/result` и `/profile-changes` в API без изменения пути. Без URL запуск падает с `RESULT_URL_UNSET` |
 | `EXTERNAL_WORKER_LAUNCH_DEADLINE_MS` | `600000` | таймаут опроса `status`/`result`; заодно бюджет приёма, если у движка не задан `acceptDeadlineMs` |
 | `EXTERNAL_WORKER_CANCEL_DEADLINE_MS` | `30000` | таймаут ожидания подтверждения отмены |
 | `EXTERNAL_WORKER_RECONCILE_DEADLINE_MS` | `5000` | бюджет проверки «знает ли воркер этот ран» перед переходом к следующему движку (#100); мёртвый движок не должен вешать проверку на таймаут запуска |

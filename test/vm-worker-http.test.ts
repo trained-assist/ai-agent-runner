@@ -86,6 +86,28 @@ describe('installable VM HTTP worker', () => {
     expect(fixture.runner.startCalls).toHaveLength(0);
   });
 
+  it('accepts run-bound callbacks behind a trusted API path prefix and rejects path or run mismatches', async () => {
+    const fixture = await startFixture({ profileWorkspaceEnabled: true, profileSavebackEnabled: true });
+    cleanups.push(fixture.close);
+    const prefixed = launchRequest({
+      resultUrl: `${API_ORIGIN}/profile-api/v1/worker/launches/${RUN_ID}/result`,
+      profileWorkspace: {
+        bindingId: 'binding-profile-a', snapshotUrl: 'https://example.test/snapshot', snapshotSha256: 'a'.repeat(64),
+        snapshotSize: 1, savebackToken: 't'.repeat(43),
+        savebackUrl: `${API_ORIGIN}/profile-api/v1/worker/launches/${RUN_ID}/profile-changes`, artifacts: [], excludedPatterns: [],
+      },
+    });
+    const accepted = await launch(fixture.base, prefixed);
+    expect(accepted.status).toBe(202);
+    expect(fixture.runner.startCalls[0]!.spec.profileWorkspace?.savebackUrl).toBe(prefixed.profileWorkspace?.savebackUrl);
+
+    const wrongRun = await launch(fixture.base, launchRequest({ resultUrl: `${API_ORIGIN}/profile-api/v1/worker/launches/another-run/result` }));
+    expect(wrongRun.status).toBe(400);
+    const wrongEndpoint = await launch(fixture.base, launchRequest({ resultUrl: `${API_ORIGIN}/profile-api/v1/worker/launches/${RUN_ID}/other` }));
+    expect(wrongEndpoint.status).toBe(400);
+    expect(fixture.runner.startCalls).toHaveLength(1);
+  });
+
   it('preserves a trusted ingress pin for Runner and rejects a pin bound to another run', async () => {
     const fixture = await startFixture();
     cleanups.push(fixture.close);
