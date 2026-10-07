@@ -100,6 +100,10 @@ export function createVmWorkerServer(options: VmWorkerServerOptions): VmWorkerSe
         sendJson(res, 501, { accepted: false, code: 'WORKER_PROFILE_WORKSPACE_UNSUPPORTED' });
         return;
       }
+      if (request.profileWorkspace?.savebackUrl && options.runner.supportsProfileSaveback?.() !== true) {
+        sendJson(res, 501, { accepted: false, code: 'WORKER_PROFILE_WORKSPACE_UNSUPPORTED' });
+        return;
+      }
       const spec = toRunSpec(request, options);
       const fingerprint = createHash('sha256').update(JSON.stringify(request)).digest('hex');
       const admission = await options.capacity.start<LaunchReceiptLike>({
@@ -173,7 +177,7 @@ function makeReceipt(request: LaunchRequest, baseUrl: string): LaunchReceiptLike
 
 function toRunSpec(request: LaunchRequest, options: VmWorkerServerOptions): RunSpec {
   const repo = request.repository.fullName;
-  const token = request.publicationToken ?? process.env['RUNNER_GIT_TOKEN'];
+  const token = request.profileWorkspace?.savebackUrl ? undefined : request.publicationToken ?? process.env['RUNNER_GIT_TOKEN'];
   return {
     contractVersion: 1,
     jobId: request.jobId,
@@ -221,6 +225,10 @@ function parseLaunchRequest(value: unknown, options: VmWorkerServerOptions): { o
   else if (value['isolation']['mode'] !== 'none') errors.push('this VM worker build only supports isolation.mode=none; per-run Unix identities are not provisioned');
   if (typeof value['cwd'] !== 'string') errors.push('cwd is required'); // validated, then deliberately ignored; host chooses the actual path
   if (typeof value['resultUrl'] === 'string' && !validCallbackUrl(value['resultUrl'], String(value['runId']), options.allowedCallbackOrigins)) errors.push('resultUrl is not an approved central API callback URL');
+  if (isRecord(value['profileWorkspace']) && value['profileWorkspace']['savebackUrl'] !== undefined
+    && (typeof value['profileWorkspace']['savebackUrl'] !== 'string' || !validSavebackUrl(value['profileWorkspace']['savebackUrl'], String(value['runId']), options.allowedCallbackOrigins))) {
+    errors.push('profileWorkspace.savebackUrl is not an approved central API saveback URL');
+  }
   if (typeof value['repository'] === 'object' && value['repository'] !== null && typeof (value['repository'] as Record<string, unknown>)['branch'] === 'string'
     && (value['repository'] as Record<string, unknown>)['branch'] !== `agent-run/${String(value['runId'])}`) errors.push('repository.branch must be the run-scoped branch');
   if (value['ingressManifest'] !== undefined) {
@@ -242,10 +250,23 @@ function validCallbackUrl(raw: string, runId: string, allowedOrigins: readonly s
   try {
     const url = new URL(raw);
     return allowedOrigins.includes(url.origin)
-      && url.protocol === 'https:'
+      && isSecureOrLoopback(url)
       && !url.username && !url.password && !url.search && !url.hash
       && url.pathname === `/v1/worker/launches/${encodeURIComponent(runId)}/result`;
   } catch { return false; }
+}
+
+function validSavebackUrl(raw: string, runId: string, allowedOrigins: readonly string[]): boolean {
+  try {
+    const url = new URL(raw);
+    return allowedOrigins.includes(url.origin) && isSecureOrLoopback(url)
+      && !url.username && !url.password && !url.search && !url.hash
+      && url.pathname === `/v1/worker/launches/${encodeURIComponent(runId)}/profile-changes`;
+  } catch { return false; }
+}
+
+function isSecureOrLoopback(url: URL): boolean {
+  return url.protocol === 'https:' || (url.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname));
 }
 
 function stateToWorkerStatus(state: string): WorkerRunStatus {
@@ -292,6 +313,10 @@ function toLaunchResult(options: VmWorkerServerOptions, snapshot: NonNullable<Re
     logUrl: `local://runs/${encodeURIComponent(snapshot.runId)}/logs`,
     repo: { fullName: spec?.repository?.fullName ?? '', branch: `agent-run/${snapshot.runId}`, commit: options.runner.profileWorkspaceCommit?.(snapshot.runId) ?? null },
     ...(result.failure ? { failure: { ...result.failure } } : {}),
+    ...(result.profileChanges ? { profileChanges: result.profileChanges } : {}),
+    ...(!result.profileChanges && result.persistence === 'failed' && spec?.profileWorkspace?.savebackUrl ? {
+      failure: { code: 'ARTIFACTS_PUSH_FAILED', failureClass: 'finalization' as const, safeSummary: 'profile saveback upload failed; the VM retained the run workspace', retryable: true },
+    } : {}),
   };
   return launch;
 }

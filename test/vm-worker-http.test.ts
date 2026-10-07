@@ -111,7 +111,7 @@ describe('installable VM HTTP worker', () => {
     const fixture = await startFixture();
     cleanups.push(fixture.close);
     const response = await launch(fixture.base, launchRequest({
-      profileWorkspace: { bindingId: 'binding-profile-a', snapshotUrl: 'https://example.test/snapshot', snapshotSha256: 'a'.repeat(64), snapshotSize: 1, savebackToken: 't'.repeat(43), savebackUrl: 'https://example.test/saveback', artifacts: [], excludedPatterns: [] },
+      profileWorkspace: { bindingId: 'binding-profile-a', snapshotUrl: 'https://example.test/snapshot', snapshotSha256: 'a'.repeat(64), snapshotSize: 1, savebackToken: 't'.repeat(43), savebackUrl: `${API_ORIGIN}/v1/worker/launches/${RUN_ID}/profile-changes`, artifacts: [], excludedPatterns: [] },
     }));
     expect(response.status).toBe(501);
     expect(await response.json()).toEqual({ accepted: false, code: 'WORKER_PROFILE_WORKSPACE_UNSUPPORTED' });
@@ -119,16 +119,17 @@ describe('installable VM HTTP worker', () => {
   });
 
   it('forwards pinned profile workspace, revision and one-run publication token only to an enabled Runner', async () => {
-    const fixture = await startFixture({ profileWorkspaceEnabled: true });
+    const fixture = await startFixture({ profileWorkspaceEnabled: true, profileSavebackEnabled: true });
     cleanups.push(fixture.close);
     const response = await launch(fixture.base, launchRequest({
       repository: { fullName: 'trained-assist/ai-agent-runner', branch: `agent-run/${RUN_ID}`, revision: 'b'.repeat(40) },
       publicationToken: 'profile-publication-token-test',
-      profileWorkspace: { bindingId: 'binding-profile-a', snapshotUrl: 'https://example.test/snapshot', snapshotSha256: 'a'.repeat(64), snapshotSize: 1, savebackToken: 't'.repeat(43), savebackUrl: 'https://example.test/saveback', artifacts: [], excludedPatterns: [] },
+      profileWorkspace: { bindingId: 'binding-profile-a', snapshotUrl: 'https://example.test/snapshot', snapshotSha256: 'a'.repeat(64), snapshotSize: 1, savebackToken: 't'.repeat(43), savebackUrl: `${API_ORIGIN}/v1/worker/launches/${RUN_ID}/profile-changes`, artifacts: [], excludedPatterns: [] },
     }));
     expect(response.status).toBe(202);
-    expect(fixture.runner.startCalls[0]!.spec.repository).toMatchObject({ revision: 'b'.repeat(40), token: 'profile-publication-token-test' });
-    expect(fixture.runner.startCalls[0]!.spec.profileWorkspace).toMatchObject({ bindingId: 'binding-profile-a', artifacts: [] });
+    expect(fixture.runner.startCalls[0]!.spec.repository).toMatchObject({ revision: 'b'.repeat(40) });
+    expect(fixture.runner.startCalls[0]!.spec.repository?.token).toBeUndefined();
+    expect(fixture.runner.startCalls[0]!.spec.profileWorkspace).toMatchObject({ bindingId: 'binding-profile-a', savebackUrl: `${API_ORIGIN}/v1/worker/launches/${RUN_ID}/profile-changes`, artifacts: [] });
   });
 
   it('reports unknown runs without inventing a receipt and rejects a disallowed repository', async () => {
@@ -193,7 +194,7 @@ async function launch(base: string, request: LaunchRequest): Promise<Response> {
   return fetch(`${base}/v1/launch`, { method: 'POST', headers: { ...authHeaders(), 'content-type': 'application/json' }, body: JSON.stringify(request) });
 }
 
-async function startFixture(input: { engineName?: string; cpuPercent?: number; bindingsInventory?: VmWorkerBindingsInventory; profileWorkspaceEnabled?: boolean } = {}): Promise<{
+async function startFixture(input: { engineName?: string; cpuPercent?: number; bindingsInventory?: VmWorkerBindingsInventory; profileWorkspaceEnabled?: boolean; profileSavebackEnabled?: boolean } = {}): Promise<{
   base: string;
   dataDir: string;
   runner: FakeRunner;
@@ -205,7 +206,7 @@ async function startFixture(input: { engineName?: string; cpuPercent?: number; b
   mkdirSync(join(dataDir, 'capacity'), { mode: 0o700 });
   chmodSync(dataDir, 0o700);
   const store = new FileCapacityReservationStore(join(dataDir, 'capacity', 'reservations.json'));
-  const runner = new FakeRunner(dataDir, input.profileWorkspaceEnabled ?? false);
+  const runner = new FakeRunner(dataDir, input.profileWorkspaceEnabled ?? false, input.profileSavebackEnabled ?? false);
   const sampler: HostUsageSampler = { sample: async (): Promise<HostUsageSample> => ({ cpuPercent: input.cpuPercent ?? 5, memoryPercent: 10, sampledAt: new Date().toISOString() }) };
   const capacity = new CapacityAdmission({ sampler, store });
   const server = createVmWorkerServer({
@@ -249,8 +250,9 @@ class FakeRunner {
   private readonly eventList: Array<Record<string, any>> = [];
   private readonly dataDir: string;
   private readonly profileWorkspaceEnabled: boolean;
+  private readonly profileSavebackEnabled: boolean;
 
-  constructor(dataDir: string, profileWorkspaceEnabled = false) { this.dataDir = dataDir; this.profileWorkspaceEnabled = profileWorkspaceEnabled; }
+  constructor(dataDir: string, profileWorkspaceEnabled = false, profileSavebackEnabled = false) { this.dataDir = dataDir; this.profileWorkspaceEnabled = profileWorkspaceEnabled; this.profileSavebackEnabled = profileSavebackEnabled; }
 
   start(spec: RunSpec, operationId: string, runtimeEnv: Record<string, string>): void {
     this.startCalls.push({ spec, operationId, runtimeEnv });
@@ -277,6 +279,7 @@ class FakeRunner {
   getRun(runId: string): Record<string, any> | null { return this.snapshot?.runId === runId ? this.snapshot : null; }
   getRunSpec(runId: string): RunSpec | null { return this.snapshot?.runId === runId ? this.spec : null; }
   supportsProfileWorkspace(): boolean { return this.profileWorkspaceEnabled; }
+  supportsProfileSaveback(): boolean { return this.profileSavebackEnabled; }
   profileWorkspaceCommit(): string | null { return null; }
   events(runId: string, after = 0): Array<Record<string, any>> { return this.snapshot?.runId === runId ? this.eventList.filter((event) => event.sequence > after) : []; }
   exportManifest(): null { return null; }

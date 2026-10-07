@@ -12,6 +12,8 @@ import { readVmWorkerBindingsInventory } from './bindings-inventory.js';
 import { readVmWorkerBuildInfo } from './build-info.js';
 import { createControlPlaneIngressResolverFromEnv } from '../storage/ingress-artifact.js';
 import { createRunBranchWorker } from '../workspace/run-branch-worker.js';
+import { createApiSavebackWorker } from '../workspace/api-saveback-worker.js';
+import type { RunBranchWorker } from '../workspace/run-branch-worker.js';
 
 function required(name: string): string {
   const value = process.env[name]?.trim();
@@ -59,6 +61,18 @@ async function main(): Promise<void> {
   const storage = createBlobStore({ backend: 'gcs', env: process.env });
   const artifacts = new ArtifactStore({ rootDir: join(dataDir, 'storage'), blob: storage });
   const exports = new RunExportStore({ rootDir: join(dataDir, 'storage'), artifacts, pruneLocalCopies: true });
+  const legacyProfileWorker = createRunBranchWorker(storage);
+  const apiSavebackWorker = createApiSavebackWorker(dataDir);
+  const profileWorkspace: RunBranchWorker = {
+    supportsSaveback: () => true,
+    prepare: (spec, cwd, token) => spec.profileWorkspace?.savebackUrl
+      ? apiSavebackWorker.prepare(spec, cwd)
+      : legacyProfileWorker.prepare(spec, cwd, token),
+    publish: (spec, cwd, token) => spec.profileWorkspace?.savebackUrl
+      ? apiSavebackWorker.publish(spec, cwd)
+      : legacyProfileWorker.publish(spec, cwd, token),
+    changes: (spec) => apiSavebackWorker.changes(spec),
+  };
 
   const runner = new Runner({
     rootDir: join(dataDir, 'runner'),
@@ -66,7 +80,7 @@ async function main(): Promise<void> {
     host: { workerId, region: engineName === 'rf-vm-agent-run' ? 'ru' : 'eu', environment: 'production', allowedEngines: ['opencode'] },
     exports,
     ingressResolver: createControlPlaneIngressResolverFromEnv(process.env),
-    profileWorkspace: createRunBranchWorker(storage),
+    profileWorkspace,
     resumeQueuedRuns: false,
   });
   const recovery = await runner.recover();
