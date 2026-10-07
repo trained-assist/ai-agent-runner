@@ -40,7 +40,7 @@ describe('structured outcomes for admission refusals (§9)', () => {
       budget: {
         correlationRef: 'budget-1',
         approved: true,
-        enforcement: { provider: 'openai', policyId: 'sandbox-v1', maxInputTokens: 12000, maxOutputTokens: 2000 },
+        enforcement: { provider: 'openai', policyId: 'sandbox-v1', maxInputTokens: 12000, maxOutputTokens: 2000, maxTotalTokens: 20000 },
       },
     }, { code: 'BUDGET_UNAVAILABLE', retryable: true });
   });
