@@ -76,12 +76,13 @@ export function createProfileWorkspaceCoordinator(options: ProfileWorkspaceRunti
   const tokenRef = 'profile-workspace-github';
   const resolveCredential = async (ref: string): Promise<string | undefined> => ref === tokenRef ? options.token : undefined;
   const objects = createBlobStore({ backend: options.objectBackend, env: options.env });
+  const admin = createGitHubRepositoryAdmin({ tokenRef, resolveToken: resolveCredential });
   const exportPolicy = compilePolicy(DEFAULT_EXPORT_POLICY);
   const workspace = new WorkspaceService({
     git: createLocalGitPort({ rootDir: join(options.rootDir, 'mirrors'), resolveCredential }),
     objects,
     bindings,
-    admin: createGitHubRepositoryAdmin({ tokenRef, resolveToken: resolveCredential }),
+    admin,
     journal,
   });
   const identity = (principal: Principal): { tenantId: string; profileId: string } => {
@@ -114,6 +115,13 @@ export function createProfileWorkspaceCoordinator(options: ProfileWorkspaceRunti
         } finally {
           rmSync(empty, { recursive: true, force: true });
         }
+      }
+      // GitHub may choose the first pushed branch (the durable bootstrap candidate) as
+      // default. Once the canonical branch has been published, align repository browsing
+      // with the same ref used for future snapshots. This also repairs existing profiles.
+      const binding = await bindings.findByProfile(tenantId, profileId);
+      if (binding?.headRevision) {
+        await admin.setDefaultBranch({ repository: binding.repository, branch: binding.branch });
       }
       const unresolved = journal.listPublications({ profileId }).find((entry) => entry.tenantId === tenantId && !['published', 'failed'].includes(entry.status));
       if (unresolved) {

@@ -113,6 +113,56 @@ describe('GitHub admin port', () => {
     expect(calls.some((call) => call.url === 'https://api.github.com/user/repos' && call.method === 'POST')).toBe(true);
   });
 
+  it('moves the repository default to an existing canonical branch after bootstrap', async () => {
+    const { admin, calls } = adminWith((url, init) => {
+      if (url === 'https://api.github.com/repos/profiles-artifacts/profile-alice' && init.method === 'GET') {
+        return { status: 200, body: { full_name: 'profiles-artifacts/profile-alice', private: true, default_branch: 'agent-run/bootstrap-123' } };
+      }
+      if (url === 'https://api.github.com/repos/profiles-artifacts/profile-alice/branches/main' && init.method === 'GET') {
+        return { status: 200, body: { name: 'main' } };
+      }
+      if (url === 'https://api.github.com/repos/profiles-artifacts/profile-alice' && init.method === 'PATCH') {
+        return { status: 200, body: { default_branch: 'main' } };
+      }
+      return { status: 500, body: { message: 'unexpected' } };
+    });
+
+    await admin.setDefaultBranch({ repository: 'profiles-artifacts/profile-alice', branch: 'main' });
+
+    const patch = calls.find((call) => call.method === 'PATCH');
+    expect(patch).toBeDefined();
+    expect(JSON.parse(String(patch?.body))).toEqual({ default_branch: 'main' });
+    expect(calls.findIndex((call) => call.url.endsWith('/branches/main'))).toBeLessThan(calls.findIndex((call) => call.method === 'PATCH'));
+  });
+
+  it('does not set a default branch until the canonical branch exists', async () => {
+    const { admin, calls } = adminWith((url, init) => {
+      if (url === 'https://api.github.com/repos/profiles-artifacts/profile-alice' && init.method === 'GET') {
+        return { status: 200, body: { full_name: 'profiles-artifacts/profile-alice', private: true, default_branch: 'agent-run/bootstrap-123' } };
+      }
+      if (url === 'https://api.github.com/repos/profiles-artifacts/profile-alice/branches/main' && init.method === 'GET') {
+        return { status: 404, body: { message: 'Branch not found' } };
+      }
+      return { status: 500, body: { message: 'unexpected' } };
+    });
+
+    await expect(admin.setDefaultBranch({ repository: 'profiles-artifacts/profile-alice', branch: 'main' })).rejects.toMatchObject({ code: 'WORKSPACE_GIT_FAILED' });
+    expect(calls.some((call) => call.method === 'PATCH')).toBe(false);
+  });
+
+  it('does not issue an update when the canonical branch is already the default', async () => {
+    const { admin, calls } = adminWith((url, init) => {
+      if (url === 'https://api.github.com/repos/profiles-artifacts/profile-alice' && init.method === 'GET') {
+        return { status: 200, body: { full_name: 'profiles-artifacts/profile-alice', private: true, default_branch: 'main' } };
+      }
+      return { status: 500, body: { message: 'unexpected' } };
+    });
+
+    await admin.setDefaultBranch({ repository: 'profiles-artifacts/profile-alice', branch: 'main' });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.method).toBe('GET');
+  });
+
   it('never puts the token into a URL or a request body', async () => {
     const { admin, calls } = adminWith((url, init) => {
       if (url === 'https://api.github.com/orgs/profiles-artifacts') return { status: 200 };

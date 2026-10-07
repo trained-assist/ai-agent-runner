@@ -38,6 +38,8 @@ export interface RepositoryAdminPort {
     private: boolean;
     description: string;
   }): Promise<{ fullName: string; url: string; created: boolean; private: boolean }>;
+  /** Set the repository's browsing/default branch after that canonical ref exists. */
+  setDefaultBranch(input: { repository: string; branch: string }): Promise<void>;
 }
 
 /** Хранилище привязки профиль → репозиторий. Источник истины о «чьё это репозиторий». */
