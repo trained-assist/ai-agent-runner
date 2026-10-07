@@ -71,6 +71,18 @@ securely distribute a shared token. Treat the binding as unprovisioned until bot
 stores and an authenticated canary have been verified. The model ladder token is not a
 workaround for this missing setup.
 
+## France/Russia deployment check (2026-10-07)
+
+The GitHub Actions deployment-drift workflow can reach both configured endpoints using
+`EU_VM_WORKER_URL` / `EU_VM_WORKER_TOKEN` and `RU_VM_WORKER_URL` / `RU_VM_WORKER_TOKEN`.
+The check confirmed both are healthy and ready on VM worker 0.3.1, source commit
+`332133113f7618f2779bb1693f5b281720cf8293`. Signed release `vm-worker-v0.3.2` is now
+available from the repository's attested release workflow, but France still needs an
+operator update. This workstation has no verified France SSH target or key; the GitHub
+repository secrets provide health-probe credentials only. Keep profile traffic falling
+back to GHA until the signed release is installed and `/version` confirms its source
+commit on France.
+
 This document is a registry template, not evidence that any production secret is already
 stored at the intended location. The release drift workflow reports worker configuration
 presence and GitHub Actions reports missing worker probe secrets; it cannot inspect
