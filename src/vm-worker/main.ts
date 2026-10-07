@@ -11,6 +11,7 @@ import { Runner } from '../runner/runner.js';
 import { readVmWorkerBindingsInventory } from './bindings-inventory.js';
 import { readVmWorkerBuildInfo } from './build-info.js';
 import { createControlPlaneIngressResolverFromEnv } from '../storage/ingress-artifact.js';
+import { resolveErrorPublisher } from '../contracts/error-publisher.js';
 import { createRunBranchWorker } from '../workspace/run-branch-worker.js';
 import { createApiSavebackWorker } from '../workspace/api-saveback-worker.js';
 import type { RunBranchWorker } from '../workspace/run-branch-worker.js';
@@ -74,6 +75,7 @@ async function main(): Promise<void> {
     changes: (spec) => apiSavebackWorker.changes(spec),
   };
 
+  const errorPublisher = resolveErrorPublisher(process.env);
   const runner = new Runner({
     rootDir: join(dataDir, 'runner'),
     adapters: { opencode: engine },
@@ -82,6 +84,7 @@ async function main(): Promise<void> {
     ingressResolver: createControlPlaneIngressResolverFromEnv(process.env),
     profileWorkspace,
     resumeQueuedRuns: false,
+    ...(errorPublisher ? { errorPublisher } : {}),
   });
   const recovery = await runner.recover();
   process.stdout.write(`${JSON.stringify({ event: 'vm_worker_runner_recovered', workerId, ...recovery })}\n`);

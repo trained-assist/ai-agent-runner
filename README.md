@@ -475,6 +475,15 @@ persist/sweep **без повторного запуска движка**, а о
 экспорте; незакрытая аренда идентичности после рестарта воркера), и все три исправлены.
 
 
+## Observability — Error Watcher
+
+Этот репозиторий публикует error-события в [trained-assist-error-watcher](https://github.com/trained-assist/trained-assist-error-watcher) — общую точку сбора ошибок платформы.
+
+- [Error Watcher](https://github.com/trained-assist/trained-assist-error-watcher)
+- [Архитектура](https://github.com/trained-assist/trained-agent-architecture)
+- [SYSTEM-ERROR-WATCHER.md](https://github.com/trained-assist/trained-agent-architecture/blob/main/SYSTEM-ERROR-WATCHER.md) — спека
+- [OBSERVABILITY-AND-ERROR-CONTRACT.md](https://github.com/trained-assist/trained-agent-architecture/blob/main/OBSERVABILITY-AND-ERROR-CONTRACT.md) — контракт observability/error
+
 ## Разработка
 
 ```bash

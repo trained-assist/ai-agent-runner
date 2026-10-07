@@ -288,6 +288,23 @@ describe('validateRunnerEvent', () => {
     const result = validateRunnerEvent(validEvent('started', { payload: { pid: -1 } }));
     expect(result.ok).toBe(false);
   });
+
+  it('accepts an event without traceId (journal written before traceId existed)', () => {
+    expect(validateRunnerEvent(validEvent('claimed')).ok).toBe(true);
+  });
+
+  it('accepts a null or short traceId', () => {
+    expect(validateRunnerEvent(validEvent('claimed', { traceId: null })).ok).toBe(true);
+    expect(validateRunnerEvent(validEvent('claimed', { traceId: 'trace-1' })).ok).toBe(true);
+  });
+
+  it('rejects an empty, oversized, or non-string traceId', () => {
+    const oversized = validateRunnerEvent(validEvent('claimed', { traceId: 'x'.repeat(201) }));
+    expect(oversized.ok).toBe(false);
+    if (!oversized.ok) expect(oversized.errors.join(' ')).toContain('event.traceId');
+    expect(validateRunnerEvent(validEvent('claimed', { traceId: '' })).ok).toBe(false);
+    expect(validateRunnerEvent(validEvent('claimed', { traceId: 42 })).ok).toBe(false);
+  });
 });
 
 describe('validateRunResult', () => {

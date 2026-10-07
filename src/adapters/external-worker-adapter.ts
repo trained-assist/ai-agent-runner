@@ -712,6 +712,7 @@ function pushRunnerEvent(
     ownerGeneration: spec.ownerGeneration,
     sequence,
     timestamp,
+    traceId: spec.traceId ?? null,
     type,
     payload,
   } as RunnerEvent);

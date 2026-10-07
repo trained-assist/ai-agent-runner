@@ -237,6 +237,7 @@ describe('stateless store: приёмные записи только в пам�
       ownerGeneration: 1,
       sequence: 1,
       timestamp: entry.createdAt,
+      traceId: null,
       type: 'claimed',
       payload: { operationId: entry.operationId },
     } as const;
