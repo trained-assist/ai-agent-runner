@@ -31,6 +31,9 @@ export interface MockWorkerOptions {
   malformed?: boolean;
   /** Отдать тело результата, не проходящее контракт. */
   malformedResult?: boolean;
+  /** Return a worker finalization failure without a profile manifest. */
+  resultFailure?: LaunchResult['failure'];
+  omitProfileChanges?: boolean;
   /** Терминальный статус рана у воркера (асинхронный контракт, #73). `unknown` — исход не установлен. */
   terminalStatus?: 'succeeded' | 'failed' | 'cancelled' | 'running' | 'unknown';
   /** Задержка доставки результата через callback (мс). */
@@ -322,8 +325,11 @@ export async function startMockWorker(options: MockWorkerOptions = {}): Promise<
         artifacts: (settings['artifacts'] as unknown[] | undefined) ?? [],
         logUrl: resultLogUrl(exitReason, settings, runId),
         repo: { fullName: 'owner/name', branch: `agent-run/${runId}`, commit: 'abc1234', baseRef: 'main' },
+        profileChanges: { files: [], deletes: [] },
+        ...(settings.resultFailure ? { failure: settings.resultFailure } : {}),
         ...over,
       } as unknown as LaunchResult;
+      if (settings.omitProfileChanges) delete (payload as Partial<LaunchResult>).profileChanges;
       if (settings.malformedResult) delete (payload as Partial<LaunchResult>).artifacts;
       results.push(payload as unknown as Record<string, unknown>);
       // Воркер предъявляет тот же общий секрет, которым мы аутентифицировали его на launch.
@@ -359,7 +365,7 @@ const TERMINAL = new Set(['succeeded', 'failed', 'cancelled']);
 
 /** Тело результата рана по настройкам мока. */
 function buildResult(runId: string, exitReason: string, settings: MockWorkerOptions & Record<string, unknown>): Record<string, unknown> {
-  return {
+  const result: Record<string, unknown> = {
     runId,
     status: 'started',
     pid: 4242,
@@ -376,7 +382,11 @@ function buildResult(runId: string, exitReason: string, settings: MockWorkerOpti
     artifacts: (settings['artifacts'] as unknown[] | undefined) ?? [],
     logUrl: resultLogUrl(exitReason, settings, runId),
     repo: { fullName: 'owner/name', branch: `agent-run/${runId}`, commit: 'abc1234', baseRef: 'main' },
+    profileChanges: { files: [], deletes: [] },
+    ...(settings.resultFailure ? { failure: settings.resultFailure } : {}),
   };
+  if (settings.omitProfileChanges) delete result['profileChanges'];
+  return result;
 }
 
 /** Адрес возврата результата, который наш API передал воркеру в запросе запуска. */

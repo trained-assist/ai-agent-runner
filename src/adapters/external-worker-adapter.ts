@@ -15,6 +15,7 @@ import {
   type ValidationResult,
 } from '../contracts/validate.js';
 import { redactSecrets, truncateLine } from '../redact.js';
+import { isSafeRelativePath } from '../storage/local-paths.js';
 import { parseRemoteMcpServerPolicies, resolveRemoteMcpAttachment, type RemoteMcpAttachment, type RemoteMcpHostOptions } from './remote-mcp.js';
 
 /**
@@ -135,7 +136,17 @@ export interface LaunchRequest {
   env: Record<string, string>;
   limits: { timeoutMs: number; maxOutputBytes: number; maxLogBytes: number };
   repository: { fullName: string; branch: string; revision?: string };
-  profileWorkspace?: { bindingId: string; objectBucket?: string; artifacts: Array<{ path: string; key: string; sha256: string; size: number }>; excludedPatterns: string[] };
+  profileWorkspace?: {
+    bindingId: string;
+    snapshotUrl: string;
+    snapshotSha256: string;
+    snapshotSize: number;
+    savebackToken: string;
+    savebackUrl: string;
+    objectBucket?: string;
+    artifacts: Array<{ path: string; key: string; sha256: string; size: number }>;
+    excludedPatterns: string[];
+  };
   /** Trusted CP input manifest pin. Artifact bytes are resolved by the worker, not supplied by the caller. */
   ingressManifest?: IngressManifestRef;
   /**
@@ -214,6 +225,7 @@ export interface LaunchResult {
    */
   logUrl: string;
   repo: LaunchRepo;
+  profileChanges?: { files: Array<{ path: string; sha256: string; size: number }>; deletes: string[] };
   failure?: LaunchFailure;
 }
 
@@ -309,6 +321,7 @@ const LAUNCH_RESULT_KEYS = [
   'artifacts',
   'logUrl',
   'repo',
+  'profileChanges',
   'failure',
 ] as const;
 
@@ -448,7 +461,10 @@ export function launchRequestFromSpec(
       branch: runBranchName(spec.runId),
       ...(spec.repository?.revision ? { revision: spec.repository.revision } : {}),
     },
-    ...(spec.profileWorkspace ? { profileWorkspace: spec.profileWorkspace } : {}),
+    ...(spec.profileWorkspace ? { profileWorkspace: {
+      ...spec.profileWorkspace,
+      savebackUrl: options.resultUrl.replace(/\/result(?:\?.*)?$/, '/profile-changes'),
+    } } : {}),
     ...(spec.ingressManifest ? { ingressManifest: spec.ingressManifest } : {}),
     // Токен публикации: без него джоба клонирует репозиторий задачи и коммитит выходы
     // токеном репозитория кольца, у которого нет прав на чужой репозиторий. На живом
@@ -461,7 +477,7 @@ export function launchRequestFromSpec(
     // Он не попадает в `workflow_dispatch` воркера: воркер получает его по одноразовому
     // claim-токену, а claim-ответ помечен `no-store`. В диспатч уезжают только runId и
     // claimToken.
-    ...(spec.repository?.token !== undefined ? { publicationToken: spec.repository.token } : {}),
+    ...(spec.repository?.token !== undefined && !spec.profileWorkspace ? { publicationToken: spec.repository.token } : {}),
     resultUrl: options.resultUrl,
     isolation: { mode: spec.isolation?.mode ?? 'none' },
     ...options.remoteMcpAttachment,
@@ -510,7 +526,7 @@ export function validateLaunchResult(input: unknown, expectedRunId: string): Val
   // настоящий opencode-шлюз его не присылает вовсе. Отсутствие этих полей — не повод
   // выбросить результат целого рана: живая проба #100 показала, что реальный ответ
   // отвергался как WORKER_PROTOCOL_INVALID, и рана с артефактами у клиента не было.
-  const OPTIONAL_RESULT_KEYS = ['failure', 'pid', 'answer'] as const;
+  const OPTIONAL_RESULT_KEYS = ['failure', 'pid', 'answer', 'profileChanges'] as const;
   checkKeys(
     input,
     LAUNCH_RESULT_KEYS,
@@ -589,6 +605,30 @@ export function validateLaunchResult(input: unknown, expectedRunId: string): Val
       }
     }
     if (input['repo']['baseRef'] !== undefined) checkString(input['repo']['baseRef'], 'launch.repo.baseRef', collector, 200);
+  }
+
+  if (input['profileChanges'] !== undefined) {
+    const value = input['profileChanges'];
+    if (!checkObject(value, 'launch.profileChanges', collector)) {
+      // already reported
+    } else {
+      checkKeys(value, ['files', 'deletes'], ['files', 'deletes'], 'launch.profileChanges', collector);
+      if (!checkArray(value['files'], 'launch.profileChanges.files', collector)) {
+        // already reported
+      } else value['files'].forEach((entry, index) => {
+        const path = `launch.profileChanges.files[${index}]`;
+        if (!checkObject(entry, path, collector)) return;
+        checkKeys(entry, ['path', 'sha256', 'size'], ['path', 'sha256', 'size'], path, collector);
+        if (!isSafeRelativePath(entry['path'])) collector.push(`${path}.path: expected safe relative path`);
+        if (typeof entry['sha256'] !== 'string' || !/^[0-9a-f]{64}$/.test(entry['sha256'])) collector.push(`${path}.sha256: expected sha256`);
+        if (!Number.isSafeInteger(entry['size']) || Number(entry['size']) < 0) collector.push(`${path}.size: expected non-negative integer`);
+      });
+      if (!checkArray(value['deletes'], 'launch.profileChanges.deletes', collector)) {
+        // already reported
+      } else value['deletes'].forEach((path, index) => {
+        if (!isSafeRelativePath(path)) collector.push(`launch.profileChanges.deletes[${index}]: expected safe relative path`);
+      });
+    }
   }
 
   const failure = input['failure'];

@@ -111,7 +111,7 @@ describe('installable VM HTTP worker', () => {
     const fixture = await startFixture();
     cleanups.push(fixture.close);
     const response = await launch(fixture.base, launchRequest({
-      profileWorkspace: { bindingId: 'binding-profile-a', artifacts: [], excludedPatterns: [] },
+      profileWorkspace: { bindingId: 'binding-profile-a', snapshotUrl: 'https://example.test/snapshot', snapshotSha256: 'a'.repeat(64), snapshotSize: 1, savebackToken: 't'.repeat(43), savebackUrl: 'https://example.test/saveback', artifacts: [], excludedPatterns: [] },
     }));
     expect(response.status).toBe(501);
     expect(await response.json()).toEqual({ accepted: false, code: 'WORKER_PROFILE_WORKSPACE_UNSUPPORTED' });
@@ -124,7 +124,7 @@ describe('installable VM HTTP worker', () => {
     const response = await launch(fixture.base, launchRequest({
       repository: { fullName: 'trained-assist/ai-agent-runner', branch: `agent-run/${RUN_ID}`, revision: 'b'.repeat(40) },
       publicationToken: 'profile-publication-token-test',
-      profileWorkspace: { bindingId: 'binding-profile-a', artifacts: [], excludedPatterns: [] },
+      profileWorkspace: { bindingId: 'binding-profile-a', snapshotUrl: 'https://example.test/snapshot', snapshotSha256: 'a'.repeat(64), snapshotSize: 1, savebackToken: 't'.repeat(43), savebackUrl: 'https://example.test/saveback', artifacts: [], excludedPatterns: [] },
     }));
     expect(response.status).toBe(202);
     expect(fixture.runner.startCalls[0]!.spec.repository).toMatchObject({ revision: 'b'.repeat(40), token: 'profile-publication-token-test' });

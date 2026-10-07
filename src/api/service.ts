@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, timingSafeEqual } from 'node:crypto';
 import type { LaunchArtifact, LaunchRepo, WorkerCancelResult } from '../adapters/external-worker-adapter.js';
 import {
   admissionEvents,
@@ -11,8 +11,6 @@ import {
   launchFailureCode,
   mapLaunchResult,
   mergeUrl,
-  repoHasCommit,
-  runBranchName,
   workerTransportFailure,
   withTimeout,
   DEFAULT_RECONCILE_DEADLINE_MS,
@@ -756,7 +754,8 @@ export class AgentApi {
   }
 
   private async execute(record: AdmissionRecord): Promise<void> {
-    const run = this.store.open(record.runId, record.createdAt, this.chainOf(record)[0]);
+    const candidates = this.chainOf(record);
+    const run = this.store.open(record.runId, record.createdAt, candidates[0] ?? record.spec.engine.name);
     const startedAt = this.nowIso();
     run.state = 'running';
     run.updatedAt = startedAt;
@@ -764,11 +763,21 @@ export class AgentApi {
     this.store.append(record.runId, admissionEvents(record.spec, startedAt));
     this.inFlight.add(record.runId);
     try {
+      if (this.opts.profileWorkspace && candidates.length === 0) {
+        this.finalize(record, workerTransportFailure(record.spec, new PreflightError(
+          'PROFILE_SAVEBACK_UNSUPPORTED', 'profile snapshot saveback is currently supported only by the GHA worker', { retryable: false },
+        ), { startedAt, finishedAt: this.nowIso() }));
+        return;
+      }
       if (this.opts.profileWorkspace) {
         try {
           const prepared = await this.opts.profileWorkspace.prepare(this.principalFor(record), record.runId);
-          record.spec.repository = { fullName: prepared.repository, token: prepared.token, revision: prepared.baseRevision };
-          record.spec.profileWorkspace = { bindingId: prepared.bindingId, ...(prepared.objectBucket ? { objectBucket: prepared.objectBucket } : {}), artifacts: prepared.artifacts, excludedPatterns: prepared.excludedPatterns };
+          record.spec.repository = { fullName: prepared.repository, revision: prepared.baseRevision };
+          record.spec.profileWorkspace = {
+            bindingId: prepared.bindingId, snapshotUrl: prepared.snapshotUrl, snapshotSha256: prepared.snapshotSha256,
+            snapshotSize: prepared.snapshotSize, savebackToken: prepared.savebackToken,
+            ...(prepared.objectBucket ? { objectBucket: prepared.objectBucket } : {}), artifacts: prepared.artifacts, excludedPatterns: prepared.excludedPatterns,
+          };
           this.store.appendPrepared(record.runId, { fullName: prepared.repository, revision: prepared.baseRevision }, record.spec.profileWorkspace);
           this.log({ event: 'profile_prepared', runId: record.runId, bindingId: prepared.bindingId, baseRevision: prepared.baseRevision });
         } catch (err) {
@@ -991,11 +1000,22 @@ export class AgentApi {
       await this.drainWorkerLogStream(record, worker);
       const mapping = mapLaunchResult(record.spec, launch, { startedAt, finishedAt: this.nowIso() }, { workerBaseUrl: worker.baseUrl });
       let publication = null;
-      if (this.opts.profileWorkspace && launch.status === 'started') {
-        if (!mapping.repo || !repoHasCommit(mapping.repo) || mapping.repo.fullName !== record.spec.repository?.fullName || mapping.repo.branch !== runBranchName(record.runId)) {
-          throw new WorkspaceError('WORKSPACE_NOT_FOUND', 'worker did not confirm the expected profile run branch');
+      if (this.opts.profileWorkspace && launch.status === 'started' && record.spec.profileWorkspace) {
+        const changes = launch.profileChanges;
+        if (!changes && launch.failure) {
+          // The worker reports an explicit finalization failure when profile uploads
+          // did not complete. Preserve that terminal result; retrying publication with
+          // a fabricated empty manifest could silently lose user changes.
+          mapping.result.persistence = 'failed';
+          mapping.result.persistenceReason = `profile saveback failed in worker: ${launch.failure.code}: ${launch.failure.safeSummary}`.slice(0, 500);
+          this.finalize(record, mapping, null);
+          this.log({ event: 'run_finished', runId: record.runId, outcome: mapping.result.outcome, exitReason: mapping.result.exitReason, exitCode: mapping.result.exitCode, artifacts: mapping.artifacts.length, logUrl: mapping.logUrl, repo: mapping.repo?.fullName ?? null });
+          return true;
         }
-        publication = await this.opts.profileWorkspace.publish(this.principalFor(record), record.runId, mapping.repo.commit!);
+        if (!changes) throw new WorkspaceError('WORKSPACE_NOT_FOUND', 'worker did not return profile saveback manifest');
+        publication = await this.opts.profileWorkspace.publish(
+          this.principalFor(record), record.runId, record.spec.repository?.revision ?? '', changes.files, changes.deletes,
+        );
         mapping.result.persistenceReason = `profile publication ${publication.status}: ${publication.committedRevision ?? publication.publicationId}`;
         if (publication.status !== 'published') mapping.result.persistence = 'pending';
         this.log({ event: 'profile_publication', runId: record.runId, publicationId: publication.publicationId, status: publication.status, committedRevision: publication.committedRevision, conflictId: publication.conflictId });
@@ -1210,7 +1230,10 @@ export class AgentApi {
  * кандидат один: движок, названный клиентом.
  */
 private chainOf(record: AdmissionRecord): readonly string[] {
-  return record.engineChain ?? [record.spec.engine.name];
+  const configured = record.engineChain ?? [record.spec.engine.name];
+  // API-owned profile saveback is currently implemented by the GHA runner. Avoid handing
+  // its snapshot contract to regional VM workers that still speak the old git-push protocol.
+  return this.opts.profileWorkspace ? configured.filter(isGhaEngine) : configured;
 }
 
 /**
@@ -1308,6 +1331,25 @@ private buildSpec(
       throw new ApiError('NOT_FOUND', `unknown run ${runId}`);
     }
     return record;
+  }
+
+  async uploadProfileChange(runId: string, token: string, path: string, bytes: Buffer, sha256: string): Promise<void> {
+    const record = this.store.getByRun(runId);
+    if (!record || !record.spec.profileWorkspace || !this.opts.profileWorkspace) throw new ApiError('NOT_FOUND', 'profile saveback run not found');
+    const expectedToken = record.spec.profileWorkspace.savebackToken;
+    if (expectedToken) {
+      const suppliedHash = createHash('sha256').update(token).digest();
+      const expectedHash = createHash('sha256').update(expectedToken).digest();
+      if (!timingSafeEqual(suppliedHash, expectedHash)) throw new ApiError('UNAUTHENTICATED', 'invalid run-scoped saveback capability');
+    }
+    const progress = this.store.progressOf(runId);
+    if (!progress || !['running', 'queued'].includes(progress.state)) throw new ApiError('NOT_FOUND', 'profile saveback run is not active');
+    try {
+      await this.opts.profileWorkspace.upload(this.principalFor(record), runId, token, path, bytes, sha256);
+    } catch (error) {
+      if (error instanceof WorkspaceError) throw new ApiError('FORBIDDEN', 'saveback capability or file policy was rejected');
+      throw error;
+    }
   }
 
   private nowIso(): string {

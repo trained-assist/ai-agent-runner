@@ -49,7 +49,7 @@ describe('profile workspace run branch worker', () => {
       });
       const spec = makeRunSpec({
         repository: { fullName: 'owner/profile', revision, token: 'one-run-github-token' },
-        profileWorkspace: { bindingId: 'binding-profile', artifacts: [], excludedPatterns: [] },
+        profileWorkspace: { bindingId: 'binding-profile', snapshotUrl: 'https://example.test/snapshot', snapshotSha256: 'a'.repeat(64), snapshotSize: 1, savebackToken: 't'.repeat(43), artifacts: [], excludedPatterns: [] },
       });
       runner.start(spec);
       const result = await runner.waitFor(spec.runId, 15_000);

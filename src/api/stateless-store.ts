@@ -150,7 +150,14 @@ export class StatelessStore {
   }
 
   appendPrepared(runId: string, repository: { fullName: string; revision?: string }, profileWorkspace?: RunSpec['profileWorkspace']): void {
-    this.write({ kind: 'prepared', runId, repository, ...(profileWorkspace ? { profileWorkspace } : {}) });
+    // Signed snapshot URLs and run-scoped write capabilities are transient secrets. The
+    // worker already holds them; durable admission state needs only the profile binding.
+    const persistedProfile = profileWorkspace ? {
+      ...profileWorkspace,
+      snapshotUrl: '',
+      savebackToken: '',
+    } : undefined;
+    this.write({ kind: 'prepared', runId, repository, ...(persistedProfile ? { profileWorkspace: persistedProfile } : {}) });
   }
 
   /** Ран принят воркером: помечаем, чтобы поллер пережил рестарт API. */
