@@ -424,6 +424,10 @@ export function launchRequestFromSpec(
       retryable: false,
     });
   }
+  const savebackToken = spec.profileWorkspace?.savebackToken;
+  if (spec.profileWorkspace && !savebackToken) {
+    throw new PreflightError('PROFILE_SAVEBACK_UNSUPPORTED', 'profile saveback capability is unavailable for this run', { retryable: false });
+  }
   const env: Record<string, string> = {};
   for (const name of spec.envAllowlist) {
     const value = options.env?.[name];
@@ -463,6 +467,7 @@ export function launchRequestFromSpec(
     },
     ...(spec.profileWorkspace ? { profileWorkspace: {
       ...spec.profileWorkspace,
+      savebackToken: savebackToken!,
       savebackUrl: options.resultUrl.replace(/\/result(?:\?.*)?$/, '/profile-changes'),
     } } : {}),
     ...(spec.ingressManifest ? { ingressManifest: spec.ingressManifest } : {}),

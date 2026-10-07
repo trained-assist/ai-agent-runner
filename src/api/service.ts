@@ -765,7 +765,7 @@ export class AgentApi {
     try {
       if (this.opts.profileWorkspace && candidates.length === 0) {
         this.finalize(record, workerTransportFailure(record.spec, new PreflightError(
-          'PROFILE_SAVEBACK_UNSUPPORTED', 'profile snapshot saveback is currently supported only by the GHA worker', { retryable: false },
+          'PROFILE_SAVEBACK_UNSUPPORTED', 'no configured worker can accept profile snapshot saveback', { retryable: false },
         ), { startedAt, finishedAt: this.nowIso() }));
         return;
       }
@@ -1230,10 +1230,7 @@ export class AgentApi {
  * кандидат один: движок, названный клиентом.
  */
 private chainOf(record: AdmissionRecord): readonly string[] {
-  const configured = record.engineChain ?? [record.spec.engine.name];
-  // API-owned profile saveback is currently implemented by the GHA runner. Avoid handing
-  // its snapshot contract to regional VM workers that still speak the old git-push protocol.
-  return this.opts.profileWorkspace ? configured.filter(isGhaEngine) : configured;
+  return record.engineChain ?? [record.spec.engine.name];
 }
 
 /**

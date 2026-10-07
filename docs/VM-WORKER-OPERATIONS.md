@@ -21,22 +21,21 @@ Required missing bindings make `/readyz` return 503; an unassigned secret owner 
 missing rotation date is a warning. The example inventories intentionally show
 `UNASSIGNED` owners until an operator records the real owner and store path.
 
-Profile-backed tasks use the existing durable workspace contract: the API pins a base
-commit and supplies a scoped publication token plus the heavy-artifact manifest. Before
-OpenCode starts, the VM checks out that exact revision on `agent-run/<runId>`, verifies
-and materializes heavy artifacts from GCS, and removes files excluded by the shared
-profile policy. On completion, it publishes allowed small files to the run branch,
-uploads heavy files to GCS with read-back checksum verification, writes the artifact
-index, and returns the confirmed commit in `repo.commit`. The API validates and merges
-that branch through its existing compare-and-swap publication coordinator.
+Profile-backed tasks use the API-owned saveback protocol. The API pins a base revision,
+creates a signed snapshot archive and issues a one-run write-only saveback capability.
+The VM verifies the snapshot size and SHA-256, materializes it without GitHub credentials,
+filters changed files through the shared export policy, and uploads each allowed file to
+the API with its SHA-256. The VM returns an explicit changes manifest (including
+deletions); the API verifies the uploaded bytes and publishes the canonical Git merge.
+The capability is omitted from durable Runner state and never enters the agent process.
+On an upload failure the VM retains its workspace and reports persistence as failed.
 
-The token is memory-only, passed to Git through a static askpass helper, and never put
-in Git arguments or durable RunSpec state. The publisher resets `origin` to the trusted
-repository URL before fetch/push, verifies the pinned revision and run branch, and uses
-a private Git index so a broad staging command cannot include credentials. If
-publication fails, the VM retains the run workspace and returns no commit; the API
-reports publication as pending/unknown rather than claiming that user data was saved.
-Runs without a profile workspace continue to return `repo.commit: null`.
+The older VM profile protocol (GitHub token, run branch and VM-side push) remains available
+for non-saveback callers during migration. New API profile runs must use the API-owned
+protocol; an older VM returns `501 WORKER_PROFILE_WORKSPACE_UNSUPPORTED` before admission,
+so the API can try the next configured worker. Only after the signed release has been
+installed and `/version` plus `/readyz` confirm it should France be the first profile
+worker. Runs without a profile workspace continue to return `repo.commit: null`.
 
 Task-scoped Control Plane `ingressManifest` pins now pass through the external-worker
 request into Runner. Configure `RUNNER_CONTROL_PLANE_URL`,

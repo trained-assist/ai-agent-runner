@@ -16,15 +16,17 @@ const POLICY = compilePolicy(DEFAULT_EXPORT_POLICY);
 const ASKPASS = ['#!/bin/sh', 'case "$1" in', "  *sername*) printf '%s\\n' 'x-access-token' ;;", '  *) printf \'%s\\n\' "$RUNNER_GIT_TOKEN" ;;', 'esac', ''].join('\n');
 
 export interface RunBranchWorker {
-  prepare(spec: RunSpec, cwd: string, token: string): Promise<void>;
-  publish(spec: RunSpec, cwd: string, token: string): Promise<string>;
+  supportsSaveback?(): boolean;
+  prepare(spec: RunSpec, cwd: string, token?: string): Promise<void>;
+  publish(spec: RunSpec, cwd: string, token?: string): Promise<string>;
+  changes?(spec: RunSpec): { files: Array<{ path: string; sha256: string; size: number }>; deletes: string[] } | undefined;
 }
 
 /** Implements the existing CP profile-workspace branch contract on a VM worker. */
 export function createRunBranchWorker(objects: BlobStore, options: { repositoryUrl?: (fullName: string) => string } = {}): RunBranchWorker {
   const repositoryUrl = options.repositoryUrl ?? buildRepositoryUrl;
   return {
-    async prepare(spec, cwd, token) {
+    async prepare(spec, cwd, token = '') {
       const workspace = requiredWorkspace(spec);
       const revision = spec.repository?.revision;
       if (!revision) throw new Error('profile workspace requires a pinned base revision');
@@ -50,7 +52,7 @@ export function createRunBranchWorker(objects: BlobStore, options: { repositoryU
         rmSync(resolveInsideRoot(cwd, entry.path, 'excluded profile path'), { recursive: true, force: true });
       }
     },
-    async publish(spec, cwd, token) {
+    async publish(spec, cwd, token = '') {
       requiredWorkspace(spec);
       const branch = runBranchName(spec.runId);
       if ((await gitText(cwd, ['rev-parse', 'HEAD'], token)).trim() !== spec.repository!.revision) throw new Error('agent changed the pinned profile base commit; refusing publication');

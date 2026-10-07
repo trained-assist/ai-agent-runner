@@ -60,6 +60,12 @@ export interface RunnerHostInfo {
   allowedEngines?: string[];
 }
 
+function withoutSavebackToken(spec: RunSpec): RunSpec {
+  const safe = structuredClone(spec);
+  if (safe.profileWorkspace) delete safe.profileWorkspace.savebackToken;
+  return safe;
+}
+
 export interface RunnerOptions {
   rootDir: string;
   adapters: Record<string, EngineAdapter>;
@@ -519,6 +525,8 @@ export class Runner {
 
   supportsProfileWorkspace(): boolean { return this.opts.profileWorkspace !== undefined; }
 
+  supportsProfileSaveback(): boolean { return this.opts.profileWorkspace?.supportsSaveback?.() === true; }
+
   events(runId: string, afterSequence = 0): RunnerEvent[] {
     const run = this.runs.get(runId);
     if (!run) return [];
@@ -603,7 +611,7 @@ export class Runner {
       cancelRequested: null,
       workerCrashed: false,
       exit: null,
-      spec,
+      spec: withoutSavebackToken(spec),
       finalized: false,
       result: null,
       fencing: { rejected: 0 },
@@ -628,8 +636,10 @@ export class Runner {
       room: null,
       answerTail: [],
       runtimeEnv: { ...runtimeEnv },
-      runtimeSecrets: [],
-      workspaceToken: spec.profileWorkspace ? spec.repository?.token ?? null : null,
+      runtimeSecrets: spec.profileWorkspace?.savebackToken ? [spec.profileWorkspace.savebackToken] : [],
+      workspaceToken: spec.profileWorkspace?.savebackUrl
+        ? spec.profileWorkspace.savebackToken ?? null
+        : spec.profileWorkspace ? spec.repository?.token ?? null : null,
       repositoryCommit: null,
       workspacePublishFailed: false,
     });
@@ -1148,8 +1158,14 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
     if (spec.profileWorkspace && !this.opts.profileWorkspace) {
       throw new PreflightError('WORKER_PROFILE_WORKSPACE_UNSUPPORTED', 'this Runner has no profile workspace checkout/publication lifecycle');
     }
-    if (spec.profileWorkspace && (!spec.repository?.revision || !spec.repository.token)) {
-      throw new PreflightError('CREDENTIALS_UNAVAILABLE', 'profile workspace requires a pinned base revision and publication token');
+    if (spec.profileWorkspace && !spec.repository?.revision) {
+      throw new PreflightError('CREDENTIALS_UNAVAILABLE', 'profile workspace requires a pinned base revision');
+    }
+    if (spec.profileWorkspace?.savebackUrl && (!spec.profileWorkspace.snapshotUrl || !this.runs.get(st.runId)?.workspaceToken)) {
+      throw new PreflightError('CREDENTIALS_UNAVAILABLE', 'profile saveback requires its pinned snapshot and scoped API capability');
+    }
+    if (spec.profileWorkspace && !spec.profileWorkspace.savebackUrl && !spec.repository?.token) {
+      throw new PreflightError('CREDENTIALS_UNAVAILABLE', 'legacy profile workspace requires a publication token');
     }
     if (spec.budget && !spec.budget.approved) {
       throw new PreflightError('BUDGET_UNAVAILABLE', spec.budget.reason ?? 'no approved budget for this run', { retryable: true });
@@ -1199,15 +1215,19 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
     }
     try {
       // clone идёт в runner (child git), НЕ в движке: cwd движка = этот клон
-      const source = resolveCloneSource(st.spec.repository);
-      const controller = new AbortController();
-      this.cloneControllers.set(st.runId, controller);
-      if (this.disposed) controller.abort();
-      await cloneRepository(source, st.spec.cwd, { signal: controller.signal });
       const run = this.runs.get(st.runId);
-      if (st.spec.profileWorkspace && this.opts.profileWorkspace) {
-        if (!run?.workspaceToken) throw new PreflightError('CREDENTIALS_UNAVAILABLE', 'profile workspace publication credential is unavailable');
-        await this.opts.profileWorkspace.prepare(st.spec, st.spec.cwd, run.workspaceToken);
+      if (st.spec.profileWorkspace && this.opts.profileWorkspace && st.spec.profileWorkspace.savebackUrl) {
+        await this.opts.profileWorkspace.prepare(st.spec, st.spec.cwd);
+      } else {
+        const source = resolveCloneSource(st.spec.repository);
+        const controller = new AbortController();
+        this.cloneControllers.set(st.runId, controller);
+        if (this.disposed) controller.abort();
+        await cloneRepository(source, st.spec.cwd, { signal: controller.signal });
+        if (st.spec.profileWorkspace && this.opts.profileWorkspace) {
+          if (!run?.workspaceToken) throw new PreflightError('CREDENTIALS_UNAVAILABLE', 'profile workspace publication credential is unavailable');
+          await this.opts.profileWorkspace.prepare(st.spec, st.spec.cwd, run.workspaceToken);
+        }
       }
     } finally {
       this.cloneControllers.delete(st.runId);
@@ -1897,11 +1917,19 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
         if (st.profileWorkspaceCommit) {
           if (run) run.repositoryCommit = st.profileWorkspaceCommit;
         } else {
-          if (!run?.workspaceToken) throw new Error('profile workspace publication credential is unavailable');
-          run.repositoryCommit = await this.opts.profileWorkspace.publish(st.spec, st.spec.cwd, run.workspaceToken);
-          st.profileWorkspaceCommit = run.repositoryCommit;
+          if (!run && !st.spec.profileWorkspace.savebackUrl) throw new Error('profile workspace runtime state is unavailable');
+          if (!run?.workspaceToken && !st.spec.profileWorkspace.savebackUrl) throw new Error('profile workspace publication credential is unavailable');
+          const publishedCommit = await this.opts.profileWorkspace.publish(st.spec, st.spec.cwd, run?.workspaceToken ?? undefined);
+          if (run) run.repositoryCommit = publishedCommit;
+          st.profileWorkspaceCommit = publishedCommit;
           this.store.saveState(st);
-          run.workspaceToken = null;
+          if (run) run.workspaceToken = null;
+        }
+        if (st.spec.profileWorkspace.savebackUrl && !st.result?.profileChanges) {
+          const changes = this.opts.profileWorkspace.changes?.(st.spec);
+          if (!changes) throw new Error('profile saveback manifest was not durably recorded');
+          st.result = { ...(st.result ?? this.computeResult(st)), profileChanges: changes };
+          this.store.saveResult(st.runId, st.result);
         }
       } catch (error) {
         if (run) { run.workspacePublishFailed = true; run.workspaceToken = null; }
@@ -1916,6 +1944,7 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
     const existingExport = this.exportManifest(st.runId);
     const captured: RunResult = {
       ...this.computeResult(st, existingExport),
+      ...(st.result?.profileChanges ? { profileChanges: st.result.profileChanges } : {}),
       ...((exit?.answer.present ?? false) ? { text: exit!.answer.text } : {}),
       ...(exit && exit.plan.length > 0 && existingExport === null ? {
         persistence: 'pending' as const,
@@ -1959,6 +1988,7 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
 
     const result: RunResult = {
       ...this.computeResult(st, exportManifest, cleanup),
+      ...(st.result?.profileChanges ? { profileChanges: st.result.profileChanges } : {}),
       ...((exit?.answer.present ?? false) ? { text: exit!.answer.text } : {}),
     };
     await this.appendProfileTrace(st, result);
@@ -2513,7 +2543,9 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
     const outputRefs = (exportManifest?.entries ?? [])
       .filter((entry) => entry.status === 'exported' && entry.artifactId !== null)
       .map((entry) => entry.artifactId as string);
-    const persistence = this.persistenceStatus(exportManifest);
+    const persistence = this.runs.get(st.runId)?.workspacePublishFailed && st.spec.profileWorkspace?.savebackUrl
+      ? { status: 'failed' as const, reason: 'profile saveback upload failed; the VM retained the run workspace' }
+      : this.persistenceStatus(exportManifest);
     const cleanupStatus = this.cleanupStatus(this.soleCopiesOnDisk(st, exportManifest), cleanup);
 
     const result: RunResult = {

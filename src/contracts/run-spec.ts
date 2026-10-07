@@ -140,7 +140,9 @@ export interface ProfileWorkspaceSpec {
   snapshotSha256: string;
   snapshotSize: number;
   /** One-run write-only bearer capability. Never a GitHub/API credential. */
-  savebackToken: string;
+  savebackToken?: string;
+  /** API upload endpoint tied to the current run. Sent only to workers that support saveback. */
+  savebackUrl?: string;
   objectBucket?: string;
   artifacts: ProfileObjectSpec[];
   excludedPatterns: string[];
@@ -756,12 +758,13 @@ export function validateRunSpec(input: unknown): ValidationResult<RunSpec> {
   if (input['profileWorkspace'] !== undefined) {
     const value = input['profileWorkspace'];
     if (checkObject(value, 'spec.profileWorkspace', collector)) {
-      checkKeys(value, ['bindingId', 'snapshotUrl', 'snapshotSha256', 'snapshotSize', 'savebackToken', 'objectBucket', 'artifacts', 'excludedPatterns'], ['bindingId', 'snapshotUrl', 'snapshotSha256', 'snapshotSize', 'savebackToken', 'artifacts', 'excludedPatterns'], 'spec.profileWorkspace', collector);
+      checkKeys(value, ['bindingId', 'snapshotUrl', 'snapshotSha256', 'snapshotSize', 'savebackToken', 'savebackUrl', 'objectBucket', 'artifacts', 'excludedPatterns'], ['bindingId', 'snapshotUrl', 'snapshotSha256', 'snapshotSize', 'artifacts', 'excludedPatterns'], 'spec.profileWorkspace', collector);
       checkString(value['bindingId'], 'spec.profileWorkspace.bindingId', collector, 200);
-      if (typeof value['snapshotUrl'] !== 'string' || !/^https:\/\//.test(value['snapshotUrl']) || value['snapshotUrl'].length > 4096) collector.push('spec.profileWorkspace.snapshotUrl: expected HTTPS URL');
+      if (typeof value['snapshotUrl'] !== 'string' || !isHttpsOrLoopbackUrl(value['snapshotUrl']) || value['snapshotUrl'].length > 4096) collector.push('spec.profileWorkspace.snapshotUrl: expected HTTPS URL');
       if (typeof value['snapshotSha256'] !== 'string' || !/^[0-9a-f]{64}$/.test(value['snapshotSha256'])) collector.push('spec.profileWorkspace.snapshotSha256: expected sha256');
       if (typeof value['snapshotSize'] !== 'number' || !Number.isSafeInteger(value['snapshotSize']) || value['snapshotSize'] < 0) collector.push('spec.profileWorkspace.snapshotSize: expected non-negative integer');
-      if (typeof value['savebackToken'] !== 'string' || value['savebackToken'].length < 32 || value['savebackToken'].length > 500) collector.push('spec.profileWorkspace.savebackToken: expected scoped bearer capability');
+      if (value['savebackToken'] !== undefined && (typeof value['savebackToken'] !== 'string' || value['savebackToken'].length < 32 || value['savebackToken'].length > 500)) collector.push('spec.profileWorkspace.savebackToken: expected scoped bearer capability');
+      if (value['savebackUrl'] !== undefined && (typeof value['savebackUrl'] !== 'string' || !isHttpsOrLoopbackUrl(value['savebackUrl']) || value['savebackUrl'].length > 4096)) collector.push('spec.profileWorkspace.savebackUrl: expected HTTPS URL');
       if (value['objectBucket'] !== undefined) checkString(value['objectBucket'], 'spec.profileWorkspace.objectBucket', collector, 200);
       if (!Array.isArray(value['artifacts'])) collector.push('spec.profileWorkspace.artifacts: expected array');
       else {
@@ -778,7 +781,7 @@ export function validateRunSpec(input: unknown): ValidationResult<RunSpec> {
         });
         if (artifacts.length > 0 && !value['objectBucket']) collector.push('spec.profileWorkspace.objectBucket: required for artifacts');
         if (!Array.isArray(value['excludedPatterns']) || value['excludedPatterns'].some((entry) => typeof entry !== 'string')) collector.push('spec.profileWorkspace.excludedPatterns: expected string array');
-        profileWorkspace = { bindingId: String(value['bindingId'] ?? ''), snapshotUrl: String(value['snapshotUrl'] ?? ''), snapshotSha256: String(value['snapshotSha256'] ?? ''), snapshotSize: Number(value['snapshotSize']), savebackToken: String(value['savebackToken'] ?? ''), ...(value['objectBucket'] ? { objectBucket: String(value['objectBucket']) } : {}), artifacts, excludedPatterns: Array.isArray(value['excludedPatterns']) ? value['excludedPatterns'] as string[] : [] };
+        profileWorkspace = { bindingId: String(value['bindingId'] ?? ''), snapshotUrl: String(value['snapshotUrl'] ?? ''), snapshotSha256: String(value['snapshotSha256'] ?? ''), snapshotSize: Number(value['snapshotSize']), ...(typeof value['savebackToken'] === 'string' ? { savebackToken: value['savebackToken'] } : {}), ...(typeof value['savebackUrl'] === 'string' ? { savebackUrl: value['savebackUrl'] } : {}), ...(value['objectBucket'] ? { objectBucket: String(value['objectBucket']) } : {}), artifacts, excludedPatterns: Array.isArray(value['excludedPatterns']) ? value['excludedPatterns'] as string[] : [] };
       }
     }
   }
@@ -835,18 +838,26 @@ export function validateRunSpec(input: unknown): ValidationResult<RunSpec> {
 }
 
 /**
- * Возвращает копию value без repository.token: токен не должен попадать в хэши
- * (specHash/payloadHash), state-файлы и admissions store — «на диске секретов нет».
+ * Возвращает копию value без секретов запуска: repository.token и scoped savebackToken
+ * не должны попадать в хэши, state-файлы и admissions store.
  */
 export function redactRepositoryToken<T>(value: T): T {
   if (value === null || typeof value !== 'object') return value;
   const record = value as Record<string, unknown>;
+  const cleaned = { ...record };
   const repository = record['repository'];
-  if (repository === null || typeof repository !== 'object' || Array.isArray(repository)) return value;
-  if (!('token' in repository)) return value;
-  const cleanedRepository = { ...(repository as Record<string, unknown>) };
-  delete cleanedRepository['token'];
-  return { ...record, repository: cleanedRepository } as T;
+  if (repository !== null && typeof repository === 'object' && !Array.isArray(repository) && 'token' in repository) {
+    const cleanedRepository = { ...(repository as Record<string, unknown>) };
+    delete cleanedRepository['token'];
+    cleaned['repository'] = cleanedRepository;
+  }
+  const profileWorkspace = record['profileWorkspace'];
+  if (profileWorkspace !== null && typeof profileWorkspace === 'object' && !Array.isArray(profileWorkspace) && 'savebackToken' in profileWorkspace) {
+    const cleanedProfile = { ...(profileWorkspace as Record<string, unknown>) };
+    delete cleanedProfile['savebackToken'];
+    cleaned['profileWorkspace'] = cleanedProfile;
+  }
+  return cleaned as T;
 }
 
 /**
@@ -868,4 +879,11 @@ export function canonicalJson(value: unknown): string {
 
 export function isRecordValue(value: unknown): value is Record<string, unknown> {
   return isRecord(value);
+}
+
+function isHttpsOrLoopbackUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:' || (url.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname));
+  } catch { return false; }
 }

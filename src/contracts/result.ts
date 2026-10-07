@@ -1,4 +1,5 @@
 import { ErrorCollector, checkKeys, checkObject, checkString, isSafeId, isUtcTimestamp, type ValidationResult } from './validate.js';
+import { isSafeRelativePath } from '../storage/local-paths.js';
 
 export const RUN_RESULT_SCHEMA_VERSION = 1 as const;
 
@@ -54,6 +55,8 @@ export interface RunResult {
   persistenceReason?: string;
   /** Commit published by a profile-workspace worker; never contains credentials. */
   repositoryCommit?: string;
+  /** Run-scoped API saveback manifest confirmed after all profile bytes were uploaded. */
+  profileChanges?: { files: Array<{ path: string; sha256: string; size: number }>; deletes: string[] };
   /**
    * Уборка чистой среды — тоже отдельный статус (issue #52, шаг 5).
    * `completed` означает проверенный контракт уборки (каталоги и сокет рана сняты,
@@ -99,6 +102,7 @@ const RESULT_KEYS = [
   'persistence',
   'persistenceReason',
   'repositoryCommit',
+  'profileChanges',
   'cleanup',
   'cleanupReason',
   'logPath',
@@ -113,7 +117,7 @@ const OUTCOME_EXIT_REASONS: Record<RunOutcome, readonly ExitReason[]> = {
 export function validateRunResult(input: unknown): ValidationResult<RunResult> {
   const collector = new ErrorCollector();
   if (!checkObject(input, 'result', collector)) return collector.finish(undefined as never);
-  const optional = new Set(['failure', 'persistenceReason', 'repositoryCommit', 'cleanupReason', 'text']);
+  const optional = new Set(['failure', 'persistenceReason', 'repositoryCommit', 'profileChanges', 'cleanupReason', 'text']);
   const required = RESULT_KEYS.filter((key) => !optional.has(key));
   checkKeys(input, RESULT_KEYS, required, 'result', collector);
 
@@ -143,6 +147,25 @@ export function validateRunResult(input: unknown): ValidationResult<RunResult> {
   if (input['exitCode'] !== null && typeof input['exitCode'] !== 'number') collector.push('result.exitCode: expected number or null');
   if (input['exitSignal'] !== null && typeof input['exitSignal'] !== 'string') collector.push('result.exitSignal: expected string or null');
   if (input['repositoryCommit'] !== undefined && (typeof input['repositoryCommit'] !== 'string' || !/^[0-9a-f]{40}$/.test(input['repositoryCommit']))) collector.push('result.repositoryCommit: expected commit sha');
+  if (input['profileChanges'] !== undefined) {
+    const manifest = input['profileChanges'];
+    if (typeof manifest !== 'object' || manifest === null || Array.isArray(manifest)) collector.push('result.profileChanges: expected object');
+    else {
+      const value = manifest as Record<string, unknown>;
+      if (Object.keys(value).some((key) => key !== 'files' && key !== 'deletes')) collector.push('result.profileChanges: unexpected property');
+      if (!Array.isArray(value['files'])) collector.push('result.profileChanges.files: expected array');
+      else value['files'].forEach((raw, index) => {
+        const entry = raw as Record<string, unknown>;
+        if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) { collector.push(`result.profileChanges.files[${index}]: expected object`); return; }
+        if (Object.keys(entry).some((key) => !['path', 'sha256', 'size'].includes(key))) collector.push(`result.profileChanges.files[${index}]: unexpected property`);
+        if (typeof entry['path'] !== 'string' || !isSafeRelativePath(entry['path'])) collector.push(`result.profileChanges.files[${index}].path: expected safe relative path`);
+        if (typeof entry['sha256'] !== 'string' || !/^[0-9a-f]{64}$/.test(entry['sha256'])) collector.push(`result.profileChanges.files[${index}].sha256: expected sha256`);
+        if (typeof entry['size'] !== 'number' || !Number.isSafeInteger(entry['size']) || entry['size'] < 0) collector.push(`result.profileChanges.files[${index}].size: expected non-negative integer`);
+      });
+      if (!Array.isArray(value['deletes'])) collector.push('result.profileChanges.deletes: expected array');
+      else value['deletes'].forEach((path, index) => { if (typeof path !== 'string' || !isSafeRelativePath(path)) collector.push(`result.profileChanges.deletes[${index}]: expected safe relative path`); });
+    }
+  }
   if (typeof input['exitObserved'] !== 'boolean') collector.push('result.exitObserved: expected boolean');
   if (!isUtcTimestamp(input['startedAt'])) collector.push('result.startedAt: expected UTC ISO timestamp');
   if (!isUtcTimestamp(input['finishedAt'])) collector.push('result.finishedAt: expected UTC ISO timestamp');

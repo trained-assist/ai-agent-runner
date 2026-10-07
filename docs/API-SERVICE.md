@@ -116,9 +116,15 @@ Export policy остаётся границей для PII/секретов: и�
 Для внешнего Runner profile snapshot storage должен поддерживать signed HTTPS download
 URL; production-конфигурация — GCS. `local-fs` остаётся только для локальных операций
 WorkspaceService и не может обслужить внешний snapshot.
-Ключи в `AGENT_API_KEY_REGISTRY` должны задавать `tenantId` и `profileId`. GHA worker
-получает snapshot через подписанную ссылку, а saveback отправляет API; profile-run не
-нуждается в GCS Workload Identity.
+Ключи в `AGENT_API_KEY_REGISTRY` должны задавать `tenantId` и `profileId`. France VM и
+GHA worker используют один snapshot/saveback-контракт: обе среды получают подписанный
+snapshot и run-scoped capability, загружают изменения в API, а публикацию в Git выполняет
+только API. Ни VM, ни GHA не нужны GitHub credentials или GCS Workload Identity. Воркеры
+выбираются по обычной цепочке France → Russia → GHA; VM старой версии обязана вернуть
+`501 WORKER_PROFILE_WORKSPACE_UNSUPPORTED` до admission, после чего API может безопасно
+перейти к следующему движку. После admission переключения нет. Перед включением France
+первым слотом нужно обновить VM до сборки с `supportsProfileSaveback()` и проверить live
+snapshot → изменение/удаление → API publication → следующий snapshot.
 
 Переменных данных больше нет: `AGENT_API_DATA_DIR`, `ARTIFACT_SHARE_SECRET`,
 `ARTIFACT_BASE_URL`, `AGENT_API_RELEASE_MANIFEST`, `AGENT_API_FAULTS` сервис не читает.

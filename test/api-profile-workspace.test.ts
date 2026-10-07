@@ -80,8 +80,8 @@ describe('profile workspace lifecycle', () => {
     expect(() => api.submit(principal, 'foreign-repo', { ...body, repository: { fullName: 'another/repo' } })).toThrowError(expect.objectContaining({ code: 'INVALID_REPOSITORY' }));
   });
 
-  it('sends profile snapshot runs to GHA and skips VM workers that still require git credentials', async () => {
-    const eu = await startMockWorker();
+  it('tries France first and falls back to GHA only when the VM explicitly rejects saveback before admission', async () => {
+    const eu = await startMockWorker({ httpStatus: 501, admissionRefusal: 'WORKER_PROFILE_WORKSPACE_UNSUPPORTED' });
     const gha = await startMockWorker();
     onTestFinished(() => eu.close());
     onTestFinished(() => gha.close());
@@ -105,7 +105,7 @@ describe('profile workspace lifecycle', () => {
     delete request['engine'];
     const receipt = api.submit(principal, 'profile-saveback-engine-choice', request);
     await waitFor(api, receipt.runId, 'succeeded');
-    expect(eu.launches).toHaveLength(0);
+    expect(eu.launches).toHaveLength(1);
     expect(gha.launches).toHaveLength(1);
     expect((gha.launches[0]?.['profileWorkspace'] as Record<string, unknown>)?.['snapshotUrl']).toBe('https://storage.googleapis.com/snapshot');
   });
