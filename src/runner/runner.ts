@@ -14,6 +14,7 @@ import type { RunResult } from '../contracts/result.js';
 import type { RunSpec } from '../contracts/run-spec.js';
 import { stripRepositoryToken, validateRunSpec } from '../contracts/run-spec.js';
 import { ConflictError, PreflightError, SpecValidationError } from '../contracts/validate.js';
+import { runnerEventToErrorEvent, type ErrorPublisher } from '../contracts/error-publisher.js';
 import { FaultInjectedError, FaultRegistry, type FaultPoint } from '../faults/registry.js';
 import { RunStore, type PersistedRunState } from './run-store.js';
 import { cloneRepository, resolveCloneSource } from './repository.js';
@@ -145,6 +146,12 @@ export interface RunnerOptions {
   mcpBrokerCommand?: { command: string; args: string[] };
   /** If false, a queued run recovered after a process restart is failed closed instead of relaunched. */
   resumeQueuedRuns?: boolean;
+  /**
+   * Публикация error-событий рана в Error Watcher (C12). Вызывается после записи в журнал,
+   * fire-and-forget: отказ публикации не влияет на ран (spool + счётчик сбросов на стороне
+   * издателя).
+   */
+  errorPublisher?: ErrorPublisher;
 }
 
 export interface StartReceipt {
@@ -1025,6 +1032,11 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
     st.sequence = event.sequence;
     st.updatedAt = this.nowIso();
     this.store.saveState(st);
+    const publisher = this.opts.errorPublisher;
+    if (publisher) {
+      const errorEvent = runnerEventToErrorEvent(event);
+      if (errorEvent) void publisher.publishError(errorEvent);
+    }
   }
 
   private async fireFault(point: FaultPoint, runId?: string): Promise<void> {
