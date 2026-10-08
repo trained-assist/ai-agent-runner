@@ -225,17 +225,17 @@ export async function startMockWorker(options: MockWorkerOptions = {}): Promise<
       // исключение: он закончен отменой, и результат обязан вернуться, даже если настроенный
       // терминальный статус воркера — `running` (иначе отмена не закрыла бы ран).
       const resultMatch = /^\/v1\/runs\/([^/]+)\/result$/.exec(url.pathname);
-        if (resultMatch) {
-          const runId = resultMatch[1]!;
-          const sequenceStatus = settings.resultHttpStatusSequence?.[resultHttpStatusIndex++];
-          const resultHttpStatus = sequenceStatus ?? settings.resultHttpStatus;
-          if (resultHttpStatus !== undefined) {
-            res.writeHead(resultHttpStatus, { 'content-type': 'text/plain' });
-            res.end('upstream worker unavailable');
-            return;
-          }
-          const record = [...live].find((entry) => entry.runId === runId);
-          if (!record || record.pending || (!TERMINAL.has(settings.terminalStatus) && !record.cancelled)) {
+      if (resultMatch) {
+        const runId = resultMatch[1]!;
+        const sequenceStatus = settings.resultHttpStatusSequence?.[resultHttpStatusIndex++];
+        const resultHttpStatus = sequenceStatus ?? settings.resultHttpStatus;
+        if (resultHttpStatus !== undefined) {
+          res.writeHead(resultHttpStatus, { 'content-type': 'text/plain' });
+          res.end('upstream worker unavailable');
+          return;
+        }
+        const record = [...live].find((entry) => entry.runId === runId);
+        if (!record || record.pending || (!TERMINAL.has(settings.terminalStatus) && !record.cancelled)) {
           res.writeHead(409, { 'content-type': 'application/json' });
           res.end(JSON.stringify({ runId, status: 'not_ready' }));
           return;
