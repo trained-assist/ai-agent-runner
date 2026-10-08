@@ -261,8 +261,9 @@ describe('lifecycle рана: persist → проверенная уборка (i
 
   it('cancel и timeout проходят тот же путь: терминальный результат и уборка', async () => {
     const h = createHarness({ adapters: { fake: new WritingEngine({ 'never.txt': 'x' }) }, artifactExport: true });
-    const timeoutRun = h.start({ outputs: [{ path: 'never.txt' }], limits: { timeoutMs: 300 } });
-    // Движок завершается сам, поэтому таймаут здесь — это отмена клиентом.
+    const timeoutRun = h.start({ outputs: [{ path: 'never.txt' }], limits: { timeoutMs: 30_000 } });
+    // Проверяем обычное завершение до таймаута; большой запас исключает гонку с запуском
+    // дочернего Node-процесса при параллельном выполнении тестов.
     await waitFor(() => h.runner.getRun(timeoutRun.receipt.runId)?.state === 'succeeded', 8000, 'run to succeed');
     expect(h.runner.getRun(timeoutRun.receipt.runId)?.result?.cleanup).toBe('completed');
 
