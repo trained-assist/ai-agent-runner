@@ -63,6 +63,7 @@ export interface HttpHarnessOptions {
   env?: Record<string, string>;
   store?: StatelessStore;
   mockTestEnabled?: boolean;
+  defaultRepository?: string;
   allowedEngines?: string[];
   mockOnly?: boolean;
 }
@@ -89,6 +90,7 @@ export async function startHttpHarness(options: HttpHarnessOptions = {}): Promis
   const service = new AgentApi({
     workers: adapter ? [adapter] : [],
     ...(options.mockTestEnabled ? { mockTestEnabled: true } : {}),
+    ...(options.defaultRepository !== undefined ? { defaultRepository: options.defaultRepository } : {}),
     logger,
     env: options.env ?? {},
     ...(options.store ? { store: options.store } : {}),

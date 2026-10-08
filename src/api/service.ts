@@ -1318,7 +1318,9 @@ private buildSpec(
     if (request.outputs !== undefined) spec.outputs = request.outputs;
     if (request.traceId !== undefined) spec.traceId = request.traceId;
     if (request.repository !== undefined) spec.repository = request.repository;
-    else if (this.opts.defaultRepository !== undefined) spec.repository = { fullName: this.opts.defaultRepository };
+    else if (context.engine.name !== MOCK_TEST_ENGINE && this.opts.defaultRepository !== undefined) {
+      spec.repository = { fullName: this.opts.defaultRepository };
+    }
     if (request.isolation !== undefined) spec.isolation = request.isolation;
     if (request.ingressManifest !== undefined) {
       spec.ingressManifest = {

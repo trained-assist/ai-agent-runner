@@ -126,6 +126,16 @@ describe('http submit, status, result, artifacts, events and cancel', () => {
     expect(h.worker.launches).toHaveLength(0);
   });
 
+  it('mock-test ignores the external worker default repository binding', async () => {
+    const h = await startHttpHarness({ mockTestEnabled: true, mockOnly: true, defaultRepository: 'invalid default repo' });
+    const body = submitBody({ engine: { name: 'mock-test', adapterVersion: '1' }, userTaskId: 'task-mock-with-invalid-default-repo' });
+    const accepted = await postSubmit(h.base, alphaKey, 'mock-invalid-default-repo', body);
+    expect(accepted.status).toBe(202);
+    const receipt = await accepted.json() as { runId: string };
+    expect(await waitForTerminal(h.base, alphaKey, receipt.runId)).toBe('succeeded');
+    expect(await (await getStatus(h.base, alphaKey, receipt.runId)).json()).toMatchObject({ engine: 'mock-test', answer: 'pong' });
+  });
+
   it('runs in mock-only API mode without configuring or contacting any external worker', async () => {
     const h = await startHttpHarness({ mockTestEnabled: true, mockOnly: true });
     const body = submitBody({ engine: { name: 'mock-test', adapterVersion: '1' } });
