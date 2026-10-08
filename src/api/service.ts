@@ -1048,7 +1048,8 @@ export class AgentApi {
         this.markUnknown(record, 'profile_publication_failed');
         return false;
       }
-      if (!(err instanceof PreflightError && ['WORKER_PROTOCOL_INVALID', 'LAUNCH_RESULT_INVALID'].includes(err.code))) {
+      const retryableTransportFailure = err instanceof PreflightError ? err.retryable : true;
+      if (retryableTransportFailure) {
         this.log({ event: 'worker_result_failed', runId: record.runId, reason: 'result_transport_unknown' });
         this.markUnknown(record, 'result_transport_unknown');
         return false;

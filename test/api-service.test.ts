@@ -226,6 +226,24 @@ describe('временные HTTP-сбои внешнего воркера', () 
       await worker.close();
     }
   });
+
+  it('некорректный успешный result остаётся терминальной ошибкой протокола', async () => {
+    const worker = await startMockWorker({ malformedResult: true });
+    worker.autoDeliver = false;
+    const api = new AgentApi({ workers: [adapterFor(worker)] });
+    try {
+      const receipt = api.submit(alpha, 'idem-malformed-result-terminal', body({ limits: { timeoutMs: 5000 } }));
+      await waitForState(api, alpha, receipt.runId, 'failed');
+
+      expect(api.result(alpha, receipt.runId).failure).toMatchObject({
+        code: 'WORKER_PROTOCOL_INVALID', retryable: false,
+      });
+      expect(worker.launches).toHaveLength(1);
+    } finally {
+      await api.dispose();
+      await worker.close();
+    }
+  });
 });
 
 describe('stateless AgentApi: финализация', () => {

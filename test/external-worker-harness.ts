@@ -398,6 +398,7 @@ function buildResult(runId: string, exitReason: string, settings: MockWorkerOpti
     ...(settings.resultFailure ? { failure: settings.resultFailure } : {}),
   };
   if (settings.omitProfileChanges) delete result['profileChanges'];
+  if (settings.malformedResult) delete result['artifacts'];
   return result;
 }
 
