@@ -74,13 +74,14 @@ jobs:
             "$SOURCE_SHA" "$SOURCE_REF" "$(node -p "require('$SOURCE_DIR/package.json').version")" > "$STAGE/candidate-manifest.json"
           npm ci --omit=dev --prefix "$STAGE" --no-audit --no-fund
           tar -czf "$RUNNER_TEMP/runner-api-sandbox-candidate.tar.gz" -C "$STAGE" candidate-manifest.json package.json package-lock.json dist node_modules scripts
+          tar -tzf "$RUNNER_TEMP/runner-api-sandbox-candidate.tar.gz" > "$RUNNER_TEMP/candidate-files.txt"
           for required in \
             candidate-manifest.json \
             scripts/install-api-sandbox-candidate.sh \
             scripts/rollback-api-sandbox-candidate.sh \
             scripts/provision-api-sandbox-principal.sh \
             scripts/enable-api-sandbox-mock-test.py; do
-            tar -tzf "$RUNNER_TEMP/runner-api-sandbox-candidate.tar.gz" | grep -Fxq "$required" || {
+            grep -Fxq "$required" "$RUNNER_TEMP/candidate-files.txt" || {
               printf 'candidate bundle missing required file: %s\n' "$required" >&2
               exit 1
             }
