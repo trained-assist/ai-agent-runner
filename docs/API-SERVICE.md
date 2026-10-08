@@ -70,6 +70,8 @@ API больше не используется** и удаляется отде�
 | `AGENT_API_PROFILE_WORKSPACE_ROOT` | — (выключено) | включает постоянный профиль для каждого Run; устойчивый каталог журнала и bare-зеркал Git |
 | `AGENT_API_PROFILE_OWNER` | — | организация приватных репозиториев профиля; обязательна при включении профиля |
 | `AGENT_API_PROFILE_GITHUB_TOKEN` | — | хостовый токен GitHub для ensure/fetch/publish; не попадает в агентское окружение или журнал |
+| `AGENT_API_PROFILE_TENANT_ROUTES_JSON` | `{}` | необязательная host-only таблица `tenantId → {owner, tokenEnv}`; `tokenEnv` ссылается на имя переменной с credential, значение секрета не помещается в JSON |
+| `AGENT_API_PROFILE_REQUIRE_TENANT_ROUTE` | `false` | при `true` API отказывает tenant без явного маршрута; используйте для выделенного synthetic/test API lane |
 | `AGENT_API_PROFILE_OBJECT_BACKEND` | `gcs` | хранилище тяжёлых файлов; `local-fs` только для локального fixture, GCS использует `GCS_BUCKET` и ADC |
 | `GCP_PROJECT` / `GOOGLE_CLOUD_PROJECT` | — | ID проекта GCS; задавайте явно при Workload Identity Federation, чтобы чтение метаданных объекта не запрашивало доступ к Cloud Resource Manager |
 | `AGENT_API_PUBLIC_URL` | `http://<host>:<port>` | публичная база API: воркер возвращает результат на `POST {resultUrl}`. Можно задать префикс reverse proxy (например, `https://runner.example/profile-api`); proxy должен передавать callback-маршруты `/v1/worker/launches/{runId}/result` и `/profile-changes` в API без изменения пути. Без URL запуск падает с `RESULT_URL_UNSET` |
@@ -113,6 +115,14 @@ Export policy остаётся границей для PII/секретов: и�
 томе, `AGENT_API_ADMISSION_LOG` на том же постоянном томе, `AGENT_API_PROFILE_OWNER`,
 `AGENT_API_PROFILE_GITHUB_TOKEN`, `AGENT_API_PROFILE_OBJECT_BACKEND=gcs`, `GCS_BUCKET`
 и `GCP_PROJECT` (либо `GOOGLE_CLOUD_PROJECT`) при WIF.
+Тестовый owner задаётся только операторской конфигурацией, например tenant route с owner
+`profile-artifacts-sandbox` и именем переменной для отдельного GitHub credential. API key
+реестра доверенно определяет `tenantId`; run body, display name и prompt не могут менять
+owner. В выделенном test lane включайте `AGENT_API_PROFILE_REQUIRE_TENANT_ROUTE=true`, чтобы
+неизвестный тестовый tenant не упал назад на обычный owner. Изменение маршрута для уже
+привязанного профиля завершается отказом до GitHub операции. Для явно маршрутизированных
+tenant журнал, локальные Git-зеркала и saveback-файлы изолированы в подкаталоге с хэшем
+`tenantId`; remote object keys по-прежнему требуют уникального trusted `profileId`.
 Для внешнего Runner profile snapshot storage должен поддерживать signed HTTPS download
 URL; production-конфигурация — GCS. `local-fs` остаётся только для локальных операций
 WorkspaceService и не может обслужить внешний snapshot.
