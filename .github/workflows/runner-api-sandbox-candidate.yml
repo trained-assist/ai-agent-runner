@@ -68,6 +68,8 @@ jobs:
           cp -R "$SOURCE_DIR/dist/." "$STAGE/dist/"
           cp "$GITHUB_WORKSPACE/deployment-tools/scripts/install-api-sandbox-candidate.sh" "$STAGE/scripts/"
           cp "$GITHUB_WORKSPACE/deployment-tools/scripts/rollback-api-sandbox-candidate.sh" "$STAGE/scripts/"
+          cp "$GITHUB_WORKSPACE/deployment-tools/scripts/provision-api-sandbox-principal.sh" "$STAGE/scripts/"
+          cp "$GITHUB_WORKSPACE/deployment-tools/scripts/enable-api-sandbox-mock-test.py" "$STAGE/scripts/"
           printf '{"target":"agent-runner-api-mcp-test","sourceSha":"%s","sourceRef":"%s","packageVersion":"%s"}\n' \
             "$SOURCE_SHA" "$SOURCE_REF" "$(node -p "require('$SOURCE_DIR/package.json').version")" > "$STAGE/candidate-manifest.json"
           npm ci --omit=dev --prefix "$STAGE" --no-audit --no-fund

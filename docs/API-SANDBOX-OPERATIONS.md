@@ -55,6 +55,25 @@ the prior unit and code pointer. The installer keeps the prior release and
 provides `/usr/local/sbin/runner-api-mcp-test-rollback SOURCE_SHA` for an
 explicit rollback.
 
+The candidate installer explicitly enables `AGENT_API_ENVIRONMENT=sandbox` and
+`AGENT_API_ENABLE_MOCK_TEST=true` only in the protected EnvironmentFile for this
+named test service. The installed root-only helper
+`runner-api-mcp-test-provision-principal` accepts a strict JSON request on stdin
+containing only `schemaVersion`, the fixed target name, and a SHA-256 key hash.
+It adds the fixed `integration-telegram-ux-v1-mock-test` principal with
+`runs:read`, `runs:write`, and the `mock-test` engine allowlist to the isolated
+registry. It never accepts the raw key, updates other principals, or modifies
+the production API registry. The file-backed registry reloads the atomic update
+without restarting the service.
+
+This helper is the Runner half of credential provisioning. The CP-owned
+bootstrap still has to generate the raw key in memory, pass only its hash to
+this helper over the declared operator channel, and write the raw key directly
+to `RUNNER_API_KEY_TELEGRAM_UX` on the isolated CP Worker. Until that paired
+operation and an authenticated CP→Runner probe are implemented, the helper
+alone does not establish a usable identity and the sandbox must not be reported
+`READY`.
+
 The sandbox MCP configuration is pinned to the `trained-assist-mcp-host-test-160`
 Worker URL, `registry.fixture_read`, `registry:fixture-read`, the fixed policy,
 catalogue, and Registry digest. The existing test environment names remain

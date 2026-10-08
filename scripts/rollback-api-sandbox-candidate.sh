@@ -19,9 +19,11 @@ log() { printf '[runner-api-sandbox] %s\n' "$1"; }
 [[ "$(systemctl show "$SERVICE" -p FragmentPath --value)" == "$UNIT_FILE" ]] || die 'service unit is not the isolated MCP test unit'
 STATE="$ROOT/rollback/$SOURCE_SHA"
 [[ -f "$STATE/unit.before" ]] || die 'rollback state for this candidate is missing'
+[[ -f "$STATE/env.before" ]] || die 'rollback environment state for this candidate is missing'
 
 systemctl stop "$SERVICE"
 cp -p "$STATE/unit.before" "$UNIT_FILE"
+cp -p "$STATE/env.before" "$ENV_FILE"
 if [[ -f "$STATE/current.before" ]]; then
   previous="$(cat "$STATE/current.before")"
   [[ "$previous" == /opt/sb/ai-agent-runner-api-mcp-test/releases/* && -d "$previous" ]] || die 'saved prior release is invalid'
