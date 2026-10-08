@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { generateApiKey, hashApiKey, KeyRegistry } from '../src/api/auth.js';
-import { parseSandboxPrincipalProvisionRequest } from '../src/ops/sandbox-principal-provisioner-cli.js';
+import { isSandboxPrincipalProvisionerEntrypoint, parseSandboxPrincipalProvisionRequest } from '../src/ops/sandbox-principal-provisioner-cli.js';
 import { provisionSandboxMockPrincipal, SANDBOX_TEST_PRINCIPAL } from '../src/ops/sandbox-principal-registry.js';
 
 const directories: string[] = [];
@@ -24,6 +24,17 @@ afterEach(() => {
 });
 
 describe('sandbox mock-test principal provisioning', () => {
+  it('recognizes a provisioner CLI invoked through the current release symlink', () => {
+    const { dir } = fixture();
+    const target = join(dir, 'provisioner.js');
+    const link = join(dir, 'current-provisioner.js');
+    writeFileSync(target, '');
+    symlinkSync(target, link);
+    expect(isSandboxPrincipalProvisionerEntrypoint(link, target)).toBe(true);
+    expect(isSandboxPrincipalProvisionerEntrypoint(undefined, target)).toBe(false);
+    expect(isSandboxPrincipalProvisionerEntrypoint(join(dir, 'missing.js'), target)).toBe(false);
+  });
+
   it('adds a hash-only, minimally scoped principal atomically and is idempotent', () => {
     const { path } = fixture();
     const rawKey = generateApiKey();

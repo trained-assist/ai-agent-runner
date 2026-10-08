@@ -1,7 +1,6 @@
 #!/usr/bin/env node
-import { readSync } from 'node:fs';
+import { readSync, realpathSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { resolve } from 'node:path';
 import { provisionSandboxMockPrincipal } from './sandbox-principal-registry.js';
 
 const REGISTRY_PATH = '/etc/agent-runner/key-registry-mcp-test.json';
@@ -29,6 +28,11 @@ export function provisionSandboxPrincipalRequest(raw: string, registryPath = REG
   return provisionSandboxMockPrincipal(registryPath, keyHash);
 }
 
+export function isSandboxPrincipalProvisionerEntrypoint(argvPath: string | undefined, modulePath: string): boolean {
+  if (!argvPath) return false;
+  try { return realpathSync(argvPath) === realpathSync(modulePath); } catch { return false; }
+}
+
 function main(): void {
   if (process.getuid?.() !== 0) throw new Error('sandbox_principal_requires_root');
   const chunks: Buffer[] = [];
@@ -46,7 +50,7 @@ function main(): void {
   process.stdout.write(`${JSON.stringify({ status: result.changed ? 'registered' : 'already_registered', ...result })}\n`);
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+if (isSandboxPrincipalProvisionerEntrypoint(process.argv[1], fileURLToPath(import.meta.url))) {
   try { main(); } catch (error) {
     const code = error instanceof Error ? error.message : 'sandbox_principal_provision_failed';
     process.stderr.write(`[sandbox-principal] ${code}\n`);
