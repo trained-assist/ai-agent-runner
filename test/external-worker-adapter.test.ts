@@ -573,6 +573,32 @@ describe('ExternalWorkerAdapter по HTTP', () => {
     }
   });
 
+  it('HTTP 502 на status остаётся retryable worker HTTP error, а не нарушением контракта', async () => {
+    const worker = await startMockWorker({ statusHttpStatus: 502 });
+    try {
+      const adapter = adapterFor(worker);
+      const receipt = await adapter.launch(makeRunSpec({ runId: 'run-http-status-502', input: { inlinePrompt: 'x' } }));
+      await expect(adapter.status(receipt.runId)).rejects.toMatchObject({
+        code: 'WORKER_HTTP_ERROR', failureClass: 'runtime', retryable: true,
+      });
+    } finally {
+      await worker.close();
+    }
+  });
+
+  it('HTTP 502 на result остаётся retryable worker HTTP error, а не ResultNotReady', async () => {
+    const worker = await startMockWorker({ resultHttpStatus: 502 });
+    try {
+      const adapter = adapterFor(worker);
+      const receipt = await adapter.launch(makeRunSpec({ runId: 'run-http-result-502', input: { inlinePrompt: 'x' } }));
+      await expect(adapter.result(receipt.runId)).rejects.toMatchObject({
+        code: 'WORKER_HTTP_ERROR', failureClass: 'runtime', retryable: true,
+      });
+    } finally {
+      await worker.close();
+    }
+  });
+
   it('cancel ходит на POST /v1/runs/{runId}/cancel', async () => {
     const worker = await startMockWorker();
     try {

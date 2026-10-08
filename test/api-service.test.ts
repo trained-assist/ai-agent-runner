@@ -180,6 +180,54 @@ describe('stateless AgentApi: приём запроса', () => {
   });
 });
 
+describe('временные HTTP-сбои внешнего воркера', () => {
+  it('повторные HTTP 502 на status сохраняют run как unknown и не отправляют новый launch', async () => {
+    const worker = await startMockWorker({ statusHttpStatus: 502 });
+    worker.autoDeliver = false;
+    const api = new AgentApi({ workers: [adapterFor(worker)] });
+    try {
+      const receipt = api.submit(alpha, 'idem-status-http-502', body({ limits: { timeoutMs: 5000 } }));
+      await waitForState(api, alpha, receipt.runId, 'unknown');
+      expect(api.status(alpha, receipt.runId).state).toBe('unknown');
+      expect(worker.launches).toHaveLength(1);
+    } finally {
+      await api.dispose();
+      await worker.close();
+    }
+  });
+
+  it('повторные HTTP 502 при чтении результата сохраняют run как unknown и не запускают второй run', async () => {
+    const worker = await startMockWorker({ resultHttpStatus: 502 });
+    worker.autoDeliver = false;
+    const api = new AgentApi({ workers: [adapterFor(worker)] });
+    try {
+      const receipt = api.submit(alpha, 'idem-result-http-502', body({ limits: { timeoutMs: 5000 } }));
+      await waitForState(api, alpha, receipt.runId, 'unknown');
+      expect(api.status(alpha, receipt.runId).state).toBe('unknown');
+      expect(worker.launches).toHaveLength(1);
+    } finally {
+      await api.dispose();
+      await worker.close();
+    }
+  });
+
+  it('повторяет чтение после временного HTTP 502 и завершает тот же run', async () => {
+    const worker = await startMockWorker({ resultHttpStatusSequence: [502] });
+    worker.autoDeliver = false;
+    const api = new AgentApi({ workers: [adapterFor(worker)] });
+    try {
+      const receipt = api.submit(alpha, 'idem-result-http-502-recover', body({ limits: { timeoutMs: 5000 } }));
+      await waitForState(api, alpha, receipt.runId, 'succeeded');
+
+      expect(api.result(alpha, receipt.runId).outcome).toBe('succeeded');
+      expect(worker.launches).toHaveLength(1);
+    } finally {
+      await api.dispose();
+      await worker.close();
+    }
+  });
+});
+
 describe('stateless AgentApi: финализация', () => {
   it('result доступен только после терминального состояния, иначе RESULT_NOT_READY', async () => {
     const api = await makeApi({ delayMs: 200 });

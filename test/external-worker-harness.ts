@@ -44,6 +44,10 @@ export interface MockWorkerOptions {
   runningStatus?: 'running';
   /** Ответить HTTP-ошибкой на запрос статуса: воркер недоступен для reconcile (#73, п. 4). */
   statusHttpStatus?: number;
+  /** Ответить HTTP-ошибкой на получение результата. */
+  resultHttpStatus?: number;
+  /** Ответить кодами по очереди на получение результата, после чего отдавать штатный результат. */
+  resultHttpStatusSequence?: number[];
   /** Задержать ответ на статус: воркер жив, но отвечает дольше бюджета reconcile. */
   statusDelayMs?: number;
   /** Expose a controllable live stdout/stderr SSE endpoint for API streaming tests. */
@@ -91,6 +95,7 @@ export async function startMockWorker(options: MockWorkerOptions = {}): Promise<
   const finishedLogStreams = new Set<string>();
   const logCursors: number[] = [];
   let lastAuthorization: string | undefined;
+  let resultHttpStatusIndex = 0;
 
   const defaults = {
     exitReason: 'completed' as const,
@@ -216,12 +221,19 @@ export async function startMockWorker(options: MockWorkerOptions = {}): Promise<
         return;
       }
 
-// Результат рана: отдаём только когда ран терминальный, иначе 409. Отменённый ран —
-        // исключение: он закончен отменой, и результат обязан вернуться, даже если настроенный
-        // терминальный статус воркера — `running` (иначе отмена не закрыла бы ран).
-        const resultMatch = /^\/v1\/runs\/([^/]+)\/result$/.exec(url.pathname);
+      // Результат рана: отдаём только когда ран терминальный, иначе 409. Отменённый ран —
+      // исключение: он закончен отменой, и результат обязан вернуться, даже если настроенный
+      // терминальный статус воркера — `running` (иначе отмена не закрыла бы ран).
+      const resultMatch = /^\/v1\/runs\/([^/]+)\/result$/.exec(url.pathname);
         if (resultMatch) {
           const runId = resultMatch[1]!;
+          const sequenceStatus = settings.resultHttpStatusSequence?.[resultHttpStatusIndex++];
+          const resultHttpStatus = sequenceStatus ?? settings.resultHttpStatus;
+          if (resultHttpStatus !== undefined) {
+            res.writeHead(resultHttpStatus, { 'content-type': 'text/plain' });
+            res.end('upstream worker unavailable');
+            return;
+          }
           const record = [...live].find((entry) => entry.runId === runId);
           if (!record || record.pending || (!TERMINAL.has(settings.terminalStatus) && !record.cancelled)) {
           res.writeHead(409, { 'content-type': 'application/json' });
