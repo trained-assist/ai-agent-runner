@@ -8,6 +8,7 @@ import { AgentApi, type ApiLogger } from './service.js';
 import { loadAgentApiConfig, requireKeyRegistry } from './config.js';
 import { createExternalWorkers } from './workers.js';
 import { createProfileWorkspaceCoordinator } from './profile-workspace.js';
+import { parseTenantProfileRoutes, requireTenantProfileRoute } from './profile-routing.js';
 
 /** Путь журнала приёмных записей: явный env, без значения — дедупликация только в памяти. */
 function admissionLogFile(raw: string | undefined): string | null {
@@ -33,10 +34,14 @@ async function main(): Promise<void> {
   if (profileRoot && !admissionLogPath) throw new Error('AGENT_API_ADMISSION_LOG is required with profile workspace');
   const objectBackend = process.env['AGENT_API_PROFILE_OBJECT_BACKEND']?.trim() ?? 'gcs';
   if (profileRoot && objectBackend !== 'gcs' && objectBackend !== 'local-fs') throw new Error('AGENT_API_PROFILE_OBJECT_BACKEND must be gcs or local-fs');
+  const tenantRoutes = parseTenantProfileRoutes(process.env['AGENT_API_PROFILE_TENANT_ROUTES_JSON'], process.env);
+  const requireTenantRoute = requireTenantProfileRoute(process.env['AGENT_API_PROFILE_REQUIRE_TENANT_ROUTE']);
   const profileWorkspace = profileRoot ? createProfileWorkspaceCoordinator({
     rootDir: profileRoot,
     owner: process.env['AGENT_API_PROFILE_OWNER']?.trim() ?? '',
     token: process.env['AGENT_API_PROFILE_GITHUB_TOKEN']?.trim() ?? '',
+    tenantRoutes,
+    requireTenantRoute,
     objectBackend: objectBackend as 'gcs' | 'local-fs',
     env: process.env,
   }) : undefined;
