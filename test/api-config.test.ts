@@ -20,6 +20,17 @@ const base = {
 };
 
 describe('конфигурация воркеров', () => {
+  it('enables mock-test only for an explicitly declared sandbox and rejects production', () => {
+    const external = { ...base, EXTERNAL_WORKER_URL: 'http://127.0.0.1:8788' };
+    expect(loadAgentApiConfig(external).mockTestEnabled).toBe(false);
+    expect(loadAgentApiConfig({ ...external, AGENT_API_ENABLE_MOCK_TEST: 'true', AGENT_API_ENVIRONMENT: 'sandbox' }).mockTestEnabled).toBe(true);
+    expect(loadAgentApiConfig({ ...base, AGENT_API_ENABLE_MOCK_TEST: 'true', AGENT_API_ENVIRONMENT: 'sandbox' }).workers).toEqual([]);
+    expect(loadAgentApiConfig({ ...base, AGENT_API_WORKERS: '[]', AGENT_API_ENABLE_MOCK_TEST: 'true', AGENT_API_ENVIRONMENT: 'sandbox' }).workers).toEqual([]);
+    expect(() => loadAgentApiConfig({ ...external, AGENT_API_ENABLE_MOCK_TEST: 'true', NODE_ENV: 'production', AGENT_API_ENVIRONMENT: 'sandbox' })).toThrow(/cannot be enabled when NODE_ENV=production/);
+    expect(() => loadAgentApiConfig({ ...external, AGENT_API_ENABLE_MOCK_TEST: 'true' })).toThrow(/requires AGENT_API_ENVIRONMENT=sandbox/);
+    expect(() => loadAgentApiConfig({ ...external, AGENT_API_ENABLE_MOCK_TEST: 'yes', AGENT_API_ENVIRONMENT: 'sandbox' })).toThrow(/must be true or false/);
+  });
+
   it('accepts a PKCS#8 DER signing key encoded for a single-line service secret', () => {
     const { privateKey } = generateKeyPairSync('ed25519');
     const privateKeyPkcs8DerBase64 = privateKey.export({ type: 'pkcs8', format: 'der' }).toString('base64');

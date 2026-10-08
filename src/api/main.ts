@@ -53,6 +53,7 @@ async function main(): Promise<void> {
     env: config.env,
     // Цепочка движков (issue #100): null = ран идёт ровно на названный клиентом движок.
     engineChain: config.engineChain ?? undefined,
+    mockTestEnabled: config.mockTestEnabled,
     // Бюджет reconcile: мёртвый движок не должен вешать проверку на таймаут запуска.
     reconcileDeadlineMs: config.reconcileDeadlineMs,
     ...(config.defaultRepository ? { defaultRepository: config.defaultRepository } : {}),

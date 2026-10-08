@@ -64,6 +64,8 @@ API больше не используется** и удаляется отде�
 | `AGENT_API_ENV` | `{}` | JSON-пул значений окружения; в воркер уходят только те, что перечислил клиент в `envAllowlist` |
 | `AGENT_API_WORKERS` | — | JSON-список `[{engine, baseUrl, token, acceptDeadlineMs?}]` — несколько движков |
 | `AGENT_API_ENGINE_CHAIN` | — | приоритетная цепочка движков через запятую, в порядке проб (issue #100) |
+| `AGENT_API_ENVIRONMENT` | — | явная роль развертывания; `sandbox` обязательна для mock-test |
+| `AGENT_API_ENABLE_MOCK_TEST` | `false` | включает внутренний `mock-test`: только при `AGENT_API_ENVIRONMENT=sandbox`, запрещён при `NODE_ENV=production`; этот engine нельзя добавлять в auto-chain |
 | `EXTERNAL_WORKER_ACCEPT_DEADLINE_MS` | `30000` | бюджет ожидания квитанции на движок; не ответил — цепочка берёт следующий |
 | `RUNNER_DEFAULT_REPO` | — | `owner/name` для клиентов, не объявивших `repository` |
 | `AGENT_API_ADMISSION_LOG` | — (выключено) | путь журнала приёмных записей; в режиме профиля обязателен, пишет также подготовленную версию, намерение запуска и терминальный результат |
@@ -271,6 +273,10 @@ POST /v1/runs   → 202 receipt              память: AdmissionRecord + с�
   когда текущий подтвердил, что ран ему не известен;
 - `engineSelection.relaunchAfterReceipt: false` — повторный `launch` после потери квитанции
   не отправляется никогда;
+- `engines` содержит `mock-test` только при явном sandbox включении; он доступен лишь по
+  явному `engine.name`, проходит обычную auth/schema/idempotency обработку и возвращает
+  синтетический `pong`, не запуская модель, внешний worker, profile или repository side effect;
+  в `engineSelection.chain` он запрещён;
 - `isolation.mode: "none"`, `launcher: null` — на хосте API нечего изолировать, агента
   запускает воркер на своей машине и объявляет границу в ответе;
 - `artifacts.export.enabled: false`, `download: false`, `shareLink: false`,
