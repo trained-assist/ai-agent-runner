@@ -70,6 +70,7 @@ API больше не используется** и удаляется отде�
 | `AGENT_API_PROFILE_WORKSPACE_ROOT` | — (выключено) | включает постоянный профиль для каждого Run; устойчивый каталог журнала и bare-зеркал Git |
 | `AGENT_API_PROFILE_OWNER` | — | организация приватных репозиториев профиля; обязательна при включении профиля |
 | `AGENT_API_PROFILE_GITHUB_TOKEN` | — | хостовый токен GitHub для ensure/fetch/publish; не попадает в агентское окружение или журнал |
+| `AGENT_API_PROFILE_DELEGATION_SECRET` | — (выключено) | HMAC secret для короткоживущей host-to-API `(principal, tenantId, profileId, expiry)` capability; обязателен для CP delegated profiles, хранится только в API и CP secret stores |
 | `AGENT_API_PROFILE_OBJECT_BACKEND` | `gcs` | хранилище тяжёлых файлов; `local-fs` только для локального fixture, GCS использует `GCS_BUCKET` и ADC |
 | `GCP_PROJECT` / `GOOGLE_CLOUD_PROJECT` | — | ID проекта GCS; задавайте явно при Workload Identity Federation, чтобы чтение метаданных объекта не запрашивало доступ к Cloud Resource Manager |
 | `AGENT_API_PUBLIC_URL` | `http://<host>:<port>` | публичная база API: воркер возвращает результат на `POST {resultUrl}`. Можно задать префикс reverse proxy (например, `https://runner.example/profile-api`); proxy должен передавать callback-маршруты `/v1/worker/launches/{runId}/result` и `/profile-changes` в API без изменения пути. Без URL запуск падает с `RESULT_URL_UNSET` |
@@ -89,6 +90,15 @@ API больше не используется** и удаляется отде�
 загружает его в приватный GCS и передаёт воркеру подписанную ссылку с SHA-256 и размером.
 Архив включает также проверенные байты больших объектов; воркеру не нужен общий доступ
 к GCS для чтения профиля.
+
+Доверенный Control Plane может переключить profile для конкретного запроса только при
+настроенном `AGENT_API_PROFILE_DELEGATION_SECRET`: он прикладывает короткоживущую HMAC
+capability, связавшую API-key principal, неизменяемый tenant из API-key registry,
+делегированный `profileId` и expiry. API проверяет подпись, tenant equality, срок и форму
+до приёма Run. Capability не разрешает выбирать owner или `repository.fullName`; owner
+выводится из host-only tenant route, а repository — из profile workspace binding.
+Без secret запрос с delegated headers отказывает; обычная не-delegated profile авторизация
+не меняется. Secret не записывается в admission journal и не передаётся воркеру.
 
 Воркер не получает GitHub token и не клонирует/пушит репозиторий профиля. Он загружает
 изменённые байты через `POST /v1/worker/launches/{runId}/profile-changes?path=...` с
