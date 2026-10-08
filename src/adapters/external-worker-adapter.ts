@@ -1254,13 +1254,7 @@ export class ExternalWorkerAdapter implements ExternalWorker {
       });
     }
     const url = `${trimTrailingSlash(base)}/v1/runs/${runId}/result`;
-    let response: Response;
-    try {
-      response = await this.getJson(url, this.deadlineMs, 'worker result');
-    } catch (err) {
-      if (err instanceof PreflightError && err.code === 'WORKER_HTTP_ERROR') throw new ResultNotReadyError(runId);
-      throw err;
-    }
+    const response = await this.getJson(url, this.deadlineMs, 'worker result');
     // 409 — ожидаемый ответ «результата ещё нет», а не нарушение контракта.
     if (response.status === 409) throw new ResultNotReadyError(runId);
     const validated = validateLaunchResult(await readJson(response), runId);
@@ -1313,7 +1307,24 @@ export class ExternalWorkerAdapter implements ExternalWorker {
     if (this.token) headers['authorization'] = `Bearer ${this.token}`;
     const controller = new AbortController();
     try {
-      return await withTimeout(this.fetchImpl(url, { method: 'GET', headers, signal: controller.signal }), deadlineMs, label, () => controller.abort());
+      const response = await withTimeout(
+        this.fetchImpl(url, { method: 'GET', headers, signal: controller.signal }),
+        deadlineMs,
+        label,
+        () => controller.abort(),
+      );
+      // A result 409 is the worker's explicit "not ready yet" response. Other
+      // non-2xx responses are transport/protocol availability failures; never
+      // parse their HTML or proxy error body as a successful JSON contract.
+      if (!(label === 'worker result' && response.status === 409) && !response.ok) {
+        try { await response.body?.cancel(); } catch { /* discard failures do not replace the HTTP classification */ }
+        throw new PreflightError(
+          'WORKER_HTTP_ERROR',
+          `the external worker answered ${response.status} on ${label}`,
+          { failureClass: 'runtime', retryable: response.status >= 500 },
+        );
+      }
+      return response;
     } catch (err) {
       if (controller.signal.aborted) controller.abort();
       throw err;

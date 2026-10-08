@@ -736,7 +736,10 @@ export class AgentApi {
         const status = (await worker.status(record.runId)).status;
         if (this.disposed) return;
         if (status === 'succeeded' || status === 'failed' || status === 'cancelled') {
-          await this.collectResult(record, worker, record.createdAt);
+          if (!await this.collectResult(record, worker, record.createdAt)) {
+            await this.pollBackoff(0);
+            await this.pollUntilTerminal(record, worker, record.createdAt);
+          }
           return;
         }
         if (!worker.restoreMcp) throw new Error('MCP_RESTORE_UNSUPPORTED');
@@ -954,10 +957,6 @@ export class AgentApi {
 
       if (status === 'succeeded' || status === 'failed' || status === 'cancelled') {
         if (await this.collectResult(record, worker, startedAt)) return;
-        if (Date.now() >= deadline) return;
-        await this.pollBackoff(attempt);
-        attempt += 1;
-        continue;
       }
       if (status === 'unknown') {
         // Исход неизвестн, но ран мог состояться. Помечаем и продолжаем спрашивать:
@@ -968,8 +967,8 @@ export class AgentApi {
         this.markUnknown(record, 'budget_exceeded');
         if (!this.inFlight.has(record.runId)) return;
         // Reconcile: воркер помнит operationId, поэтому мы можем спрашивать бесконечно,
-        // не рискуя вторым запуском. Клиент видит unknown и решает сам.
-        continue;
+        // не рискуя вторым запуском. Клиент видит unknown и решает сам. Backoff ниже
+        // ограничивает частоту даже после превышения бюджета ожидания.
       }
       await this.pollBackoff(attempt);
       attempt += 1;
@@ -1047,6 +1046,12 @@ export class AgentApi {
         // Reconcile the same run branch/publication after storage or Git recovers.
         this.log({ event: 'profile_publication_failed', runId: record.runId, code: err instanceof WorkspaceError ? err.code : 'WORKSPACE_GIT_FAILED' });
         this.markUnknown(record, 'profile_publication_failed');
+        return false;
+      }
+      const retryableTransportFailure = err instanceof PreflightError ? err.retryable : true;
+      if (retryableTransportFailure) {
+        this.log({ event: 'worker_result_failed', runId: record.runId, reason: 'result_transport_unknown' });
+        this.markUnknown(record, 'result_transport_unknown');
         return false;
       }
       this.log({ event: 'run_failed', runId: record.runId, message: err instanceof Error ? err.message : String(err) });
