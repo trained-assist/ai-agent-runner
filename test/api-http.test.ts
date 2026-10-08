@@ -22,9 +22,60 @@ import { StatelessStore } from '../src/api/stateless-store.js';
 import { KeyRegistry, keyRecordFor } from '../src/api/auth.js';
 import { createAgentApiServer } from '../src/api/server.js';
 import { createHarness, waitFor } from './helpers.js';
-import { createHash } from 'node:crypto';
+import { createHash, createHmac } from 'node:crypto';
 
 describe('http auth, scopes and structured refusals', () => {
+  it('accepts only short-lived CP-signed tenant/profile workspace capabilities', async () => {
+    const key = 'ak_delegated_profile_test_key_012345678901234567890123456789';
+    const secret = 'delegation-secret-that-is-only-shared-with-control-plane';
+    const principal = { principalId: 'cp-sandbox', tenantId: 'telegram-sandbox', profileId: 'integration-telegram-ux-v1', scopes: ['runs:read', 'runs:write'] as Array<'runs:read'|'runs:write'>, engines: ['fake'] };
+    const keys = KeyRegistry.fromRecords([keyRecordFor(key, principal)]);
+    const received: import('../src/contracts/run-spec.js').RunSpec[] = [];
+    const worker = { name: 'fake', baseUrl: null,
+      async launch(spec: import('../src/contracts/run-spec.js').RunSpec) { received.push(spec); return { runId: spec.runId, operationId: spec.operationId, status: 'accepted' as const, statusUrl: 'http://local/status', resultUrl: 'http://local/result' }; },
+      async status(runId: string) { return { runId, status: 'running' as const }; }, async result(runId: string) { throw new Error(runId); }, async cancel(runId: string) { return { status: 'unknown_run' as const }; } };
+    const service = new AgentApi({ workers: [worker], store: new StatelessStore() });
+    const server = createAgentApiServer(service, { keys, profileDelegationSecret: secret });
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    const address = server.address() as import('node:net').AddressInfo;
+    const base = `http://127.0.0.1:${address.port}`;
+    const profileId = 'prof-synthetic-account-001';
+    const expiresAt = String(Date.now() + 60_000);
+    const signature = createHmac('sha256', secret).update(`${principal.principalId}\0${principal.tenantId}\0${profileId}\0${expiresAt}`).digest('hex');
+    const delegated = { authorization: `Bearer ${key}`, 'content-type': 'application/json', 'idempotency-key': 'delegated-run-1',
+      'x-agent-profile-id': profileId, 'x-agent-profile-tenant': principal.tenantId, 'x-agent-profile-exp': expiresAt, 'x-agent-profile-sig': signature };
+    try {
+      const response = await fetch(`${base}/v1/runs`, { method: 'POST', headers: delegated,
+        body: JSON.stringify({ engine: { name: 'fake', adapterVersion: '1' }, limits: { timeoutMs: 5000 }, envAllowlist: [], userTaskId: 'delegated-task-1' }) });
+      expect(response.status).toBe(202);
+      await waitFor(() => received.length === 1, 2000, 'delegated profile launch');
+      expect(received[0]?.profileId).toBe(profileId);
+
+      const forged = await fetch(`${base}/v1/runs`, { method: 'POST', headers: { ...delegated, 'idempotency-key': 'delegated-run-forged', 'x-agent-profile-sig': '0'.repeat(64) },
+        body: JSON.stringify({ engine: { name: 'fake', adapterVersion: '1' }, limits: { timeoutMs: 5000 }, envAllowlist: [] }) });
+      expect(forged.status).toBe(403);
+      expect(received).toHaveLength(1);
+
+      const expired = String(Date.now() - 1000);
+      const oldSignature = createHmac('sha256', secret).update(`${principal.principalId}\0${principal.tenantId}\0${profileId}\0${expired}`).digest('hex');
+      const stale = await fetch(`${base}/v1/runs`, { method: 'POST', headers: { ...delegated, 'idempotency-key': 'delegated-run-expired', 'x-agent-profile-exp': expired, 'x-agent-profile-sig': oldSignature },
+        body: JSON.stringify({ engine: { name: 'fake', adapterVersion: '1' }, limits: { timeoutMs: 5000 }, envAllowlist: [] }) });
+      expect(stale.status).toBe(403);
+      expect(received).toHaveLength(1);
+
+      const foreignTenantExpiry = String(Date.now() + 60_000);
+      const foreignTenantSignature = createHmac('sha256', secret).update(`${principal.principalId}\0foreign-tenant\0${profileId}\0${foreignTenantExpiry}`).digest('hex');
+      const foreignTenant = await fetch(`${base}/v1/runs`, { method: 'POST', headers: { ...delegated,
+        'idempotency-key': 'delegated-run-foreign-tenant', 'x-agent-profile-tenant': 'foreign-tenant',
+        'x-agent-profile-exp': foreignTenantExpiry, 'x-agent-profile-sig': foreignTenantSignature },
+        body: JSON.stringify({ engine: { name: 'fake', adapterVersion: '1' }, limits: { timeoutMs: 5000 }, envAllowlist: [] }) });
+      expect(foreignTenant.status).toBe(403);
+      expect(received).toHaveLength(1);
+    } finally {
+      service.dispose(); server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve()));
+    }
+  });
+
   it('отказывает без ключа, без scope и на кривых запросах — структурированно и без ключевого материала', async () => {
     const h = await startHttpHarness();
 

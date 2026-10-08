@@ -64,7 +64,8 @@ async function main(): Promise<void> {
   const resumed = service.resumeDispatched();
   if (resumed > 0) log({ event: 'dispatched_runs_resumed', count: resumed });
 
-  const server = createAgentApiServer(service, { keys, logger: log });
+  const server = createAgentApiServer(service, { keys, logger: log,
+    profileDelegationSecret: process.env['AGENT_API_PROFILE_DELEGATION_SECRET']?.trim() || undefined });
   // Терминальные раны не переживают себя: без этого процесса память только растёт, а у
   // stateless-сервиса нет ни файла, ни внешнего сборщика мусора.
   const sweeper = setInterval(() => {
