@@ -14,6 +14,8 @@ export interface RemoteMcpServerPolicy {
   startupTimeoutMs: number;
   policyVersion?: string;
   catalogueVersion?: string;
+  /** Optional test-only pin, compared with the separately trusted test resolver config. */
+  registryDigest?: string;
 }
 
 export interface RemoteMcpBinding {
@@ -73,7 +75,8 @@ export interface RemoteMcpHostOptions {
 
 export interface TestRegistryBindingConfig {
   token: string;
-  privateKeyPem: string;
+  privateKeyPem?: string;
+  privateKeyPkcs8DerBase64?: string;
   registryDigest: string;
   catalogueVersion: string;
 }
@@ -83,19 +86,25 @@ const TEST_SERVER = 'trained-assist-registry-test';
 const TEST_REF = 'registry-mcp-test-160-read';
 const TEST_TOOL = 'registry.fixture_read';
 const TEST_POLICY = 'registry-fixture-policy-v1';
+const TEST_URL = 'https://trained-assist-mcp-host-test-160.skillset-apply.workers.dev/mcp';
 
 /** Trusted process-only binding for the pinned Telegram UX integration profile. */
 export function configuredTestRegistryBindingResolver(config: TestRegistryBindingConfig | undefined): RemoteMcpBindingResolver | undefined {
   if (!config) return undefined;
   if (!/^[A-Za-z0-9._~-]{16,2048}$/.test(config.token) || config.registryDigest !== '129ab5033964c3ed5be47414711026cc2469b3d9af90ce83ee071cba7f005ea9' ||
+      (Boolean(config.privateKeyPem) === Boolean(config.privateKeyPkcs8DerBase64)) ||
       !/^[A-Za-z0-9._-]{1,200}$/.test(config.catalogueVersion)) throw new Error('test registry MCP binding configuration is invalid');
   let key;
-  try { key = createPrivateKey(config.privateKeyPem); } catch { throw new Error('test registry MCP signing key is invalid'); }
+  try {
+    key = config.privateKeyPem
+      ? createPrivateKey(config.privateKeyPem)
+      : createPrivateKey({ key: Buffer.from(config.privateKeyPkcs8DerBase64!, 'base64'), format: 'der', type: 'pkcs8' });
+  } catch { throw new Error('test registry MCP signing key is invalid'); }
   if (key.asymmetricKeyType !== 'ed25519') throw new Error('test registry MCP signing key must be Ed25519');
   return (bindingRef, context) => {
-    if (bindingRef !== TEST_REF || context.profileId !== TEST_PROFILE || context.serverId !== TEST_SERVER ||
+    if (bindingRef !== TEST_REF || context.profileId !== TEST_PROFILE || context.serverId !== TEST_SERVER || context.url !== TEST_URL ||
         context.allowedTools.length !== 1 || context.allowedTools[0] !== TEST_TOOL) return null;
-    if (context.policyVersion !== TEST_POLICY || context.catalogueVersion !== config.catalogueVersion || context.scope !== 'registry:fixture:read') return null;
+    if (context.policyVersion !== TEST_POLICY || context.catalogueVersion !== config.catalogueVersion || context.scope !== 'registry:fixture-read') return null;
     const now = Math.floor(Date.now() / 1000);
     const payload = Buffer.from(JSON.stringify({
       iss: 'trained-assist-agent-runner', aud: 'trained-assist:registry-mcp:test', sub: context.runId,
@@ -293,7 +302,7 @@ export function parseRemoteMcpServerPolicies(raw: string | undefined): Record<st
     const tokenNames = new Set<string>();
     for (const [serverId, policy] of Object.entries(input)) {
       if (!/^[A-Za-z0-9._-]{1,64}$/.test(serverId) || !isRecord(policy) ||
-          Object.keys(policy).some(key => !['url', 'tokenEnvName', 'headers', 'allowedTools', 'bindingScopes', 'startupTimeoutMs', 'policyVersion', 'catalogueVersion'].includes(key)) ||
+          Object.keys(policy).some(key => !['url', 'tokenEnvName', 'headers', 'allowedTools', 'bindingScopes', 'startupTimeoutMs', 'policyVersion', 'catalogueVersion', 'registryDigest'].includes(key)) ||
           !isRemoteMcpUrl(policy.url) || typeof policy.tokenEnvName !== 'string' ||
           !/^RUNNER_MCP_[A-Z0-9_]{1,48}$/.test(policy.tokenEnvName) || tokenNames.has(policy.tokenEnvName) ||
           !isRecord(policy.headers) || !isRecord(policy.bindingScopes) || Object.keys(policy.bindingScopes).length === 0 ||
@@ -303,7 +312,8 @@ export function parseRemoteMcpServerPolicies(raw: string | undefined): Record<st
           !policy.allowedTools.every(tool => typeof tool === 'string' && MCP_TOOL_NAME.test(tool)) ||
           new Set(policy.allowedTools).size !== policy.allowedTools.length ||
           (policy.policyVersion !== undefined && (typeof policy.policyVersion !== 'string' || !/^[A-Za-z0-9._-]{1,200}$/.test(policy.policyVersion))) ||
-          (policy.catalogueVersion !== undefined && (typeof policy.catalogueVersion !== 'string' || !/^[A-Za-z0-9._-]{1,200}$/.test(policy.catalogueVersion)))) throw new Error();
+          (policy.catalogueVersion !== undefined && (typeof policy.catalogueVersion !== 'string' || !/^[A-Za-z0-9._-]{1,200}$/.test(policy.catalogueVersion))) ||
+          (policy.registryDigest !== undefined && (typeof policy.registryDigest !== 'string' || !/^[a-f0-9]{64}$/.test(policy.registryDigest)))) throw new Error();
       const headers: Record<string, string> = Object.create(null);
       const entries = Object.entries(policy.headers);
       if (entries.length === 0 || entries.length > 8 || new Set(entries.map(([name]) => name.toLowerCase())).size !== entries.length ||
@@ -314,7 +324,7 @@ export function parseRemoteMcpServerPolicies(raw: string | undefined): Record<st
         headers[name] = template;
       }
       tokenNames.add(policy.tokenEnvName);
-      servers[serverId] = { url: policy.url, tokenEnvName: policy.tokenEnvName, headers, allowedTools: [...policy.allowedTools], bindingScopes: { ...policy.bindingScopes } as Record<string, string>, startupTimeoutMs: Number(policy.startupTimeoutMs), ...(typeof policy.policyVersion === 'string' ? { policyVersion: policy.policyVersion } : {}), ...(typeof policy.catalogueVersion === 'string' ? { catalogueVersion: policy.catalogueVersion } : {}) };
+      servers[serverId] = { url: policy.url, tokenEnvName: policy.tokenEnvName, headers, allowedTools: [...policy.allowedTools], bindingScopes: { ...policy.bindingScopes } as Record<string, string>, startupTimeoutMs: Number(policy.startupTimeoutMs), ...(typeof policy.policyVersion === 'string' ? { policyVersion: policy.policyVersion } : {}), ...(typeof policy.catalogueVersion === 'string' ? { catalogueVersion: policy.catalogueVersion } : {}), ...(typeof policy.registryDigest === 'string' ? { registryDigest: policy.registryDigest } : {}) };
     }
     return servers;
   } catch {

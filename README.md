@@ -18,6 +18,7 @@ API и host-компоненты выполнения ai-agent-job. Run имее
 |---|---|
 | Модель и ownership | [ARCHITECTURE](ARCHITECTURE.md), [общая архитектура](https://github.com/trained-assist/trained-agent-architecture/blob/main/ARCHITECTURE.md) |
 | API/config/operator procedures | [API service](docs/API-SERVICE.md), [external worker contract](docs/EXTERNAL-WORKER-CONTRACT.md) |
+| Isolated Runner API sandbox | [sandbox operations](docs/API-SANDBOX-OPERATIONS.md), [candidate workflow](.github/workflows/runner-api-sandbox-candidate.yml) |
 | Workspace | [H1–H5](docs/workspace-module-hooks.md), `src/workspace/`, `test/workspace-service.test.ts` |
 | Contract validation | `src/contracts/` |
 | API lifecycle | `src/api/`, `src/adapters/external-worker-adapter.ts` |

@@ -1,0 +1,96 @@
+name: Runner API sandbox candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Branch or commit to build for the isolated Runner API sandbox
+        required: true
+        default: main
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+
+jobs:
+  build-attest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: deployment-tools
+          fetch-depth: 1
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref }}
+          path: source
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: source/package-lock.json
+      - name: Validate candidate source and record identity
+        id: source
+        env:
+          REQUESTED_REF: ${{ inputs.source_ref }}
+        run: |
+          set -euo pipefail
+          [[ "$REQUESTED_REF" =~ ^[A-Za-z0-9._/-]{1,120}$ ]]
+          [[ "$REQUESTED_REF" != -* ]]
+          SOURCE_SHA="$(git -C source rev-parse HEAD)"
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          git -C source cat-file -e "$SOURCE_SHA^{commit}"
+          printf 'sha=%s\n' "$SOURCE_SHA" >> "$GITHUB_OUTPUT"
+          printf 'ref=%s\n' "$REQUESTED_REF" >> "$GITHUB_OUTPUT"
+      - run: npm ci
+        working-directory: source
+      - run: npm run typecheck
+        working-directory: source
+      - run: npm test
+        working-directory: source
+      - run: npm run build
+        working-directory: source
+      - name: Assemble isolated API candidate
+        env:
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+          SOURCE_REF: ${{ steps.source.outputs.ref }}
+          RUNNER_TEMP: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          SOURCE_DIR="$GITHUB_WORKSPACE/source"
+          STAGE="$RUNNER_TEMP/runner-api-sandbox-candidate"
+          mkdir -p "$STAGE/dist" "$STAGE/scripts"
+          cp "$SOURCE_DIR/package.json" "$SOURCE_DIR/package-lock.json" "$STAGE/"
+          cp -R "$SOURCE_DIR/dist/." "$STAGE/dist/"
+          cp "$GITHUB_WORKSPACE/deployment-tools/scripts/install-api-sandbox-candidate.sh" "$STAGE/scripts/"
+          cp "$GITHUB_WORKSPACE/deployment-tools/scripts/rollback-api-sandbox-candidate.sh" "$STAGE/scripts/"
+          printf '{"target":"agent-runner-api-mcp-test","sourceSha":"%s","sourceRef":"%s","packageVersion":"%s"}\n' \
+            "$SOURCE_SHA" "$SOURCE_REF" "$(node -p "require('$SOURCE_DIR/package.json').version")" > "$STAGE/candidate-manifest.json"
+          npm ci --omit=dev --prefix "$STAGE" --no-audit --no-fund
+          tar -czf "$RUNNER_TEMP/runner-api-sandbox-candidate.tar.gz" -C "$STAGE" candidate-manifest.json package.json package-lock.json dist node_modules scripts
+          (cd "$RUNNER_TEMP" && sha256sum runner-api-sandbox-candidate.tar.gz > runner-api-sandbox-candidate.tar.gz.sha256)
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ runner.temp }}/runner-api-sandbox-candidate.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: runner-api-sandbox-candidate-${{ steps.source.outputs.sha }}
+          path: |
+            ${{ runner.temp }}/runner-api-sandbox-candidate.tar.gz
+            ${{ runner.temp }}/runner-api-sandbox-candidate.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 7
+      - name: Publish candidate identity
+        env:
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+          SOURCE_REF: ${{ steps.source.outputs.ref }}
+        run: |
+          {
+            printf 'Candidate source: %s (%s)\n\n' "$SOURCE_REF" "$SOURCE_SHA"
+            printf 'Target: isolated agent-runner-api-mcp-test only.\n\n'
+            printf 'The artifact is signed and retained for 7 days. This workflow does not deploy it.\n'
+          } >> "$GITHUB_STEP_SUMMARY"

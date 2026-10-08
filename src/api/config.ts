@@ -248,13 +248,24 @@ export function loadAgentApiConfig(env: Record<string, string | undefined> = pro
     try { parsed = new URL(publicUrl); } catch { throw new Error('AGENT_API_PUBLIC_URL: expected an absolute http(s) URL without credentials, query, or fragment'); }
     if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password || parsed.search || parsed.hash) throw new Error('AGENT_API_PUBLIC_URL: expected an absolute http(s) URL without credentials, query, or fragment');
   }
-  const token = envValue(env, 'AGENT_API_TEST_MCP_BEARER');
+  const remoteMcpServers = parseRemoteMcpServerPolicies(envValue(env, 'AGENT_API_REMOTE_MCP_SERVERS'));
+  const registryTestPolicy = remoteMcpServers?.['trained-assist-registry-test'];
+  if (registryTestPolicy && registryTestPolicy.url !== 'https://trained-assist-mcp-host-test-160.skillset-apply.workers.dev/mcp') {
+    throw new Error('test registry MCP policy must pin the isolated Host test endpoint');
+  }
+  // Legacy names remain accepted for the already provisioned isolated #160 test service.
+  const token = envValue(env, 'AGENT_API_TEST_MCP_BEARER') ?? envValue(env, 'RUNNER_MCP_REGISTRY_TEST_TOKEN');
   const privateKeyPem = envValue(env, 'AGENT_API_TEST_MCP_ED25519_PRIVATE_KEY');
-  const catalogueVersion = envValue(env, 'AGENT_API_TEST_MCP_CATALOGUE_VERSION');
-  const registryDigest = envValue(env, 'AGENT_API_TEST_MCP_REGISTRY_DIGEST');
-  const testValues = [token, privateKeyPem, catalogueVersion, registryDigest];
+  const privateKeyPkcs8DerBase64 = envValue(env, 'AGENT_API_TEST_MCP_ED25519_PRIVATE_KEY_B64') ?? envValue(env, 'RUNNER_MCP_REGISTRY_TEST_SIGNING_KEY_B64');
+  const catalogueVersion = envValue(env, 'AGENT_API_TEST_MCP_CATALOGUE_VERSION') ?? registryTestPolicy?.catalogueVersion;
+  const registryDigest = envValue(env, 'AGENT_API_TEST_MCP_REGISTRY_DIGEST') ?? registryTestPolicy?.registryDigest;
+  if (registryTestPolicy?.registryDigest && registryDigest !== registryTestPolicy.registryDigest) {
+    throw new Error('test registry MCP policy digest does not match its trusted resolver configuration');
+  }
+  if (privateKeyPem !== undefined && privateKeyPkcs8DerBase64 !== undefined) throw new Error('test registry MCP configuration must use one signing key format');
+  const testValues = [token, privateKeyPem ?? privateKeyPkcs8DerBase64, catalogueVersion, registryDigest];
   if (testValues.some(value => value !== undefined) && testValues.some(value => value === undefined)) throw new Error('test registry MCP configuration requires bearer, Ed25519 key, catalogue version and pinned registry digest');
-  const testRegistryResolver = configuredTestRegistryBindingResolver(testValues.every(value => value === undefined) ? undefined : { token: token!, privateKeyPem: privateKeyPem!, catalogueVersion: catalogueVersion!, registryDigest: registryDigest! });
+  const testRegistryResolver = configuredTestRegistryBindingResolver(testValues.every(value => value === undefined) ? undefined : { token: token!, ...(privateKeyPem ? { privateKeyPem } : { privateKeyPkcs8DerBase64: privateKeyPkcs8DerBase64! }), catalogueVersion: catalogueVersion!, registryDigest: registryDigest! });
   const existingResolver = configuredDocumentsBindingResolver(envValue(env, 'AGENT_API_DOCUMENTS_MCP_MODULE'), envValue(env, 'AGENT_API_DOCUMENTS_MCP_REGISTRATIONS')) ?? bindingFileResolver(envValue(env, 'AGENT_API_REMOTE_MCP_BINDINGS_FILE'));
   const resolveBinding: RemoteMcpBindingResolver = async (bindingRef, context) => context.profileId === 'integration-telegram-ux-v1' || bindingRef === 'registry-mcp-test-160-read'
     ? context.profileId === 'integration-telegram-ux-v1' ? testRegistryResolver?.(bindingRef, context) ?? null : null
@@ -270,7 +281,7 @@ export function loadAgentApiConfig(env: Record<string, string | undefined> = pro
     defaultRepository: env['RUNNER_DEFAULT_REPO']?.trim() || null,
     publicUrl,
     reconcileDeadlineMs,
-    remoteMcp: { servers: parseRemoteMcpServerPolicies(envValue(env, 'AGENT_API_REMOTE_MCP_SERVERS')), resolveBinding },
+    remoteMcp: { servers: remoteMcpServers, resolveBinding },
   };
 }
 

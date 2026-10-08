@@ -90,13 +90,16 @@ The opt-in process resolver supports only profile `integration-telegram-ux-v1`, 
 `registry.fixture_read`. Its remote descriptor must include `policyVersion` and
 `catalogueVersion`; both must match the trusted server policy and configured catalogue
 version. The trusted server policy must pin `policyVersion` to
-`registry-fixture-policy-v1` and scope the binding to `registry:fixture:read`. Other
+`registry-fixture-policy-v1` and scope the binding to `registry:fixture-read`, matching
+the CP and Host fixture contract. Other
 profiles continue through the configured documents resolver or private binding-file
 fallback. The test profile never falls back to either resolver.
 
-Enable it only through host process configuration using `AGENT_API_TEST_MCP_BEARER`,
-`AGENT_API_TEST_MCP_ED25519_PRIVATE_KEY`, `AGENT_API_TEST_MCP_CATALOGUE_VERSION`, and
-`AGENT_API_TEST_MCP_REGISTRY_DIGEST`. All four are required together. The digest is pinned
+Enable it only through host process configuration using `AGENT_API_TEST_MCP_BEARER`, one of
+`AGENT_API_TEST_MCP_ED25519_PRIVATE_KEY` (PEM) or
+`AGENT_API_TEST_MCP_ED25519_PRIVATE_KEY_B64` (PKCS#8 DER),
+`AGENT_API_TEST_MCP_CATALOGUE_VERSION`, and `AGENT_API_TEST_MCP_REGISTRY_DIGEST`.
+All four are required together. The digest is pinned
 in code to `129ab5033964c3ed5be47414711026cc2469b3d9af90ce83ee071cba7f005ea9`; a fixture
 catalog change requires an explicit policy revision. Supply a secret Bearer and Ed25519
 PKCS#8 private key through the runtime secret manager; do not place their values in source,
