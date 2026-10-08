@@ -87,7 +87,8 @@ export function provisionSandboxMockPrincipal(registryPath: string, keyHash: unk
   if (!existsSync(registryPath)) throw new Error('sandbox_principal_registry_missing');
   const before = lstatSync(registryPath);
   if (!before.isFile() || before.isSymbolicLink()) throw new Error('sandbox_principal_registry_not_regular_file');
-  if ((before.mode & 0o077) !== 0) throw new Error('sandbox_principal_registry_permissions_too_open');
+  const registryMode = before.mode & 0o777;
+  if (registryMode !== 0o600 && registryMode !== 0o640) throw new Error('sandbox_principal_registry_permissions_too_open');
   if (KeyRegistry.loadFile(registryPath).size() === 0) throw new Error('sandbox_principal_registry_empty');
 
   const lockPath = `${registryPath}.bootstrap-lock`;
@@ -121,9 +122,9 @@ export function provisionSandboxMockPrincipal(registryPath: string, keyHash: unk
       engines: [...SANDBOX_TEST_PRINCIPAL.engines],
     };
     registry.principals.push(record);
-    writeFileSync(tempPath, `${JSON.stringify(registry, null, 2)}\n`, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+    writeFileSync(tempPath, `${JSON.stringify(registry, null, 2)}\n`, { encoding: 'utf8', mode: registryMode, flag: 'wx' });
     chownSync(tempPath, before.uid, before.gid);
-    chmodSync(tempPath, 0o600);
+    chmodSync(tempPath, registryMode);
     const tempFd = openSync(tempPath, 'r');
     try { fsyncSync(tempFd); } finally { closeSync(tempFd); }
     renameSync(tempPath, registryPath);

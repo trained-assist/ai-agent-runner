@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -52,6 +52,19 @@ describe('sandbox mock-test principal provisioning', () => {
     expect(registryView.authenticate(`Bearer ${rawKey}`)).toMatchObject({ principalId: SANDBOX_TEST_PRINCIPAL.principalId, tenantId: SANDBOX_TEST_PRINCIPAL.tenantId, profileId: SANDBOX_TEST_PRINCIPAL.profileId, engines: ['mock-test'] });
     expect(provisionSandboxMockPrincipal(path, keyHash)).toMatchObject({ changed: false });
     expect((JSON.parse(readFileSync(path, 'utf8')) as { principals: unknown[] }).principals).toHaveLength(2);
+  });
+
+  it('preserves the sandbox API-readable 0640 registry mode during atomic replacement', () => {
+    const { path } = fixture();
+    const rawKey = generateApiKey();
+    const keyHash = hashApiKey(rawKey);
+    chmodSync(path, 0o640);
+    provisionSandboxMockPrincipal(path, keyHash);
+    expect(statSync(path).mode & 0o777).toBe(0o640);
+    expect(KeyRegistry.loadFile(path).authenticate(`Bearer ${rawKey}`)).toMatchObject({
+      principalId: SANDBOX_TEST_PRINCIPAL.principalId,
+      profileId: SANDBOX_TEST_PRINCIPAL.profileId,
+    });
   });
 
   it('rejects invalid hashes, existing hash collisions, unsafe file modes and symlinks', () => {
