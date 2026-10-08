@@ -157,6 +157,7 @@ snapshot → изменение/удаление → API publication → сле�
 |---|---|
 | `GET /healthz` | единственный маршрут без ключа: `{status, workers: [{engine, baseUrl}], runs, admissions, events}` |
 | `GET /v1/capabilities` | декларация возможностей (см. §5) |
+| `POST /v1/profiles/workspace` | идемпотентно создаёт/проверяет приватный workspace по signed tenant/profile; scope `profiles:provision`, тело `{}`, Agent Run не запускается |
 | `POST /v1/runs` | приём: `Idempotency-Key` обязателен; `202` — новый receipt, `200` — дедуп |
 | `GET /v1/runs/{id}/status` | состояние рана, курсор событий, `answer` агента |
 | `GET /v1/runs/{id}/result` | `RunResult` после терминального состояния, иначе `409 RESULT_NOT_READY` |
@@ -164,6 +165,16 @@ snapshot → изменение/удаление → API publication → сле�
 | `GET /v1/runs/{id}/artifacts` | ветка рана, ссылка на merge, ссылки на файлы по коммиту и `logUrl` |
 | `GET /v1/runs/{id}/log` | `302` на ссылку лога в Google Storage |
 | `POST /v1/runs/{id}/cancel` | пробрасывает отмену воркеру; `202` — принята, `200` — уже терминальный |
+
+`POST /v1/profiles/workspace` требует API key со scope `profiles:provision`, пустое тело
+`{}` и все четыре короткоживущих заголовка `x-agent-profile-*`. `tenantId` берётся из API key;
+profile выбирается только подписанной capability. Owner, repo name, branch и GitHub token
+из запроса не принимаются. API выполняет private-repo ensure, проверяет ownership marker,
+создаёт начальный marker commit и фиксирует canonical branch. Ответ содержит `status`,
+`tenantId`, `profileId`, `bindingId`, `repository`, `branch`, `revision` и `private`; это
+внутренний receipt для доверенного Control Plane. Повторный запрос возвращает то же
+профильное связывание. Никакой Worker, admission или model-token allowance не используется.
+При выключенном provisioning API отвечает 503 `PROFILE_WORKSPACE_UNAVAILABLE`.
 
 Для `eu-vm-agent-run` и `rf-vm-agent-run` центральный `/events` также зеркалит stdout/stderr
 из replayable worker SSE, пока агент работает. Worker cursor переживает разрыв соединения,

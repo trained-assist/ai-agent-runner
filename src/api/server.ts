@@ -96,6 +96,22 @@ export function createAgentApiServer(service: AgentApi, options: AgentApiServerO
       return 200;
     }
 
+    if (segments[0] === 'v1' && segments[1] === 'profiles' && segments[2] === 'workspace' && segments.length === 3) {
+      if (req.method !== 'POST') throw new ApiError('METHOD_NOT_ALLOWED', 'profile workspace provisioning supports POST only');
+      if (![req.headers['x-agent-profile-id'], req.headers['x-agent-profile-tenant'], req.headers['x-agent-profile-exp'], req.headers['x-agent-profile-sig']]
+        .every((value) => typeof value === 'string' && value.trim().length > 0)) {
+        throw new ApiError('FORBIDDEN', 'profile workspace provisioning requires a signed profile capability');
+      }
+      requireScope(principal, 'profiles:provision');
+      const body = await readJsonBody(req, maxBodyBytes);
+      if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).length !== 0) {
+        throw new ApiError('INVALID_REQUEST', 'profile workspace provisioning accepts only an empty JSON object');
+      }
+      const receipt = await service.provisionProfileWorkspace(principal);
+      sendJson(res, 200, receipt);
+      return 200;
+    }
+
     if (segments[0] !== 'v1' || segments[1] !== 'runs') {
       throw new ApiError('ROUTE_NOT_FOUND', `no route for ${path}`);
     }

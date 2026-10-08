@@ -79,7 +79,7 @@ describe('api key registry', () => {
       expect(() => KeyRegistry.loadFile(path)).toThrow(/invalid keyHash/);
 
       expect(KeyRegistry.loadFile(join(dir, 'missing.json')).size()).toBe(0);
-      expect(RUN_SCOPES).toEqual(['runs:read', 'runs:write']);
+      expect(RUN_SCOPES).toEqual(['runs:read', 'runs:write', 'profiles:provision']);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

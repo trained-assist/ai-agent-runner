@@ -134,6 +134,14 @@ export interface CancelRequest {
 export interface ApiCapabilities {
   schemaVersion: 1;
   contract: { name: 'ai-agent-runner/serverless-agent-api'; version: number };
+  profileWorkspaceProvisioning: {
+    enabled: boolean;
+    method: 'POST';
+    path: '/v1/profiles/workspace';
+    scope: 'profiles:provision';
+    requiresSignedProfileCapability: true;
+    launchesAgent: false;
+  };
   idempotency: {
     header: 'Idempotency-Key';
     repeatWithSameKey: 'same_receipt';

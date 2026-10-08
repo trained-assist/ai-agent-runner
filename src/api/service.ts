@@ -554,6 +554,32 @@ export class AgentApi {
     return { runId, status: 'stop_pending', state: current?.state ?? run.state };
   }
 
+  /** Provision a trusted profile workspace without admitting or launching an Agent Run. */
+  async provisionProfileWorkspace(principal: Principal): Promise<import('./profile-workspace.js').ProvisionedProfileWorkspace> {
+    const provision = this.opts.profileWorkspace?.provision;
+    if (!provision) throw new ApiError('PROFILE_WORKSPACE_UNAVAILABLE', 'profile workspace provisioning is not configured');
+    try {
+      const receipt = await provision.call(this.opts.profileWorkspace, principal);
+      this.log({
+        event: 'profile_workspace_provisioned', principalId: principal.principalId,
+        tenantId: receipt.tenantId, profileId: receipt.profileId,
+        bindingId: receipt.bindingId, repository: receipt.repository, revision: receipt.revision,
+      });
+      return receipt;
+    } catch (err) {
+      if (err instanceof WorkspaceError && err.code === 'WORKSPACE_FORBIDDEN') {
+        throw new ApiError('FORBIDDEN', 'profile workspace is not available for this trusted tenant/profile');
+      }
+      if (err instanceof WorkspaceError) {
+        throw new ApiError('PROFILE_WORKSPACE_UNAVAILABLE', 'profile workspace could not be provisioned', {
+          workspaceCode: err.code,
+          retryable: err.retryable,
+        });
+      }
+      throw err;
+    }
+  }
+
   /**
    * Честная декларация возможностей (epic #74, шаг 7): изоляции на хосте API нет (её
    * обеспечивает воркер), движок один, байты артефактов и логов API не отдаёт.
@@ -562,6 +588,14 @@ export class AgentApi {
     return {
       schemaVersion: API_CAPABILITIES_SCHEMA_VERSION,
       contract: { name: 'ai-agent-runner/serverless-agent-api', version: API_CONTRACT_VERSION },
+      profileWorkspaceProvisioning: {
+        enabled: this.opts.profileWorkspace?.provision !== undefined,
+        method: 'POST',
+        path: '/v1/profiles/workspace',
+        scope: 'profiles:provision',
+        requiresSignedProfileCapability: true,
+        launchesAgent: false,
+      },
       idempotency: {
         header: 'Idempotency-Key',
         repeatWithSameKey: 'same_receipt',
