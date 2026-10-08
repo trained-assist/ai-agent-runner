@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { generateKeyPairSync, verify } from 'node:crypto';
 import { createExternalWorkers, loadAgentApiConfig } from '../src/api/config.js';
+import { configuredTestRegistryBindingResolver } from '../src/adapters/remote-mcp.js';
 import { AgentApi } from '../src/api/service.js';
 import type { Principal } from '../src/api/auth.js';
 import type { RunSpec } from '../src/contracts/run-spec.js';
@@ -19,6 +20,36 @@ const base = {
 };
 
 describe('конфигурация воркеров', () => {
+  it('accepts a PKCS#8 DER signing key encoded for a single-line service secret', () => {
+    const { privateKey } = generateKeyPairSync('ed25519');
+    const privateKeyPkcs8DerBase64 = privateKey.export({ type: 'pkcs8', format: 'der' }).toString('base64');
+    const resolver = configuredTestRegistryBindingResolver({ token: 'opaque-test-bearer-token-123', privateKeyPkcs8DerBase64,
+      catalogueVersion: 'catalogue-v1', registryDigest: '129ab5033964c3ed5be47414711026cc2469b3d9af90ce83ee071cba7f005ea9' });
+    expect(resolver).toBeTypeOf('function');
+  });
+
+  it('loads the provisioned sandbox MCP secret names and digest from its pinned server policy', () => {
+    const { privateKey } = generateKeyPairSync('ed25519');
+    const privateKeyPkcs8DerBase64 = privateKey.export({ type: 'pkcs8', format: 'der' }).toString('base64');
+    const server = {
+      url: 'https://trained-assist-mcp-host-test-160.skillset-apply.workers.dev/mcp',
+      tokenEnvName: 'RUNNER_MCP_REGISTRY_TEST_TOKEN',
+      headers: { Authorization: 'Bearer {env:RUNNER_MCP_REGISTRY_TEST_TOKEN}' },
+      allowedTools: ['registry.fixture_read'],
+      bindingScopes: { 'registry-mcp-test-160-read': 'registry:fixture-read' },
+      startupTimeoutMs: 10000,
+      policyVersion: 'registry-fixture-policy-v1',
+      catalogueVersion: 'registry-fixture-catalogue-v1',
+      registryDigest: '129ab5033964c3ed5be47414711026cc2469b3d9af90ce83ee071cba7f005ea9',
+    };
+    const config = loadAgentApiConfig({ ...base, EXTERNAL_WORKER_URL: 'http://127.0.0.1:8788',
+      AGENT_API_REMOTE_MCP_SERVERS: JSON.stringify({ 'trained-assist-registry-test': server }),
+      RUNNER_MCP_REGISTRY_TEST_TOKEN: 'opaque-test-bearer-token-123',
+      RUNNER_MCP_REGISTRY_TEST_SIGNING_KEY_B64: privateKeyPkcs8DerBase64 });
+    expect(config.remoteMcp?.servers['trained-assist-registry-test']?.url).toBe(server.url);
+    expect(config.remoteMcp?.servers['trained-assist-registry-test']?.registryDigest).toBe(server.registryDigest);
+  });
+
   it('process config resolves the pinned test binding after receipt runId creation and signs that runId', async () => {
     const mock = await startMockWorker({ autoDeliver: false });
     const { privateKey, publicKey } = generateKeyPairSync('ed25519');
@@ -26,10 +57,11 @@ describe('конфигурация воркеров', () => {
     try {
       const policy = {
         'trained-assist-registry-test': {
-          url: 'https://registry.test.example/mcp', tokenEnvName: 'RUNNER_MCP_REGISTRY_TEST',
+          url: 'https://trained-assist-mcp-host-test-160.skillset-apply.workers.dev/mcp', tokenEnvName: 'RUNNER_MCP_REGISTRY_TEST',
           headers: { Authorization: 'Bearer {env:RUNNER_MCP_REGISTRY_TEST}' },
-          allowedTools: ['registry.fixture_read'], bindingScopes: { 'registry-mcp-test-160-read': 'registry:fixture:read' },
+          allowedTools: ['registry.fixture_read'], bindingScopes: { 'registry-mcp-test-160-read': 'registry:fixture-read' },
           startupTimeoutMs: 1000, policyVersion: 'registry-fixture-policy-v1', catalogueVersion: 'catalogue-v1',
+          registryDigest: '129ab5033964c3ed5be47414711026cc2469b3d9af90ce83ee071cba7f005ea9',
         },
       };
       const config = loadAgentApiConfig({
@@ -46,8 +78,8 @@ describe('конфигурация воркеров', () => {
       const principal: Principal = { principalId: 'integration-telegram-ux-v1', profileId: 'integration-telegram-ux-v1', scopes: ['runs:read', 'runs:write'] };
       const receipt = api.submit(principal, 'test-registry-run-1', {
         engine: { name: worker.name, adapterVersion: '1' }, limits: { timeoutMs: 15000 }, envAllowlist: [], input: { inlinePrompt: 'Read the registry fixture.' },
-        credentialBindings: [{ ref: 'registry-mcp-test-160-read', scope: 'registry:fixture:read' }],
-        mcp: { servers: [{ serverId: 'trained-assist-registry-test', transport: 'remote', url: 'https://registry.test.example/mcp', bindingRef: 'registry-mcp-test-160-read', allowedTools: ['registry.fixture_read'], policyVersion: 'registry-fixture-policy-v1', catalogueVersion: 'catalogue-v1' }] },
+        credentialBindings: [{ ref: 'registry-mcp-test-160-read', scope: 'registry:fixture-read' }],
+        mcp: { servers: [{ serverId: 'trained-assist-registry-test', transport: 'remote', url: 'https://trained-assist-mcp-host-test-160.skillset-apply.workers.dev/mcp', bindingRef: 'registry-mcp-test-160-read', allowedTools: ['registry.fixture_read'], policyVersion: 'registry-fixture-policy-v1', catalogueVersion: 'catalogue-v1' }] },
       });
       for (let i = 0; i < 50 && mock.launches.length === 0; i += 1) await new Promise(resolve => setTimeout(resolve, 10));
       expect(JSON.stringify(logs)).not.toContain('opaque-test-bearer-token-123');
