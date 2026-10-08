@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { execFileSync, spawn } from 'node:child_process';
 import { createServer, type Server } from 'node:http';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -21,6 +21,8 @@ describe('France VM API-owned profile saveback', () => {
     mkdirSync(profile, { recursive: true });
     writeFileSync(join(profile, 'state.md'), 'before\n');
     writeFileSync(join(profile, 'remove.md'), 'delete me\n');
+    chmodSync(join(profile, 'state.md'), 0o444);
+    chmodSync(join(profile, 'remove.md'), 0o444);
     const archive = join(root, 'snapshot.tar.gz');
     execFileSync('tar', ['--format', 'ustar', '-czf', archive, '-C', profile, '.']);
     const archiveBytes = readFileSync(archive);

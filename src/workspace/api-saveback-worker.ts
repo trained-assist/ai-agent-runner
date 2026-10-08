@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import type { ProfileWorkspaceSpec, RunSpec } from '../contracts/run-spec.js';
@@ -56,6 +56,9 @@ export function createApiSavebackWorker(dataDir: string): RunBranchWorker & {
           if (relative && !isSafeRelativePath(relative)) throw new Error('profile snapshot contains an unsafe path');
         }
         execFileSync('tar', ['--no-same-owner', '--no-same-permissions', '-xzf', archive, '-C', cwd], { stdio: 'pipe' });
+        // Archives are untrusted inputs. Ignore read-only/executable mode bits so an
+        // existing snapshot file remains writable by the per-run identity in GHA/VM.
+        makeWorkspaceWritable(cwd);
       } finally {
         rmSync(temp, { recursive: true, force: true });
       }
@@ -109,6 +112,19 @@ export function createApiSavebackWorker(dataDir: string): RunBranchWorker & {
       try { return readReceipt(receiptPath(receipts, spec.runId)).manifest; } catch { return undefined; }
     },
   };
+}
+
+function makeWorkspaceWritable(root: string): void {
+  const entries = readdirSync(root, { withFileTypes: true });
+  for (const entry of entries) {
+    const path = join(root, entry.name);
+    if (entry.isDirectory()) {
+      makeWorkspaceWritable(path);
+      chmodSync(path, 0o700);
+    } else if (entry.isFile()) {
+      chmodSync(path, 0o600);
+    }
+  }
 }
 
 function requiredSavebackWorkspace(spec: RunSpec): ProfileWorkspaceSpec {
