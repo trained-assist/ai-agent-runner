@@ -14,6 +14,7 @@ import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { compilePolicy, DEFAULT_EXPORT_POLICY, matchRule, patternToRegExp } from '../workspace/policy.js';
 import { resolveInsideRoot, isSafeRelativePath } from '../storage/local-paths.js';
 import { execFileSync } from 'node:child_process';
+import { selectProfileRepositoryRoute, type ProfileRepositoryRoute } from './profile-routing.js';
 
 /** The API key is the authority for tenant/profile; a worker result never supplies either. */
 export interface PreparedProfileRun {
@@ -29,7 +30,20 @@ export interface PreparedProfileRun {
   excludedPatterns: string[];
 }
 
+export interface ProvisionedProfileWorkspace {
+  status: 'ready';
+  tenantId: string;
+  profileId: string;
+  bindingId: string;
+  repository: string;
+  branch: string;
+  revision: string;
+  private: true;
+}
+
 export interface ProfileWorkspaceCoordinator {
+  /** Creates or verifies the profile repository and ownership marker without preparing a run. */
+  provision?(principal: Principal): Promise<ProvisionedProfileWorkspace>;
   prepare(principal: Principal, runId: string): Promise<PreparedProfileRun>;
   upload(principal: Principal, runId: string, token: string, path: string, bytes: Buffer, sha256: string): Promise<void>;
   publish(principal: Principal, runId: string, baseRevision: string, files: Array<{ path: string; sha256: string; size: number }>, deletes: string[]): Promise<WorkspacePublication>;
@@ -60,69 +74,154 @@ export interface ProfileWorkspaceRuntimeOptions {
   rootDir: string;
   owner: string;
   token: string;
+  /** Trusted host-side tenant routes. Neither tenant IDs nor owners come from a run body. */
+  tenantRoutes?: Record<string, ProfileRepositoryRoute>;
+  /** Isolated test API instances can reject every tenant that is not explicitly routed. */
+  requireTenantRoute?: boolean;
   objectBackend: 'gcs' | 'local-fs';
   env?: Record<string, string | undefined>;
 }
 
+interface ProfileWorkspaceRouteRuntime {
+  rootDir: string;
+  journal: WorkspaceJournal;
+  bindings: JournalBindings;
+  workspace: WorkspaceService;
+  admin: ReturnType<typeof createGitHubRepositoryAdmin>;
+}
+
 /** Durable journal/mirrors live on the API host; canonical bytes live in Git and object storage. */
 export function createProfileWorkspaceCoordinator(options: ProfileWorkspaceRuntimeOptions): ProfileWorkspaceCoordinator {
-  if (!options.rootDir || !options.owner || !options.token) throw new Error('profile workspace requires rootDir, owner and GitHub token');
+  const tenantOnly = !!options.requireTenantRoute && Object.keys(options.tenantRoutes ?? {}).length > 0;
+  if (!options.rootDir || (!tenantOnly && (!options.owner || !options.token))) throw new Error('profile workspace requires rootDir, owner and GitHub token unless every tenant route is explicit');
   if (options.objectBackend === 'local-fs' && process.env['NODE_ENV'] === 'production') {
     throw new Error('production profile workspace requires remote object storage');
   }
-  const journal = new WorkspaceJournal(join(options.rootDir, 'journal'));
-  journal.init();
-  const bindings = new JournalBindings(journal);
-  const tokenRef = 'profile-workspace-github';
-  const resolveCredential = async (ref: string): Promise<string | undefined> => ref === tokenRef ? options.token : undefined;
+  const credentialTokens = new Map<string, string>();
+  const routeRefs = new Map<string, string>();
+  const defaultTokenRef = 'profile-workspace-github:default';
+  if (options.token) credentialTokens.set(defaultTokenRef, options.token);
+  for (const [tenantId, route] of Object.entries(options.tenantRoutes ?? {})) {
+    if (!tenantId.trim() || !route.owner.trim() || !route.token.trim()) throw new Error('profile workspace tenant route requires tenantId, owner and token');
+    const ref = `profile-workspace-github:tenant:${createHash('sha256').update(tenantId).digest('hex').slice(0, 24)}`;
+    routeRefs.set(tenantId, ref);
+    credentialTokens.set(ref, route.token);
+  }
+  const resolveCredential = async (ref: string): Promise<string | undefined> => credentialTokens.get(ref);
   const objects = createBlobStore({ backend: options.objectBackend, env: options.env });
-  const admin = createGitHubRepositoryAdmin({ tokenRef, resolveToken: resolveCredential });
   const exportPolicy = compilePolicy(DEFAULT_EXPORT_POLICY);
-  const workspace = new WorkspaceService({
-    git: createLocalGitPort({ rootDir: join(options.rootDir, 'mirrors'), resolveCredential }),
-    objects,
-    bindings,
-    admin,
-    journal,
-  });
-  const identity = (principal: Principal): { tenantId: string; profileId: string } => {
+  const runtimes = new Map<string, ProfileWorkspaceRouteRuntime>();
+  const runtimeFor = (key: string, rootDir: string, credentialTokenRef: string): ProfileWorkspaceRouteRuntime => {
+    let runtime = runtimes.get(key);
+    if (!runtime) {
+      const journal = new WorkspaceJournal(join(rootDir, 'journal'));
+      journal.init();
+      const bindings = new JournalBindings(journal);
+      const git = createLocalGitPort({ rootDir: join(rootDir, 'mirrors'), resolveCredential });
+      const admin = createGitHubRepositoryAdmin({ tokenRef: credentialTokenRef, resolveToken: resolveCredential });
+      const workspace = new WorkspaceService({ git, objects, bindings, admin, journal });
+      runtime = { rootDir, journal, bindings, workspace, admin };
+      runtimes.set(key, runtime);
+    }
+    return runtime;
+  };
+  const defaultRuntime = runtimeFor('default', options.rootDir, defaultTokenRef);
+  const routeRuntimeFor = (tenantId: string, credentialTokenRef: string): ProfileWorkspaceRouteRuntime => {
+    const routeKey = `tenant:${tenantId}`;
+    const rootDir = join(options.rootDir, 'tenant-routes', createHash('sha256').update(tenantId).digest('hex').slice(0, 24));
+    return runtimeFor(routeKey, rootDir, credentialTokenRef);
+  };
+  const identity = (principal: Principal): { tenantId: string; profileId: string; owner: string; credentialTokenRef: string; runtime: ProfileWorkspaceRouteRuntime } => {
     if (!principal.tenantId) throw new WorkspaceError('WORKSPACE_FORBIDDEN', 'API key has no trusted tenantId');
-    return { tenantId: principal.tenantId, profileId: principal.profileId };
+    const route = selectProfileRepositoryRoute({
+      tenantId: principal.tenantId,
+      defaultRoute: { owner: options.owner, token: options.token },
+      tenantRoutes: options.tenantRoutes,
+      requireTenantRoute: options.requireTenantRoute,
+    });
+    const credentialTokenRef = routeRefs.get(principal.tenantId) ?? defaultTokenRef;
+    const runtime = routeRefs.has(principal.tenantId)
+      ? routeRuntimeFor(principal.tenantId, credentialTokenRef)
+      : defaultRuntime;
+    return { tenantId: principal.tenantId, profileId: principal.profileId, owner: route.owner, credentialTokenRef, runtime };
+  };
+  const assertRouteMatchesBinding = async (runtime: ProfileWorkspaceRouteRuntime, tenantId: string, profileId: string, owner: string): Promise<void> => {
+    const binding = await runtime.bindings.findByProfile(tenantId, profileId);
+    if (binding && binding.owner.toLowerCase() !== owner.toLowerCase()) {
+      throw new WorkspaceError('WORKSPACE_FORBIDDEN', 'configured profile repository route does not match the existing tenant binding');
+    }
+  };
+  type InternalProvisionReceipt = ProvisionedProfileWorkspace & {
+    credentialTokenRef: string;
+    runtime: ProfileWorkspaceRouteRuntime;
+  };
+  const ensureInFlight = new Map<string, Promise<InternalProvisionReceipt>>();
+  const ensureReady = (principal: Principal): Promise<InternalProvisionReceipt> => {
+    const { tenantId, profileId } = identity(principal);
+    const key = `${tenantId}\0${profileId}`;
+    const inFlight = ensureInFlight.get(key);
+    if (inFlight) return inFlight;
+    const operation = ensureReadyOnce(principal);
+    ensureInFlight.set(key, operation);
+    void operation.finally(() => {
+      if (ensureInFlight.get(key) === operation) ensureInFlight.delete(key);
+    }).catch(() => undefined);
+    return operation;
+  };
+  const ensureReadyOnce = async (principal: Principal): Promise<InternalProvisionReceipt> => {
+    const { tenantId, profileId, owner, credentialTokenRef, runtime } = identity(principal);
+    const { bindings, workspace, admin } = runtime;
+    if ((await bindings.list()).some((binding) => binding.profileId === profileId && binding.tenantId !== tenantId)) {
+      throw new WorkspaceError('WORKSPACE_FORBIDDEN', 'profileId is already bound to another tenant');
+    }
+    await assertRouteMatchesBinding(runtime, tenantId, profileId, owner);
+    const profileKey = createHash('sha256').update(`${tenantId}\0${profileId}`).digest('hex').slice(0, 32);
+    await workspace.ensureProfileRepository({
+      operationId: `ensure:${profileKey}`,
+      tenantId,
+      profileId,
+      owner,
+      credentialTokenRef,
+    });
+    if (!(await bindings.findByProfile(tenantId, profileId))?.headRevision) {
+      const empty = mkdtempSync(join(tmpdir(), 'profile-bootstrap-'));
+      try {
+        const bootstrap = await workspace.publishRunChanges({
+          operationId: `bootstrap:${profileKey}`,
+          tenantId, profileId, runId: `bootstrap-${profileKey}`,
+          workspacePath: empty, baseRevision: EMPTY_TREE, credentialTokenRef,
+        });
+        if (bootstrap.status !== 'published') throw new WorkspaceError('WORKSPACE_GIT_FAILED', 'profile bootstrap was not published');
+      } finally {
+        rmSync(empty, { recursive: true, force: true });
+      }
+    }
+    const binding = await bindings.findByProfile(tenantId, profileId);
+    if (!binding?.headRevision || !binding.private || binding.owner.toLowerCase() !== owner.toLowerCase()) {
+      throw new WorkspaceError('WORKSPACE_GIT_FAILED', 'profile repository is not fully initialized');
+    }
+    await admin.setDefaultBranch({ repository: binding.repository, branch: binding.branch });
+    return {
+      status: 'ready', tenantId, profileId, bindingId: binding.bindingId,
+      repository: binding.repository, branch: binding.branch,
+      revision: binding.headRevision, private: true,
+      credentialTokenRef, runtime,
+    };
   };
   return {
+    async provision(principal) {
+      const ready = await ensureReady(principal);
+      return {
+        status: ready.status, tenantId: ready.tenantId, profileId: ready.profileId,
+        bindingId: ready.bindingId, repository: ready.repository, branch: ready.branch,
+        revision: ready.revision, private: ready.private,
+      };
+    },
     async prepare(principal, runId) {
-      const { tenantId, profileId } = identity(principal);
-      if ((await bindings.list()).some((binding) => binding.profileId === profileId && binding.tenantId !== tenantId)) {
-        throw new WorkspaceError('WORKSPACE_FORBIDDEN', 'profileId is already bound to another tenant');
-      }
-      const profileKey = createHash('sha256').update(`${tenantId}\0${profileId}`).digest('hex').slice(0, 32);
-      const ensured = await workspace.ensureProfileRepository({
-        operationId: `ensure:${profileKey}`,
-        tenantId,
-        profileId,
-        owner: options.owner,
-        credentialTokenRef: tokenRef,
-      });
-      if (!(await bindings.findByProfile(tenantId, profileId))?.headRevision) {
-        const empty = mkdtempSync(join(tmpdir(), 'profile-bootstrap-'));
-        try {
-          const bootstrap = await workspace.publishRunChanges({
-            operationId: `bootstrap:${profileKey}`,
-            tenantId, profileId, runId: `bootstrap-${profileKey}`,
-            workspacePath: empty, baseRevision: EMPTY_TREE, credentialTokenRef: tokenRef,
-          });
-          if (bootstrap.status !== 'published') throw new WorkspaceError('WORKSPACE_GIT_FAILED', 'profile bootstrap was not published');
-        } finally {
-          rmSync(empty, { recursive: true, force: true });
-        }
-      }
-      // GitHub may choose the first pushed branch (the durable bootstrap candidate) as
-      // default. Once the canonical branch has been published, align repository browsing
-      // with the same ref used for future snapshots. This also repairs existing profiles.
-      const binding = await bindings.findByProfile(tenantId, profileId);
-      if (binding?.headRevision) {
-        await admin.setDefaultBranch({ repository: binding.repository, branch: binding.branch });
-      }
+      const ready = await ensureReady(principal);
+      const { tenantId, profileId, credentialTokenRef, runtime } = ready;
+      const { workspace, journal } = runtime;
+      const { repository } = ready;
       const unresolved = journal.listPublications({ profileId }).find((entry) => entry.tenantId === tenantId && !['published', 'failed'].includes(entry.status));
       if (unresolved) {
         throw new WorkspaceError('WORKSPACE_HEAD_CHANGED', `profile has unresolved publication ${unresolved.publicationId}`, {
@@ -133,7 +232,7 @@ export function createProfileWorkspaceCoordinator(options: ProfileWorkspaceRunti
         operationId: `prepare:${runId}`,
         tenantId,
         profileId,
-        credentialTokenRef: tokenRef,
+        credentialTokenRef,
       });
       if (snapshot.warnings.length > 0 || (snapshot.artifacts > 0 && options.objectBackend !== 'gcs')) {
         throw new WorkspaceError('WORKSPACE_STORAGE_UNAVAILABLE', 'profile snapshot cannot be fully materialized by this worker', {
@@ -149,7 +248,7 @@ export function createProfileWorkspaceCoordinator(options: ProfileWorkspaceRunti
       try {
         for (const entry of snapshot.manifest) {
           if (!isSafeRelativePath(entry.path)) throw new WorkspaceError('WORKSPACE_PATH_DENIED', `unsafe snapshot path ${entry.path}`);
-          const bytes = await workspace.readProfileBlob({ tenantId, profileId, revision: snapshot.baseRevision, path: entry.path, credentialTokenRef: tokenRef });
+          const bytes = await workspace.readProfileBlob({ tenantId, profileId, revision: snapshot.baseRevision, path: entry.path, credentialTokenRef });
           if (bytes.length !== entry.size || createHash('sha256').update(bytes).digest('hex') !== entry.sha256) {
             throw new WorkspaceError('WORKSPACE_STORAGE_UNAVAILABLE', `snapshot checksum mismatch for ${entry.path}`);
           }
@@ -168,11 +267,11 @@ export function createProfileWorkspaceCoordinator(options: ProfileWorkspaceRunti
         const expiresAt = new Date(Date.now() + 2 * 60 * 60 * 1000);
         const signed = await objects.shareUrl(archiveKey, { expiresAt });
         const writebackToken = randomBytes(32).toString('base64url');
-        const savebackDir = join(options.rootDir, 'saveback', runId);
+        const savebackDir = join(runtime.rootDir, 'saveback', runId);
         mkdirSync(savebackDir, { recursive: true, mode: 0o700 });
         writeFileSync(join(savebackDir, 'capability.json'), JSON.stringify({ tokenHash: createHash('sha256').update(writebackToken).digest('hex'), tenantId, profileId, baseRevision: snapshot.baseRevision, snapshotKey: archiveKey, expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString() }), { mode: 0o600 });
         return {
-          bindingId: snapshot.bindingId, repository: ensured.repository, baseRevision: snapshot.baseRevision,
+          bindingId: snapshot.bindingId, repository, baseRevision: snapshot.baseRevision,
           snapshotUrl: signed.url, snapshotSha256: createHash('sha256').update(archiveBytes).digest('hex'), snapshotSize: archiveBytes.length,
           savebackToken: writebackToken,
           ...(options.objectBackend === 'gcs' ? { objectBucket: options.env?.['GCS_BUCKET'] ?? '' } : {}),
@@ -184,11 +283,11 @@ export function createProfileWorkspaceCoordinator(options: ProfileWorkspaceRunti
       }
     },
     async upload(principal, runId, token, path, bytes, sha256) {
-      const { tenantId, profileId } = identity(principal);
+      const { tenantId, profileId, runtime } = identity(principal);
       if (!isSafeRelativePath(path) || !/^[0-9a-f]{64}$/.test(sha256) || createHash('sha256').update(bytes).digest('hex') !== sha256) throw new WorkspaceError('WORKSPACE_PATH_DENIED', 'saveback path or checksum is invalid');
       if (matchRule(exportPolicy, path).action === 'exclude') throw new WorkspaceError('WORKSPACE_PATH_DENIED', 'saveback path is excluded by the profile export policy');
       if (bytes.length > 100_000_000) throw new WorkspaceError('WORKSPACE_TOO_LARGE', 'saveback file exceeds the 100 MB per-file limit');
-      const dir = join(options.rootDir, 'saveback', runId);
+      const dir = join(runtime.rootDir, 'saveback', runId);
       const capPath = join(dir, 'capability.json');
       if (!existsSync(capPath)) throw new WorkspaceError('WORKSPACE_FORBIDDEN', 'saveback capability is not active');
       const cap = JSON.parse(readFileSync(capPath, 'utf8')) as { tokenHash: string; tenantId: string; profileId: string; expiresAt: string; uploaded?: Record<string, { sha256: string; size: number }> };
@@ -205,8 +304,9 @@ export function createProfileWorkspaceCoordinator(options: ProfileWorkspaceRunti
       writeFileSync(capPath, JSON.stringify(cap), { mode: 0o600 });
     },
     async publish(principal, runId, baseRevision, files, deletes) {
-      const { tenantId, profileId } = identity(principal);
-      const dir = join(options.rootDir, 'saveback', runId);
+      const { tenantId, profileId, owner, credentialTokenRef, runtime } = identity(principal);
+      const { workspace } = runtime;
+      const dir = join(runtime.rootDir, 'saveback', runId);
       const capPath = join(dir, 'capability.json');
       if (!existsSync(capPath)) throw new WorkspaceError('WORKSPACE_FORBIDDEN', 'saveback capability is not active');
       const cap = JSON.parse(readFileSync(capPath, 'utf8')) as { tenantId: string; profileId: string; baseRevision: string; snapshotKey?: string; expiresAt: string; uploaded?: Record<string, { sha256: string; size: number }> };
@@ -214,9 +314,10 @@ export function createProfileWorkspaceCoordinator(options: ProfileWorkspaceRunti
       const workspacePath = mkdtempSync(join(tmpdir(), `profile-save-${runId}-`));
       let durablePublication = false;
       try {
-        const snapshot = await workspace.prepareProfileWorkspace({ operationId: `saveback-base:${runId}`, tenantId, profileId, revision: baseRevision, credentialTokenRef: tokenRef });
+        await assertRouteMatchesBinding(runtime, tenantId, profileId, owner);
+        const snapshot = await workspace.prepareProfileWorkspace({ operationId: `saveback-base:${runId}`, tenantId, profileId, revision: baseRevision, credentialTokenRef });
         for (const entry of snapshot.manifest) {
-          const bytes = await workspace.readProfileBlob({ tenantId, profileId, revision: baseRevision, path: entry.path, credentialTokenRef: tokenRef });
+          const bytes = await workspace.readProfileBlob({ tenantId, profileId, revision: baseRevision, path: entry.path, credentialTokenRef });
           const target = resolveInsideRoot(workspacePath, entry.path, 'profile base path');
           mkdirSync(join(target, '..'), { recursive: true, mode: 0o700 });
           writeFileSync(target, bytes, { mode: 0o600 });
@@ -239,7 +340,7 @@ export function createProfileWorkspaceCoordinator(options: ProfileWorkspaceRunti
           if (matchRule(exportPolicy, path).action === 'exclude') throw new WorkspaceError('WORKSPACE_PATH_DENIED', 'saveback delete path is excluded by the profile export policy');
           rmSync(resolveInsideRoot(workspacePath, path, 'saveback delete'), { force: true });
         }
-        const publication = await workspace.publishRunChanges({ operationId: `publish:${runId}`, tenantId, profileId, runId, workspacePath, baseRevision, credentialTokenRef: tokenRef });
+        const publication = await workspace.publishRunChanges({ operationId: `publish:${runId}`, tenantId, profileId, runId, workspacePath, baseRevision, credentialTokenRef });
         durablePublication = true;
         return publication;
       } finally {

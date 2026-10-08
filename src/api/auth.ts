@@ -1,9 +1,9 @@
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 
-export type Scope = 'runs:read' | 'runs:write';
+export type Scope = 'runs:read' | 'runs:write' | 'profiles:provision';
 
-export const RUN_SCOPES: readonly Scope[] = ['runs:read', 'runs:write'];
+export const RUN_SCOPES: readonly Scope[] = ['runs:read', 'runs:write', 'profiles:provision'];
 
 export interface Principal {
   principalId: string;

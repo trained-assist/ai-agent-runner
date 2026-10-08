@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import type { ProfileWorkspaceSpec, RunSpec } from '../contracts/run-spec.js';
@@ -56,6 +56,9 @@ export function createApiSavebackWorker(dataDir: string): RunBranchWorker & {
           if (relative && !isSafeRelativePath(relative)) throw new Error('profile snapshot contains an unsafe path');
         }
         execFileSync('tar', ['--no-same-owner', '--no-same-permissions', '-xzf', archive, '-C', cwd], { stdio: 'pipe' });
+        // Archives are untrusted inputs. Ignore read-only/executable mode bits so an
+        // existing snapshot file remains writable by the per-run identity in GHA/VM.
+        makeWorkspaceWritable(cwd);
       } finally {
         rmSync(temp, { recursive: true, force: true });
       }
@@ -111,6 +114,19 @@ export function createApiSavebackWorker(dataDir: string): RunBranchWorker & {
   };
 }
 
+function makeWorkspaceWritable(root: string): void {
+  const entries = readdirSync(root, { withFileTypes: true });
+  for (const entry of entries) {
+    const path = join(root, entry.name);
+    if (entry.isDirectory()) {
+      makeWorkspaceWritable(path);
+      chmodSync(path, 0o700);
+    } else if (entry.isFile()) {
+      chmodSync(path, 0o600);
+    }
+  }
+}
+
 function requiredSavebackWorkspace(spec: RunSpec): ProfileWorkspaceSpec {
   if (!spec.profileWorkspace?.savebackUrl || !spec.profileWorkspace.snapshotUrl) {
     throw new Error('profile saveback requires a pinned snapshot and run-scoped API capability');
@@ -126,7 +142,8 @@ async function uploadFile(profile: ProfileWorkspaceSpec, token: string, relative
     redirect: 'error',
     signal: AbortSignal.timeout(60_000),
     headers: { authorization: `Bearer ${token}`, 'content-type': 'application/octet-stream', 'x-content-sha256': sha256 },
-    body: bytes,
+    // Node's fetch accepts Buffer, while the DOM BodyInit type omits Node buffers.
+    body: bytes as unknown as RequestInit['body'],
   });
   if (!response.ok) throw new Error(`profile saveback upload failed with HTTP ${response.status}`);
 }

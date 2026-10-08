@@ -70,6 +70,9 @@ API больше не используется** и удаляется отде�
 | `AGENT_API_PROFILE_WORKSPACE_ROOT` | — (выключено) | включает постоянный профиль для каждого Run; устойчивый каталог журнала и bare-зеркал Git |
 | `AGENT_API_PROFILE_OWNER` | — | организация приватных репозиториев профиля; обязательна при включении профиля |
 | `AGENT_API_PROFILE_GITHUB_TOKEN` | — | хостовый токен GitHub для ensure/fetch/publish; не попадает в агентское окружение или журнал |
+| `AGENT_API_PROFILE_TENANT_ROUTES_JSON` | `{}` | необязательная host-only таблица `tenantId → {owner, tokenEnv}`; `tokenEnv` ссылается на имя переменной с credential, значение секрета не помещается в JSON |
+| `AGENT_API_PROFILE_REQUIRE_TENANT_ROUTE` | `false` | при `true` API отказывает tenant без явного маршрута; используйте для выделенного synthetic/test API lane |
+| `AGENT_API_PROFILE_DELEGATION_SECRET` | — (выключено) | HMAC secret для короткоживущей host-to-API `(principal, tenantId, profileId, expiry)` capability; обязателен для CP delegated profiles, хранится только в API и CP secret stores |
 | `AGENT_API_PROFILE_OBJECT_BACKEND` | `gcs` | хранилище тяжёлых файлов; `local-fs` только для локального fixture, GCS использует `GCS_BUCKET` и ADC |
 | `GCP_PROJECT` / `GOOGLE_CLOUD_PROJECT` | — | ID проекта GCS; задавайте явно при Workload Identity Federation, чтобы чтение метаданных объекта не запрашивало доступ к Cloud Resource Manager |
 | `AGENT_API_PUBLIC_URL` | `http://<host>:<port>` | публичная база API: воркер возвращает результат на `POST {resultUrl}`. Можно задать префикс reverse proxy (например, `https://runner.example/profile-api`); proxy должен передавать callback-маршруты `/v1/worker/launches/{runId}/result` и `/profile-changes` в API без изменения пути. Без URL запуск падает с `RESULT_URL_UNSET` |
@@ -89,6 +92,15 @@ API больше не используется** и удаляется отде�
 загружает его в приватный GCS и передаёт воркеру подписанную ссылку с SHA-256 и размером.
 Архив включает также проверенные байты больших объектов; воркеру не нужен общий доступ
 к GCS для чтения профиля.
+
+Доверенный Control Plane может переключить profile для конкретного запроса только при
+настроенном `AGENT_API_PROFILE_DELEGATION_SECRET`: он прикладывает короткоживущую HMAC
+capability, связавшую API-key principal, неизменяемый tenant из API-key registry,
+делегированный `profileId` и expiry. API проверяет подпись, tenant equality, срок и форму
+до приёма Run. Capability не разрешает выбирать owner или `repository.fullName`; owner
+выводится из host-only tenant route, а repository — из profile workspace binding.
+Без secret запрос с delegated headers отказывает; обычная не-delegated profile авторизация
+не меняется. Secret не записывается в admission journal и не передаётся воркеру.
 
 Воркер не получает GitHub token и не клонирует/пушит репозиторий профиля. Он загружает
 изменённые байты через `POST /v1/worker/launches/{runId}/profile-changes?path=...` с
@@ -113,6 +125,14 @@ Export policy остаётся границей для PII/секретов: и�
 томе, `AGENT_API_ADMISSION_LOG` на том же постоянном томе, `AGENT_API_PROFILE_OWNER`,
 `AGENT_API_PROFILE_GITHUB_TOKEN`, `AGENT_API_PROFILE_OBJECT_BACKEND=gcs`, `GCS_BUCKET`
 и `GCP_PROJECT` (либо `GOOGLE_CLOUD_PROJECT`) при WIF.
+Тестовый owner задаётся только операторской конфигурацией, например tenant route с owner
+`profile-artifacts-sandbox` и именем переменной для отдельного GitHub credential. API key
+реестра доверенно определяет `tenantId`; run body, display name и prompt не могут менять
+owner. В выделенном test lane включайте `AGENT_API_PROFILE_REQUIRE_TENANT_ROUTE=true`, чтобы
+неизвестный тестовый tenant не упал назад на обычный owner. Изменение маршрута для уже
+привязанного профиля завершается отказом до GitHub операции. Для явно маршрутизированных
+tenant журнал, локальные Git-зеркала и saveback-файлы изолированы в подкаталоге с хэшем
+`tenantId`; remote object keys по-прежнему требуют уникального trusted `profileId`.
 Для внешнего Runner profile snapshot storage должен поддерживать signed HTTPS download
 URL; production-конфигурация — GCS. `local-fs` остаётся только для локальных операций
 WorkspaceService и не может обслужить внешний snapshot.
@@ -137,6 +157,7 @@ snapshot → изменение/удаление → API publication → сле�
 |---|---|
 | `GET /healthz` | единственный маршрут без ключа: `{status, workers: [{engine, baseUrl}], runs, admissions, events}` |
 | `GET /v1/capabilities` | декларация возможностей (см. §5) |
+| `POST /v1/profiles/workspace` | идемпотентно создаёт/проверяет приватный workspace по signed tenant/profile; scope `profiles:provision`, тело `{}`, Agent Run не запускается |
 | `POST /v1/runs` | приём: `Idempotency-Key` обязателен; `202` — новый receipt, `200` — дедуп |
 | `GET /v1/runs/{id}/status` | состояние рана, курсор событий, `answer` агента |
 | `GET /v1/runs/{id}/result` | `RunResult` после терминального состояния, иначе `409 RESULT_NOT_READY` |
@@ -144,6 +165,16 @@ snapshot → изменение/удаление → API publication → сле�
 | `GET /v1/runs/{id}/artifacts` | ветка рана, ссылка на merge, ссылки на файлы по коммиту и `logUrl` |
 | `GET /v1/runs/{id}/log` | `302` на ссылку лога в Google Storage |
 | `POST /v1/runs/{id}/cancel` | пробрасывает отмену воркеру; `202` — принята, `200` — уже терминальный |
+
+`POST /v1/profiles/workspace` требует API key со scope `profiles:provision`, пустое тело
+`{}` и все четыре короткоживущих заголовка `x-agent-profile-*`. `tenantId` берётся из API key;
+profile выбирается только подписанной capability. Owner, repo name, branch и GitHub token
+из запроса не принимаются. API выполняет private-repo ensure, проверяет ownership marker,
+создаёт начальный marker commit и фиксирует canonical branch. Ответ содержит `status`,
+`tenantId`, `profileId`, `bindingId`, `repository`, `branch`, `revision` и `private`; это
+внутренний receipt для доверенного Control Plane. Повторный запрос возвращает то же
+профильное связывание. Никакой Worker, admission или model-token allowance не используется.
+При выключенном provisioning API отвечает 503 `PROFILE_WORKSPACE_UNAVAILABLE`.
 
 Для `eu-vm-agent-run` и `rf-vm-agent-run` центральный `/events` также зеркалит stdout/stderr
 из replayable worker SSE, пока агент работает. Worker cursor переживает разрыв соединения,

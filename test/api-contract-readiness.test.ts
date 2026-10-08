@@ -17,6 +17,7 @@ import {
 
 interface Capabilities {
   contract: { name: string; version: number };
+  profileWorkspaceProvisioning: { enabled: boolean; method: string; path: string; scope: string; requiresSignedProfileCapability: boolean; launchesAgent: boolean };
   idempotency: { header: string; repeatWithSameKey: string; newAttemptRequires: string };
   states: string[];
   events: { cursor: boolean; replay: boolean; sse: boolean; lastEventId: boolean };
@@ -44,6 +45,7 @@ describe('GET /v1/capabilities: декларация, а не догадки (#7
     const caps = (await response.json()) as Capabilities;
 
     expect(caps.contract.name).toBe('ai-agent-runner/serverless-agent-api');
+    expect(caps.profileWorkspaceProvisioning).toMatchObject({ enabled: false, method: 'POST', path: '/v1/profiles/workspace', scope: 'profiles:provision', requiresSignedProfileCapability: true, launchesAgent: false });
     expect(caps.idempotency).toMatchObject({
       header: 'Idempotency-Key',
       repeatWithSameKey: 'same_receipt',

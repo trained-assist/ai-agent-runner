@@ -4,7 +4,7 @@ import { TERMINAL_EVENT_TYPES } from '../contracts/events.js';
 import type { KeyRegistry, Principal, Scope } from './auth.js';
 import { ApiError } from './errors.js';
 import type { AgentApi, ApiLogger, RunCancelReceipt } from './service.js';
-import { createHash } from 'node:crypto';
+import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 
 /**
  * HTTP-фасад stateless API (epic #74). Маршруты те же, что у приёмника, но за каждым из них
@@ -20,6 +20,8 @@ export interface AgentApiServerOptions {
   keepaliveMs?: number;
   /** Базовый URL API: используется в ссылках, которые отдаёт сервер. */
   baseUrl?: string;
+  /** Shared only with the trusted Control Plane; signs tenant/profile run scopes. */
+  profileDelegationSecret?: string;
 }
 
 const DEFAULT_MAX_BODY_BYTES = 1_000_000;
@@ -82,14 +84,31 @@ export function createAgentApiServer(service: AgentApi, options: AgentApiServerO
       return 201;
     }
 
-    const principal = options.keys.authenticate(req.headers['authorization']);
-    if (!principal) throw new ApiError('UNAUTHENTICATED', 'a valid Bearer API key is required');
+    const authenticated = options.keys.authenticate(req.headers['authorization']);
+    if (!authenticated) throw new ApiError('UNAUTHENTICATED', 'a valid Bearer API key is required');
+    const principal = delegatedPrincipal(authenticated, req.headers, options.profileDelegationSecret);
 
     const segments = path.split('/').filter((segment) => segment.length > 0);
 
     if (segments[0] === 'v1' && segments[1] === 'capabilities' && segments.length === 2) {
       if (req.method !== 'GET') throw new ApiError('METHOD_NOT_ALLOWED', 'capabilities supports GET only');
       sendJson(res, 200, service.capabilities());
+      return 200;
+    }
+
+    if (segments[0] === 'v1' && segments[1] === 'profiles' && segments[2] === 'workspace' && segments.length === 3) {
+      if (req.method !== 'POST') throw new ApiError('METHOD_NOT_ALLOWED', 'profile workspace provisioning supports POST only');
+      if (![req.headers['x-agent-profile-id'], req.headers['x-agent-profile-tenant'], req.headers['x-agent-profile-exp'], req.headers['x-agent-profile-sig']]
+        .every((value) => typeof value === 'string' && value.trim().length > 0)) {
+        throw new ApiError('FORBIDDEN', 'profile workspace provisioning requires a signed profile capability');
+      }
+      requireScope(principal, 'profiles:provision');
+      const body = await readJsonBody(req, maxBodyBytes);
+      if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).length !== 0) {
+        throw new ApiError('INVALID_REQUEST', 'profile workspace provisioning accepts only an empty JSON object');
+      }
+      const receipt = await service.provisionProfileWorkspace(principal);
+      sendJson(res, 200, receipt);
       return 200;
     }
 
@@ -263,6 +282,31 @@ export function createAgentApiServer(service: AgentApi, options: AgentApiServerO
   }
 
   return server;
+}
+
+function delegatedPrincipal(principal: Principal, headers: IncomingMessage['headers'], secret?: string): Principal {
+  const profileId = headerString(headers['x-agent-profile-id']);
+  const tenantId = headerString(headers['x-agent-profile-tenant']);
+  const expiresAt = headerString(headers['x-agent-profile-exp']);
+  const signature = headerString(headers['x-agent-profile-sig']);
+  if (!profileId && !tenantId && !expiresAt && !signature) return principal;
+  if (!secret || !principal.tenantId || !profileId || !tenantId || tenantId !== principal.tenantId
+    || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/.test(profileId)
+    || !expiresAt || !/^\d{13}$/.test(expiresAt) || Number(expiresAt) < Date.now()
+    || Number(expiresAt) > Date.now() + 5 * 60_000 || !signature || !/^[0-9a-f]{64}$/.test(signature)) {
+    throw new ApiError('FORBIDDEN', 'invalid or expired host profile capability');
+  }
+  const message = `${principal.principalId}\0${tenantId}\0${profileId}\0${expiresAt}`;
+  const expected = createHmac('sha256', secret).update(message).digest();
+  const provided = Buffer.from(signature, 'hex');
+  if (provided.length !== expected.length || !timingSafeEqual(provided, expected)) {
+    throw new ApiError('FORBIDDEN', 'invalid or expired host profile capability');
+  }
+  return { ...principal, profileId };
+}
+
+function headerString(value: string | string[] | undefined): string | null {
+  return typeof value === 'string' ? value.trim() : null;
 }
 
 function writeFrame(res: ServerResponse, event: string, data: unknown): void {
