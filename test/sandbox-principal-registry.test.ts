@@ -33,12 +33,12 @@ describe('sandbox mock-test principal provisioning', () => {
     const registry = JSON.parse(readFileSync(path, 'utf8')) as { principals: Array<Record<string, unknown>> };
     const record = registry.principals.find((entry) => entry['keyHash'] === keyHash);
 
-    expect(result).toMatchObject({ changed: true, principalId: SANDBOX_TEST_PRINCIPAL.principalId, profileId: SANDBOX_TEST_PRINCIPAL.profileId });
-    expect(record).toMatchObject({ principalId: SANDBOX_TEST_PRINCIPAL.principalId, profileId: SANDBOX_TEST_PRINCIPAL.profileId, scopes: ['runs:read', 'runs:write'], engines: ['mock-test'] });
+    expect(result).toMatchObject({ changed: true, principalId: SANDBOX_TEST_PRINCIPAL.principalId, tenantId: SANDBOX_TEST_PRINCIPAL.tenantId, profileId: SANDBOX_TEST_PRINCIPAL.profileId });
+    expect(record).toMatchObject({ principalId: SANDBOX_TEST_PRINCIPAL.principalId, tenantId: SANDBOX_TEST_PRINCIPAL.tenantId, profileId: SANDBOX_TEST_PRINCIPAL.profileId, scopes: ['runs:read', 'runs:write'], engines: ['mock-test'] });
     expect(JSON.stringify(result)).not.toContain(rawKey);
     expect(JSON.stringify(result)).not.toContain(keyHash);
     expect(JSON.stringify(registry)).not.toContain(rawKey);
-    expect(registryView.authenticate(`Bearer ${rawKey}`)).toMatchObject({ principalId: SANDBOX_TEST_PRINCIPAL.principalId, profileId: SANDBOX_TEST_PRINCIPAL.profileId, engines: ['mock-test'] });
+    expect(registryView.authenticate(`Bearer ${rawKey}`)).toMatchObject({ principalId: SANDBOX_TEST_PRINCIPAL.principalId, tenantId: SANDBOX_TEST_PRINCIPAL.tenantId, profileId: SANDBOX_TEST_PRINCIPAL.profileId, engines: ['mock-test'] });
     expect(provisionSandboxMockPrincipal(path, keyHash)).toMatchObject({ changed: false });
     expect((JSON.parse(readFileSync(path, 'utf8')) as { principals: unknown[] }).principals).toHaveLength(2);
   });

@@ -7,7 +7,8 @@ import { KeyRegistry, RUN_SCOPES } from '../api/auth.js';
 
 export const SANDBOX_TEST_PRINCIPAL = {
   principalId: 'integration-telegram-ux-v1-mock-test',
-  profileId: 'integration-telegram-ux-v1',
+  tenantId: 'integration-telegram-ux-v1-mock-test',
+  profileId: 'integration-telegram-ux-v1-mock-test',
   scopes: ['runs:read', 'runs:write'] as const,
   engines: ['mock-test'] as const,
 } as const;
@@ -29,6 +30,7 @@ interface RegistryFile {
 export interface SandboxPrincipalProvisionResult {
   changed: boolean;
   principalId: string;
+  tenantId: string;
   profileId: string;
   scopes: readonly string[];
   engines: readonly string[];
@@ -95,12 +97,13 @@ export function provisionSandboxMockPrincipal(registryPath: string, keyHash: unk
   try {
     const registry = parseRegistry(readFileSync(registryPath, 'utf8'));
     if (registry.principals.some((record) => record.principalId === SANDBOX_TEST_PRINCIPAL.principalId
-      && (record.profileId !== SANDBOX_TEST_PRINCIPAL.profileId || record.tenantId !== undefined))) {
+      && (record.profileId !== SANDBOX_TEST_PRINCIPAL.profileId || record.tenantId !== SANDBOX_TEST_PRINCIPAL.tenantId))) {
       throw new Error('sandbox_principal_identity_conflict');
     }
     const existingByHash = registry.principals.find((record) => record.keyHash === keyHash);
     if (existingByHash) {
       if (existingByHash.principalId !== SANDBOX_TEST_PRINCIPAL.principalId
+        || existingByHash.tenantId !== SANDBOX_TEST_PRINCIPAL.tenantId
         || existingByHash.profileId !== SANDBOX_TEST_PRINCIPAL.profileId
         || JSON.stringify([...existingByHash.scopes].sort()) !== JSON.stringify([...SANDBOX_TEST_PRINCIPAL.scopes].sort())
         || JSON.stringify([...(existingByHash.engines ?? [])].sort()) !== JSON.stringify([...SANDBOX_TEST_PRINCIPAL.engines].sort())) {
@@ -112,6 +115,7 @@ export function provisionSandboxMockPrincipal(registryPath: string, keyHash: unk
     const record: RegistryRecord = {
       keyHash,
       principalId: SANDBOX_TEST_PRINCIPAL.principalId,
+      tenantId: SANDBOX_TEST_PRINCIPAL.tenantId,
       profileId: SANDBOX_TEST_PRINCIPAL.profileId,
       scopes: [...SANDBOX_TEST_PRINCIPAL.scopes],
       engines: [...SANDBOX_TEST_PRINCIPAL.engines],
