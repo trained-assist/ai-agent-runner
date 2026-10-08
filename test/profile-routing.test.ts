@@ -55,6 +55,22 @@ describe('tenant-scoped profile repository routing', () => {
     }
   });
 
+  it('supports a strict tenant-only lane with no default owner or credential', () => {
+    const rootDir = mkdtempSync(join(tmpdir(), 'profile-routing-tenant-only-'));
+    try {
+      expect(() => createProfileWorkspaceCoordinator({
+        rootDir,
+        owner: '',
+        token: '',
+        objectBackend: 'local-fs',
+        requireTenantRoute: true,
+        tenantRoutes: { 'sandbox3-acceptance': { owner: 'profile-artifacts-sandbox', token: 'org-token-fixture' } },
+      })).not.toThrow();
+    } finally {
+      rmSync(rootDir, { recursive: true, force: true });
+    }
+  });
+
   it('keeps profiles with the same display name distinct when their trusted profile IDs differ', () => {
     const first = repositoryNameFor('test-user-01');
     const second = repositoryNameFor('test-user-02');

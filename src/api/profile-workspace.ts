@@ -79,14 +79,15 @@ interface ProfileWorkspaceRouteRuntime {
 
 /** Durable journal/mirrors live on the API host; canonical bytes live in Git and object storage. */
 export function createProfileWorkspaceCoordinator(options: ProfileWorkspaceRuntimeOptions): ProfileWorkspaceCoordinator {
-  if (!options.rootDir || !options.owner || !options.token) throw new Error('profile workspace requires rootDir, owner and GitHub token');
+  const tenantOnly = !!options.requireTenantRoute && Object.keys(options.tenantRoutes ?? {}).length > 0;
+  if (!options.rootDir || (!tenantOnly && (!options.owner || !options.token))) throw new Error('profile workspace requires rootDir, owner and GitHub token unless every tenant route is explicit');
   if (options.objectBackend === 'local-fs' && process.env['NODE_ENV'] === 'production') {
     throw new Error('production profile workspace requires remote object storage');
   }
   const credentialTokens = new Map<string, string>();
   const routeRefs = new Map<string, string>();
   const defaultTokenRef = 'profile-workspace-github:default';
-  credentialTokens.set(defaultTokenRef, options.token);
+  if (options.token) credentialTokens.set(defaultTokenRef, options.token);
   for (const [tenantId, route] of Object.entries(options.tenantRoutes ?? {})) {
     if (!tenantId.trim() || !route.owner.trim() || !route.token.trim()) throw new Error('profile workspace tenant route requires tenantId, owner and token');
     const ref = `profile-workspace-github:tenant:${createHash('sha256').update(tenantId).digest('hex').slice(0, 24)}`;
