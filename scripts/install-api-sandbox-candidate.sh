@@ -138,28 +138,17 @@ for _ in $(seq 1 30); do
 done
 [[ "$HEALTHY" == 1 ]] || die 'test API did not become healthy'
 
-python3 - "$API_PORT" <<'PY'
-import hashlib, json, sys, urllib.error, urllib.request
-port = sys.argv[1]
-key_path = '/etc/agent-runner/runner-test-api-key'
+python3 <<'PY'
+import json
 registry_path = '/etc/agent-runner/key-registry-mcp-test.json'
-key = open(key_path, encoding='utf-8').read().strip()
 records = json.load(open(registry_path, encoding='utf-8')).get('principals', [])
-digest = hashlib.sha256(key.encode()).hexdigest()
-if not any(record.get('keyHash') == digest and record.get('profileId') == 'integration-telegram-ux-v1'
-           and record.get('principalId') == 'integration-telegram-ux-v1' for record in records):
-    raise SystemExit('test API credential registry does not match its protected key file')
-request = urllib.request.Request(f'http://127.0.0.1:{port}/v1/runs/run_01234567-89ab-cdef-0123-456789abcdef/status',
-                                 headers={'Authorization': f'Bearer {key}'})
-try:
-    response = urllib.request.urlopen(request, timeout=5)
-    status = response.status
-except urllib.error.HTTPError as error:
-    status = error.code
-if status != 404:
-    raise SystemExit(f'authenticated test API probe expected 404, got {status}')
+required = {'runs:read', 'runs:write'}
+if not any(record.get('profileId') == 'integration-telegram-ux-v1'
+           and record.get('principalId') == 'integration-telegram-ux-v1'
+           and required.issubset(set(record.get('scopes', []))) for record in records):
+    raise SystemExit('test API registry lacks the scoped Telegram UX principal')
 PY
 
 ROLLBACK_ACTIVE=0
 trap - EXIT
-log "installed and health-checked isolated candidate $SOURCE_SHA"
+log "installed and health-checked isolated candidate $SOURCE_SHA; scoped test principal is present"

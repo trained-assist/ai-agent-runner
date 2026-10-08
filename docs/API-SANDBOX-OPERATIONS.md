@@ -47,8 +47,10 @@ opening SSH. The remote installer independently checks the target hostname,
 unit name, environment-file path, port, artifact checksum, source manifest, and
 archive paths. It installs a versioned directory below
 `/opt/sb/ai-agent-runner-api-mcp-test`, updates only
-`agent-runner-api-mcp-test.service`, and requires both liveness and an
-authenticated not-found probe before reporting success. Failed startup restores
+`agent-runner-api-mcp-test.service`, and requires liveness plus the scoped
+Telegram UX principal in the configured registry before reporting success.
+The authenticated CP-to-Runner probe is performed by a disposable end-to-end
+acceptance task after deployment. Failed startup restores
 the prior unit and code pointer. The installer keeps the prior release and
 provides `/usr/local/sbin/runner-api-mcp-test-rollback SOURCE_SHA` for an
 explicit rollback.
@@ -62,8 +64,10 @@ service; deployment output and evidence contain names and status only.
 ## Observe and reset
 
 Use authenticated Runner API submit/status/result/events/artifacts endpoints for
-test runs. The deployment script checks `GET /healthz` and confirms the test
-API credential with a synthetic unknown run ID; it does not create a task.
+test runs. The installer checks `GET /healthz` and verifies the scoped test
+principal in the configured key registry without reading or printing credential
+values. The acceptance task proves authenticated CP-to-Runner admission; the
+installer itself does not create a task.
 Service logs are available with:
 
 ```bash
