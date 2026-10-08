@@ -142,7 +142,8 @@ async function uploadFile(profile: ProfileWorkspaceSpec, token: string, relative
     redirect: 'error',
     signal: AbortSignal.timeout(60_000),
     headers: { authorization: `Bearer ${token}`, 'content-type': 'application/octet-stream', 'x-content-sha256': sha256 },
-    body: bytes,
+    // Node's fetch accepts Buffer, while the DOM BodyInit type omits Node buffers.
+    body: bytes as unknown as RequestInit['body'],
   });
   if (!response.ok) throw new Error(`profile saveback upload failed with HTTP ${response.status}`);
 }
