@@ -15,21 +15,27 @@ to `main`.
 
 ## Build a candidate
 
-Run the manual **Runner API sandbox candidate** workflow from the default
-branch, with the desired branch or commit in `source_ref`:
+Run the manual **Runner API sandbox candidate** workflow from a ref that
+contains the installer and packaging changes you intend to use. The workflow
+ref supplies those deployment scripts; `source_ref` supplies the Runner source.
+For an unmerged PR that changes both, use that PR branch for both refs:
 
 ```bash
 gh workflow run runner-api-sandbox-candidate.yml \
   --repo trained-assist/ai-agent-runner \
-  --ref main \
-  -f source_ref=fix/example-candidate
+  --ref feat/sandbox-principal-bootstrap-20261008 \
+  -f source_ref=feat/sandbox-principal-bootstrap-20261008
 ```
+
+After that workflow is merged, `--ref main` can package a branch or commit
+passed through `source_ref`.
 
 The workflow checks out the selected source ref, runs `npm run typecheck`,
 `npm test`, and `npm run build`, packages the API with production dependencies, attests the
 archive with GitHub build provenance, and retains the artifact for seven days.
-It never connects to a VM. The artifact manifest pins the exact source SHA and
-target service.
+It verifies the required installer, rollback, mock principal provisioning,
+and mock-mode scripts are present in the archive. It never connects to a VM.
+The artifact manifest pins the exact source SHA and target service.
 
 Download the artifact and deploy it from an operator workstation with GitHub
 attestation access and the existing `vm2` SSH alias:
