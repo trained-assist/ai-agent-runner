@@ -10,6 +10,7 @@ const PUBLIC_URL = `https://${WORKER}.skillset-apply.workers.dev`;
 const PRINCIPAL_ID = 'integration-telegram-ux-v1';
 const PROFILE_ID = 'integration-telegram-ux-v1';
 const TENANT_ID = 'telegram-ux-sandbox-20261009';
+const PROFILE_REPOSITORY = 'vovalikessmoothy-png/cp-telegram-ux-runner-sandbox';
 const MCP_CATALOGUE_VERSION = 'registry-fixture-catalogue-v1';
 
 function run(command, args, options = {}) {
@@ -28,7 +29,8 @@ function validateConfig(config) {
   if (config.name !== WORKER || config.workers_dev !== true
     || config.vars?.RUNNER_API_PUBLIC_URL !== PUBLIC_URL
     || config.vars?.RUNNER_ENGINE !== 'eu-vm-agent-run'
-    || config.vars?.MOCK_TEST_ENABLED !== 'true') {
+    || config.vars?.MOCK_TEST_ENABLED !== 'true'
+    || !config.vars?.ALLOWED_REPOSITORIES?.split(',').map((value) => value.trim()).includes(PROFILE_REPOSITORY)) {
     throw new Error('runner_sandbox_config_mismatch');
   }
 }
@@ -140,6 +142,7 @@ async function main() {
   const keyHash = createHash('sha256').update(apiKey).digest('hex');
   const registry = JSON.stringify([{
     keyHash, principalId: PRINCIPAL_ID, profileId: PROFILE_ID, tenantId: TENANT_ID,
+    repository: PROFILE_REPOSITORY,
     scopes: ['runs:read', 'runs:write'], engines: ['eu-vm-agent-run'],
     mcpBindings: ['registry-mcp-test-160-read'],
   }]);
