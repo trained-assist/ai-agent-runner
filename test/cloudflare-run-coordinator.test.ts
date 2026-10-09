@@ -86,7 +86,8 @@ describe('Cloudflare Runner run coordinator', () => {
     env.FETCH = async (input) => {
       const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
       if (url.pathname === '/v1/launch') return Response.json({ error: 'INVALID_REQUEST',
-        details: ['launch.region: unsupported', 'repository.token: invalid', 'token=never-log-this-value'] }, { status: 400 });
+        details: ['launch.region: unsupported', 'engine does not match this worker',
+          'token=never-log-this-value'] }, { status: 400 });
       return Response.json({ status: 'unknown' });
     };
     const response = await coordinator.fetch(call('/v1/runs', body, { 'idempotency-key': 'worker-refusal' }));
@@ -101,7 +102,7 @@ describe('Cloudflare Runner run coordinator', () => {
     expect(result).toMatchObject({
       runId: receipt.runId, userTaskId: 'task-a', outcome: 'failed', exitReason: 'preflight_refused',
       exitObserved: false, failure: { code: 'WORKER_INVALID_REQUEST', failureClass: 'preflight', retryable: false,
-        safeSummary: expect.stringContaining('rejected fields: launch.region, repository.token') },
+        safeSummary: expect.stringContaining('rejected fields: launch.region, engine') },
     });
     expect(JSON.stringify(result)).not.toContain('never-log-this-value');
 

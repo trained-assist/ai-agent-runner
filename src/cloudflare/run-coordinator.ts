@@ -58,7 +58,7 @@ function workerRefusalFields(body: unknown): string[] {
   const fields = new Set<string>();
   for (const detail of details) {
     if (typeof detail !== 'string') continue;
-    const match = /^([A-Za-z][A-Za-z0-9_.[\]-]{0,159}):/.exec(detail);
+    const match = /^([A-Za-z][A-Za-z0-9_.[\]-]{0,159})(?::|\s+(?:is|does|must|contains|are|was|required)\b)/i.exec(detail);
     if (match?.[1]) fields.add(match[1]);
     if (fields.size >= 12) break;
   }
