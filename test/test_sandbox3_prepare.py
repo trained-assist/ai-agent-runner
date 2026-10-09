@@ -96,7 +96,7 @@ class PrepareTests(unittest.TestCase):
                 self.assertNotIn('synthetic-key', json.dumps(result))
 
     def test_proxy_inspect_emits_only_markers_without_config_or_secrets(self):
-        result = type('Process', (), {'returncode': 0, 'stdout': 'server_name 169-58-15-230.sslip.io; listen 443 ssl; proxy_set_header Authorization private-secret; location /runner-mcp-test/ {}'})()
+        result = type('Process', (), {'returncode': 0, 'stdout': '# configuration file /etc/nginx/nginx.conf:\nserver_name 169-58-15-230.sslip.io; listen 443 ssl; proxy_set_header Authorization private-secret; location /runner-mcp-test/ {}'})()
         with patch.object(prepare.subprocess, 'run', return_value=result):
             report = prepare.proxy_inspect()
         self.assertTrue(report['hostMentioned'])
@@ -115,3 +115,25 @@ class PrepareTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class ProxyGrammarTests(unittest.TestCase):
+    def dump(self, config):
+        return '# configuration file /etc/nginx/sites-enabled/runner:\n' + config
+
+    def test_exact_host_tls_and_legacy_upstream_must_share_one_server(self):
+        valid = "server { listen 443 ssl; server_name 169-58-15-230.sslip.io; location /runner-mcp-test/ { proxy_pass http://127.0.0.1:18882/; } }"
+        targets = prepare.nginx_route_targets(self.dump(valid))
+        self.assertEqual(len(targets), 1)
+        self.assertEqual(targets[0]['content'][targets[0]['server']['end'] - 1], '}')
+        split = "server { listen 443 ssl; server_name other.invalid; location /runner-mcp-test/ { proxy_pass http://127.0.0.1:18882/; } } server { listen 80; server_name 169-58-15-230.sslip.io; }"
+        self.assertEqual(prepare.nginx_route_targets(self.dump(split)), [])
+        self.assertEqual(prepare.nginx_route_targets(self.dump(valid.replace('18882', '9999'))), [])
+        self.assertEqual(len(prepare.nginx_route_targets(self.dump(valid + valid))), 2)
+
+    def test_comments_and_quoted_braces_do_not_change_structure(self):
+        valid = "# server { listen 443 ssl; }\nserver { listen 443 ssl; server_name '169-58-15-230.sslip.io'; add_header X-Test \"text with } # {\"; location /runner-mcp-test { proxy_pass http://127.0.0.1:18882; } }"
+        self.assertEqual(len(prepare.nginx_route_targets(self.dump(valid))), 1)
+        for invalid in ['server {', 'server { add_header X \"unfinished; }', 'server { listen 443 }']:
+            with self.assertRaisesRegex(ValueError, 'sandbox3_proxy_config_unsupported'):
+                prepare.nginx_route_targets(self.dump(invalid))

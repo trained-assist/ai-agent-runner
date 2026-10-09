@@ -268,3 +268,10 @@ exit status, without raw journalctl or environment contents.
 Root-owned runtime staging is made 0755 explicitly: mktemp starts at 0700, which
 would prevent the distinct service UID from entering the installed code root.
 Private state/config permissions are unchanged.
+
+Proxy inspection additionally parses nginx source/server blocks and reports a
+bounded qualifiedRouteTargetCount. A target requires the exact sandbox hostname,
+TLS listen 443 and the existing MCP loopback upstream in the same server block.
+Markers in separate servers never authorize a route edit. Raw source paths,
+certificate paths, header values and configuration stay out of evidence.
+Unsupported or ambiguous grammar fails closed before any mutation.
