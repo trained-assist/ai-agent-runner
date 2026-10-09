@@ -91,6 +91,27 @@ service; deployment output and evidence contain names and status only.
 
 ## Observe and reset
 
+### Read-only admission and binding inventory
+
+`scripts/inspect-api-sandbox.py --inventory` reads only the declared test
+EnvironmentFile, admission journal and current candidate manifest on the pinned
+VM2 host. Run it as the authorized root operator, or send the reviewed script
+over pinned SSH stdin with `python3 - --inventory`. It emits only source SHA,
+approved engine names, binding-presence booleans and admission counts. It does
+not emit raw configuration, credentials, run IDs, prompts, results or exception
+text, and performs no restart, migration, provisioning or file write.
+
+Missing, malformed, oversized, symlinked or overly readable protected files
+produce a sanitized reason code. Unknown outcomes remain nonterminal even when
+a `completed` journal record exists. `--require-terminal-journal` exits nonzero
+unless every journal admission is terminal. `journalTerminalOnly` describes the
+observed journal snapshot; it does not establish a held admission fence, Worker
+exit proof, profile readiness or E2E acceptance. Reconcile exact accepted runs
+and exclude concurrent intake before any restart. A separate service/journal is
+required when old outcomes remain unknown. Recovery ownership:
+[Runner #212](https://github.com/trained-assist/ai-agent-runner/issues/212),
+[architecture #236](https://github.com/trained-assist/trained-agent-architecture/issues/236).
+
 Use authenticated Runner API submit/status/result/events/artifacts endpoints for
 test runs. The installer checks `GET /healthz` and verifies the scoped test
 principal in the configured key registry without reading or printing credential
