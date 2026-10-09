@@ -100,13 +100,40 @@ WantedBy=multi-user.target
     write_exclusive(paths['unit'], unit, 0o644, operator_uid, operator_gid)
 
 
+def runtime_proof(root=ROOT):
+    try:
+        release = (root / 'current').resolve(strict=True)
+        if root.resolve(strict=True) != root or release.parent != root / 'releases':
+            return None, False
+        manifest_path = release / 'candidate-manifest.json'
+        if manifest_path.is_symlink() or manifest_path.stat().st_size > 65536:
+            return None, False
+        manifest = json.loads(manifest_path.read_text())
+        source = manifest.get('sourceSha')
+        if manifest.get('target') not in {'agent-runner-api-mcp-test', 'agent-runner-api-sandbox'} \
+                or not isinstance(source, str) or not re.fullmatch('[a-f0-9]{40}', source) or release.name != source:
+            return None, False
+        process = subprocess.run(['systemctl', 'show', TARGET + '.service', '-p', 'MainPID', '--value'],
+                                 capture_output=True, text=True, timeout=10)
+        if process.returncode != 0 or not re.fullmatch('[1-9][0-9]{0,8}', process.stdout.strip()):
+            return source, False
+        pid = process.stdout.strip()
+        args = Path('/proc/' + pid + '/cmdline').read_bytes().split(b'\0')
+        expected = ['/usr/local/bin/node'.encode(), str(root / 'current/dist/api/main.js').encode(), b'']
+        return source, args == expected and Path('/proc/' + pid + '/cwd').resolve(strict=True) == release
+    except Exception:
+        return None, False
+
+
 def inspect():
     active = subprocess.run(['systemctl', 'is-active', TARGET + '.service'], capture_output=True, timeout=10)
     proxies = {}
     for name in ['caddy', 'nginx']:
         result = subprocess.run(['systemctl', 'is-active', name + '.service'], capture_output=True, timeout=10)
         proxies[name] = result.returncode == 0
+    source, execution_verified = runtime_proof()
     return {'schemaVersion': 1, 'target': TARGET, 'serviceActive': active.returncode == 0,
+            'runtimeSourceSha': source, 'serviceExecSourceVerified': execution_verified,
             'componentsExist': {name: os.path.lexists(path) for name, path in PATHS.items()},
             'proxyServicesActive': proxies, 'realExecutionVerified': False}
 

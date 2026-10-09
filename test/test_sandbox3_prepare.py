@@ -50,6 +50,22 @@ class PrepareTests(unittest.TestCase):
                 prepare.validate_request({**REQUEST, **changes})
         self.assertEqual(prepare.validate_request(REQUEST), REQUEST)
 
+    def test_runtime_source_proof_refuses_alias_and_foreign_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            outside = root / 'outside'; outside.mkdir(); (root / 'current').symlink_to(outside)
+            self.assertEqual(prepare.runtime_proof(root), (None, False))
+            (root / 'current').unlink()
+            release = root / 'releases' / ('a' * 40); release.mkdir(parents=True)
+            (root / 'current').symlink_to(release)
+            manifest = release / 'candidate-manifest.json'
+            manifest.write_text(json.dumps({'target': 'production', 'sourceSha': 'a' * 40}))
+            self.assertEqual(prepare.runtime_proof(root), (None, False))
+            manifest.write_text(json.dumps({'target': 'agent-runner-api-mcp-test', 'sourceSha': 'a' * 40}))
+            result = type('Process', (), {'returncode': 0, 'stdout': '0'})()
+            with patch.object(prepare.subprocess, 'run', return_value=result):
+                self.assertEqual(prepare.runtime_proof(root), ('a' * 40, False))
+
     def test_cli_errors_never_emit_secret_exception_text(self):
         output = io.StringIO()
         with patch.object(prepare.os, 'geteuid', side_effect=RuntimeError(REQUEST['delegationSecret'])), \
