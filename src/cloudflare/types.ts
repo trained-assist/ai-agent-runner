@@ -16,6 +16,8 @@ export interface DurableObjectStateLike {
 export interface RunnerWorkerEnv {
   FETCH?: typeof fetch;
   RUNNER_API_KEYS: string;
+  /** HMAC secret for short-lived Control Plane profile capabilities. */
+  AGENT_API_PROFILE_DELEGATION_SECRET?: string;
   VM_WORKER_URL: string;
   VM_WORKER_TOKEN: string;
   RUNNER_API_PUBLIC_URL: string;

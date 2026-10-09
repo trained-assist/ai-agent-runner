@@ -36,6 +36,29 @@ async function authenticate(request: Request, env: RunnerWorkerEnv): Promise<Api
     ...(record.engines ? { engines: record.engines } : {}), ...(record.mcpBindings ? { mcpBindings: record.mcpBindings } : {}), keyHash: record.keyHash } : null;
 }
 
+async function delegatedPrincipal(request: Request, principal: ApiPrincipal, env: RunnerWorkerEnv): Promise<ApiPrincipal> {
+  const profileId = request.headers.get('x-agent-profile-id')?.trim() ?? '';
+  const tenantId = request.headers.get('x-agent-profile-tenant')?.trim() ?? '';
+  const expiresAt = request.headers.get('x-agent-profile-exp')?.trim() ?? '';
+  const signature = request.headers.get('x-agent-profile-sig')?.trim() ?? '';
+  if (!profileId && !tenantId && !expiresAt && !signature) return principal;
+  const now = Date.now();
+  if (!env.AGENT_API_PROFILE_DELEGATION_SECRET?.trim() || !principal.tenantId
+    || !profileId || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/.test(profileId)
+    || !tenantId || tenantId !== principal.tenantId
+    || !/^\d{13}$/.test(expiresAt) || Number(expiresAt) < now || Number(expiresAt) > now + 5 * 60_000
+    || !/^[0-9a-f]{64}$/.test(signature)) {
+    throw new Error('invalid_or_expired_host_profile_capability');
+  }
+  const message = `${principal.principalId}\0${tenantId}\0${profileId}\0${expiresAt}`;
+  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(env.AGENT_API_PROFILE_DELEGATION_SECRET),
+    { name: 'HMAC', hash: 'SHA-256' }, false, ['verify']);
+  const signatureBytes = Uint8Array.from(signature.match(/../g)!, (byte) => Number.parseInt(byte, 16));
+  const valid = await crypto.subtle.verify('HMAC', key, signatureBytes, new TextEncoder().encode(message));
+  if (!valid) throw new Error('invalid_or_expired_host_profile_capability');
+  return { ...principal, profileId };
+}
+
 function validKeyConfig(value: unknown): value is KeyConfig {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const record = value as Record<string, unknown>;
@@ -65,9 +88,12 @@ export default {
     const url = new URL(request.url);
     if (url.pathname === '/healthz' && request.method === 'GET') return json({ status: 'ok', service: 'ai-agent-runner-api', placement: 'cloudflare-worker', executionWorker: 'eu-vm-agent-run' });
     if (url.pathname === '/version' && request.method === 'GET') return json({ service: 'ai-agent-runner-api', runtime: 'cloudflare-worker', contractVersion: 1 });
-    let principal: ApiPrincipal | null;
-    try { principal = await authenticate(request, env); } catch { return error('SERVER_MISCONFIGURED', 'Runner API authentication is not configured', 503); }
-    if (!principal) return error('UNAUTHENTICATED', 'a valid Bearer API key is required', 401);
+    let authenticated: ApiPrincipal | null;
+    try { authenticated = await authenticate(request, env); } catch { return error('SERVER_MISCONFIGURED', 'Runner API authentication is not configured', 503); }
+    if (!authenticated) return error('UNAUTHENTICATED', 'a valid Bearer API key is required', 401);
+    let principal: ApiPrincipal;
+    try { principal = await delegatedPrincipal(request, authenticated, env); }
+    catch { return error('FORBIDDEN', 'invalid or expired host profile capability', 403); }
     if (url.pathname === '/v1/capabilities' && request.method === 'GET') {
       if (!requireScope(principal, 'runs:read')) return error('FORBIDDEN', 'API key does not have the required scope', 403);
       return json({ schemaVersion: 1, contract: { name: 'ai-agent-runner/serverless-agent-api', version: 1 }, placement: 'cloudflare-worker', executionRegions: ['eu-vm-agent-run'] });

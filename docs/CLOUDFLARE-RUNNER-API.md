@@ -45,6 +45,12 @@ Worker secrets:
   Repository is authoritative and cannot be overridden by requests; a repository is required
   for real execution except for the exact pinned Telegram UX Registry test principal described
   below. The list stores hashes, never raw API keys.
+- `AGENT_API_PROFILE_DELEGATION_SECRET`: HMAC secret used only when the trusted Control Plane
+  sends the complete `x-agent-profile-*` capability header set. The Worker checks the signature,
+  configured API-key tenant, profile ID and short expiry before changing the effective profile.
+  Keep the same secret in the paired CP and Runner secret stores; never place it in `vars`, source,
+  or request bodies. Without this secret, ordinary API-key profile requests continue to work and
+  any partial or delegated capability is rejected.
 - `VM_WORKER_URL`: HTTPS address of the France execution worker route.
 - `VM_WORKER_TOKEN`: the France worker's current Bearer credential.
 - `RUN_LAUNCH_ENCRYPTION_KEY`: stable random value of at least 32 characters. The Durable
