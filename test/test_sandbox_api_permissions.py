@@ -62,6 +62,11 @@ class PermissionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'sandbox_permissions_environment_owner_mismatch'):
             permissions.restrict_files(self.env, self.journal, {os.getuid() + 1}, os.getuid(), {os.getgid()})
         self.assertEqual(self.env.stat().st_mode & 0o777, 0o644)
+        self.env.chmod(0o600)
+        self.journal.chmod(0o644)
+        result = permissions.restrict_files(self.env, self.journal, {os.getuid() + 1}, os.getuid(), {os.getgid()})
+        self.assertEqual(result, {'environment': 'already_private', 'journal': 'restricted'})
+        self.assertEqual(self.env.stat().st_uid, os.getuid())
 
     def test_symlinks_and_hardlinks_refuse_before_mutation(self):
         other = self.journal.with_name('other'); self.journal.rename(other); self.journal.symlink_to(other)
