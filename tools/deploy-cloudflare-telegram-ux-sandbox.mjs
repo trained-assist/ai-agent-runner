@@ -42,7 +42,7 @@ async function fetchJson(url, init = {}) {
 async function retryProbe(probe) {
   // Cloudflare can take tens of seconds to expose an updated secret binding at
   // every edge after a Worker secret write; keep retrying through that window.
-  const delays = [0, 1_000, 2_000, 4_000, 8_000, 15_000, 30_000];
+  const delays = [0, 1_000, 2_000, 4_000, 8_000, 15_000, 30_000, 60_000];
   for (const delay of delays) {
     if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
     try { if (await probe()) return true; } catch { /* retry transient edge/secret propagation failures */ }
@@ -115,7 +115,9 @@ async function main() {
   try { mcpPrivateKey = createPrivateKey({ key: JSON.parse(mcpRunnerPrivateJwk), format: 'jwk' }); }
   catch { throw new Error('runner_sandbox_mcp_private_jwk_invalid'); }
   if (mcpPrivateKey.asymmetricKeyType !== 'ed25519') throw new Error('runner_sandbox_mcp_private_jwk_invalid');
-  const mcpExpiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+  const mcpLeaseExpiry = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+  mcpLeaseExpiry.setUTCHours(23, 59, 59, 0);
+  const mcpExpiresAt = mcpLeaseExpiry.toISOString();
   // Non-secret fingerprint lets operators confirm the GitHub sandbox secret is
   // paired with the separately stored Worker credential without exposing it.
   console.log(JSON.stringify({ apiKeyFingerprint: createHash('sha256').update(apiKey).digest('hex').slice(0, 16) }));
