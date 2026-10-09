@@ -26,7 +26,7 @@ def validated_file(path, expected_uids, component):
         metadata = os.fstat(fd)
         if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
             raise ValueError(f'sandbox_permissions_{component}_not_unique_regular_file')
-        if metadata.st_uid not in expected_uids:
+        if expected_uids is not None and metadata.st_uid not in expected_uids:
             raise ValueError(f'sandbox_permissions_{component}_owner_mismatch')
         current = os.stat(path, follow_symlinks=False)
         if (current.st_dev, current.st_ino) != (metadata.st_dev, metadata.st_ino):
@@ -61,8 +61,15 @@ def validate_environment(fd):
 def restrict_files(env_path, journal_path, env_uids, journal_uid, trusted_groups):
     with ExitStack() as stack:
         # Validate both before changing either; root/service-owned env stays owned.
-        env = stack.enter_context(validated_file(env_path, env_uids, 'environment'))
+        env = stack.enter_context(validated_file(env_path, None, 'environment'))
         journal = stack.enter_context(validated_file(journal_path, {journal_uid}, 'journal'))
+        # A private existing EnvironmentFile needs no mutation: systemd reads it
+        # as root regardless of its operator owner. Ownership must be approved
+        # before any environment mode change; journal ownership stays strict.
+        env_mode = stat.S_IMODE(env[1].st_mode)
+        env_private = env_mode == 0o600 or (env_mode == 0o640 and env[1].st_gid in trusted_groups)
+        if not env_private and env[1].st_uid not in env_uids:
+            raise ValueError('sandbox_permissions_environment_owner_mismatch')
         validate_environment(env[0])
         result = {}
         for component, path, (fd, metadata) in [('environment', Path(env_path), env), ('journal', Path(journal_path), journal)]:
