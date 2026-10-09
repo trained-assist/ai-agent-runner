@@ -77,8 +77,9 @@ PY
 RELEASE="$ROOT/releases/$SOURCE_SHA"
 CURRENT="$ROOT/current"
 if [[ -L "$CURRENT" && "$(readlink -f "$CURRENT")" == "$RELEASE" ]]; then
-  systemctl restart "$SERVICE"
+  if ! systemctl is-active --quiet "$SERVICE"; then systemctl restart "$SERVICE"; fi
   curl -fsS --retry 5 --retry-delay 1 --max-time 5 "http://127.0.0.1:$PORT/healthz" >/dev/null || die 'current candidate is unhealthy'
+  systemctl is-active --quiet "$SERVICE" || die 'current service is not active'
   printf '[%s-api] current release %s is healthy\n' "$LANE" "$SOURCE_SHA"
   exit 0
 fi
@@ -86,6 +87,7 @@ fi
 install -d -m 0755 "$ROOT/releases"
 STAGE="$(mktemp -d "$ROOT/releases/.stage.XXXXXX")"
 PREVIOUS=""
+NEW_RELEASE_CREATED=0
 [[ ! -L "$CURRENT" ]] || PREVIOUS="$(readlink -f "$CURRENT")"
 rollback() {
   status=$?
@@ -98,6 +100,7 @@ rollback() {
       rm -f "$CURRENT"
       systemctl stop "$SERVICE" >/dev/null 2>&1 || true
     fi
+    if (( NEW_RELEASE_CREATED == 1 )); then rm -rf -- "$RELEASE"; fi
   fi
   [[ ! -d "$STAGE" ]] || rm -rf -- "$STAGE"
   return "$status"
@@ -107,6 +110,11 @@ tar -xzf "$BUNDLE_PATH" -C "$STAGE" --no-same-owner
 [[ -f "$STAGE/dist/api/main.js" && -d "$STAGE/node_modules" ]] || die 'candidate runtime incomplete'
 chown -R sandbox:sandbox "$STAGE"
 mv "$STAGE" "$RELEASE"
+NEW_RELEASE_CREATED=1
+# Close the race between the first journal check and the code switch. The old
+# process cannot accept another run after stop; terminal state remains on disk.
+systemctl stop "$SERVICE"
+python3 "$JOURNAL_CHECKER" "$JOURNAL" || die 'a new run appeared during deployment'
 ln -sfn "$RELEASE" "$CURRENT.next"
 mv -Tf "$CURRENT.next" "$CURRENT"
 systemctl restart "$SERVICE"
@@ -116,5 +124,6 @@ for _ in $(seq 1 30); do
   sleep 1
 done
 [[ "$healthy" == 1 ]] || die 'API did not become healthy'
+systemctl is-active --quiet "$SERVICE" || die 'API service is not active'
 trap - EXIT
 printf '[%s-api] installed %s to dedicated service\n' "$LANE" "$SOURCE_SHA"
