@@ -46,6 +46,7 @@ import type { Principal } from './auth.js';
 import type { ProfileWorkspaceCoordinator } from './profile-workspace.js';
 import { WorkspaceError } from '../workspace/contract.js';
 import { compilePolicy, DEFAULT_EXPORT_POLICY, matchRule } from '../workspace/policy.js';
+import { MOCK_TEST_ENGINE, MockTestWorker } from './mock-test-worker.js';
 
 /**
  * Stateless-ядро API (epic #74). Принимает запрос, вызывает внешнего воркера по HTTP и держит
@@ -132,6 +133,8 @@ export interface AgentApiOptions {
    * совпало с `engine.name`; неизвестный движок отклоняется до записи в память.
    */
   workers: ExternalWorker[];
+  /** Explicitly expose the in-process mock-test executor; disabled by default. */
+  mockTestEnabled?: boolean;
   /**
    * Приоритетная цепочка движков (issue #100), в порядке проб. Клиент, назвавший конкретный
    * `engine.name`, цепочкой не пользуется — она включается только для ранов без движка.
@@ -206,10 +209,11 @@ export class AgentApi {
 
   constructor(options: AgentApiOptions) {
     this.opts = options;
-    if (options.workers.length === 0) {
+    const workers = [...options.workers, ...(options.mockTestEnabled ? [new MockTestWorker()] : [])];
+    if (workers.length === 0) {
       throw new Error('AgentApi requires at least one external worker: without it there is no way to launch an agent');
     }
-    this.workers = options.workers;
+    this.workers = workers;
     // Цепочка без воркера — опечатка в конфиге: молча выбросить такой шаг нельзя, иначе ран
     // падал бы на середине цепочки вместо отказа на старте.
     const missing = (options.engineChain ?? []).filter((engine) => !this.workerFor(engine));
@@ -217,6 +221,9 @@ export class AgentApi {
       throw new Error(`engineChain names engines without a worker: ${missing.join(', ')}`);
     }
     this.chain = [...(options.engineChain ?? [])];
+    if (this.chain.includes(MOCK_TEST_ENGINE)) {
+      throw new Error('mock-test is explicit-only and cannot be included in AGENT_API_ENGINE_CHAIN');
+    }
     this.store = options.store ?? new StatelessStore({}, options.admissionLogPath ?? null, !!options.profileWorkspace);
     this.maxActiveRuns = options.maxActiveRuns ?? DEFAULT_STATELESS_LIMITS.maxActiveRuns;
     this.logger = options.logger ?? defaultLogger;
@@ -806,7 +813,7 @@ export class AgentApi {
         ), { startedAt, finishedAt: this.nowIso() }));
         return;
       }
-      if (this.opts.profileWorkspace) {
+      if (this.opts.profileWorkspace && candidates[0] !== MOCK_TEST_ENGINE) {
         try {
           const prepared = await this.opts.profileWorkspace.prepare(this.principalFor(record), record.runId);
           record.spec.repository = { fullName: prepared.repository, revision: prepared.baseRevision };
@@ -1031,7 +1038,10 @@ export class AgentApi {
     try {
       const launch = await worker.result(record.runId);
       await this.drainWorkerLogStream(record, worker);
-      const mapping = mapLaunchResult(record.spec, launch, { startedAt, finishedAt: this.nowIso() }, { workerBaseUrl: worker.baseUrl });
+      const mapping = mapLaunchResult(record.spec, launch, { startedAt, finishedAt: this.nowIso() }, {
+        workerBaseUrl: worker.baseUrl,
+        ...(worker.name === MOCK_TEST_ENGINE ? { cleanupReason: 'mock-test created no Agent process, external workspace, or persistent side effect' } : {}),
+      });
       let publication = null;
       if (this.opts.profileWorkspace && launch.status === 'started' && record.spec.profileWorkspace) {
         const changes = launch.profileChanges;
@@ -1342,7 +1352,9 @@ private buildSpec(
     if (request.outputs !== undefined) spec.outputs = request.outputs;
     if (request.traceId !== undefined) spec.traceId = request.traceId;
     if (request.repository !== undefined) spec.repository = request.repository;
-    else if (this.opts.defaultRepository !== undefined) spec.repository = { fullName: this.opts.defaultRepository };
+    else if (context.engine.name !== MOCK_TEST_ENGINE && this.opts.defaultRepository !== undefined) {
+      spec.repository = { fullName: this.opts.defaultRepository };
+    }
     if (request.isolation !== undefined) spec.isolation = request.isolation;
     if (request.ingressManifest !== undefined) {
       spec.ingressManifest = {

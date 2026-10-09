@@ -224,7 +224,8 @@ export interface LaunchResult {
    * расхождение с контрактом; пустая строка — честный ответ «лог не опубликован».
    */
   logUrl: string;
-  repo: LaunchRepo;
+  /** Null when the accepted execution intentionally has no repository side effects (e.g. mock-test). */
+  repo: LaunchRepo | null;
   profileChanges?: { files: Array<{ path: string; sha256: string; size: number }>; deletes: string[] };
   failure?: LaunchFailure;
 }
@@ -595,7 +596,9 @@ export function validateLaunchResult(input: unknown, expectedRunId: string): Val
   // а реальный отказ воркера — как расхождение с контрактом. Пустую ссылку `runLogRef`
   // заменяет адресом рана у воркера, а `mapLaunchResult` — на `null`.
   checkText(input['logUrl'], 'launch.logUrl', collector, 500);
-  if (!checkObject(input['repo'], 'launch.repo', collector)) {
+  if (input['repo'] === null) {
+    // A no-workspace execution such as mock-test has no repository to report.
+  } else if (!checkObject(input['repo'], 'launch.repo', collector)) {
     // уже сообщено
   } else {
     checkKeys(input['repo'], ['fullName', 'branch', 'commit', 'baseRef'], ['fullName', 'branch'], 'launch.repo', collector);
@@ -666,6 +669,8 @@ export interface LaunchMapping {
 export interface LaunchMappingOptions {
   /** Базовый URL воркера: источник ссылки на лог, когда воркер её не вернул. */
   workerBaseUrl?: string | null;
+  /** Override cleanup evidence for internal executors that never create an external workspace. */
+  cleanupReason?: string;
 }
 
 /**
@@ -756,6 +761,7 @@ export function mapLaunchResult(
     exitObserved: launch.exitCode !== null || launch.exitSignal !== null,
     startedAt: times.startedAt,
     finishedAt: times.finishedAt,
+    ...(typeof launch.answer === 'string' ? { text: launch.answer } : {}),
     ...(failure ? { failure } : {}),
     usage: { status: 'unknown' },
     outputRefs,
@@ -765,7 +771,7 @@ export function mapLaunchResult(
         ? `artifacts are committed to ${repo?.fullName ?? 'the user repository'} at ${repo?.commit ?? 'unknown'}; the API keeps no bytes`
         : 'the worker reported no artifacts',
     cleanup: 'completed',
-    cleanupReason: 'the external worker owns the workspace and tears it down with its ephemeral host; there is nothing to clean on the API host',
+    cleanupReason: options.cleanupReason ?? 'the external worker owns the workspace and tears it down with its ephemeral host; there is nothing to clean on the API host',
     logPath: runLogRef(launch, options.workerBaseUrl ?? null, spec.runId),
   };
   const validated = validateRunResult(result);
@@ -848,7 +854,7 @@ function runnerEventsFromLaunch(
     push('log', { stream: 'runner', level: 'info', message: `session log: ${logUrl}` }, times.startedAt);
   }
   push('exit', { code: launch.exitCode, signal: launch.exitSignal }, times.finishedAt);
-  push('finalizing', { reason: 'external worker returned the run result' }, times.finishedAt);
+  push('finalizing', { reason: 'execution backend returned the run result' }, times.finishedAt);
   // Полей ровно столько, сколько объявляет AgentExitResolvedEvent: fromManifest — счётчик
   // файлов, прочитанных из манифеста агента, reason — строка (в контракте он не nullable).
   const answered = typeof launch.answer === 'string' && launch.answer.length > 0;

@@ -46,6 +46,8 @@ export interface AgentApiProcessConfig {
    * который назвал клиент.
    */
   engineChain: string[] | null;
+  /** In-process mock-test is available only with an explicit sandbox deployment declaration. */
+  mockTestEnabled: boolean;
   /** Пулы значений окружения, которые можно передать воркеру (по envAllowlist рана). */
   env: Record<string, string>;
   /** Репозиторий по умолчанию, когда клиент не объявил `repository` (воркер клонирует его сам). */
@@ -101,6 +103,7 @@ function parseWorkers(
   launchDeadlineMs: number,
   acceptDeadlineMs: number,
   cancelDeadlineMs: number,
+  allowEmpty = false,
 ): WorkerConfig[] {
   if (raw === undefined) {
     // Одиночный конфиг остаётся рабочим: у нас пока один движок.
@@ -128,8 +131,8 @@ function parseWorkers(
   } catch {
     throw new Error('AGENT_API_WORKERS: expected a JSON array of {engine, baseUrl, token}');
   }
-  if (!Array.isArray(parsed) || parsed.length === 0) {
-    throw new Error('AGENT_API_WORKERS: expected a non-empty JSON array of {engine, baseUrl, token}');
+  if (!Array.isArray(parsed) || (parsed.length === 0 && !allowEmpty)) {
+    throw new Error(`AGENT_API_WORKERS: expected a ${allowEmpty ? 'JSON' : 'non-empty JSON'} array of {engine, baseUrl, token}`);
   }
   const seen = new Set<string>();
   return parsed.map((entry, index) => {
@@ -235,8 +238,19 @@ export function loadAgentApiConfig(env: Record<string, string | undefined> = pro
   const acceptDeadlineMs = intEnv(env, 'EXTERNAL_WORKER_ACCEPT_DEADLINE_MS', DEFAULT_ACCEPT_DEADLINE_MS);
   const cancelDeadlineMs = intEnv(env, 'EXTERNAL_WORKER_CANCEL_DEADLINE_MS', DEFAULT_CANCEL_DEADLINE_MS);
   const reconcileDeadlineMs = intEnv(env, 'EXTERNAL_WORKER_RECONCILE_DEADLINE_MS', DEFAULT_RECONCILE_DEADLINE_MS);
-  const workers = parseWorkers(env, env['AGENT_API_WORKERS'], launchDeadlineMs, acceptDeadlineMs, cancelDeadlineMs);
-  if (workers.length === 0) {
+  const mockTestRaw = envValue(env, 'AGENT_API_ENABLE_MOCK_TEST');
+  if (mockTestRaw !== undefined && mockTestRaw !== 'true' && mockTestRaw !== 'false') {
+    throw new Error('AGENT_API_ENABLE_MOCK_TEST must be true or false');
+  }
+  const mockTestEnabled = mockTestRaw === 'true';
+  if (mockTestEnabled && envValue(env, 'AGENT_API_ENVIRONMENT') !== 'sandbox') {
+    throw new Error('AGENT_API_ENABLE_MOCK_TEST=true requires AGENT_API_ENVIRONMENT=sandbox');
+  }
+  if (mockTestEnabled && envValue(env, 'NODE_ENV') === 'production') {
+    throw new Error('mock-test cannot be enabled when NODE_ENV=production');
+  }
+  const workers = parseWorkers(env, env['AGENT_API_WORKERS'], launchDeadlineMs, acceptDeadlineMs, cancelDeadlineMs, mockTestEnabled);
+  if (workers.length === 0 && !mockTestEnabled) {
     throw new Error('no external worker configured: set AGENT_API_WORKERS, or EXTERNAL_WORKER_URL for a single default worker');
   }
   // Цепочка разбирается после воркеров: её имена обязаны быть среди объявленных движков.
@@ -277,6 +291,7 @@ export function loadAgentApiConfig(env: Record<string, string | undefined> = pro
     keyRegistryPath,
     workers,
     engineChain,
+    mockTestEnabled,
     env: parseEnvPool(env['AGENT_API_ENV']),
     defaultRepository: env['RUNNER_DEFAULT_REPO']?.trim() || null,
     publicUrl,
