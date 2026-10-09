@@ -127,9 +127,11 @@ export class RunnerRunCoordinator {
     const mockTest = engine === 'mock-test';
     if ((engine !== (this.env.RUNNER_ENGINE || DEFAULT_ENGINE) && !(mockTest && this.env.MOCK_TEST_ENABLED === 'true')) || (principal.engines && !principal.engines.includes(engine))) return error('FORBIDDEN', 'requested engine is not allowed for this key', 403);
     const allowedRepositories = new Set(this.env.ALLOWED_REPOSITORIES.split(',').map((item) => item.trim()).filter(Boolean));
-    const repository = body.repository?.fullName || this.env.DEFAULT_REPOSITORY;
-    if (typeof repository !== 'string' || !repository) return error('INVALID_REPOSITORY', 'repository is required; configure an approved default repository or pass one in the request', 400);
-    if (!allowedRepositories.has(repository)) return error('INVALID_REPOSITORY', 'repository is not approved on this Runner API', 400);
+    const requestedRepository = body.repository?.fullName;
+    if (principal.repository && requestedRepository && requestedRepository !== principal.repository) return error('REPOSITORY_BINDING_MISMATCH', 'request repository does not match the authenticated profile binding', 403);
+    if (!mockTest && !principal.repository) return error('SERVER_MISCONFIGURED', 'authenticated profile has no repository binding', 503);
+    const repository = mockTest ? '' : principal.repository!;
+    if (repository && !allowedRepositories.has(repository)) return error('INVALID_REPOSITORY', 'repository is not approved on this Runner API', 400);
     if (body.repository?.token !== undefined && (typeof body.repository.token !== 'string' || body.repository.token.length > 500)) return error('INVALID_REQUEST', 'repository.token is invalid', 400);
     const requestedEnv = Array.isArray(body.envAllowlist) ? body.envAllowlist : [];
     const allowedEnv = new Set((this.env.ALLOWED_ENVIRONMENT_NAMES ?? '').split(',').map((item) => item.trim()).filter(Boolean));

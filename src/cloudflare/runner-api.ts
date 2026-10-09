@@ -31,6 +31,7 @@ async function authenticate(request: Request, env: RunnerWorkerEnv): Promise<Api
   const digest = await sha256(match[1]);
   const record = configured.find((entry) => entry.keyHash === digest);
   return record ? { principalId: record.principalId, profileId: record.profileId,
+    ...(record.repository ? { repository: record.repository } : {}),
     ...(record.tenantId ? { tenantId: record.tenantId } : {}), scopes: record.scopes,
     ...(record.engines ? { engines: record.engines } : {}), keyHash: record.keyHash } : null;
 }
@@ -38,12 +39,18 @@ async function authenticate(request: Request, env: RunnerWorkerEnv): Promise<Api
 function validKeyConfig(value: unknown): value is KeyConfig {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const record = value as Record<string, unknown>;
+  const repository = record['repository'];
+  const engines = record['engines'];
+  const validRepository = typeof repository === 'string'
+    && /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,98}[A-Za-z0-9])?\/[A-Za-z0-9](?:[A-Za-z0-9._-]{0,98}[A-Za-z0-9])?$/.test(repository);
+  const mockOnly = Array.isArray(engines) && engines.length > 0 && engines.every((engine) => engine === 'mock-test');
   return typeof record['keyHash'] === 'string' && /^[0-9a-f]{64}$/.test(record['keyHash'])
     && typeof record['principalId'] === 'string' && !!record['principalId']
     && typeof record['profileId'] === 'string' && !!record['profileId']
     && (record['tenantId'] === undefined || typeof record['tenantId'] === 'string' && !!record['tenantId'])
     && Array.isArray(record['scopes']) && record['scopes'].length > 0 && record['scopes'].every((scope) => ['runs:read', 'runs:write'].includes(String(scope)))
-    && (record['engines'] === undefined || Array.isArray(record['engines']) && record['engines'].every((engine) => typeof engine === 'string'));
+    && (engines === undefined || Array.isArray(engines) && engines.every((engine) => typeof engine === 'string'))
+    && (validRepository || mockOnly);
 }
 
 function requireScope(principal: ApiPrincipal, scope: string): boolean { return principal.scopes.includes(scope); }

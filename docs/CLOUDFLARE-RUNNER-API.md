@@ -29,7 +29,10 @@ Telegram UX:
 Each deployment needs these secrets:
 
 - `RUNNER_API_KEYS`: JSON list of principals with `keyHash`, `principalId`, `profileId`,
-  optional `tenantId`, scopes, and allowed engines. It contains hashes, never raw API keys.
+  `repository` (`owner/name`) for every real execution principal, optional `tenantId`, scopes,
+  and allowed engines. The authenticated principal's repository is authoritative; requests
+  cannot override it. The repository must also appear in `ALLOWED_REPOSITORIES`. Only a
+  `mock-test`-only principal may omit this field. The list contains hashes, never raw API keys.
 - `VM_WORKER_URL`: HTTPS address of the existing France VM worker route.
 - `VM_WORKER_TOKEN`: the worker's current Bearer credential.
 - `RUN_LAUNCH_ENCRYPTION_KEY`: stable random value of at least 32 characters. Run requests
@@ -39,7 +42,9 @@ Each deployment needs these secrets:
 
 The France worker must allow the corresponding `workers.dev` origin in
 `VM_WORKER_ALLOWED_CALLBACK_ORIGINS`, and its approved repository/environment lists must
-match this Worker configuration. Check `/readyz` on the VM before any live canary.
+match this Worker configuration. The Telegram UX sandbox allowlist includes its isolated
+`vovalikessmoothy-png/cp-telegram-ux-runner-sandbox` repository. Check `/readyz` on the VM
+before any live canary.
 
 The current Wrangler configs use `workers_dev` and a SQLite Durable Object migration.
 Deployment creates persistent Cloudflare state. The sandbox3 Worker currently has no API

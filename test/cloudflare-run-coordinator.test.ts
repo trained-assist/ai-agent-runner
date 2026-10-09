@@ -14,7 +14,7 @@ class MemoryStorage implements DurableStorage {
   async transaction<T>(callback: (transaction: DurableStorage) => Promise<T>): Promise<T> { return callback(this); }
 }
 
-const principal: ApiPrincipal = { principalId: 'principal-a', profileId: 'profile-a', scopes: ['runs:read', 'runs:write'], keyHash: 'a'.repeat(64) };
+const principal: ApiPrincipal = { principalId: 'principal-a', profileId: 'profile-a', repository: 'trained-assist/ai-agent-runner', scopes: ['runs:read', 'runs:write'], keyHash: 'a'.repeat(64) };
 
 function setup() {
   const storage = new MemoryStorage();
@@ -24,8 +24,8 @@ function setup() {
   const env: RunnerWorkerEnv = {
     RUNNER_API_KEYS: '[]', VM_WORKER_URL: 'https://france.example', VM_WORKER_TOKEN: 'worker-secret',
     RUNNER_API_PUBLIC_URL: 'https://runner-api.example', RUN_LAUNCH_ENCRYPTION_KEY: 'encryption-key-long-enough-for-test-only',
-    RUNNER_ENGINE: 'eu-vm-agent-run', DEFAULT_REPOSITORY: 'trained-assist/ai-agent-runner',
-    ALLOWED_REPOSITORIES: 'trained-assist/ai-agent-runner', ALLOWED_ENVIRONMENT_NAMES: '', RUNNER_RUNS: {} as RunnerWorkerEnv['RUNNER_RUNS'],
+    RUNNER_ENGINE: 'eu-vm-agent-run',
+    ALLOWED_REPOSITORIES: 'trained-assist/ai-agent-runner,team/profile-one', ALLOWED_ENVIRONMENT_NAMES: '', RUNNER_RUNS: {} as RunnerWorkerEnv['RUNNER_RUNS'],
     FETCH: async (input, init) => {
       const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
       if (url.pathname === '/v1/launch') {
@@ -41,9 +41,9 @@ function setup() {
   return { coordinator, storage, launched, env };
 }
 
-function call(path: string, body?: unknown, headers: Record<string, string> = {}): Request {
+function call(path: string, body?: unknown, headers: Record<string, string> = {}, actingPrincipal: ApiPrincipal = principal): Request {
   return new Request(`https://runner-runs.internal${path}`, { method: body === undefined ? 'GET' : 'POST',
-    headers: { 'x-runner-principal': JSON.stringify(principal), ...(body === undefined ? {} : { 'content-type': 'application/json' }), ...headers },
+    headers: { 'x-runner-principal': JSON.stringify(actingPrincipal), ...(body === undefined ? {} : { 'content-type': 'application/json' }), ...headers },
     ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
 }
 
@@ -77,6 +77,30 @@ describe('Cloudflare Runner run coordinator', () => {
     expect(await status.json()).toMatchObject({ state: 'succeeded', answer: 'done' });
     const result = await coordinator.fetch(call(`/v1/runs/${receipt.runId}/result`));
     expect(await result.json()).toMatchObject({ outcome: 'succeeded', text: 'done' });
+  });
+
+  it('uses the authenticated principal repository and rejects request attempts to override it', async () => {
+    const boundPrincipal: ApiPrincipal = { ...principal, repository: 'team/profile-one' };
+    const { coordinator, launched, storage } = setup();
+    const response = await coordinator.fetch(call('/v1/runs', body, { 'idempotency-key': 'bound-repository' }, boundPrincipal));
+    expect(response.status).toBe(202);
+    await coordinator.alarm();
+    expect(launched[0]?.['repository']).toMatchObject({ fullName: 'team/profile-one' });
+
+    const rejected = await coordinator.fetch(call('/v1/runs', { ...body, repository: { fullName: 'other/profile' } }, { 'idempotency-key': 'override-repository' }, boundPrincipal));
+    expect(rejected.status).toBe(403);
+    expect(await rejected.json()).toMatchObject({ error: { code: 'REPOSITORY_BINDING_MISMATCH' } });
+    expect(storage.values.size).toBe(1);
+  });
+
+  it('fails closed when a real execution principal has no repository binding', async () => {
+    const { coordinator, storage, launched } = setup();
+    const unboundPrincipal: ApiPrincipal = { ...principal, repository: undefined };
+    const response = await coordinator.fetch(call('/v1/runs', body, { 'idempotency-key': 'missing-repository-binding' }, unboundPrincipal));
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({ error: { code: 'SERVER_MISCONFIGURED' } });
+    expect(storage.values.get('runner-v1')).toMatchObject({ runs: {}, idempotency: {} });
+    expect(launched).toHaveLength(0);
   });
 
   it('does not reveal runs to a different principal', async () => {

@@ -13,7 +13,6 @@
     "RUNNER_API_PUBLIC_URL": "https://trained-assist-runner-api-sandbox3.skillset-apply.workers.dev",
     "RUNNER_ENGINE": "eu-vm-agent-run",
     "MOCK_TEST_ENABLED": "true",
-    "DEFAULT_REPOSITORY": "trained-assist/ai-agent-runner",
     "ALLOWED_REPOSITORIES": "trained-assist/ai-agent-runner",
     "ALLOWED_ENVIRONMENT_NAMES": "LLM_LADDER_TOKEN"
   }

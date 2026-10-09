@@ -22,7 +22,6 @@ export interface RunnerWorkerEnv {
   RUN_LAUNCH_ENCRYPTION_KEY: string;
   RUNNER_ENGINE?: string;
   MOCK_TEST_ENABLED?: string;
-  DEFAULT_REPOSITORY?: string;
   ALLOWED_REPOSITORIES: string;
   ALLOWED_ENVIRONMENT_NAMES?: string;
   LLM_LADDER_TOKEN?: string;
@@ -35,6 +34,8 @@ export interface ApiPrincipal {
   keyHash: string;
   principalId: string;
   profileId: string;
+  /** Trusted repository binding for this profile principal; request bodies cannot override it. */
+  repository?: string;
   tenantId?: string;
   scopes: string[];
   engines?: string[];
