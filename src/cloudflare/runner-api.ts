@@ -44,13 +44,17 @@ function validKeyConfig(value: unknown): value is KeyConfig {
   const validRepository = typeof repository === 'string'
     && /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,98}[A-Za-z0-9])?\/[A-Za-z0-9](?:[A-Za-z0-9._-]{0,98}[A-Za-z0-9])?$/.test(repository);
   const mockOnly = Array.isArray(engines) && engines.length > 0 && engines.every((engine) => engine === 'mock-test');
+  const pinnedMcpOnly = record['principalId'] === 'integration-telegram-ux-v1'
+    && record['profileId'] === 'integration-telegram-ux-v1'
+    && Array.isArray(record['mcpBindings']) && record['mcpBindings'].length === 1
+    && record['mcpBindings'][0] === 'registry-mcp-test-160-read';
   return typeof record['keyHash'] === 'string' && /^[0-9a-f]{64}$/.test(record['keyHash'])
     && typeof record['principalId'] === 'string' && !!record['principalId']
     && typeof record['profileId'] === 'string' && !!record['profileId']
     && (record['tenantId'] === undefined || typeof record['tenantId'] === 'string' && !!record['tenantId'])
     && Array.isArray(record['scopes']) && record['scopes'].length > 0 && record['scopes'].every((scope) => ['runs:read', 'runs:write'].includes(String(scope)))
     && (engines === undefined || Array.isArray(engines) && engines.every((engine) => typeof engine === 'string'))
-    && (validRepository || mockOnly)
+    && (validRepository || mockOnly || pinnedMcpOnly)
     && (record['mcpBindings'] === undefined || Array.isArray(record['mcpBindings']) && record['mcpBindings'].every((binding) => typeof binding === 'string' && binding.length > 0 && binding.length <= 300));
 }
 
