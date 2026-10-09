@@ -236,8 +236,8 @@ def nginx_route_targets(text):
                     legacy = any(item['name'] == 'location' and any(arg.startswith('/runner-mcp-test') for arg in item['args'])
                         and any(sub['name'] == 'proxy_pass' and sub['args'] in (['http://127.0.0.1:18882/'], ['http://127.0.0.1:18882'])
                             for sub in item['children'] or []) for item in children)
-                    if host and tls and legacy:
-                        targets.append({'path': path, 'content': content, 'server': node})
+                    if host and tls:
+                        targets.append({'path': path, 'content': content, 'server': node, 'legacyUpstreamMatched': legacy})
                 if children: visit(children, node['name'])
         visit(nginx_nodes(content))
     return targets
@@ -279,11 +279,8 @@ def proxy_update(dump, original):
     target = targets[0]
     if target['content'].rstrip('\n') != original.rstrip('\n'):
         raise ValueError('sandbox3_proxy_source_changed')
-    # Refuse regex or similarly prefixed legacy locations before selecting a file.
-    legacy = [item for item in target['server']['children'] or [] if item['name'] == 'location'
-              and item['args'] and item['args'][-1] in ('/runner-mcp-test', '/runner-mcp-test/')
-              and (len(item['args']) == 1 or item['args'][0] in ('^~', '='))]
-    if not legacy: raise ValueError('sandbox3_proxy_legacy_route_unsupported')
+    # Select the declared TLS host independently of the legacy upstream. All
+    # pre-existing routes are preserved byte-for-byte by the single insertion.
     if '/runner-sandbox3' in dump or PROXY_MARKER in original:
         raise ValueError('sandbox3_proxy_route_already_present')
     offset = target['server']['end'] - 1

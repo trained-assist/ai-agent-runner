@@ -121,14 +121,15 @@ class ProxyGrammarTests(unittest.TestCase):
     def dump(self, config):
         return '# configuration file /etc/nginx/sites-enabled/runner:\n' + config
 
-    def test_exact_host_tls_and_legacy_upstream_must_share_one_server(self):
+    def test_exact_host_and_tls_must_share_one_server(self):
         valid = "server { listen 443 ssl; server_name 169-58-15-230.sslip.io; location /runner-mcp-test/ { proxy_pass http://127.0.0.1:18882/; } }"
         targets = prepare.nginx_route_targets(self.dump(valid))
         self.assertEqual(len(targets), 1)
         self.assertEqual(targets[0]['content'][targets[0]['server']['end'] - 1], '}')
         split = "server { listen 443 ssl; server_name other.invalid; location /runner-mcp-test/ { proxy_pass http://127.0.0.1:18882/; } } server { listen 80; server_name 169-58-15-230.sslip.io; }"
         self.assertEqual(prepare.nginx_route_targets(self.dump(split)), [])
-        self.assertEqual(prepare.nginx_route_targets(self.dump(valid.replace('18882', '9999'))), [])
+        self.assertEqual(len(prepare.nginx_route_targets(self.dump(valid.replace('18882', '9999')))), 1)
+        self.assertFalse(prepare.nginx_route_targets(self.dump(valid.replace('18882', '9999')))[0]['legacyUpstreamMatched'])
         self.assertEqual(len(prepare.nginx_route_targets(self.dump(valid + valid))), 2)
 
     def test_comments_and_quoted_braces_do_not_change_structure(self):
@@ -155,10 +156,9 @@ class ProxyUpdateTests(unittest.TestCase):
         self.assertIn('proxy_pass http://127.0.0.1:18883/;', updated)
         self.assertEqual(len(prepare.nginx_nodes(updated)), 2)
 
-    def test_conflict_ambiguity_changed_source_and_lookalike_route_refuse(self):
+    def test_conflict_ambiguity_and_changed_source_refuse(self):
         for dump, original in [(self.dump(self.CONFIG * 2), self.CONFIG * 2),
                                (self.dump(self.CONFIG), self.CONFIG + '# changed'),
-                               (self.dump(self.CONFIG.replace('/runner-mcp-test/', '/runner-mcp-test-foreign/')), self.CONFIG.replace('/runner-mcp-test/', '/runner-mcp-test-foreign/')),
                                (self.dump(self.CONFIG + '# /runner-sandbox3'), self.CONFIG + '# /runner-sandbox3')]:
             with self.assertRaisesRegex(ValueError, 'sandbox3_proxy_'):
                 prepare.proxy_update(dump, original)
@@ -213,3 +213,16 @@ location /runner-mcp-test/ { proxy_pass http://127.0.0.1:18882/; proxy_set_heade
         for invalid in ['listen 443' + chr(92), 'proxy_set_header Host ${host;', 'server { listen 443 }']:
             with self.assertRaisesRegex(ValueError, 'sandbox3_proxy_'):
                 prepare.nginx_nodes(invalid)
+
+
+class ProxyIndependentLegacyTests(unittest.TestCase):
+    def test_other_legacy_upstream_and_no_legacy_route_are_preserved(self):
+        for location in ['location /runner-mcp-test/ { proxy_pass http://127.0.0.1:18880/; }', 'location / { return 404; }']:
+            config = 'server { listen 443 ssl; server_name 169-58-15-230.sslip.io; ' + location + ' }\n'
+            dump = '# configuration file /etc/nginx/sites-enabled/runner:\n' + config
+            _, updated = prepare.proxy_update(dump, config)
+            self.assertEqual(updated.replace(prepare.PROXY_BLOCK, '', 1), config)
+        for server in ['server { listen 80; server_name 169-58-15-230.sslip.io; }',
+                       'server { listen 443 ssl; server_name foreign.invalid; }']:
+            with self.assertRaisesRegex(ValueError, 'sandbox3_proxy_target_ambiguous'):
+                prepare.proxy_update('# configuration file /etc/nginx/sites-enabled/runner:\n' + server, server)

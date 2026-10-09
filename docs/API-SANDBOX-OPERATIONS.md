@@ -271,14 +271,14 @@ Private state/config permissions are unchanged.
 
 Proxy inspection additionally parses nginx source/server blocks and reports a
 bounded qualifiedRouteTargetCount. A target requires the exact sandbox hostname,
-TLS listen 443 and the existing MCP loopback upstream in the same server block.
+TLS listen 443 in the same server block. Legacy route/upstream presence is independent metadata.
 Markers in separate servers never authorize a route edit. Raw source paths,
 certificate paths, header values and configuration stay out of evidence.
 Unsupported or ambiguous grammar fails closed before any mutation.
 
 `prepare-api-sandbox3.py --configure-proxy` is an explicit isolated route operation.
 It requires the exact signed sandbox3 process, active nginx and one qualified
-TLS/host/legacy upstream server. It refuses any existing sandbox3 route, alias
+TLS server for the exact declared host. It refuses any existing sandbox3 route, alias
 outside `/etc/nginx`, writable/non-root configuration, source changes or an
 existing exclusive root-only backup. It adds only `/runner-sandbox3` locations,
 preserves original bytes around the insertion, validates `nginx -t`, then reloads
@@ -286,3 +286,9 @@ nginx without restarting Runner. Validation/reload failure restores only this
 operation's unchanged config bytes; a conflicting operator edit is preserved.
 The private original backup stays under `/etc/agent-runner`, never service state
 or evidence. External TLS/health/auth checks must separately prove public routing.
+
+The live corrected grammar inspection (CP run 37911004901) passed with zero
+targets under the original legacy-upstream-dependent selector. Selection now
+requires the exact declared host and TLS in one server, independently of where
+legacy paths point. Their configuration stays byte-for-byte preserved. A zero
+or ambiguous TLS host count still refuses mutation.
