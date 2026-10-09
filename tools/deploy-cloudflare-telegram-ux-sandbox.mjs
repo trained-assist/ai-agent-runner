@@ -42,9 +42,9 @@ async function fetchJson(url, init = {}) {
 }
 
 async function retryProbe(probe) {
-  // Cloudflare can take tens of seconds to expose an updated secret binding at
-  // every edge after a Worker secret write; keep retrying through that window.
-  const delays = [0, 1_000, 2_000, 4_000, 8_000, 15_000, 30_000, 60_000];
+  // Updated Worker secret bindings can take several minutes to reach every
+  // edge. Keep the probe inside the deploy job's 15-minute budget.
+  const delays = [0, 1_000, 2_000, 4_000, 8_000, 15_000, 30_000, 60_000, 60_000, 60_000];
   for (const delay of delays) {
     if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
     try { if (await probe()) return true; } catch { /* retry transient edge/secret propagation failures */ }
@@ -89,10 +89,12 @@ async function verifyDeployment(sourceSha, apiKey, delegationSecret) {
   const taskId = 'telegram-ux-delegation-health-probe';
   const digest = createHash('sha256').update(`${PRINCIPAL_ID}\0${PROFILE_ID}\0${taskId}`).digest('hex');
   const runId = `run_${digest}_${'0'.repeat(24)}`;
-  const expiresAt = String(Date.now() + 60_000);
-  const message = `${PRINCIPAL_ID}\0${TENANT_ID}\0${PROFILE_ID}\0${expiresAt}`;
-  const signature = createHmac('sha256', delegationSecret).update(message).digest('hex');
   if (!await retryProbe(async () => {
+    // Each retry needs a fresh capability. A signature created before the
+    // retry window expires while Cloudflare propagates the updated secret.
+    const expiresAt = String(Date.now() + 60_000);
+    const message = `${PRINCIPAL_ID}\0${TENANT_ID}\0${PROFILE_ID}\0${expiresAt}`;
+    const signature = createHmac('sha256', delegationSecret).update(message).digest('hex');
     const status = await fetchJson(`${PUBLIC_URL}/v1/runs/${runId}/status`, {
       headers: {
         authorization: `Bearer ${apiKey}`,
