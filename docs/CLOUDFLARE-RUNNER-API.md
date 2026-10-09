@@ -1,6 +1,9 @@
 # Cloudflare Runner API
 
-Status: implementation slice added 2026-10-09; not deployed.
+Status: implementation slice added 2026-10-09. The sandbox3 Worker was deployed on
+2026-10-09 (version `3c981002-600f-4a02-ad9f-3727f6c8c8e6`) and passed an authenticated
+Durable Object `mock-test` probe returning `pong`. Its API key registry is currently empty,
+so it does not accept runs. Telegram UX and real sandbox acceptance are not deployed.
 
 ## Runtime boundary
 
@@ -38,10 +41,11 @@ The France worker must allow the corresponding `workers.dev` origin in
 `VM_WORKER_ALLOWED_CALLBACK_ORIGINS`, and its approved repository/environment lists must
 match this Worker configuration. Check `/readyz` on the VM before any live canary.
 
-The current Wrangler configs use `workers_dev` and a new SQLite Durable Object migration.
-Deploying creates persistent Cloudflare state. The sandbox3 issue requires an explicit
-resource budget before creating paid resources, so no deployment or live test is authorized
-by this code change alone.
+The current Wrangler configs use `workers_dev` and a SQLite Durable Object migration.
+Deployment creates persistent Cloudflare state. The sandbox3 Worker currently has no API
+principals configured. Until the runtime gaps below are implemented, it is suitable only for
+infrastructure diagnostics and the isolated `mock-test` path; neither proves a live Telegram
+run or repository persistence.
 
 ## Local verification
 

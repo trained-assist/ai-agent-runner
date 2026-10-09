@@ -198,7 +198,7 @@ ARTIFACT_SHARE_SECRET=<random>    # HMAC-секрет share-токенов; бе
 
 The following historical instructions describe a VM-hosted API and are retained for regression
 context only. Do not run them for current sandbox or production deployment. Use the Cloudflare
-Worker configs linked above after runtime gaps and the resource budget are approved.
+Worker configs linked above after runtime gaps are resolved and the target is explicitly configured.
 
 Сервисный запуск того же API на одной VM: `infra/agent-runner-api.service` (systemd, `User=sandbox`, `Restart=always`, **без каталога данных и без capabilities** — процессу нечего писать и некого переключать) + `scripts/deploy-api-service.sh` (build → config dir → генерация API-ключа `0600` → адрес и токен воркера → юнит → enable+start → `GET /healthz` → проверка auth → **ufw открывает порт только после успешной auth-пробы**). Порт **8787**, health — `GET /healthz` (единственный маршрут без ключа).
 
