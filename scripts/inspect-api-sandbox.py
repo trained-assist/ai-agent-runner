@@ -17,7 +17,7 @@ JOURNAL = Path('/var/lib/agent-runner/mcp-test/admissions.jsonl')
 MANIFEST = Path('/opt/sb/ai-agent-runner-api-mcp-test/current/candidate-manifest.json')
 TERMINAL = {'succeeded', 'failed', 'cancelled'}
 BINDINGS = (
-    'AGENT_API_WORKERS', 'EXTERNAL_WORKER_URL', 'EXTERNAL_WORKER_TOKEN',
+    'AGENT_API_WORKERS', 'EXTERNAL_WORKER_URL', 'EXTERNAL_WORKER_TOKEN', 'AGENT_API_ENGINE_CHAIN',
     'AGENT_API_PROFILE_WORKSPACE_ROOT', 'AGENT_API_PROFILE_OWNER',
     'AGENT_API_PROFILE_GITHUB_TOKEN', 'AGENT_API_PROFILE_TENANT_ROUTES_JSON',
     'AGENT_API_PROFILE_DELEGATION_SECRET', 'AGENT_API_PUBLIC_URL',
@@ -75,12 +75,22 @@ def environment_metadata(text):
         pool = json.loads(values.get('AGENT_API_ENV', '{}'))
         if not isinstance(workers, list) or not isinstance(pool, dict):
             raise ValueError()
-        engines = [entry.get('engine') for entry in workers if isinstance(entry, dict)]
-        if len(engines) != len(workers) or any(engine not in {
+        allowed_engines = {
             'dynamic-ip-azure-agent-run', 'azure-dynamic-ip-agent-run', 'eu-vm-agent-run',
             'ru-vm-agent-run', 'mock-test',
-        } for engine in engines):
+        }
+        engines = [entry.get('engine') for entry in workers if isinstance(entry, dict)]
+        if len(engines) != len(workers) or any(engine not in allowed_engines for engine in engines):
             raise ValueError()
+        # Match parseWorkers: an explicit worker list takes precedence, including
+        # an explicit empty list in mock-only mode. The legacy single-worker
+        # binding otherwise has a concrete default engine, not an empty list.
+        if not values.get('AGENT_API_WORKERS', '').strip() and (
+                values.get('EXTERNAL_WORKER_URL', '').strip() or values.get('DYNAMIC_IP_AZURE_URL', '').strip()):
+            engine = values.get('EXTERNAL_WORKER_ENGINE', '').strip() or 'azure-dynamic-ip-agent-run'
+            if engine not in allowed_engines:
+                raise ValueError()
+            engines.append(engine)
     except (ValueError, TypeError):
         raise ValueError('sandbox_inventory_environment_invalid') from None
     return {
