@@ -9,7 +9,7 @@ interface RunRecord {
   engine: string; state: State; sequence: number; createdAt: string; updatedAt: string; startedAt: string | null;
   finishedAt: string | null; answer: string | null; cancelRequested: boolean; launchCiphertext: string;
   launchAttempts: number; result?: Record<string, unknown>; workerReceipt?: Record<string, unknown>;
-  launchRejection?: { status: number; code: string };
+  launchRejection?: { status: number; code: string; fields: string[] };
   lastError?: string;
   artifacts: Array<Record<string, unknown>>; repo: Record<string, unknown> | null; logUrl: string | null;
   events: Array<Record<string, unknown>>;
@@ -51,16 +51,32 @@ function workerRefusalCode(body: unknown, status: number): string {
   return `HTTP_${status}`;
 }
 
+function workerRefusalFields(body: unknown): string[] {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return [];
+  const value = body as Record<string, unknown>;
+  const details = Array.isArray(value.details) ? value.details : Array.isArray(value.errors) ? value.errors : [];
+  const fields = new Set<string>();
+  for (const detail of details) {
+    if (typeof detail !== 'string') continue;
+    const match = /^([A-Za-z][A-Za-z0-9_.[\]-]{0,159})(?::|\s+(?:is|does|must|contains|are|was|required)\b)/i.exec(detail);
+    if (match?.[1]) fields.add(match[1]);
+    if (fields.size >= 12) break;
+  }
+  return [...fields];
+}
+
 function refusedLaunchResult(run: RunRecord): Record<string, unknown> {
   const status = run.launchRejection?.status ?? Number(run.lastError?.match(/HTTP (4\d\d)/)?.[1] ?? 400);
   const code = run.launchRejection?.code ?? 'WORKER_LAUNCH_REJECTED';
+  const fields = run.launchRejection?.fields ?? [];
+  const fieldSummary = fields.length ? `; rejected fields: ${fields.join(', ')}` : '';
   return {
     schemaVersion: 1, runId: run.runId, jobId: run.jobId, userTaskId: run.userTaskId,
     profileId: run.profileId, ownerGeneration: run.ownerGeneration, outcome: 'failed',
     exitReason: 'preflight_refused', exitCode: null, exitSignal: null, exitObserved: false,
     startedAt: run.startedAt ?? run.createdAt, finishedAt: run.finishedAt ?? now(),
     failure: { code: code.startsWith('WORKER_') ? code : `WORKER_${code}`, failureClass: 'preflight',
-      safeSummary: `The France execution worker refused the run before accepting it (HTTP ${status}, ${code}).`, retryable: false },
+      safeSummary: `The France execution worker refused the run before accepting it (HTTP ${status}, ${code}${fieldSummary}).`, retryable: false },
     usage: { status: 'unknown' }, outputRefs: [], persistence: 'not_required',
     persistenceReason: 'The execution worker did not accept the run; there is nothing to persist.',
     cleanup: 'completed', cleanupReason: 'No execution receipt was issued by the worker.',
@@ -357,9 +373,10 @@ export class RunnerRunCoordinator {
             if (response.status < 500 || response.status === 503) {
               const rejection = await response.clone().json().catch(() => null);
               const code = workerRefusalCode(rejection, response.status);
-              run.launchRejection = { status: response.status, code };
+              const fields = workerRefusalFields(rejection);
+              run.launchRejection = { status: response.status, code, fields };
               run.result = refusedLaunchResult(run);
-              transition(run, 'failed', { reason: `worker_rejected_${response.status}`, code });
+              transition(run, 'failed', { reason: `worker_rejected_${response.status}`, code, ...(fields.length ? { fields } : {}) });
               run.lastError = `worker launch rejected with HTTP ${response.status}`;
               changed = true;
               continue;
