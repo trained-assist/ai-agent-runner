@@ -59,11 +59,11 @@ async function verifyFranceWorker(url, token) {
   }
 }
 
-function putSecret(name, value) {
-  const result = spawnSync('npx', ['wrangler', 'secret', 'put', name, '--config', CONFIG, '--name', WORKER], {
-    input: `${value}\n`, encoding: 'utf8', maxBuffer: 1024 * 1024,
+function putSecrets(entries) {
+  const result = spawnSync('npx', ['wrangler', 'secret', 'bulk', '--config', CONFIG, '--name', WORKER], {
+    input: JSON.stringify(Object.fromEntries(entries)), encoding: 'utf8', maxBuffer: 1024 * 1024,
   });
-  if (result.error || result.status !== 0) throw new Error(`runner_sandbox_secret_sync_failed:${name}`);
+  if (result.error || result.status !== 0) throw new Error('runner_sandbox_secret_bulk_sync_failed');
 }
 
 async function verifyDeployment(sourceSha, apiKey, delegationSecret) {
@@ -147,7 +147,7 @@ async function main() {
   run('npx', ['wrangler', 'deploy', '--config', CONFIG, '--var', `BUILD_SHA:${sourceSha}`,
     '--var', `MCP_TEST_CATALOGUE_VERSION:${MCP_CATALOGUE_VERSION}`,
     '--var', `MCP_TEST_EXPIRES_AT:${mcpExpiresAt}`], { stdio: 'inherit' });
-  for (const [name, value] of [
+  putSecrets([
     ['RUNNER_API_KEYS', registry],
     ['AGENT_API_PROFILE_DELEGATION_SECRET', delegationSecret],
     ['RUN_LAUNCH_ENCRYPTION_KEY', encryptionKey],
@@ -156,7 +156,7 @@ async function main() {
     ['LLM_LADDER_TOKEN', ladderToken],
     ['MCP_TEST_AUTH_TOKEN', mcpAuthToken],
     ['MCP_TEST_RUNNER_PRIVATE_JWK', mcpRunnerPrivateJwk],
-  ]) putSecret(name, value);
+  ]);
 
   await verifyDeployment(sourceSha, apiKey, delegationSecret);
   console.log(JSON.stringify({ ok: true, worker: WORKER, sourceSha,
