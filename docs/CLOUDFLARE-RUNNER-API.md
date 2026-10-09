@@ -25,10 +25,18 @@ engine returns fixed `pong` without calling the VM or a model.
 ## Configuration
 
 Separate Worker configurations and Durable Object namespaces are defined for sandbox3 and
-Telegram UX:
+Telegram UX. A dedicated, mock-only Worker is provisioned for the CP sandbox3 admission
+contract so it can have an independent key registry and run store:
 
 - `wrangler.sandbox3.jsonc`
+- `wrangler.cp-sandbox3.jsonc`
 - `wrangler.telegram-ux-v1.jsonc`
+
+The CP sandbox3 Worker is `trained-assist-runner-api-cp-sandbox3`. Its default engine is
+`mock-test`, it has no France worker URL/token, and its only principal is provisioned from
+the CP sandbox's derived API key with `runs:read`/`runs:write` and `engines: ["mock-test"]`.
+It has its own Durable Object namespace. Do not copy the existing sandbox3 or Telegram UX
+key registry into it.
 
 Worker secrets:
 
