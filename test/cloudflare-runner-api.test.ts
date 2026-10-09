@@ -43,4 +43,20 @@ describe('Cloudflare Runner API Worker', () => {
     expect(response.status).toBe(503);
     expect(get).not.toHaveBeenCalled();
   });
+
+  it('accepts the exact pinned test MCP principal without a repository binding', async () => {
+    const token = 'runner-api-mcp-test';
+    const keyHash = await sha256(token);
+    const coordinatorFetch = vi.fn(async (request: Request) => {
+      expect(request.headers.get('x-runner-principal')).toContain('registry-mcp-test-160-read');
+      return Response.json({ runId: 'run-test' }, { status: 202 });
+    });
+    const env = {
+      RUNNER_API_KEYS: JSON.stringify([{ keyHash, principalId: 'integration-telegram-ux-v1', profileId: 'integration-telegram-ux-v1', scopes: ['runs:read', 'runs:write'], mcpBindings: ['registry-mcp-test-160-read'] }]),
+      RUNNER_RUNS: { idFromName: vi.fn().mockReturnValue('runs-do'), get: vi.fn().mockReturnValue({ fetch: coordinatorFetch }) },
+    } as unknown as RunnerWorkerEnv;
+    const response = await runnerApi.fetch(new Request('https://api.example/v1/runs', { method: 'POST', headers: { authorization: `Bearer ${token}`, 'idempotency-key': 'mcp-test', 'content-type': 'application/json' }, body: JSON.stringify({ userTaskId: 'task-telegram' }) }), env);
+    expect(response.status).toBe(202);
+    expect(coordinatorFetch).toHaveBeenCalledOnce();
+  });
 });
