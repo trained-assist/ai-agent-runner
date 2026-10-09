@@ -1,45 +1,60 @@
 # Isolated Runner API sandbox
 
-## Dedicated sandbox3 through GitHub Actions
+## Repeatable API sandbox creation through GitHub Actions
 
-The second Telegram lane uses a **different** API target,
-`agent-runner-api-sandbox3.service` on port 18883. The candidate workflow now
-accepts `target=agent-runner-api-sandbox3`. Its signed artifact can be deployed
-with the manual `runner-api-sandbox3-deploy.yml` workflow, so the operator does
-not need local SSH access. This path never installs the shared `mcp-test` API.
+The manual `runner-api-sandbox-deploy.yml` workflow creates or updates a named
+Runner API lane (`sandbox3` through `sandbox5`). A single signed candidate built
+with `target=agent-runner-api-sandbox` can be installed into several lanes.
+For lane `sandboxN`, the workflow uses a separate GitHub environment
+`runner-api-sandboxN` and the VM paths below:
 
-Before dispatching a deployment, an operator must bootstrap on `vm2`:
+| Resource | Per-lane value |
+|---|---|
+| API unit | `agent-runner-api-sandboxN.service` |
+| Port | `18880 + N` (`sandbox3` = `18883`) |
+| Environment | `/etc/agent-runner/agent-runner-api-sandboxN.env` |
+| Key registry | `/etc/agent-runner/key-registry-sandboxN.json` |
+| Admission journal | `/var/lib/agent-runner/sandboxN/admissions.jsonl` |
+| Profile workspace | `/var/lib/agent-runner/sandboxN/profiles` |
+| Release root | `/opt/sb/ai-agent-runner-api-sandboxN` |
+| API principal/profile | `integration-sandboxN-v1` |
 
-- `/etc/systemd/system/agent-runner-api-sandbox3.service`, using only
-  `/etc/agent-runner/agent-runner-api-sandbox3.env` and a distinct writable state
-  directory;
-- a dedicated environment with `AGENT_API_PORT=18883`,
-  `AGENT_API_KEY_REGISTRY=/etc/agent-runner/key-registry-sandbox3.json`,
-  `AGENT_API_ADMISSION_LOG=/var/lib/agent-runner/sandbox3/admissions.jsonl`,
-  `AGENT_API_ENVIRONMENT=sandbox`, a real external worker, and no enabled
-  `mock-test` engine;
-- a separate key registry containing the scoped `integration-sandbox3-v1`
-  principal and a network route from the sandbox3 CP to this API;
-- GitHub environment `runner-api-sandbox3` with `VM2_SANDBOX3_SSH_HOST`,
-  `VM2_SANDBOX3_SSH_USER`, `VM2_SANDBOX3_SSH_PRIVATE_KEY`, and
-  `VM2_SANDBOX3_KNOWN_HOSTS` secrets. The SSH user must have narrowly scoped
-  passwordless sudo for the sandbox3 installer; protect the environment with
-  trusted reviewers. Do not reuse the production or shared test credentials.
+Each GitHub environment has the **same secret names**, with lane-specific values:
+`VM2_SSH_HOST`, `VM2_SSH_USER`, `VM2_SSH_PRIVATE_KEY`, `VM2_KNOWN_HOSTS`,
+`RUNNER_API_ENV_FILE`, and `RUNNER_API_KEY_REGISTRY_JSON`. The API env must set
+that lane's exact port, registry and journal paths, `AGENT_API_ENVIRONMENT=sandbox`,
+a lane-specific `AGENT_API_PROFILE_WORKSPACE_ROOT`,
+a distinct delegation secret, and a real external worker. The registry must
+contain the matching lane principal with `runs:read` and `runs:write`. Keep
+these environment secrets restricted to the lane operators; the SSH user needs
+only the sandbox API bootstrap/install sudo path. The existing API's credential
+for calling a GHA worker does **not** grant GHA SSH or systemd access to `vm2`.
+Worker/provider access may use the same approved backend, but each CP→API
+principal, delegation secret, registry, journal and workspace path is distinct.
+For a later lane, `inherit_worker_from=sandboxN` copies only the existing API's
+worker routing and provider variables inside `vm2`; GitHub Actions never reads
+or logs their values. The source may be another named sandbox lane or the
+existing `mcp-test` API; if that service has no real worker route, bootstrap
+fails. The first lane can instead receive worker access through its own
+`RUNNER_API_ENV_FILE` secret. This option
+does not copy the source API principal, delegation secret, or run state.
 
-The installer checks the exact host, service, env file, port, registry,
-principal, empty admission journal, artifact checksum, and manifest target
-before changing code. It restarts only `agent-runner-api-sandbox3.service` and
-restores the previous release if health fails. A nonempty journal blocks an
-update until its accepted runs are reconciled. A successful deploy proves API
-liveness only; a Telegram task must still prove Runner admission, execution,
-result persistence, and delivery.
+For a new lane, dispatch `runner-api-sandbox-candidate.yml` with a reviewed
+source ref and `target=agent-runner-api-sandbox`. Record the successful run ID
+and source SHA. Dispatch `runner-api-sandbox-deploy.yml` with `lane`, that run ID,
+SHA, and `bootstrap=true` (optionally `inherit_worker_from`). The job verifies the artifact checksum, GitHub
+attestation and manifest before connecting to the pinned VM host. Bootstrap
+creates only the named lane's unit, env, registry and state directory, and
+refuses to overwrite an existing lane. On later code updates use
+`bootstrap=false`. The installer checks the named paths and principal, refuses
+a journal with unfinished runs, and rolls back to the
+previous code if health fails. No shared API or VM worker is restarted.
 
-Dispatch `runner-api-sandbox-candidate.yml` with the exact source ref and
-`target=agent-runner-api-sandbox3`. Record the successful run ID and source SHA.
-Then dispatch `runner-api-sandbox3-deploy.yml` with that run ID and SHA. The
-deploy job verifies the checksum, GitHub provenance, and target-specific
-manifest before opening SSH with pinned host keys. If any bootstrap item is
-missing, it fails without changing the shared API.
+A network route from each CP to its Runner API port and paired CP/Runner keys
+must be verified separately. API health alone does not prove a Telegram task,
+GHA execution, persistence or delivery. To rebuild a broken lane, first inspect
+and reconcile its accepted runs and preserve required evidence; do not remove
+its state or reuse another lane's credentials as part of the deploy workflow.
 
 This procedure deploys a signed Runner API candidate to the test-only
 `agent-runner-api-mcp-test.service` on SSH target `vm2`. It does not install the
