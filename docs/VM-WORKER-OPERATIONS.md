@@ -167,8 +167,9 @@ On restart, queued runs are failed closed instead of relaunched with missing
 memory-only credentials. Already-running child processes are reconciled by Runner
 recovery, and capacity reservations stay active until terminal state is observed.
 
-The API remains responsible for worker ordering and failover. A VM only answers its
-own health/capacity and runs accepted work; it never routes to another VM or GHA.
+The Cloudflare Runner API selects the France VM worker for these sandbox lanes. A VM only
+answers its own health/capacity and runs accepted work; it never routes to another VM or GHA.
+These lanes do not fall back to GitHub Actions when France is unavailable.
 
 This drift check is deliberately narrower than product migration acceptance. See
 [VM-WORKER-LEGACY-COMPATIBILITY.md](VM-WORKER-LEGACY-COMPATIBILITY.md) and

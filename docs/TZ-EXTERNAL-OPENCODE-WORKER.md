@@ -1,5 +1,10 @@
 # ТЗ: внешний воркер `dynamic-ip-azure-agent-run`
 
+> **Superseded runtime topology.** This document is historical. The Runner API now runs as
+> a Cloudflare Worker and the France VM is only an execution worker. Control Plane calls
+> Runner API through a private service binding; it does not call this VM directly. See
+> [CLOUDFLARE-RUNNER-API.md](CLOUDFLARE-RUNNER-API.md).
+
 **Для:** внешней команды (отдельный репозиторий). Воркер запускает opencode-раны по запросу
 нашего API.
 

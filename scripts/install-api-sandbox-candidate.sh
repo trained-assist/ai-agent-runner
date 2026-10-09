@@ -15,6 +15,8 @@ API_PORT="18882"
 die() { printf '[runner-api-sandbox] ERROR: %s\n' "$1" >&2; exit 1; }
 log() { printf '[runner-api-sandbox] %s\n' "$1"; }
 
+die 'VM-hosted Node API installation is retired; Runner API deployment belongs to Cloudflare Workers'
+
 [[ $EUID -eq 0 ]] || die 'installer requires root'
 [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || die 'source SHA is malformed'
 [[ "$BUNDLE_SHA" =~ ^[0-9a-f]{64}$ ]] || die 'bundle SHA is malformed'

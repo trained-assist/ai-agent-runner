@@ -1,4 +1,11 @@
-# Serverless Agent API — деплой, конфигурация, смоук
+# Legacy Node Agent API — конфигурация и прошлые приёмки
+
+> **Retired as the current runtime.** This document records the previous `node:http` API
+> hosted on a VM. Do not use its deployment instructions for sandbox or production. The
+> current target is the Cloudflare Worker + Durable Object implementation in
+> [CLOUDFLARE-RUNNER-API.md](CLOUDFLARE-RUNNER-API.md). The France VM is now only the
+> execution worker. Sections below are retained for local regression tests and historical
+> acceptance evidence.
 
 Статус документа: **05.10.2026, асинхронный контракт запуска (эпик #74, контракт #73).**
 В базовом режиме API обслуживает ран без локального workspace. Режим постоянного профиля

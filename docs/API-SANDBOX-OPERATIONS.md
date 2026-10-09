@@ -1,5 +1,10 @@
 # Isolated Runner API sandbox
 
+> **Legacy VM-hosted Node API procedure.** The GitHub deploy workflow is disabled and its
+> installers now refuse writes. Current sandbox Runner APIs are Cloudflare Workers; see
+> [CLOUDFLARE-RUNNER-API.md](CLOUDFLARE-RUNNER-API.md). This file remains as historical
+> operational evidence and must not be used to provision a new VM API lane.
+
 ## Repeatable API sandbox creation through GitHub Actions
 
 The manual `runner-api-sandbox-deploy.yml` workflow creates or updates a named

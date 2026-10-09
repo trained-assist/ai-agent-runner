@@ -41,7 +41,8 @@ concurrency:
 
 jobs:
   deploy:
-    if: github.ref == 'refs/heads/main' && contains(fromJSON('["sandbox3","sandbox4","sandbox5"]'), inputs.lane)
+    # Retired: the Runner API runs on Cloudflare; this workflow installs the old Node API on a VM.
+    if: false
     runs-on: ubuntu-latest
     environment: runner-api-${{ inputs.lane }}
     timeout-minutes: 20

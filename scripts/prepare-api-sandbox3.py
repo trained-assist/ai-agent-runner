@@ -690,6 +690,8 @@ def main():
     try:
         if os.geteuid() != 0 or socket.gethostname().split('.')[0] != 'vmi3617957':
             raise ValueError('sandbox3_prepare_operator_target_invalid')
+        if sys.argv[1:] in (['--prepare'], ['--configure-proxy'], ['--configure-native'], ['--mock-probe']):
+            raise ValueError('sandbox3_prepare_retired_cloudflare_runner_api')
         if sys.argv[1:] == ['--configure-native']:
             text = sys.stdin.read(65537)
             if len(text.encode()) > 65536: raise ValueError('sandbox3_native_request_too_large')

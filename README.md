@@ -2,6 +2,16 @@
 
 API и host-компоненты выполнения ai-agent-job. Run имеет отдельную идентичность, clean room, разрешённый context/env, наблюдаемый результат и lifecycle сохранения данных.
 
+## Current runtime topology
+
+The current target is a serverless Cloudflare Runner API with Durable Object state. The
+Control Plane calls it through a private service binding. Runner API selects the existing
+France VM execution worker by default; that VM does not host the API. The Control Plane does
+not bind directly to execution workers, and GHA is not a fallback. See
+[Cloudflare Runner API](docs/CLOUDFLARE-RUNNER-API.md) for the implementation status and
+unsupported contract paths. The older Node HTTP API and VM deployment procedures below are
+legacy test/acceptance fixtures, not the current deployment path.
+
 Документы содержат действующие требования, контракты и инструкции. Планы выполнения, статусы, ревью прошлых версий и evidence ведутся в GitHub issues/PR/Project. Целевая модель не является утверждением о текущем deployment; его готовность проверяется по конкретным SHA и приёмке.
 
 ## Границы
@@ -17,13 +27,13 @@ API и host-компоненты выполнения ai-agent-job. Run имее
 | Граница | Источник |
 |---|---|
 | Модель и ownership | [ARCHITECTURE](ARCHITECTURE.md), [общая архитектура](https://github.com/trained-assist/trained-agent-architecture/blob/main/ARCHITECTURE.md) |
-| API/config/operator procedures | [API service](docs/API-SERVICE.md), [external worker contract](docs/EXTERNAL-WORKER-CONTRACT.md) |
+| API/config/operator procedures | [Cloudflare Runner API](docs/CLOUDFLARE-RUNNER-API.md), [legacy Node API](docs/API-SERVICE.md), [external worker contract](docs/EXTERNAL-WORKER-CONTRACT.md) |
 | Isolated Runner API sandbox | [sandbox operations](docs/API-SANDBOX-OPERATIONS.md), [candidate workflow](.github/workflows/runner-api-sandbox-candidate.yml) |
 | Workspace | [H1–H5](docs/workspace-module-hooks.md), `src/workspace/`, `test/workspace-service.test.ts` |
 | Contract validation | `src/contracts/` |
 | API lifecycle | `src/api/`, `src/adapters/external-worker-adapter.ts` |
 | Scoped MCP | [MCP lifecycle](docs/MCP-LIFECYCLE.md) |
-| Регионы и изоляция | [Multi-worker](docs/MULTI-WORKER-REGION.md) |
+| Регионы и изоляция | [Multi-worker (legacy planning)](docs/MULTI-WORKER-REGION.md) |
 | VM worker operations and release | [VM worker operations](docs/VM-WORKER-OPERATIONS.md), [release workflow](.github/workflows/vm-worker-release.yml) |
 | Current capacity and secret inventory | [Capacity operations](docs/CAPACITY-STORE-OPERATIONS.md), [VM worker secret inventory](docs/VM-WORKER-SECRET-INVENTORY.md) |
 | Remote MCP and legacy compatibility | [Remote MCP](docs/REMOTE-MCP.md), [VM worker legacy compatibility](docs/VM-WORKER-LEGACY-COMPATIBILITY.md) |
@@ -45,7 +55,7 @@ Live probes используют synthetic profiles и scoped test credentials; 
 
 [Persistence #95](https://github.com/trained-assist/ai-agent-runner/issues/95), [региональные workers #136](https://github.com/trained-assist/ai-agent-runner/issues/136), [интегратор](https://github.com/trained-assist/trained-agent-architecture/issues/140). Проверяйте source/deployed SHA: наличие кода и зелёный CI не означают live readiness.
 
-Retiring GCP VM is not a development or fallback target. Use the own Agent Run API and serverless by default; a necessary persistent service belongs on the existing French VM. Other Google services remain allowed. Exit coordination: https://github.com/trained-assist/trained-agent-architecture/issues/145.
+Retiring GCP VM is not a development or fallback target. The Runner API is serverless on Cloudflare; the existing French VM only executes jobs. These sandbox lanes have no GHA fallback. Other Google services remain allowed. Exit coordination: https://github.com/trained-assist/trained-agent-architecture/issues/145.
 
 ## Slice 1 — что реализовано
 
@@ -75,7 +85,11 @@ Retiring GCP VM is not a development or fallback target. Use the own Agent Run A
 
 Каждый сбой из §9, существующий в этом slice, воспроизводим fault-injection'ом на fake engine — `test/faults.test.ts`.
 
-## Slice 2 — Serverless Agent API (P04–P06)
+## Legacy Slice 2 — Node Agent API (P04–P06)
+
+The implementation below describes the older Node API, retained for local tests and previous
+acceptance fixtures. It is not the current Runner API deployment; see the Cloudflare Worker
+implementation and its known gaps in [docs/CLOUDFLARE-RUNNER-API.md](docs/CLOUDFLARE-RUNNER-API.md).
 
 Соответствует [SERVERLESS-AGENT-API.md](https://github.com/trained-assist/trained-agent-architecture/blob/main/SERVERLESS-AGENT-API.md), ARCHITECTURE §4.6 и карточкам [P04/P05/P06 эпика E2](https://github.com/trained-assist/trained-agent-architecture/issues/18). Внешний admission/result adapter для одной VM: node:http без фреймворков, один процесс — один владелец.
 
@@ -180,7 +194,11 @@ ARTIFACT_SHARE_SECRET=<random>    # HMAC-секрет share-токенов; бе
 - **Gap GCS presigned:** v4-подпись под ADC требует `roles/iam.serviceAccountTokenCreator` у сервис-аккаунта (локального приватного ключа нет и не будет); без права `getSignedUrl` → `BLOB_BACKEND_UNSUPPORTED`, рабочая альтернатива — share-токен через API (local-fs путь) либо R2/S3. Smoke на живом бакете — отдельной задачей, в тестах только инжектируемый bucket.
 - **Вне этого slice (roadmap):** интеграция с GitHub — текстовой образ профиля → приватные репозитории `profiles-artifacts` ([trained-assist-agent#1921](https://github.com/trained-assist/trained-assist-agent/issues/1921)); materialize при старте и sweep в finalizing (D2); открытые вопросы ARCH §10 — snapshot/commit semantics и retention/export-гарантии.
 
-## Деплой на песочную VM + runner-cli (dogfooding, runner#7)
+## Legacy VM API deployment notes (not current)
+
+The following historical instructions describe a VM-hosted API and are retained for regression
+context only. Do not run them for current sandbox or production deployment. Use the Cloudflare
+Worker configs linked above after runtime gaps and the resource budget are approved.
 
 Сервисный запуск того же API на одной VM: `infra/agent-runner-api.service` (systemd, `User=sandbox`, `Restart=always`, **без каталога данных и без capabilities** — процессу нечего писать и некого переключать) + `scripts/deploy-api-service.sh` (build → config dir → генерация API-ключа `0600` → адрес и токен воркера → юнит → enable+start → `GET /healthz` → проверка auth → **ufw открывает порт только после успешной auth-пробы**). Порт **8787**, health — `GET /healthz` (единственный маршрут без ключа).
 
@@ -496,7 +514,9 @@ npm run build       # tsc -p tsconfig.build.json → dist/   (запуск се�
 
 Требования: Node 20+, npm. CI (`.github/workflows/ci.yml`) гоняет `npm ci` + typecheck + test на каждый push/PR.
 
-Библиотека + внешний network-API: локальный adapter на VM (ARCHITECTURE §3) и Serverless Agent API выше — оба в этом репозитории; storage/артефакты есть (Slice D1), следующий этап — materialize/sweep и artifact transfer.
+Legacy development notes: the Node API and local VM adapter remain available for module tests
+and historical fixtures. They are not the current network deployment; use the Cloudflare
+Worker topology in [docs/CLOUDFLARE-RUNNER-API.md](docs/CLOUDFLARE-RUNNER-API.md).
 
 Минимальный запуск API (ключи — sha256-hashes в файле реестра, сам plaintext-ключ вне репозитория и логов):
 
@@ -540,7 +560,7 @@ Remote MCP descriptors and trusted scoped-token attachment: [host contract](docs
 6. **MCP lifecycle + scoped bindings (P13, сделано)** — per-run stdio процессы, handshake/readiness/timeout/cleanup, общий capability handler на MCP и API facade; дальше — доменные tools (P14) и интеграционная песочница (P15).
 6. **Worker API и межмашинные leases/fencing** — при переходе к нескольким workers (ARCHITECTURE §9, пп. 5–6).
 7. **Интеграция с GitHub** — текстовой образ профиля выгружается в приватные репозитории `profiles-artifacts` ([trained-assist-agent#1921](https://github.com/trained-assist/trained-assist-agent/issues/1921)); **не в этом slice**, только roadmap-строка — решение за владельцем (PR #13 arch-репо, открытый вопрос §8.3).
-8. **VM OpenCode worker** — локальная реализация, release attestation, commit identity, worker drift/binding check и systemd updater с rollback есть (`scripts/install-vm-worker.sh`, [операционная инструкция](docs/VM-WORKER-OPERATIONS.md)); API остаётся единственным маршрутизатором. France и Russia endpoints сейчас отвечают на `/version` и `/readyz` (0.3.1 на 2026-10-07). PR #184 добавил API-owned profile saveback в VM worker; подписанный релиз `vm-worker-v0.3.2` создан, но ещё не установлен на France. До обновления France profile runs должны переходить на GHA по pre-admission `WORKER_PROFILE_WORKSPACE_UNSUPPORTED`; подтверждение live сохранения профиля и acceptance по issue #174 остаются открытыми.
+8. **VM OpenCode worker** — локальная реализация, release attestation, commit identity, worker drift/binding check и systemd updater с rollback есть (`scripts/install-vm-worker.sh`, [операционная инструкция](docs/VM-WORKER-OPERATIONS.md)). В текущем контуре Runner API на Cloudflare маршрутизирует на France worker; VM не маршрутизирует на другие исполнители, и GHA не является fallback. Поддержка profile saveback и другие runtime gates описаны в [CLOUDFLARE-RUNNER-API.md](docs/CLOUDFLARE-RUNNER-API.md).
 
 Отложено из P04–P06 (вне этого этапа): callback delivery, квоты/конкурентность по principals (caps), `awaiting_user` durable prompt+response, multi-VM admission — контракты местами зарезервированы, реализация следует за control plane.
 

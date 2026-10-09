@@ -35,7 +35,7 @@ Stateless HTTP не означает отсутствия durable admission, bin
 
 ## Регионы и ресурсы
 
-Placement проверяется для каждого engine/fallback. Claude/Codex не исполняются в РФ. Региональный OpenCode canary проходит Франция → РФ → GHA через тот же API. При CPU или RAM >=60% VM не принимает новую нагрузку; policy направляет её в GHA. Недоступный fallback даёт явный отказ, не нарушение порога. GCP VM не участвует в новых запусках.
+Placement задаёт Runner API, не Control Plane. Этот sandbox Runner API закреплён за France VM execution worker; отказ worker даёт ошибку или `unknown`, без автоматического GHA fallback. GHA и региональная цепочка France → РФ → GHA из прежнего multi-worker плана не входят в этот runtime path. GCP VM не участвует в новых запусках.
 
 ## Наблюдаемость и приёмка
 
@@ -43,4 +43,4 @@ Structured events содержат profile/task/run/operation/generation и stag
 
 API canary проверяет receipt → engine → run branch/manifest → canonical publication → cleanup → следующий Run читает новый revision, включая concurrent CAS, conflict, повтор callback, storage failure и restart. CLI smoke, module tests и deployment acceptance — разные доказательства. Статус и план исполнения: [#95](https://github.com/trained-assist/ai-agent-runner/issues/95), [#136](https://github.com/trained-assist/ai-agent-runner/issues/136), [Integrator](https://github.com/trained-assist/trained-agent-architecture/issues/140).
 
-Retiring GCP VM is not a development or fallback target. Use the own Agent Run API and serverless by default; a necessary persistent service belongs on the existing French VM. Other Google services remain allowed. Exit coordination: https://github.com/trained-assist/trained-agent-architecture/issues/145.
+Retiring GCP VM is not a development or fallback target. The Runner API is serverless on Cloudflare; its Durable Object owns admission and run state. The existing France VM is only the execution worker called by Runner API. The Control Plane reaches Runner API through a Cloudflare service binding and has no direct worker URL. GHA is not an execution fallback. Other Google services remain allowed. Exit coordination: https://github.com/trained-assist/trained-agent-architecture/issues/145.

@@ -8,6 +8,10 @@
 > ответил квитанцией первым.
 # Multi-worker/region contract (P30, этап I10)
 
+> **Legacy planning document.** Its France → Russia → GHA routing chain is not the current
+> sandbox runtime. Current Runner API dispatch is pinned to the France VM worker with no GHA
+> fallback; see [CLOUDFLARE-RUNNER-API.md](CLOUDFLARE-RUNNER-API.md).
+
 Карточка [#69](https://github.com/trained-assist/trained-agent-architecture/issues/69),
 эпик [E7](https://github.com/trained-assist/trained-agent-architecture/issues/23),
 этап [SANDBOX · I10](https://github.com/trained-assist/trained-agent-architecture/blob/main/SANDBOX.md#i10--promotion-совместимость-rueu),

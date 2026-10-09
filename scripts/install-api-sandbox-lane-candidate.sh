@@ -26,6 +26,9 @@ REGISTRY=/etc/agent-runner/key-registry-${LANE}.json
 JOURNAL=/var/lib/agent-runner/${LANE}/admissions.jsonl
 
 die() { printf '[%s-api] ERROR: %s\n' "$LANE" "$1" >&2; exit 1; }
+
+die 'VM-hosted Node API installation is retired; Runner API deployment belongs to Cloudflare Workers'
+
 [[ $EUID -eq 0 ]] || die 'root is required'
 [[ "$(hostname -s)" == vmi3617957 ]] || die 'unrecognized host'
 [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ && "$BUNDLE_SHA" =~ ^[0-9a-f]{64}$ ]] || die 'invalid candidate identity'

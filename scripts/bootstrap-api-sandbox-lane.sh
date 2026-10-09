@@ -23,6 +23,7 @@ ROOT=/opt/sb/ai-agent-runner-api-${LANE}
 STATE=/var/lib/agent-runner/${LANE}
 
 die() { printf '[%s-bootstrap] ERROR: %s\n' "$LANE" "$1" >&2; exit 1; }
+die 'VM-hosted Node API bootstrap is retired; Runner API state is provisioned with the Cloudflare Worker'
 [[ $EUID -eq 0 ]] || die 'root is required'
 [[ "$(hostname -s)" == vmi3617957 ]] || die 'unrecognized host'
 [[ -f "$ENV_SOURCE" && -f "$REGISTRY_SOURCE" ]] || die 'bootstrap inputs missing'
