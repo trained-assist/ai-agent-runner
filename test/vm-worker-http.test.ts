@@ -108,6 +108,19 @@ describe('installable VM HTTP worker', () => {
     expect(fixture.runner.startCalls).toHaveLength(1);
   });
 
+  it('accepts the run-bound result endpoint used by the Cloudflare Runner API', async () => {
+    const fixture = await startFixture();
+    cleanups.push(fixture.close);
+    const request = launchRequest({ resultUrl: `${API_ORIGIN}/v1/runs/${RUN_ID}/result` });
+    const accepted = await launch(fixture.base, request);
+    expect(accepted.status).toBe(202);
+    expect(fixture.runner.startCalls).toHaveLength(1);
+
+    const wrongRun = await launch(fixture.base, launchRequest({ resultUrl: `${API_ORIGIN}/v1/runs/another-run/result` }));
+    expect(wrongRun.status).toBe(400);
+    expect(fixture.runner.startCalls).toHaveLength(1);
+  });
+
   it('preserves a trusted ingress pin for Runner and rejects a pin bound to another run', async () => {
     const fixture = await startFixture();
     cleanups.push(fixture.close);

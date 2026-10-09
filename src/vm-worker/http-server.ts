@@ -267,8 +267,10 @@ function validSavebackUrl(raw: string, runId: string, allowedOrigins: readonly s
 
 /** Accept an optional reverse-proxy base path, while keeping the endpoint suffix exact and run-bound. */
 function hasRunBoundCallbackPath(pathname: string, runId: string, endpoint: 'result' | 'profile-changes'): boolean {
-  const suffix = `/v1/worker/launches/${encodeURIComponent(runId)}/${endpoint}`;
-  return pathname.endsWith(suffix);
+  const suffixes = endpoint === 'result'
+    ? [`/v1/worker/launches/${encodeURIComponent(runId)}/result`, `/v1/runs/${encodeURIComponent(runId)}/result`]
+    : [`/v1/worker/launches/${encodeURIComponent(runId)}/profile-changes`];
+  return suffixes.some((suffix) => pathname.endsWith(suffix));
 }
 
 function isSecureOrLoopback(url: URL): boolean {
