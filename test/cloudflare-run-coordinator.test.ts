@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { RunnerRunCoordinator } from '../src/cloudflare/run-coordinator.js';
 import type { ApiPrincipal, DurableObjectStateLike, DurableStorage, RunnerWorkerEnv } from '../src/cloudflare/types.js';
+import { generateKeyPairSync, verify } from 'node:crypto';
 
 class MemoryStorage implements DurableStorage {
   values = new Map<string, unknown>();
@@ -48,6 +49,7 @@ function call(path: string, body?: unknown, headers: Record<string, string> = {}
 }
 
 const body = { userTaskId: 'task-a', input: { inlinePrompt: 'say done' }, envAllowlist: [], limits: { timeoutMs: 300_000 } };
+const testMcp = { servers: [{ serverId: 'trained-assist-registry-test', transport: 'remote', url: 'https://trained-assist-mcp-host-test-160.skillset-apply.workers.dev/mcp', bindingRef: 'registry-mcp-test-160-read', allowedTools: ['registry.fixture_read'], policyVersion: 'registry-fixture-policy-v1', catalogueVersion: 'registry-fixture-catalogue-v1' }] };
 
 describe('Cloudflare Runner run coordinator', () => {
   it('durably deduplicates submissions and never stores a publication token as plaintext', async () => {
@@ -139,5 +141,49 @@ describe('Cloudflare Runner run coordinator', () => {
     expect(launched).toHaveLength(0);
     const status = await coordinator.fetch(call(`/v1/runs/${receipt.runId}/status`));
     expect(await status.json()).toMatchObject({ state: 'succeeded', engine: 'mock-test', answer: 'pong' });
+  });
+
+  it('attaches a run-bound proof and bearer only for the pinned Registry MCP principal', async () => {
+    const pair = generateKeyPairSync('ed25519');
+    const privateJwk = pair.privateKey.export({ format: 'jwk' });
+    const publicJwk = pair.publicKey.export({ format: 'jwk' });
+    const { coordinator, launched, env } = setup();
+    env.MCP_TEST_AUTH_TOKEN = 'test-host-bearer-token-123';
+    env.MCP_TEST_RUNNER_PRIVATE_JWK = JSON.stringify(privateJwk);
+    env.MCP_TEST_CATALOGUE_VERSION = 'registry-fixture-catalogue-v1';
+    env.MCP_TEST_EXPIRES_AT = new Date(Date.now() + 60 * 60_000).toISOString();
+    const mcpPrincipal: ApiPrincipal = { ...principal, principalId: 'integration-telegram-ux-v1', profileId: 'integration-telegram-ux-v1', mcpBindings: ['registry-mcp-test-160-read'] };
+    const request = new Request('https://runner-runs.internal/v1/runs', { method: 'POST', headers: { 'x-runner-principal': JSON.stringify(mcpPrincipal), 'idempotency-key': 'pinned-mcp-run', 'content-type': 'application/json' }, body: JSON.stringify({ ...body, mcp: testMcp }) });
+    const response = await coordinator.fetch(request);
+    expect(response.status).toBe(202);
+    const receipt = await response.json() as { runId: string };
+    await coordinator.alarm();
+    const launch = launched[0]!;
+    const attachment = launch.mcp as { servers: Record<string, { headers: Record<string, string> }> ; mcpSecrets: Record<string, string> };
+    const server = attachment.servers['trained-assist-registry-test']!;
+    const proof = server.headers['X-MCP-Run-Binding']!;
+    const [header, payload, signature] = proof.split('.');
+    const claims = JSON.parse(Buffer.from(payload!, 'base64url').toString('utf8')) as Record<string, unknown>;
+    expect(JSON.parse(Buffer.from(header!, 'base64url').toString('utf8'))).toEqual({ alg: 'EdDSA', typ: 'JWT' });
+    expect(claims).toMatchObject({ runId: receipt.runId, sub: receipt.runId, userTaskId: 'task-a', profileId: 'integration-telegram-ux-v1', principalId: 'integration-telegram-ux-v1', scope: 'registry:fixture-read', serverId: 'trained-assist-registry-test', bindingRef: 'registry-mcp-test-160-read', catalogueVersion: 'registry-fixture-catalogue-v1', registryDigest: '129ab5033964c3ed5be47414711026cc2469b3d9af90ce83ee071cba7f005ea9' });
+    expect(Object.keys(claims).sort()).toEqual(['allowedTools', 'aud', 'bindingRef', 'catalogueVersion', 'exp', 'iat', 'iss', 'policyVersion', 'principalId', 'profileId', 'registryDigest', 'runId', 'scope', 'serverId', 'sub', 'userTaskId'].sort());
+    expect(verify(null, Buffer.from(`${header}.${payload}`), pair.publicKey, Buffer.from(signature!, 'base64url'))).toBe(true);
+    expect(server.headers).toMatchObject({ Authorization: 'Bearer test-host-bearer-token-123', 'X-MCP-Operation': 'invocation', 'X-MCP-Scope': 'registry:fixture-read', 'X-MCP-Run-Id': receipt.runId, 'X-MCP-User-Task-Id': 'task-a' });
+    expect(attachment.mcpSecrets).toEqual({ RUNNER_MCP_REGISTRY_TEST: 'test-host-bearer-token-123' });
+    expect(JSON.stringify((await coordinator['read']()).runs[receipt.runId])).not.toContain('test-host-bearer-token-123');
+  });
+
+  it('rejects unbound or altered MCP descriptors before storing a run', async () => {
+    const { coordinator, storage, env } = setup();
+    env.MCP_TEST_AUTH_TOKEN = 'test-host-bearer-token-123';
+    env.MCP_TEST_RUNNER_PRIVATE_JWK = JSON.stringify(generateKeyPairSync('ed25519').privateKey.export({ format: 'jwk' }));
+    env.MCP_TEST_CATALOGUE_VERSION = 'registry-fixture-catalogue-v1';
+    env.MCP_TEST_EXPIRES_AT = new Date(Date.now() + 60 * 60_000).toISOString();
+    const bodyWith = (principalValue: ApiPrincipal, descriptor: unknown, key: string) => new Request('https://runner-runs.internal/v1/runs', { method: 'POST', headers: { 'x-runner-principal': JSON.stringify(principalValue), 'idempotency-key': key, 'content-type': 'application/json' }, body: JSON.stringify({ ...body, mcp: descriptor }) });
+    const wrongPrincipal = await coordinator.fetch(bodyWith(principal, testMcp, 'wrong-principal'));
+    expect(wrongPrincipal.status).toBe(422);
+    const badEndpoint = await coordinator.fetch(bodyWith({ ...principal, principalId: 'integration-telegram-ux-v1', profileId: 'integration-telegram-ux-v1', mcpBindings: ['registry-mcp-test-160-read'] }, { servers: [{ ...testMcp.servers[0], url: 'https://attacker.example/mcp' }] }, 'wrong-endpoint'));
+    expect(badEndpoint.status).toBe(422);
+    expect(JSON.stringify(storage.values.get('runner-v1'))).not.toContain('test-host-bearer-token-123');
   });
 });

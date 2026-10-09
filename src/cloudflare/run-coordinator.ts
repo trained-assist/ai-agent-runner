@@ -20,6 +20,15 @@ const ACTIVE = new Set<State>(['queued', 'starting', 'running']);
 const TERMINAL = new Set<State>(['succeeded', 'failed', 'cancelled']);
 const now = (): string => new Date().toISOString();
 const stateKey = 'runner-v1';
+const MCP_TEST = Object.freeze({
+  profile: 'integration-telegram-ux-v1', principal: 'integration-telegram-ux-v1',
+  server: 'trained-assist-registry-test', binding: 'registry-mcp-test-160-read',
+  tool: 'registry.fixture_read', scope: 'registry:fixture-read', policy: 'registry-fixture-policy-v1',
+  audience: 'trained-assist:registry-mcp:test', issuer: 'trained-assist-agent-runner',
+  url: 'https://trained-assist-mcp-host-test-160.skillset-apply.workers.dev/mcp',
+  digest: '129ab5033964c3ed5be47414711026cc2469b3d9af90ce83ee071cba7f005ea9',
+  tokenEnv: 'RUNNER_MCP_REGISTRY_TEST',
+});
 
 function principalOf(request: Request): ApiPrincipal | null {
   try { return JSON.parse(request.headers.get('x-runner-principal') ?? 'null') as ApiPrincipal | null; } catch { return null; }
@@ -119,7 +128,26 @@ export class RunnerRunCoordinator {
     if (!taskId || (typeof inputPrompt !== 'string' || !inputPrompt.trim()) && !instructions) return error('INVALID_REQUEST', 'userTaskId and a non-empty prompt or instructions are required', 400, { errors: ['userTaskId: expected safe id', 'input.inlinePrompt: expected non-empty string'] });
     if ((typeof inputPrompt === 'string' && inputPrompt.length > 100_000) || instructions.length > 10_000) return error('INVALID_REQUEST', 'prompt or instructions exceed their size limit', 400);
     if (Array.isArray(body.input?.refs) && body.input.refs.length) return error('INPUT_REFS_UNSUPPORTED', 'input refs need a durable workspace and are not supported by this Worker API yet', 422);
-    if (body.mcp?.servers?.length) return error('MCP_HOST_POLICY_MISSING', 'MCP bindings are not configured for this Worker API', 422);
+    const mcp = body.mcp?.servers?.length ? body.mcp.servers : [];
+    if (!Array.isArray(mcp) || mcp.length > 1) return error('MCP_HOST_POLICY_MISSING', 'only the pinned test Registry MCP server is supported by this Worker API', 422);
+    if (mcp.length === 1) {
+      const server = mcp[0];
+      const fields = ['serverId', 'transport', 'url', 'bindingRef', 'allowedTools', 'policyVersion', 'catalogueVersion'];
+      if (!server || typeof server !== 'object' || Object.keys(server).some((field) => !fields.includes(field)) ||
+          principal.profileId !== MCP_TEST.profile || principal.principalId !== MCP_TEST.principal ||
+          !principal.mcpBindings?.includes(MCP_TEST.binding) || server.serverId !== MCP_TEST.server ||
+          server.transport !== 'remote' || server.url !== MCP_TEST.url || server.bindingRef !== MCP_TEST.binding ||
+          !Array.isArray(server.allowedTools) || server.allowedTools.length !== 1 || server.allowedTools[0] !== MCP_TEST.tool ||
+          server.policyVersion !== MCP_TEST.policy || typeof server.catalogueVersion !== 'string' ||
+          !/^[A-Za-z0-9._~-]{1,200}$/.test(server.catalogueVersion) ||
+          (this.env.MCP_TEST_CATALOGUE_VERSION && server.catalogueVersion !== this.env.MCP_TEST_CATALOGUE_VERSION)) {
+        return error('MCP_HOST_POLICY_MISSING', 'MCP descriptor is outside this principal’s pinned test Registry policy', 422);
+      }
+      if (!this.env.MCP_TEST_AUTH_TOKEN || !this.env.MCP_TEST_RUNNER_PRIVATE_JWK || !this.env.MCP_TEST_CATALOGUE_VERSION || !this.env.MCP_TEST_EXPIRES_AT ||
+          !Number.isFinite(Date.parse(this.env.MCP_TEST_EXPIRES_AT)) || Date.parse(this.env.MCP_TEST_EXPIRES_AT) <= Date.now()) {
+        return error('MCP_BINDING_UNAVAILABLE', 'pinned test Registry MCP secrets or lease are not configured', 503);
+      }
+    }
     if (body.profileWorkspace || body.ingressManifest || body.credentialBindings?.length) return error('FEATURE_UNSUPPORTED', 'profile workspace, ingress manifests, and credential bindings are not supported by this Worker API yet', 422);
     if (body.isolation !== undefined && body.isolation?.mode !== 'none') return error('ISOLATION_UNSUPPORTED', 'the France VM worker currently supports isolation.mode=none only', 422);
     if (body.regionConstraints?.allowedRegions && !body.regionConstraints.allowedRegions.includes('eu')) return error('REGION_UNAVAILABLE', 'this Runner API only dispatches to the France EU worker', 422);
@@ -183,7 +211,8 @@ export class RunnerRunCoordinator {
           input: { inlinePrompt: `${typeof inputPrompt === 'string' ? inputPrompt : ''}${instructions ? `${inputPrompt ? '\n\nAdditional instructions: ' : ''}${instructions}` : ''}` }, cwd: `/tmp/runner/${runId}`, envAllowlist, env: launchEnv, limits: { timeoutMs: clampInteger(limits.timeoutMs, 300_000, 1_000, 86_400_000), maxOutputBytes: clampInteger(limits.maxOutputBytes, 5_000_000, 1, 100_000_000), maxLogBytes: clampInteger(limits.maxLogBytes, 5_000_000, 1, 100_000_000) },
           repository: { fullName: repository ?? '', branch: `agent-run/${runId}`, ...(body.repository?.revision ? { revision: body.repository.revision } : {}) },
           ...(typeof body.repository?.token === 'string' ? { publicationToken: body.repository.token } : {}),
-          resultUrl, isolation: body.isolation ?? { mode: 'none' }, outputs: Array.isArray(body.outputs) ? body.outputs : [] };
+          resultUrl, isolation: body.isolation ?? { mode: 'none' }, outputs: Array.isArray(body.outputs) ? body.outputs : [],
+          ...(mcp.length ? { mcp: await this.testRegistryAttachment(mcp[0], { runId, taskId, profileId: principal.profileId, timeoutMs: clampInteger(limits.timeoutMs, 300_000, 1_000, 86_400_000) }) } : {}) };
       record = { requestId, runId, userTaskId: taskId, conversationId, jobId, ownerGeneration, principalId: principal.principalId, profileId: principal.profileId,
         ...(principal.tenantId ? { tenantId: principal.tenantId } : {}), idempotencyKey: idemKey, payloadHash, engine, state: 'queued', sequence: 0,
         createdAt: time, updatedAt: time, startedAt: null, finishedAt: null, answer: null, cancelRequested: false, launchAttempts: 0, events: [], artifacts: [], repo: null, logUrl: null, launchCiphertext: await encrypt(JSON.stringify(launch), this.env.RUN_LAUNCH_ENCRYPTION_KEY) };
@@ -224,6 +253,37 @@ export class RunnerRunCoordinator {
     if (run.workerReceipt) await this.worker(`/v1/runs/${runId}/cancel`, 'POST', {});
     await this.state.storage.setAlarm(Date.now() + 100);
     return json({ runId, status: run.workerReceipt ? 'stop_pending' : 'stopped', state: run.state }, run.workerReceipt ? 202 : 200);
+  }
+
+  private async testRegistryAttachment(server: Record<string, unknown>, context: { runId: string; taskId: string; profileId: string; timeoutMs: number }): Promise<Record<string, unknown>> {
+    const expiresAt = Date.parse(this.env.MCP_TEST_EXPIRES_AT!);
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    const exp = Math.min(Math.floor(expiresAt / 1000), nowSeconds + Math.max(60, Math.ceil(context.timeoutMs / 1000) + 60));
+    if (exp <= nowSeconds) throw new Error('MCP_TEST_EXPIRES_AT lease has expired');
+    let jwk: JsonWebKey;
+    try { jwk = JSON.parse(this.env.MCP_TEST_RUNNER_PRIVATE_JWK!) as JsonWebKey; } catch { throw new Error('MCP_TEST_RUNNER_PRIVATE_JWK is invalid'); }
+    if (jwk.kty !== 'OKP' || jwk.crv !== 'Ed25519' || typeof jwk.d !== 'string' || typeof jwk.x !== 'string') throw new Error('MCP test signing key must be an Ed25519 private JWK');
+    const key = await crypto.subtle.importKey('jwk', jwk, { name: 'Ed25519' }, false, ['sign']);
+    const claims = {
+      iss: MCP_TEST.issuer, aud: MCP_TEST.audience, sub: context.runId, runId: context.runId,
+      userTaskId: context.taskId, profileId: MCP_TEST.profile, principalId: MCP_TEST.principal,
+      serverId: MCP_TEST.server, bindingRef: MCP_TEST.binding, allowedTools: [MCP_TEST.tool], scope: MCP_TEST.scope,
+      policyVersion: MCP_TEST.policy, catalogueVersion: String(server['catalogueVersion']), registryDigest: MCP_TEST.digest,
+      iat: nowSeconds, exp,
+    };
+    const encode = (value: unknown): string => base64Url(new TextEncoder().encode(JSON.stringify(value)));
+    const signingInput = `${encode({ alg: 'EdDSA', typ: 'JWT' })}.${encode(claims)}`;
+    const signature = await crypto.subtle.sign({ name: 'Ed25519' }, key, new TextEncoder().encode(signingInput));
+    const proof = `${signingInput}.${base64Url(new Uint8Array(signature))}`;
+    return {
+      servers: { [MCP_TEST.server]: { type: 'remote', url: MCP_TEST.url, enabled: true, headers: {
+        Authorization: `Bearer ${this.env.MCP_TEST_AUTH_TOKEN}`,
+        'X-MCP-Operation': 'invocation', 'X-MCP-Scope': MCP_TEST.scope,
+        'X-MCP-User-Task-Id': context.taskId, 'X-MCP-Profile': context.profileId,
+        'X-MCP-Run-Id': context.runId, 'X-MCP-Run-Binding': proof,
+      } } },
+      mcpSecrets: { [MCP_TEST.tokenEnv]: this.env.MCP_TEST_AUTH_TOKEN },
+    };
   }
 
   async alarm(): Promise<void> {
@@ -380,4 +440,5 @@ async function decrypt(value: string, rawKey: string): Promise<string> {
 
 function base64(bytes: Uint8Array): string { let binary = ''; for (const byte of bytes) binary += String.fromCharCode(byte); return btoa(binary); }
 function fromBase64(value: string): Uint8Array { return Uint8Array.from(atob(value), (char) => char.charCodeAt(0)); }
+function base64Url(bytes: Uint8Array): string { return base64(bytes).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, ''); }
 

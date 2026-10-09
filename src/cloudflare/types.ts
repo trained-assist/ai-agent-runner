@@ -26,6 +26,10 @@ export interface RunnerWorkerEnv {
   ALLOWED_ENVIRONMENT_NAMES?: string;
   LLM_LADDER_TOKEN?: string;
   OPENAI_API_KEY?: string;
+  MCP_TEST_AUTH_TOKEN?: string;
+  MCP_TEST_RUNNER_PRIVATE_JWK?: string;
+  MCP_TEST_CATALOGUE_VERSION?: string;
+  MCP_TEST_EXPIRES_AT?: string;
   [binding: string]: unknown;
   RUNNER_RUNS: { idFromName(name: string): unknown; get(id: unknown): { fetch(request: Request): Promise<Response> } };
 }
@@ -39,4 +43,5 @@ export interface ApiPrincipal {
   tenantId?: string;
   scopes: string[];
   engines?: string[];
+  mcpBindings?: string[];
 }
