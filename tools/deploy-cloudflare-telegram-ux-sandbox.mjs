@@ -38,6 +38,15 @@ async function fetchJson(url, init = {}) {
   return { response, body };
 }
 
+async function retryProbe(probe) {
+  const delays = [0, 1_000, 2_000, 4_000, 8_000];
+  for (const delay of delays) {
+    if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
+    try { if (await probe()) return true; } catch { /* retry transient edge/secret propagation failures */ }
+  }
+  return false;
+}
+
 async function verifyFranceWorker(url, token) {
   const { response, body } = await fetchJson(`${url.replace(/\/+$/, '')}/readyz`, {
     headers: { authorization: `Bearer ${token}` },
@@ -55,23 +64,22 @@ function putSecret(name, value) {
 }
 
 async function verifyDeployment(sourceSha, apiKey, delegationSecret) {
-  const { response: healthResponse, body: health } = await fetchJson(`${PUBLIC_URL}/healthz`);
-  if (!healthResponse.ok || health?.service !== 'ai-agent-runner-api'
-    || health?.placement !== 'cloudflare-worker' || health?.executionWorker !== 'eu-vm-agent-run') {
-    throw new Error('runner_sandbox_health_failed');
-  }
-  const { response: versionResponse, body: version } = await fetchJson(`${PUBLIC_URL}/version`);
-  if (!versionResponse.ok || version?.runtime !== 'cloudflare-worker' || version?.buildSha !== sourceSha) {
-    throw new Error('runner_sandbox_build_sha_mismatch');
-  }
-
-  const { response: capabilitiesResponse, body: capabilities } = await fetchJson(`${PUBLIC_URL}/v1/capabilities`, {
-    headers: { authorization: `Bearer ${apiKey}` },
-  });
-  if (!capabilitiesResponse.ok || capabilities?.contract?.name !== 'trained-assist-runner/serverless-agent-api'
-    || !capabilities?.executionRegions?.includes('eu-vm-agent-run')) {
-    throw new Error('runner_sandbox_api_key_probe_failed');
-  }
+  if (!await retryProbe(async () => {
+    const { response, body } = await fetchJson(`${PUBLIC_URL}/healthz`);
+    return response.ok && body?.service === 'ai-agent-runner-api'
+      && body?.placement === 'cloudflare-worker' && body?.executionWorker === 'eu-vm-agent-run';
+  })) throw new Error('runner_sandbox_health_failed');
+  if (!await retryProbe(async () => {
+    const { response, body } = await fetchJson(`${PUBLIC_URL}/version`);
+    return response.ok && body?.runtime === 'cloudflare-worker' && body?.buildSha === sourceSha;
+  })) throw new Error('runner_sandbox_build_sha_mismatch');
+  if (!await retryProbe(async () => {
+    const { response, body } = await fetchJson(`${PUBLIC_URL}/v1/capabilities`, {
+      headers: { authorization: `Bearer ${apiKey}` },
+    });
+    return response.ok && body?.contract?.name === 'trained-assist-runner/serverless-agent-api'
+      && body?.executionRegions?.includes('eu-vm-agent-run');
+  })) throw new Error('runner_sandbox_api_key_probe_failed');
 
   const taskId = 'telegram-ux-delegation-health-probe';
   const digest = createHash('sha256').update(`${PRINCIPAL_ID}\0${PROFILE_ID}\0${taskId}`).digest('hex');
@@ -79,18 +87,18 @@ async function verifyDeployment(sourceSha, apiKey, delegationSecret) {
   const expiresAt = String(Date.now() + 60_000);
   const message = `${PRINCIPAL_ID}\0${TENANT_ID}\0${PROFILE_ID}\0${expiresAt}`;
   const signature = createHmac('sha256', delegationSecret).update(message).digest('hex');
-  const status = await fetchJson(`${PUBLIC_URL}/v1/runs/${runId}/status`, {
-    headers: {
-      authorization: `Bearer ${apiKey}`,
-      'x-agent-profile-id': PROFILE_ID,
-      'x-agent-profile-tenant': TENANT_ID,
-      'x-agent-profile-exp': expiresAt,
-      'x-agent-profile-sig': signature,
-    },
-  });
-  if (status.response.status !== 404 || status.body?.error?.code !== 'NOT_FOUND') {
-    throw new Error('runner_sandbox_delegation_probe_failed');
-  }
+  if (!await retryProbe(async () => {
+    const status = await fetchJson(`${PUBLIC_URL}/v1/runs/${runId}/status`, {
+      headers: {
+        authorization: `Bearer ${apiKey}`,
+        'x-agent-profile-id': PROFILE_ID,
+        'x-agent-profile-tenant': TENANT_ID,
+        'x-agent-profile-exp': expiresAt,
+        'x-agent-profile-sig': signature,
+      },
+    });
+    return status.response.status === 404 && status.body?.error?.code === 'NOT_FOUND';
+  })) throw new Error('runner_sandbox_delegation_probe_failed');
 }
 
 async function main() {
