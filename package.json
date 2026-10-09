@@ -13,13 +13,19 @@
     "build": "tsc -p tsconfig.build.json && node scripts/copy-mcp-fixtures.mjs && node scripts/copy-isolation-probe.mjs && node scripts/write-vm-worker-build-info.mjs",
     "start": "node dist/api/main.js",
     "start:vm-worker": "node dist/vm-worker/main.js",
+    "worker:dev:sandbox3": "wrangler dev -c wrangler.sandbox3.jsonc",
+    "worker:dev:telegram-ux": "wrangler dev -c wrangler.telegram-ux-v1.jsonc",
+    "worker:dry-run:sandbox3": "wrangler deploy --dry-run -c wrangler.sandbox3.jsonc",
+    "worker:dry-run:telegram-ux": "wrangler deploy --dry-run -c wrangler.telegram-ux-v1.jsonc",
     "test": "vitest run",
     "test:watch": "vitest"
   },
   "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261009.1",
     "@types/node": "^20.19.0",
     "typescript": "^5.6.3",
-    "vitest": "^2.1.9"
+    "vitest": "^2.1.9",
+    "wrangler": "^4.149.0"
   },
   "dependencies": {
     "@google-cloud/storage": "^7.22.0"

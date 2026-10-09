@@ -1,5 +1,10 @@
 # VM worker configuration and secret inventory
 
+> API-side paths later in this inventory describe the retired Node API. Current Runner API
+> secrets belong in each lane's Cloudflare Worker secret store, not on a VM. See
+> [CLOUDFLARE-RUNNER-API.md](CLOUDFLARE-RUNNER-API.md). The France VM owns only execution
+> worker credentials and runtime secrets.
+
 The checked-in France and Russia inventories under `deploy/vm-worker/inventory/` record
 binding names and metadata only. They must never contain values. `/version` reports
 whether required process-environment bindings are present, their configured source,

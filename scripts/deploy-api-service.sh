@@ -78,6 +78,8 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+die "the VM-hosted Node API is retired; use the Cloudflare Worker configs after the gates in docs/CLOUDFLARE-RUNNER-API.md are cleared"
+
 [[ "$PORT" =~ ^[0-9]+$ ]] || die "--port: expected 1..65535, got \"$PORT\""
 PORT=$((10#$PORT))
 (( PORT >= 1 && PORT <= 65535 )) || die "--port: expected 1..65535, got \"$PORT\""

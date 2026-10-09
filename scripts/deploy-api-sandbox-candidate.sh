@@ -16,6 +16,8 @@ USAGE
 
 die() { printf '[runner-api-sandbox] ERROR: %s\n' "$1" >&2; exit 1; }
 
+die 'VM-hosted Node API deployment is retired; deploy the Cloudflare Worker after its documented gates are cleared'
+
 ARTIFACT="${1:-}"
 [[ -n "$ARTIFACT" ]] || { usage >&2; exit 2; }
 [[ -f "$ARTIFACT" ]] || die 'candidate archive is missing'
