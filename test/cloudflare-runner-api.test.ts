@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import { createHmac, createHash } from 'node:crypto';
 import runnerApi, { sha256 } from '../src/cloudflare/runner-api.js';
 import type { RunnerWorkerEnv } from '../src/cloudflare/types.js';
 
@@ -58,5 +59,68 @@ describe('Cloudflare Runner API Worker', () => {
     const response = await runnerApi.fetch(new Request('https://api.example/v1/runs', { method: 'POST', headers: { authorization: `Bearer ${token}`, 'idempotency-key': 'mcp-test', 'content-type': 'application/json' }, body: JSON.stringify({ userTaskId: 'task-telegram' }) }), env);
     expect(response.status).toBe(202);
     expect(coordinatorFetch).toHaveBeenCalledOnce();
+  });
+});
+
+describe('Cloudflare Runner delegated profile capability', () => {
+  const apiKey = 'delegated-test-api-key';
+  const delegationSecret = 'delegated-test-profile-secret';
+  const tenantId = 'tenant-a';
+  const profileId = 'profile-delegated';
+
+  function delegatedSetup() {
+    const coordinatorFetch = vi.fn(async (request: Request) => Response.json({
+      principal: JSON.parse(request.headers.get('x-runner-principal')!),
+    }, { status: 202 }));
+    const principal = { principalId: 'cp-service-principal', tenantId, profileId: 'service-profile',
+      repository: 'trained-assist/ai-agent-runner', scopes: ['runs:read', 'runs:write'] };
+    const idFromName = vi.fn((name: string) => name);
+    const env = {
+      RUNNER_API_KEYS: JSON.stringify([{ ...principal, keyHash: createHash('sha256').update(apiKey).digest('hex') }]),
+      AGENT_API_PROFILE_DELEGATION_SECRET: delegationSecret,
+      RUNNER_RUNS: { idFromName, get: vi.fn().mockReturnValue({ fetch: coordinatorFetch }) },
+    } as unknown as RunnerWorkerEnv;
+    return { env, coordinatorFetch, idFromName };
+  }
+
+  function signedHeaders(principalId: string, delegatedProfile = profileId, tenant = tenantId,
+    expiresAt = String(Date.now() + 60_000)) {
+    const message = `${principalId}\0${tenant}\0${delegatedProfile}\0${expiresAt}`;
+    const signature = createHmac('sha256', delegationSecret).update(message).digest('hex');
+    return { 'x-agent-profile-id': delegatedProfile, 'x-agent-profile-tenant': tenant,
+      'x-agent-profile-exp': expiresAt, 'x-agent-profile-sig': signature };
+  }
+
+  function submit(env: RunnerWorkerEnv, headers: Record<string, string>) {
+    return runnerApi.fetch(new Request('https://api.example/v1/runs', { method: 'POST',
+      headers: { authorization: `Bearer ${apiKey}`, 'content-type': 'application/json', ...headers },
+      body: JSON.stringify({ userTaskId: 'task-delegated' }) }), env);
+  }
+
+  it('verifies the capability and applies the signed profile before identity hashing and dispatch', async () => {
+    const { env, coordinatorFetch, idFromName } = delegatedSetup();
+    const response = await submit(env, signedHeaders('cp-service-principal'));
+    expect(response.status).toBe(202);
+    expect(JSON.parse(coordinatorFetch.mock.calls[0]![0].headers.get('x-runner-principal')!))
+      .toMatchObject({ principalId: 'cp-service-principal', tenantId, profileId });
+    expect(idFromName).toHaveBeenCalledWith(`task-${createHash('sha256').update(`cp-service-principal\0${profileId}\0task-delegated`).digest('hex')}`);
+  });
+
+  it('rejects forged, expired, cross-tenant and partial capabilities before dispatch', async () => {
+    const { env, coordinatorFetch } = delegatedSetup();
+    const forged = signedHeaders('another-principal');
+    const expired = signedHeaders('cp-service-principal', profileId, tenantId, String(Date.now() - 1));
+    const crossTenant = signedHeaders('cp-service-principal', profileId, 'tenant-b');
+    for (const headers of [forged, expired, crossTenant, { 'x-agent-profile-id': profileId }]) {
+      expect((await submit(env, headers)).status).toBe(403);
+    }
+    expect(coordinatorFetch).not.toHaveBeenCalled();
+  });
+
+  it('rejects delegated capability headers when the verifier secret is missing', async () => {
+    const { env, coordinatorFetch } = delegatedSetup();
+    delete (env as unknown as Record<string, unknown>).AGENT_API_PROFILE_DELEGATION_SECRET;
+    expect((await submit(env, signedHeaders('cp-service-principal'))).status).toBe(403);
+    expect(coordinatorFetch).not.toHaveBeenCalled();
   });
 });
