@@ -107,6 +107,9 @@ async function main() {
     required('RUN_LAUNCH_ENCRYPTION_KEY', 32), required('EU_VM_WORKER_URL', 1),
     required('EU_VM_WORKER_TOKEN', 24), required('LLM_LADDER_TOKEN', 1),
   ];
+  // Non-secret fingerprint lets operators confirm the GitHub sandbox secret is
+  // paired with the separately stored Worker credential without exposing it.
+  console.log(JSON.stringify({ apiKeyFingerprint: createHash('sha256').update(apiKey).digest('hex').slice(0, 16) }));
   let workerUrl;
   try {
     workerUrl = new URL(franceUrl);
