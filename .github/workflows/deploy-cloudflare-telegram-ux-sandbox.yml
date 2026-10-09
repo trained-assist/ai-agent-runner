@@ -1,0 +1,37 @@
+name: Deploy Telegram UX Cloudflare Runner sandbox
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cloudflare-runner-telegram-ux-sandbox
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: sandbox
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+      RUNNER_API_KEY_AGENT_API: ${{ secrets.RUNNER_API_KEY_AGENT_API }}
+      AGENT_API_PROFILE_DELEGATION_SECRET: ${{ secrets.AGENT_API_PROFILE_DELEGATION_SECRET }}
+      RUN_LAUNCH_ENCRYPTION_KEY: ${{ secrets.RUN_LAUNCH_ENCRYPTION_KEY }}
+      EU_VM_WORKER_URL: ${{ secrets.EU_VM_WORKER_URL }}
+      EU_VM_WORKER_TOKEN: ${{ secrets.EU_VM_WORKER_TOKEN }}
+      LLM_LADDER_TOKEN: ${{ secrets.LLM_LADDER_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npx vitest run test/cloudflare-runner-api.test.ts test/cloudflare-run-coordinator.test.ts
+      - run: npm run worker:dry-run:telegram-ux
+      - run: node tools/deploy-cloudflare-telegram-ux-sandbox.mjs

@@ -87,7 +87,7 @@ export default {
   async fetch(request: Request, env: RunnerWorkerEnv): Promise<Response> {
     const url = new URL(request.url);
     if (url.pathname === '/healthz' && request.method === 'GET') return json({ status: 'ok', service: 'ai-agent-runner-api', placement: 'cloudflare-worker', executionWorker: 'eu-vm-agent-run' });
-    if (url.pathname === '/version' && request.method === 'GET') return json({ service: 'ai-agent-runner-api', runtime: 'cloudflare-worker', contractVersion: 1 });
+    if (url.pathname === '/version' && request.method === 'GET') return json({ service: 'ai-agent-runner-api', runtime: 'cloudflare-worker', contractVersion: 1, buildSha: env.BUILD_SHA ?? null });
     let authenticated: ApiPrincipal | null;
     try { authenticated = await authenticate(request, env); } catch { return error('SERVER_MISCONFIGURED', 'Runner API authentication is not configured', 503); }
     if (!authenticated) return error('UNAUTHENTICATED', 'a valid Bearer API key is required', 401);

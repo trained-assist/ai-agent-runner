@@ -79,6 +79,18 @@ never overwrite the secret from an unverified local copy. The live sandbox3 regi
 been inspected and no new principal has been provisioned. The separate Telegram UX Worker
 config names a service binding to a Worker that does not exist yet.
 
+The dedicated Telegram UX Runner Worker is deployed by
+`.github/workflows/deploy-cloudflare-telegram-ux-sandbox.yml` from protected `main` using the
+`sandbox` GitHub environment. That workflow verifies the France worker readiness and Cloudflare
+account, hashes the environment-held API key into the Worker registry, synchronizes the paired
+delegation/encryption/France/model secrets, deploys the pinned config, and verifies Worker
+placement, exact source SHA, API authentication, and signed profile delegation. Required
+environment secrets are `CF_API_TOKEN`, `RUNNER_API_KEY_AGENT_API`,
+`AGENT_API_PROFILE_DELEGATION_SECRET`, and `RUN_LAUNCH_ENCRYPTION_KEY`. France worker URL/token
+and `LLM_LADDER_TOKEN` are supplied from the existing repository secrets. Keep the API key and
+delegation secret paired with the same-named Control Plane sandbox bindings; neither belongs in
+Wrangler vars or source.
+
 ## Verification
 
 ```bash
