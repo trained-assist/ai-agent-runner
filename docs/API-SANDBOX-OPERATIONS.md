@@ -156,3 +156,9 @@ readiness. Those claims require a separately recorded end-to-end task result.
 - Production promotion: reviewed main change, signed `vm-worker-v*` release,
   then the production operator path. This sandbox workflow has no production
   target or credential.
+
+The permission helper verifies the fixed systemd service runs as `sandbox`.
+Its EnvironmentFile may be owned by root or that service account; both are
+valid existing installation layouts. Journal ownership remains pinned to
+`sandbox`, so restricting its mode cannot remove the service writer's access.
+Unrelated owners still fail before any mode change.
