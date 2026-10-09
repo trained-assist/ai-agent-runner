@@ -149,12 +149,92 @@ def inspect():
             'proxyServicesActive': proxies, 'realExecutionVerified': False}
 
 
+def nginx_tokens(text):
+    """Parse only configuration grammar; never interpret variables or execute content."""
+    tokens = []
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char.isspace():
+            index += 1; continue
+        if char == '#':
+            end = text.find('\n', index); index = len(text) if end < 0 else end + 1; continue
+        start = index
+        if char in '{};':
+            tokens.append((char, start, index + 1)); index += 1; continue
+        if char in "\"'":
+            quote = char; index += 1; value = ''
+            while index < len(text) and text[index] != quote:
+                if text[index] == '\\':
+                    index += 1
+                    if index >= len(text): raise ValueError('sandbox3_proxy_config_unsupported')
+                    escaped = text[index]
+                    value += {'t': '\t', 'r': '\r', 'n': '\n', '\\': '\\', '"': '"', "'": "'"}.get(escaped, '\\' + escaped)
+                    index += 1; continue
+                value += text[index]; index += 1
+            if index >= len(text): raise ValueError('sandbox3_proxy_config_unsupported')
+            index += 1; tokens.append((value, start, index)); continue
+        while index < len(text) and not text[index].isspace() and text[index] not in ';{}':
+            if text[index] in "\"'\\": raise ValueError('sandbox3_proxy_config_unsupported')
+            index += 1
+        tokens.append((text[start:index], start, index))
+    return tokens
+
+
+def nginx_nodes(text):
+    tokens = nginx_tokens(text)
+    def parse(index, nested=False):
+        nodes = []; words = []; start = None
+        while index < len(tokens):
+            value, begin, end = tokens[index]; index += 1
+            if value == '}':
+                if not nested or words: raise ValueError('sandbox3_proxy_config_unsupported')
+                return nodes, index, end
+            if value in (';', '{'):
+                if not words: raise ValueError('sandbox3_proxy_config_unsupported')
+                children = None
+                if value == '{': children, index, end = parse(index, True)
+                nodes.append({'name': words[0], 'args': words[1:], 'start': start, 'end': end, 'children': children})
+                words = []; start = None
+            else:
+                if start is None: start = begin
+                words.append(value)
+        if nested or words: raise ValueError('sandbox3_proxy_config_unsupported')
+        return nodes, index, len(text)
+    return parse(0)[0]
+
+
+def nginx_route_targets(text):
+    # nginx -T emits exact source boundaries. Raw content stays in memory.
+    sources = re.split(r'^# configuration file ([^\n:]+):\n', text, flags=re.M)
+    if len(sources) < 3 or len(sources) > 401: raise ValueError('sandbox3_proxy_config_unsupported')
+    targets = []
+    for index in range(1, len(sources), 2):
+        path, content = sources[index:index + 2]
+        def visit(nodes, parent=None):
+            for node in nodes:
+                children = node['children'] or []
+                if node['name'] == 'server' and parent in (None, 'http'):
+                    host = any(item['name'] == 'server_name' and '169-58-15-230.sslip.io' in item['args'] for item in children)
+                    tls = any(item['name'] == 'listen' and 'ssl' in item['args']
+                        and any(re.fullmatch(r'(?:[^:]+:)?443', arg) for arg in item['args']) for item in children)
+                    legacy = any(item['name'] == 'location' and any(arg.startswith('/runner-mcp-test') for arg in item['args'])
+                        and any(sub['name'] == 'proxy_pass' and sub['args'] in (['http://127.0.0.1:18882/'], ['http://127.0.0.1:18882'])
+                            for sub in item['children'] or []) for item in children)
+                    if host and tls and legacy:
+                        targets.append({'path': path, 'content': content, 'server': node})
+                if children: visit(children, node['name'])
+        visit(nginx_nodes(content))
+    return targets
+
+
 def proxy_inspect():
     result = subprocess.run(['nginx', '-T'], capture_output=True, text=True, timeout=10)
     if result.returncode != 0:
         raise ValueError('sandbox3_proxy_config_unavailable')
-    # Never return nginx config, certificate/key paths or configured header values.
     text = result.stdout
+    if len(text.encode('utf-8')) > 2 * 1024 * 1024: raise ValueError('sandbox3_proxy_config_too_large')
+    targets = nginx_route_targets(text)
     host = bool(re.search(r'server_name\s+[^;]*\b169-58-15-230\.sslip\.io\b', text))
     tls = bool(re.search(r'listen\s+[^;]*443[^;]*ssl', text))
     legacy_location = bool(re.search(r'location[^\{]*?/runner-mcp-test', text))
@@ -162,7 +242,7 @@ def proxy_inspect():
     return {'schemaVersion': 1, 'target': TARGET, 'hostMentioned': host, 'tlsMentioned': tls,
             'legacyPathMentioned': legacy_location, 'sandbox3PathMentioned': new_location,
             'sandbox3UpstreamMentioned': '127.0.0.1:18883' in text,
-            'publicRouteVerified': False}
+            'qualifiedRouteTargetCount': min(len(targets), 100), 'publicRouteVerified': False}
 
 
 def api_request(method, path, key, body=None, idempotency=None):
