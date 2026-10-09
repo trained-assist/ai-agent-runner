@@ -57,9 +57,26 @@ STATE="$ROOT/rollback/$SOURCE_SHA"
 install -d -m 0755 -o root -g root "$ROOT/releases" "$ROOT/rollback" "$STATE"
 if [[ -L "$CURRENT" && "$(readlink -f "$CURRENT")" == "$RELEASE" ]]; then
   log 'candidate is already current; verifying service health'
+  CURRENT_ENV_BACKUP="$STATE/env.idempotent.before.$$"
+  cp -p "$ENV_FILE" "$CURRENT_ENV_BACKUP"
+  CURRENT_ENV_CHANGED=0
+  restore_current_environment() {
+    local status=$?
+    if (( status != 0 )) && (( CURRENT_ENV_CHANGED == 1 )); then
+      log 'idempotent candidate check failed; restoring the prior sandbox environment'
+      cp -p "$CURRENT_ENV_BACKUP" "$ENV_FILE"
+      systemctl restart "$SERVICE" >/dev/null 2>&1 || true
+    fi
+    rm -f "$CURRENT_ENV_BACKUP"
+    return "$status"
+  }
+  trap restore_current_environment EXIT
   install -m 0755 -o root -g root "$RELEASE/scripts/provision-api-sandbox-principal.sh" /usr/local/sbin/runner-api-mcp-test-provision-principal
   MOCK_MODE_STATE="$(python3 "$RELEASE/scripts/enable-api-sandbox-mock-test.py" "$ENV_FILE")" || die 'could not enable sandbox mock-test mode'
-  [[ "$MOCK_MODE_STATE" == mock_test_sandbox_mode_already_enabled ]] || systemctl restart "$SERVICE"
+  if [[ "$MOCK_MODE_STATE" != mock_test_sandbox_mode_already_enabled ]]; then
+    CURRENT_ENV_CHANGED=1
+    systemctl restart "$SERVICE"
+  fi
   HEALTHY=0
   for _ in $(seq 1 30); do
     if curl -fsS --max-time 5 "http://127.0.0.1:$API_PORT/healthz" >/dev/null; then HEALTHY=1; break; fi
@@ -68,6 +85,9 @@ if [[ -L "$CURRENT" && "$(readlink -f "$CURRENT")" == "$RELEASE" ]]; then
   [[ "$HEALTHY" == 1 ]] || die 'current candidate health check failed'
   grep -Fxq 'AGENT_API_ENVIRONMENT=sandbox' "$ENV_FILE" || die 'mock-test sandbox environment is not enabled'
   grep -Fxq 'AGENT_API_ENABLE_MOCK_TEST=true' "$ENV_FILE" || die 'mock-test sandbox engine is not enabled'
+  CURRENT_ENV_CHANGED=0
+  trap - EXIT
+  rm -f "$CURRENT_ENV_BACKUP"
   exit 0
 fi
 
