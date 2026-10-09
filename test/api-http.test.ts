@@ -7,6 +7,7 @@ import {
   alphaKey,
   authHeader,
   getArtifacts,
+  getResult,
   getStatus,
   noScopeKey,
   postCancel,
@@ -145,6 +146,77 @@ describe('http auth, scopes and structured refusals', () => {
 });
 
 describe('http submit, status, result, artifacts, events and cancel', () => {
+  it('mock-test authenticates and validates a normal request, returns pong, deduplicates, and never launches the external worker', async () => {
+    const h = await startHttpHarness({ mockTestEnabled: true });
+    const capabilities = await fetch(`${h.base}/v1/capabilities`, { headers: authHeader(alphaKey) });
+    expect(capabilities.status).toBe(200);
+    const declared = await capabilities.json() as { engines: string[]; engineSelection: { chain: string[] } };
+    expect(declared.engines).toContain('mock-test');
+    expect(declared.engineSelection.chain).not.toContain('mock-test');
+
+    const noAuth = await postSubmit(h.base, 'ak_invalid', 'mock-no-auth', submitBody({ engine: { name: 'mock-test', adapterVersion: '1' } }));
+    expect(noAuth.status).toBe(401);
+    const noWriteScope = await postSubmit(h.base, readerKey, 'mock-reader', submitBody({ engine: { name: 'mock-test', adapterVersion: '1' } }));
+    expect(noWriteScope.status).toBe(403);
+    const malformed = await postSubmit(h.base, alphaKey, 'mock-malformed', { engine: { name: 'mock-test', adapterVersion: '1' }, envAllowlist: [], limits: { timeoutMs: -1 } });
+    expect(malformed.status).toBe(400);
+
+    const body = submitBody({ engine: { name: 'mock-test', adapterVersion: '1' }, userTaskId: 'task-mock-test-contract' });
+    const accepted = await postSubmit(h.base, alphaKey, 'mock-valid-once', body);
+    expect(accepted.status).toBe(202);
+    const receipt = await accepted.json() as { runId: string };
+    expect(await waitForTerminal(h.base, alphaKey, receipt.runId)).toBe('succeeded');
+    const status = await getStatus(h.base, alphaKey, receipt.runId);
+    expect(await status.json()).toMatchObject({ state: 'succeeded', engine: 'mock-test', answer: 'pong' });
+    const result = await getResult(h.base, alphaKey, receipt.runId);
+    expect(await result.json()).toMatchObject({ outcome: 'succeeded', text: 'pong', persistence: 'not_required', cleanup: 'completed' });
+
+    const duplicate = await postSubmit(h.base, alphaKey, 'mock-valid-once', body);
+    expect(duplicate.status).toBe(200);
+    expect(await duplicate.json()).toMatchObject({ runId: receipt.runId, deduplicated: true });
+    expect(h.worker.launches).toHaveLength(0);
+  });
+
+  it('mock-test ignores the external worker default repository binding', async () => {
+    const h = await startHttpHarness({ mockTestEnabled: true, mockOnly: true, defaultRepository: 'invalid default repo' });
+    const body = submitBody({ engine: { name: 'mock-test', adapterVersion: '1' }, userTaskId: 'task-mock-with-invalid-default-repo' });
+    const accepted = await postSubmit(h.base, alphaKey, 'mock-invalid-default-repo', body);
+    expect(accepted.status).toBe(202);
+    const receipt = await accepted.json() as { runId: string };
+    expect(await waitForTerminal(h.base, alphaKey, receipt.runId)).toBe('succeeded');
+    expect(await (await getStatus(h.base, alphaKey, receipt.runId)).json()).toMatchObject({ engine: 'mock-test', answer: 'pong' });
+  });
+
+  it('runs in mock-only API mode without configuring or contacting any external worker', async () => {
+    const h = await startHttpHarness({ mockTestEnabled: true, mockOnly: true });
+    const body = submitBody({ engine: { name: 'mock-test', adapterVersion: '1' } });
+    const accepted = await postSubmit(h.base, alphaKey, 'mock-only-run', body);
+    expect(accepted.status).toBe(202);
+    const receipt = await accepted.json() as { runId: string };
+    expect(await waitForTerminal(h.base, alphaKey, receipt.runId)).toBe('succeeded');
+    expect(await (await getStatus(h.base, alphaKey, receipt.runId)).json()).toMatchObject({ answer: 'pong' });
+    expect(await (await getResult(h.base, alphaKey, receipt.runId)).json()).toMatchObject({ text: 'pong' });
+    const automatic = await postSubmit(h.base, alphaKey, 'mock-only-auto-select', submitBody());
+    expect(automatic.status).toBe(403);
+    expect(((await automatic.json()) as { error: { code: string } }).error.code).toBe('ENGINE_NOT_ALLOWED');
+  });
+
+  it('mock-test is opt-in, profile-scoped by engine authorization, and excluded from automatic selection', async () => {
+    const h = await startHttpHarness({ mockTestEnabled: true, allowedEngines: ['azure-dynamic-ip-agent-run'] });
+    const refused = await postSubmit(h.base, alphaKey, 'mock-not-authorized', submitBody({ engine: { name: 'mock-test', adapterVersion: '1' } }));
+    expect(refused.status).toBe(403);
+    expect(((await refused.json()) as { error: { code: string } }).error.code).toBe('ENGINE_NOT_ALLOWED');
+    expect(h.worker.launches).toHaveLength(0);
+  });
+
+  it('rejects mock-test when the API was not enabled for sandbox use', async () => {
+    const h = await startHttpHarness();
+    const response = await postSubmit(h.base, alphaKey, 'mock-disabled', submitBody({ engine: { name: 'mock-test', adapterVersion: '1' } }));
+    expect(response.status).toBe(403);
+    expect(((await response.json()) as { error: { code: string } }).error.code).toBe('ENGINE_NOT_ALLOWED');
+    expect(h.worker.launches).toHaveLength(0);
+  });
+
   it('accepts an ingress pin over POST /v1/runs and passes a server-bound RunSpec to the worker', async () => {
     const h = await startHttpHarness();
     const pin = { contractVersion: 1, manifestRef: 'cp-input-manifest:task-http-ingress', manifestVersion: 'b'.repeat(64) };

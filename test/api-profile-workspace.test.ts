@@ -12,6 +12,9 @@ import { adapterFor, startMockWorker } from './external-worker-harness.js';
 import { createAgentApiServer } from '../src/api/server.js';
 import { KeyRegistry, keyRecordFor } from '../src/api/auth.js';
 import { StatelessStore } from '../src/api/stateless-store.js';
+import { STATELESS_STORE_SCHEMA_VERSION } from '../src/api/stateless-store.js';
+import { makeRunSpec } from './helpers.js';
+import { SANDBOX_TEST_PRINCIPAL } from '../src/ops/sandbox-principal-registry.js';
 
 const principal: Principal = { principalId: 'user-a', tenantId: 'tenant-a', profileId: 'profile-a', scopes: ['runs:read', 'runs:write'] };
 const body = { engine: { name: 'azure-dynamic-ip-agent-run', adapterVersion: '1' }, input: { inlinePrompt: 'save profile' }, limits: { timeoutMs: 3000 }, envAllowlist: [] };
@@ -26,6 +29,62 @@ async function waitFor(api: AgentApi, runId: string, state: string): Promise<voi
 }
 
 describe('profile workspace lifecycle', () => {
+  it('allows isolated mock-test beside an old profile admission without exposing or changing it', async () => {
+    const store = new StatelessStore({}, null, true);
+    const oldSpec = makeRunSpec({
+      runId: 'run-legacy-unknown',
+      userTaskId: 'task-legacy-unknown',
+      profileId: 'integration-telegram-ux-v1',
+      engine: { name: 'azure-dynamic-ip-agent-run', adapterVersion: '1' },
+    });
+    store.put({
+      schemaVersion: STATELESS_STORE_SCHEMA_VERSION,
+      requestId: 'req-legacy-unknown', userTaskId: oldSpec.userTaskId,
+      conversationId: oldSpec.conversationId, principalId: 'integration-telegram-ux-v1',
+      tenantId: 'integration-telegram-ux-v1', profileId: oldSpec.profileId,
+      jobId: oldSpec.jobId, idempotencyKey: 'legacy-idempotency', payloadHash: 'a'.repeat(64),
+      runId: oldSpec.runId, operationId: oldSpec.operationId, ownerGeneration: oldSpec.ownerGeneration,
+      spec: oldSpec, engineChain: [oldSpec.engine.name], createdAt: new Date().toISOString(),
+    });
+    const workspaceCalls: string[] = [];
+    const workspace: ProfileWorkspaceCoordinator = {
+      async prepare() { workspaceCalls.push('prepare'); throw new Error('mock must not prepare a profile workspace'); },
+      async upload() { workspaceCalls.push('upload'); throw new Error('mock must not upload workspace files'); },
+      async publish() { workspaceCalls.push('publish'); throw new Error('mock must not publish workspace files'); },
+      async readObject() { workspaceCalls.push('read'); throw new Error('mock must not read profile objects'); },
+    };
+    const mockPrincipal: Principal = {
+      principalId: SANDBOX_TEST_PRINCIPAL.principalId,
+      tenantId: SANDBOX_TEST_PRINCIPAL.tenantId,
+      profileId: SANDBOX_TEST_PRINCIPAL.profileId,
+      scopes: [...SANDBOX_TEST_PRINCIPAL.scopes],
+      engines: [...SANDBOX_TEST_PRINCIPAL.engines],
+    };
+    const api = new AgentApi({ workers: [], mockTestEnabled: true, profileWorkspace: workspace, store, logger: () => {} });
+    onTestFinished(() => api.dispose());
+
+    const receipt = api.submit(mockPrincipal, 'mock-probe-idempotency', {
+      userTaskId: 'sandbox-bootstrap-runner-mock-probe-v1',
+      conversationId: 'sandbox-bootstrap-runner-mock-probe-v1',
+      engine: { name: 'mock-test', adapterVersion: '1' },
+      input: { inlinePrompt: 'Return exactly pong.' },
+      limits: { timeoutMs: 5000 },
+      envAllowlist: [],
+    });
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline && api.status(mockPrincipal, receipt.runId).state !== 'succeeded') {
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+
+    expect(api.status(mockPrincipal, receipt.runId)).toMatchObject({ state: 'succeeded', answer: 'pong' });
+    expect(api.result(mockPrincipal, receipt.runId)).toMatchObject({ outcome: 'succeeded', text: 'pong', persistence: 'not_required' });
+    expect(workspaceCalls).toEqual([]);
+    expect(store.listAll().map(record => record.runId)).toEqual([oldSpec.runId, receipt.runId]);
+    expect(() => api.status(mockPrincipal, oldSpec.runId)).toThrowError(expect.objectContaining({ code: 'NOT_FOUND' }));
+    await expect(api.cancel(mockPrincipal, oldSpec.runId)).rejects.toThrowError(expect.objectContaining({ code: 'NOT_FOUND' }));
+    expect(store.progressOf(oldSpec.runId)).toBeNull();
+  });
+
   it('does not persist snapshot URLs or saveback capabilities in the admission journal', () => {
     const root = mkdtempSync(join(tmpdir(), 'profile-capability-journal-'));
     try {

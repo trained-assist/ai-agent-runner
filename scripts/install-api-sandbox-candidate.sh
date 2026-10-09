@@ -57,7 +57,17 @@ STATE="$ROOT/rollback/$SOURCE_SHA"
 install -d -m 0755 -o root -g root "$ROOT/releases" "$ROOT/rollback" "$STATE"
 if [[ -L "$CURRENT" && "$(readlink -f "$CURRENT")" == "$RELEASE" ]]; then
   log 'candidate is already current; verifying service health'
-  curl -fsS --max-time 5 "http://127.0.0.1:$API_PORT/healthz" >/dev/null || die 'current candidate health check failed'
+  install -m 0755 -o root -g root "$RELEASE/scripts/provision-api-sandbox-principal.sh" /usr/local/sbin/runner-api-mcp-test-provision-principal
+  MOCK_MODE_STATE="$(python3 "$RELEASE/scripts/enable-api-sandbox-mock-test.py" "$ENV_FILE")" || die 'could not enable sandbox mock-test mode'
+  [[ "$MOCK_MODE_STATE" == mock_test_sandbox_mode_already_enabled ]] || systemctl restart "$SERVICE"
+  HEALTHY=0
+  for _ in $(seq 1 30); do
+    if curl -fsS --max-time 5 "http://127.0.0.1:$API_PORT/healthz" >/dev/null; then HEALTHY=1; break; fi
+    sleep 1
+  done
+  [[ "$HEALTHY" == 1 ]] || die 'current candidate health check failed'
+  grep -Fxq 'AGENT_API_ENVIRONMENT=sandbox' "$ENV_FILE" || die 'mock-test sandbox environment is not enabled'
+  grep -Fxq 'AGENT_API_ENABLE_MOCK_TEST=true' "$ENV_FILE" || die 'mock-test sandbox engine is not enabled'
   exit 0
 fi
 
@@ -65,12 +75,14 @@ fi
 rm -rf -- "$STAGE"
 install -d -m 0755 -o root -g root "$STAGE"
 tar -xzf "$BUNDLE_PATH" -C "$STAGE" --no-same-owner
-[[ -f "$STAGE/dist/api/main.js" && -d "$STAGE/node_modules" && -f "$STAGE/scripts/install-api-sandbox-candidate.sh" && -f "$STAGE/scripts/rollback-api-sandbox-candidate.sh" ]] || die 'candidate bundle is incomplete'
+[[ -f "$STAGE/dist/api/main.js" && -f "$STAGE/dist/ops/sandbox-principal-provisioner-cli.js" && -d "$STAGE/node_modules" && -f "$STAGE/scripts/install-api-sandbox-candidate.sh" && -f "$STAGE/scripts/rollback-api-sandbox-candidate.sh" && -f "$STAGE/scripts/provision-api-sandbox-principal.sh" && -f "$STAGE/scripts/enable-api-sandbox-mock-test.py" ]] || die 'candidate bundle is incomplete'
 chown -R sandbox:sandbox "$STAGE"
 mv "$STAGE" "$RELEASE"
 install -m 0755 -o root -g root "$RELEASE/scripts/rollback-api-sandbox-candidate.sh" /usr/local/sbin/runner-api-mcp-test-rollback
+install -m 0755 -o root -g root "$RELEASE/scripts/provision-api-sandbox-principal.sh" /usr/local/sbin/runner-api-mcp-test-provision-principal
 
 if [[ -e "$UNIT_FILE" ]]; then cp -p "$UNIT_FILE" "$STATE/unit.before"; fi
+cp -p "$ENV_FILE" "$STATE/env.before"
 PREVIOUS_TARGET=''
 if [[ -L "$CURRENT" ]]; then PREVIOUS_TARGET="$(readlink -f "$CURRENT")"; fi
 if [[ -n "$PREVIOUS_TARGET" ]]; then printf '%s\n' "$PREVIOUS_TARGET" > "$STATE/current.before"; fi
@@ -83,6 +95,7 @@ rollback() {
   log 'candidate startup failed; restoring the prior test service files'
   systemctl stop "$SERVICE" >/dev/null 2>&1 || true
   if [[ -f "$STATE/unit.before" ]]; then cp -p "$STATE/unit.before" "$UNIT_FILE"; fi
+  if [[ -f "$STATE/env.before" ]]; then cp -p "$STATE/env.before" "$ENV_FILE"; fi
   if [[ -n "$PREVIOUS_TARGET" && -d "$PREVIOUS_TARGET" ]]; then
     ln -sfn "$PREVIOUS_TARGET" "$ROOT/current.rollback"
     mv -Tf "$ROOT/current.rollback" "$CURRENT"
@@ -95,6 +108,8 @@ rollback() {
 }
 ROLLBACK_ACTIVE=1
 trap rollback EXIT
+
+python3 "$RELEASE/scripts/enable-api-sandbox-mock-test.py" "$ENV_FILE" >/dev/null || die 'could not enable sandbox mock-test mode'
 
 systemctl stop "$SERVICE"
 cat > "$UNIT_FILE.tmp" <<EOF
@@ -137,6 +152,9 @@ for _ in $(seq 1 30); do
   sleep 1
 done
 [[ "$HEALTHY" == 1 ]] || die 'test API did not become healthy'
+
+grep -Fxq 'AGENT_API_ENVIRONMENT=sandbox' "$ENV_FILE" || die 'mock-test sandbox environment is not enabled'
+grep -Fxq 'AGENT_API_ENABLE_MOCK_TEST=true' "$ENV_FILE" || die 'mock-test sandbox engine is not enabled'
 
 python3 <<'PY'
 import json

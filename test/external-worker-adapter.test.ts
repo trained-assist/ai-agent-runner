@@ -556,7 +556,7 @@ describe('ExternalWorkerAdapter по HTTP', () => {
       const receipt = await adapter.launch(makeRunSpec({ runId: 'run-http-done', input: { inlinePrompt: 'x' } }));
       const result = await adapter.result(receipt.runId);
       expect(result.exitReason).toBe('completed');
-      expect(result.repo.fullName).toBe('owner/name');
+      expect(result.repo?.fullName).toBe('owner/name');
     } finally {
       await worker.close();
     }

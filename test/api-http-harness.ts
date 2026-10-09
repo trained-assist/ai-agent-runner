@@ -62,6 +62,10 @@ export interface HttpHarnessOptions {
   workerEngineName?: string;
   env?: Record<string, string>;
   store?: StatelessStore;
+  mockTestEnabled?: boolean;
+  defaultRepository?: string;
+  allowedEngines?: string[];
+  mockOnly?: boolean;
 }
 
 export interface HttpHarness {
@@ -73,24 +77,26 @@ export interface HttpHarness {
 }
 
 export async function startHttpHarness(options: HttpHarnessOptions = {}): Promise<HttpHarness> {
-  const worker = await startMockWorker(options.worker ?? {});
-  const adapter = adapterFor(worker, {
+  const worker = options.mockOnly ? null : await startMockWorker(options.worker ?? {});
+  const adapter = worker ? adapterFor(worker, {
     ...(options.workerEngineName ? { engineName: options.workerEngineName } : {}),
     ...(options.workerToken !== undefined ? { token: options.workerToken } : {}),
     env: options.env ?? {},
-  });
+  }) : null;
   const logs: Record<string, unknown>[] = [];
   const logger = (entry: Record<string, unknown>): void => {
     logs.push(entry);
   };
   const service = new AgentApi({
-    workers: [adapter],
+    workers: adapter ? [adapter] : [],
+    ...(options.mockTestEnabled ? { mockTestEnabled: true } : {}),
+    ...(options.defaultRepository !== undefined ? { defaultRepository: options.defaultRepository } : {}),
     logger,
     env: options.env ?? {},
     ...(options.store ? { store: options.store } : {}),
   });
   const server = createAgentApiServer(service, {
-    keys: testKeyRegistry(options.workerEngineName ? [options.workerEngineName] : undefined),
+    keys: testKeyRegistry(options.allowedEngines ?? (options.workerEngineName ? [options.workerEngineName] : options.mockTestEnabled ? [...alphaPrincipal.engines!, 'mock-test'] : undefined)),
     logger,
     streamPollMs: options.streamPollMs ?? 10,
     keepaliveMs: options.keepaliveMs ?? 10_000,
@@ -100,18 +106,18 @@ export async function startHttpHarness(options: HttpHarnessOptions = {}): Promis
   const port = (server.address() as AddressInfo).port;
   // Адрес нашего API становится известен только после старта: воркер получает его в
   // `LaunchRequest.resultUrl`, и результат приходит на реальный порт харнесса.
-  adapter.setResultBaseUrl(`http://127.0.0.1:${port}`);
+  adapter?.setResultBaseUrl(`http://127.0.0.1:${port}`);
 
   const harness: HttpHarness = {
     base: `http://127.0.0.1:${port}`,
-    worker,
+    worker: worker!,
     service,
     logs,
     async close() {
       service.dispose();
       server.closeAllConnections();
       await new Promise<void>((resolve) => server.close(() => resolve()));
-      await worker.close();
+      await worker?.close();
     },
   };
   onTestFinished(() => harness.close());

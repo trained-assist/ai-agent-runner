@@ -15,21 +15,27 @@ to `main`.
 
 ## Build a candidate
 
-Run the manual **Runner API sandbox candidate** workflow from the default
-branch, with the desired branch or commit in `source_ref`:
+Run the manual **Runner API sandbox candidate** workflow from a ref that
+contains the installer and packaging changes you intend to use. The workflow
+ref supplies those deployment scripts; `source_ref` supplies the Runner source.
+For an unmerged PR that changes both, use that PR branch for both refs:
 
 ```bash
 gh workflow run runner-api-sandbox-candidate.yml \
   --repo trained-assist/ai-agent-runner \
-  --ref main \
-  -f source_ref=fix/example-candidate
+  --ref feat/sandbox-principal-bootstrap-20261008 \
+  -f source_ref=feat/sandbox-principal-bootstrap-20261008
 ```
+
+After that workflow is merged, `--ref main` can package a branch or commit
+passed through `source_ref`.
 
 The workflow checks out the selected source ref, runs `npm run typecheck`,
 `npm test`, and `npm run build`, packages the API with production dependencies, attests the
 archive with GitHub build provenance, and retains the artifact for seven days.
-It never connects to a VM. The artifact manifest pins the exact source SHA and
-target service.
+It verifies the required installer, rollback, mock principal provisioning,
+and mock-mode scripts are present in the archive. It never connects to a VM.
+The artifact manifest pins the exact source SHA and target service.
 
 Download the artifact and deploy it from an operator workstation with GitHub
 attestation access and the existing `vm2` SSH alias:
@@ -54,6 +60,28 @@ acceptance task after deployment. Failed startup restores
 the prior unit and code pointer. The installer keeps the prior release and
 provides `/usr/local/sbin/runner-api-mcp-test-rollback SOURCE_SHA` for an
 explicit rollback.
+
+The candidate installer explicitly enables `AGENT_API_ENVIRONMENT=sandbox` and
+`AGENT_API_ENABLE_MOCK_TEST=true` only in the protected EnvironmentFile for this
+named test service. The installed root-only helper
+`runner-api-mcp-test-provision-principal` accepts a strict JSON request on stdin
+containing only `schemaVersion`, the fixed target name, and a SHA-256 key hash.
+It adds the fixed `integration-telegram-ux-v1-mock-test` principal, tenant, and
+profile with `runs:read`, `runs:write`, and the `mock-test` engine allowlist to
+the isolated registry. Its synthetic tenant/profile are distinct from the
+Telegram UX profile, so its read/status/cancel scope cannot reach the old
+profile's admission records. It never accepts the raw key, updates other
+principals, or modifies the production API registry. The file-backed registry
+reloads the atomic update without restarting the service.
+
+This helper is the Runner half of credential provisioning. The CP-owned
+bootstrap must generate the raw key in memory, pass only its hash to this helper
+over the declared operator channel, and store the raw key in a dedicated
+mock-probe binding on the isolated CP Worker. It must not replace the normal
+`RUNNER_API_KEY_TELEGRAM_UX`, which belongs to the Telegram UX profile. Until
+that paired operation and an authenticated CP→Runner `mock-test` probe are
+implemented, the helper alone does not establish a usable identity and the
+sandbox must not be reported `READY`.
 
 The sandbox MCP configuration is pinned to the `trained-assist-mcp-host-test-160`
 Worker URL, `registry.fixture_read`, `registry:fixture-read`, the fixed policy,
