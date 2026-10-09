@@ -39,7 +39,9 @@ async function fetchJson(url, init = {}) {
 }
 
 async function retryProbe(probe) {
-  const delays = [0, 1_000, 2_000, 4_000, 8_000];
+  // Cloudflare can take tens of seconds to expose an updated secret binding at
+  // every edge after a Worker secret write; keep retrying through that window.
+  const delays = [0, 1_000, 2_000, 4_000, 8_000, 15_000, 30_000];
   for (const delay of delays) {
     if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
     try { if (await probe()) return true; } catch { /* retry transient edge/secret propagation failures */ }
