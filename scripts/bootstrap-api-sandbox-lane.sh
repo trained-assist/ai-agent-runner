@@ -2,6 +2,11 @@
 set -euo pipefail
 
 LANE="${1:-}"
+if [[ "$LANE" == --contract-sandbox3 ]]; then
+  [[ $EUID -eq 0 && "$(hostname -s)" == vmi3617957 ]] || exit 1
+  [[ -f "${2:-}" && ( "${3:---prepare}" == --prepare || "${3:---prepare}" == --inspect ) ]] || exit 1
+  exec python3 "$2" "${3:---prepare}"
+fi
 ENV_SOURCE="${2:-}"
 REGISTRY_SOURCE="${3:-}"
 INHERIT_WORKER_FROM="${4:-}"
@@ -21,7 +26,7 @@ die() { printf '[%s-bootstrap] ERROR: %s\n' "$LANE" "$1" >&2; exit 1; }
 [[ $EUID -eq 0 ]] || die 'root is required'
 [[ "$(hostname -s)" == vmi3617957 ]] || die 'unrecognized host'
 [[ -f "$ENV_SOURCE" && -f "$REGISTRY_SOURCE" ]] || die 'bootstrap inputs missing'
-[[ ! -e "$ENV_FILE" && ! -e "$REGISTRY" && ! -e "$UNIT_FILE" && ! -e "$ROOT" ]] || die 'service already exists; refusing to replace credentials or state'
+[[ ! -e "$ENV_FILE" && ! -L "$ENV_FILE" && ! -e "$REGISTRY" && ! -L "$REGISTRY" && ! -e "$UNIT_FILE" && ! -L "$UNIT_FILE" && ! -e "$ROOT" && ! -L "$ROOT" && ! -e "$STATE" && ! -L "$STATE" ]] || die 'service already exists; refusing to replace credentials or state'
 [[ -x /usr/local/bin/node ]] || die 'Node runtime missing'
 id sandbox >/dev/null || die 'sandbox service user missing'
 
@@ -90,6 +95,7 @@ PY
 # provider access, while CP principal/delegation and run state stay separate.
 install -d -o root -g root -m 0755 /etc/agent-runner
 install -d -o sandbox -g sandbox -m 0700 "$STATE"
+install -o sandbox -g sandbox -m 0600 /dev/null "$STATE/admissions.jsonl"
 install -d -o root -g root -m 0755 "$ROOT"
 install -m 0600 -o root -g root "$ENV_SOURCE" "$ENV_FILE"
 install -m 0600 -o sandbox -g sandbox "$REGISTRY_SOURCE" "$REGISTRY"

@@ -226,3 +226,30 @@ A private existing operator-owned EnvironmentFile remains untouched during
 permission repair, since systemd reads it as root. Changing an unsafe environment
 mode still requires root/sandbox ownership; journal ownership stays pinned to
 sandbox before restriction. No chown or service restart is performed.
+
+## Initial sandbox3 contract stage through the existing bootstrap
+
+The CP #231 operator channel has proven SSH and read-only access to the existing
+signed ab8e7a3 candidate. `bootstrap-api-sandbox-lane.sh --contract-sandbox3
+PREPARER_PATH --inspect` delegates to the separately byte-verified fixed-target
+preparer and reports component/proxy-service booleans. `--prepare` accepts only
+fixed-target JSON on stdin (API key hash and delegation secret), refuses any
+existing namespace/alias/occupied port and creates a distinct `sandbox3-api`
+nonlogin account, private config/registry/journal and a root-owned runtime root.
+It does not start a service, copy old credentials/state or provision providers.
+Secrets stay out of arguments/logs. Initial registry engines are mock-test only;
+there is no default chain, real worker/model access or profile workspace yet.
+
+The existing lane installer accepts the ab8e7a3 artifact only with the explicit
+sixth argument `--existing-mcp-runtime` and the pinned source/checksum, for
+sandbox3 exclusively. The unchanged artifact target and exclusive install
+target are separate identities. It accepts safe regular npm file symlinks and
+refuses escaping links/chains/ancestors/duplicates. Unit user/runtime, canonical
+private files and service-owned journal are checked; installed code is root-owned.
+It never stops an active API: a terminal snapshot alone is not an admission
+fence, so later updates require a separately verified operator quiescence path.
+If admissions become unresolved during startup, rollback preserves this runtime.
+
+Expected public route: `https://169-58-15-230.sslip.io/runner-sandbox3`. Its proxy,
+TLS and CP reachability require separate proof. Initial mock stage is not bounded
+real worker/profile storage or Telegram acceptance.
