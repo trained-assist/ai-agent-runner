@@ -112,6 +112,18 @@ required when old outcomes remain unknown. Recovery ownership:
 [Runner #212](https://github.com/trained-assist/ai-agent-runner/issues/212),
 [architecture #236](https://github.com/trained-assist/trained-agent-architecture/issues/236).
 
+If inventory reports a protected file's permissions are too open, use the
+separate explicit `scripts/restrict-api-sandbox-permissions.py --restrict`
+operator helper. It accepts only the pinned VM2 host and the declared MCP test
+EnvironmentFile/journal paths. It verifies canonical regular files, single
+links, expected root/sandbox owners and the sandbox port/registry/journal
+configuration before any change. Accepted private modes are retained; unsafe
+modes become `0600` for the same owner. It changes file modes only and emits
+component/status labels. It does not edit records, rotate secrets or restart
+services. Stream exact reviewed bytes over pinned SSH and rerun read-only
+inventory afterward. Live failure and repair ownership:
+[Runner #214](https://github.com/trained-assist/ai-agent-runner/issues/214).
+
 Use authenticated Runner API submit/status/result/events/artifacts endpoints for
 test runs. The installer checks `GET /healthz` and verifies the scoped test
 principal in the configured key registry without reading or printing credential

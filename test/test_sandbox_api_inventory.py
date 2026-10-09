@@ -106,6 +106,8 @@ AGENT_API_PROFILE_GITHUB_TOKEN=private-github-token
             path.chmod(0o644)
             with self.assertRaisesRegex(ValueError, '^sandbox_inventory_permissions_too_open$'):
                 inventory.read_regular(path, 16)
+            with self.assertRaisesRegex(ValueError, '^sandbox_inventory_journal_permissions_too_open$'):
+                inventory.read_component(path, 16, 'journal')
 
 
 if __name__ == '__main__':
