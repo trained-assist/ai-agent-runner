@@ -85,7 +85,8 @@ describe('Cloudflare Runner run coordinator', () => {
     const { coordinator, env, storage } = setup();
     env.FETCH = async (input) => {
       const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
-      if (url.pathname === '/v1/launch') return Response.json({ error: 'INVALID_REQUEST', details: ['launch.region: unsupported'] }, { status: 400 });
+      if (url.pathname === '/v1/launch') return Response.json({ error: 'INVALID_REQUEST',
+        details: ['launch.region: unsupported', 'repository.token: invalid', 'token=never-log-this-value'] }, { status: 400 });
       return Response.json({ status: 'unknown' });
     };
     const response = await coordinator.fetch(call('/v1/runs', body, { 'idempotency-key': 'worker-refusal' }));
@@ -96,10 +97,13 @@ describe('Cloudflare Runner run coordinator', () => {
     expect(await status.json()).toMatchObject({ state: 'failed', connectionLost: false });
     const resultResponse = await coordinator.fetch(call(`/v1/runs/${receipt.runId}/result`));
     expect(resultResponse.status).toBe(200);
-    expect(await resultResponse.json()).toMatchObject({
+    const result = await resultResponse.json() as Record<string, unknown>;
+    expect(result).toMatchObject({
       runId: receipt.runId, userTaskId: 'task-a', outcome: 'failed', exitReason: 'preflight_refused',
-      exitObserved: false, failure: { code: 'WORKER_INVALID_REQUEST', failureClass: 'preflight', retryable: false },
+      exitObserved: false, failure: { code: 'WORKER_INVALID_REQUEST', failureClass: 'preflight', retryable: false,
+        safeSummary: expect.stringContaining('rejected fields: launch.region, repository.token') },
     });
+    expect(JSON.stringify(result)).not.toContain('never-log-this-value');
 
     // Older deployed records can be terminal without a stored result. A poll
     // after upgrading must still receive proof of non-admission, not a 409.
