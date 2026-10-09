@@ -81,6 +81,38 @@ describe('Cloudflare Runner run coordinator', () => {
     expect(await result.json()).toMatchObject({ outcome: 'succeeded', text: 'done' });
   });
 
+  it('returns a terminal preflight result when France refuses the launch before admission', async () => {
+    const { coordinator, env, storage } = setup();
+    env.FETCH = async (input) => {
+      const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+      if (url.pathname === '/v1/launch') return Response.json({ error: 'INVALID_REQUEST', details: ['launch.region: unsupported'] }, { status: 400 });
+      return Response.json({ status: 'unknown' });
+    };
+    const response = await coordinator.fetch(call('/v1/runs', body, { 'idempotency-key': 'worker-refusal' }));
+    const receipt = await response.json() as { runId: string };
+    await coordinator.alarm();
+
+    const status = await coordinator.fetch(call(`/v1/runs/${receipt.runId}/status`));
+    expect(await status.json()).toMatchObject({ state: 'failed', connectionLost: false });
+    const resultResponse = await coordinator.fetch(call(`/v1/runs/${receipt.runId}/result`));
+    expect(resultResponse.status).toBe(200);
+    expect(await resultResponse.json()).toMatchObject({
+      runId: receipt.runId, userTaskId: 'task-a', outcome: 'failed', exitReason: 'preflight_refused',
+      exitObserved: false, failure: { code: 'WORKER_INVALID_REQUEST', failureClass: 'preflight', retryable: false },
+    });
+
+    // Older deployed records can be terminal without a stored result. A poll
+    // after upgrading must still receive proof of non-admission, not a 409.
+    const stored = storage.values.get('runner-v1') as { runs: Record<string, { result?: unknown; launchRejection?: unknown }> };
+    delete stored.runs[receipt.runId]!.result;
+    delete stored.runs[receipt.runId]!.launchRejection;
+    await storage.put('runner-v1', stored);
+    const legacyResult = await coordinator.fetch(call(`/v1/runs/${receipt.runId}/result`));
+    expect(legacyResult.status).toBe(200);
+    expect(await legacyResult.json()).toMatchObject({ exitReason: 'preflight_refused', exitObserved: false,
+      failure: { code: 'WORKER_LAUNCH_REJECTED', failureClass: 'preflight' } });
+  });
+
   it('uses the authenticated principal repository and rejects request attempts to override it', async () => {
     const boundPrincipal: ApiPrincipal = { ...principal, repository: 'team/profile-one' };
     const { coordinator, launched, storage } = setup();
