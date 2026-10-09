@@ -273,22 +273,36 @@ PROXY_BLOCK = """
 """
 
 
+def proxy_updates(dump, originals):
+    targets = nginx_route_targets(dump)
+    if not 1 <= len(targets) <= 2: raise ValueError('sandbox3_proxy_target_ambiguous')
+    if '/runner-sandbox3' in dump or any(PROXY_MARKER in original for original in originals.values()):
+        raise ValueError('sandbox3_proxy_route_already_present')
+    offsets = {}
+    for target in targets:
+        original = originals.get(target['path'])
+        if original is None or target['content'].rstrip('\n') != original.rstrip('\n'):
+            raise ValueError('sandbox3_proxy_source_changed')
+        offset = target['server']['end'] - 1
+        if offset >= len(original) or original[offset] != '}': raise ValueError('sandbox3_proxy_source_changed')
+        offsets.setdefault(target['path'], []).append(offset)
+    updates = {}
+    for path, positions in offsets.items():
+        if len(set(positions)) != len(positions): raise ValueError('sandbox3_proxy_target_ambiguous')
+        updated = originals[path]
+        for offset in sorted(positions, reverse=True):
+            updated = updated[:offset] + PROXY_BLOCK + updated[offset:]
+        nginx_nodes(updated)
+        updates[path] = updated
+    return updates
+
+
 def proxy_update(dump, original):
     targets = nginx_route_targets(dump)
-    if len(targets) != 1: raise ValueError('sandbox3_proxy_target_ambiguous')
-    target = targets[0]
-    if target['content'].rstrip('\n') != original.rstrip('\n'):
-        raise ValueError('sandbox3_proxy_source_changed')
-    # Select the declared TLS host independently of the legacy upstream. All
-    # pre-existing routes are preserved byte-for-byte by the single insertion.
-    if '/runner-sandbox3' in dump or PROXY_MARKER in original:
-        raise ValueError('sandbox3_proxy_route_already_present')
-    offset = target['server']['end'] - 1
-    if offset >= len(original) or original[offset] != '}': raise ValueError('sandbox3_proxy_source_changed')
-    updated = original[:offset] + PROXY_BLOCK + original[offset:]
-    # Parse output before writing; preserve every original byte around one insertion.
-    nginx_nodes(updated)
-    return target['path'], updated
+    if not targets or len(set(target['path'] for target in targets)) != 1:
+        raise ValueError('sandbox3_proxy_target_ambiguous')
+    path = targets[0]['path']
+    return path, proxy_updates(dump, {path: original})[path]
 
 
 def atomic_proxy_config(path, content, metadata):
@@ -303,36 +317,40 @@ def atomic_proxy_config(path, content, metadata):
         if os.path.lexists(temporary): os.unlink(temporary)
 
 
-def apply_proxy_config(path, original, updated, metadata):
-    if path.read_bytes().decode('utf-8') != original: raise ValueError('sandbox3_proxy_source_changed')
-    atomic_proxy_config(path, updated, metadata)
+def apply_proxy_configs(configs):
+    for path, original, updated, metadata in configs:
+        if path.read_bytes().decode('utf-8') != original: raise ValueError('sandbox3_proxy_source_changed')
+    written = []
     try:
+        for path, original, updated, metadata in configs:
+            if path.read_bytes().decode('utf-8') != original: raise ValueError('sandbox3_proxy_source_changed')
+            atomic_proxy_config(path, updated, metadata)
+            written.append((path, original, updated, metadata))
         check = subprocess.run(['nginx', '-t'], capture_output=True, timeout=10)
         if check.returncode != 0: raise ValueError('sandbox3_proxy_validation_failed')
         reload = subprocess.run(['systemctl', 'reload', 'nginx.service'], capture_output=True, timeout=15)
         if reload.returncode != 0: raise ValueError('sandbox3_proxy_reload_failed')
     except Exception:
         # Restore the original config only if this operation's bytes still own the file.
-        if path.read_bytes().decode('utf-8') != updated: raise ValueError('sandbox3_proxy_rollback_conflict') from None
-        atomic_proxy_config(path, original, metadata)
+        conflict = False
+        for path, original, updated, metadata in reversed(written):
+            if path.read_bytes().decode('utf-8') != updated:
+                conflict = True
+                continue
+            atomic_proxy_config(path, original, metadata)
+        if conflict: raise ValueError('sandbox3_proxy_rollback_conflict') from None
         check = subprocess.run(['nginx', '-t'], capture_output=True, timeout=10)
         if check.returncode == 0:
             subprocess.run(['systemctl', 'reload', 'nginx.service'], capture_output=True, timeout=15)
         raise
 
-def configure_proxy():
-    source, verified = runtime_proof()
-    if not verified or source != 'ab8e7a3da4efa45c2154d67423542a6974576f22':
-        raise ValueError('sandbox3_proxy_runtime_not_verified')
-    active = subprocess.run(['systemctl', 'is-active', 'nginx.service'], capture_output=True, timeout=10)
-    if active.returncode != 0: raise ValueError('sandbox3_proxy_service_inactive')
-    dump = subprocess.run(['nginx', '-T'], capture_output=True, text=True, timeout=10)
-    if dump.returncode != 0 or len(dump.stdout.encode('utf-8')) > 2 * 1024 * 1024:
-        raise ValueError('sandbox3_proxy_config_unavailable')
-    targets = nginx_route_targets(dump.stdout)
-    if len(targets) != 1: raise ValueError('sandbox3_proxy_target_ambiguous')
-    path = Path(targets[0]['path']).resolve(strict=True)
-    # nginx sites-enabled symlinks may resolve to sites-available; write only the canonical root-owned file.
+
+def apply_proxy_config(path, original, updated, metadata):
+    apply_proxy_configs([(path, original, updated, metadata)])
+
+
+def read_proxy_source(source):
+    path = Path(source).resolve(strict=True)
     if not str(path).startswith('/etc/nginx/') or path.parent.resolve(strict=True) != path.parent:
         raise ValueError('sandbox3_proxy_config_path_unsafe')
     for parent in [path.parent, *path.parent.parents]:
@@ -345,13 +363,34 @@ def configure_proxy():
         if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != 0 or metadata.st_nlink != 1 \
                 or metadata.st_mode & 0o022 or metadata.st_size > 1024 * 1024:
             raise ValueError('sandbox3_proxy_config_path_unsafe')
-        original = handle.read()
-    _, updated = proxy_update(dump.stdout, original)
-    # Root-only backup is exclusive, outside the service-owned state and never emitted.
-    backup = Path('/etc/agent-runner/sandbox3-proxy-original.conf')
-    write_exclusive(backup, original, 0o600, 0, 0)
-    apply_proxy_config(path, original, updated, metadata)
+        return path, handle.read(), metadata
+
+def configure_proxy():
+    source, verified = runtime_proof()
+    if not verified or source != 'ab8e7a3da4efa45c2154d67423542a6974576f22':
+        raise ValueError('sandbox3_proxy_runtime_not_verified')
+    active = subprocess.run(['systemctl', 'is-active', 'nginx.service'], capture_output=True, timeout=10)
+    if active.returncode != 0: raise ValueError('sandbox3_proxy_service_inactive')
+    dump = subprocess.run(['nginx', '-T'], capture_output=True, text=True, timeout=10)
+    if dump.returncode != 0 or len(dump.stdout.encode('utf-8')) > 2 * 1024 * 1024:
+        raise ValueError('sandbox3_proxy_config_unavailable')
+    targets = nginx_route_targets(dump.stdout)
+    if not 1 <= len(targets) <= 2: raise ValueError('sandbox3_proxy_target_ambiguous')
+    sources = {target['path']: read_proxy_source(target['path']) for target in targets}
+    if len({value[0] for value in sources.values()}) != len(sources):
+        raise ValueError('sandbox3_proxy_target_ambiguous')
+    updates = proxy_updates(dump.stdout, {key: value[1] for key, value in sources.items()})
+    # Unique root-only backups support two files without overwriting earlier evidence.
+    backup = Path(tempfile.mkdtemp(prefix='sandbox3-proxy-backup-', dir='/etc/agent-runner'))
+    configs = []
+    for index, (key, updated) in enumerate(updates.items()):
+        path, original, metadata = sources[key]
+        write_exclusive(backup / (str(index) + '.conf'), original, 0o600, 0, 0)
+        configs.append((path, original, updated, metadata))
+    write_exclusive(backup / 'paths.json', json.dumps([str(config[0]) for config in configs]), 0o600, 0, 0)
+    apply_proxy_configs(configs)
     return {'schemaVersion': 1, 'target': TARGET, 'proxyConfigured': True,
+            'matchedServerCount': len(targets), 'changedFileCount': len(configs),
             'legacyConfigPreserved': True, 'serviceRestarted': False, 'publicRouteVerified': False}
 
 
