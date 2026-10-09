@@ -171,7 +171,7 @@ exit proof, profile readiness or E2E acceptance. Reconcile exact accepted runs
 and exclude concurrent intake before any restart. A separate service/journal is
 required when old outcomes remain unknown. Recovery ownership:
 [Runner #212](https://github.com/trained-assist/ai-agent-runner/issues/212),
-[architecture #236](https://github.com/trained-assist/trained-agent-architecture/issues/236).
+[architecture #193](https://github.com/trained-assist/trained-agent-architecture/issues/193).
 
 If inventory reports a protected file's permissions are too open, use the
 separate explicit `scripts/restrict-api-sandbox-permissions.py --restrict`
