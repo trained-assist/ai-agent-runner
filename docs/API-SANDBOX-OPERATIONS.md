@@ -1,5 +1,61 @@
 # Isolated Runner API sandbox
 
+## Repeatable API sandbox creation through GitHub Actions
+
+The manual `runner-api-sandbox-deploy.yml` workflow creates or updates a named
+Runner API lane (`sandbox3` through `sandbox5`). A single signed candidate built
+with `target=agent-runner-api-sandbox` can be installed into several lanes.
+For lane `sandboxN`, the workflow uses a separate GitHub environment
+`runner-api-sandboxN` and the VM paths below:
+
+| Resource | Per-lane value |
+|---|---|
+| API unit | `agent-runner-api-sandboxN.service` |
+| Port | `18880 + N` (`sandbox3` = `18883`) |
+| Environment | `/etc/agent-runner/agent-runner-api-sandboxN.env` |
+| Key registry | `/etc/agent-runner/key-registry-sandboxN.json` |
+| Admission journal | `/var/lib/agent-runner/sandboxN/admissions.jsonl` |
+| Profile workspace | `/var/lib/agent-runner/sandboxN/profiles` |
+| Release root | `/opt/sb/ai-agent-runner-api-sandboxN` |
+| API principal/profile | `integration-sandboxN-v1` |
+
+Each GitHub environment has the **same secret names**, with lane-specific values:
+`VM2_SSH_HOST`, `VM2_SSH_USER`, `VM2_SSH_PRIVATE_KEY`, `VM2_KNOWN_HOSTS`,
+`RUNNER_API_ENV_FILE`, and `RUNNER_API_KEY_REGISTRY_JSON`. The API env must set
+that lane's exact port, registry and journal paths, `AGENT_API_ENVIRONMENT=sandbox`,
+a lane-specific `AGENT_API_PROFILE_WORKSPACE_ROOT`,
+a distinct delegation secret, and a real external worker. The registry must
+contain the matching lane principal with `runs:read` and `runs:write`. Keep
+these environment secrets restricted to the lane operators; the SSH user needs
+only the sandbox API bootstrap/install sudo path. The existing API's credential
+for calling a GHA worker does **not** grant GHA SSH or systemd access to `vm2`.
+Worker/provider access may use the same approved backend, but each CP→API
+principal, delegation secret, registry, journal and workspace path is distinct.
+For a later lane, `inherit_worker_from=sandboxN` copies only the existing API's
+worker routing and provider variables inside `vm2`; GitHub Actions never reads
+or logs their values. The source may be another named sandbox lane or the
+existing `mcp-test` API; if that service has no real worker route, bootstrap
+fails. The first lane can instead receive worker access through its own
+`RUNNER_API_ENV_FILE` secret. This option
+does not copy the source API principal, delegation secret, or run state.
+
+For a new lane, dispatch `runner-api-sandbox-candidate.yml` with a reviewed
+source ref and `target=agent-runner-api-sandbox`. Record the successful run ID
+and source SHA. Dispatch `runner-api-sandbox-deploy.yml` with `lane`, that run ID,
+SHA, and `bootstrap=true` (optionally `inherit_worker_from`). The job verifies the artifact checksum, GitHub
+attestation and manifest before connecting to the pinned VM host. Bootstrap
+creates only the named lane's unit, env, registry and state directory, and
+refuses to overwrite an existing lane. On later code updates use
+`bootstrap=false`. The installer checks the named paths and principal, refuses
+a journal with unfinished runs, and rolls back to the
+previous code if health fails. No shared API or VM worker is restarted.
+
+A network route from each CP to its Runner API port and paired CP/Runner keys
+must be verified separately. API health alone does not prove a Telegram task,
+GHA execution, persistence or delivery. To rebuild a broken lane, first inspect
+and reconcile its accepted runs and preserve required evidence; do not remove
+its state or reuse another lane's credentials as part of the deploy workflow.
+
 This procedure deploys a signed Runner API candidate to the test-only
 `agent-runner-api-mcp-test.service` on SSH target `vm2`. It does not install the
 VM worker, deploy production, alter the legacy `agent-runner-api.service`, or
