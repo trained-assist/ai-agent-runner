@@ -91,6 +91,20 @@ AGENT_API_PROFILE_GITHUB_TOKEN=private-github-token
         with self.assertRaisesRegex(ValueError, '^sandbox_inventory_environment_invalid$'):
             inventory.environment_metadata('AGENT_API_WORKERS=[{"engine":"private-secret-name"}]')
 
+    def test_single_external_worker_reports_the_actual_default_without_private_values(self):
+        result = inventory.environment_metadata('EXTERNAL_WORKER_URL=https://private.example\nEXTERNAL_WORKER_TOKEN=private-token')
+        self.assertEqual(result['workerEngines'], ['azure-dynamic-ip-agent-run'])
+        self.assertNotIn('private', json.dumps(result))
+        explicit = inventory.environment_metadata('EXTERNAL_WORKER_URL=https://private.example\nEXTERNAL_WORKER_ENGINE=eu-vm-agent-run')
+        self.assertEqual(explicit['workerEngines'], ['eu-vm-agent-run'])
+        empty = inventory.environment_metadata('AGENT_API_WORKERS=[]\nEXTERNAL_WORKER_URL=https://private.example')
+        self.assertEqual(empty['workerEngines'], [])
+        self.assertEqual(inventory.environment_metadata('')['workerEngines'], [])
+        legacy = inventory.environment_metadata('DYNAMIC_IP_AZURE_URL=https://private.example')
+        self.assertEqual(legacy['workerEngines'], ['azure-dynamic-ip-agent-run'])
+        with self.assertRaisesRegex(ValueError, '^sandbox_inventory_environment_invalid$'):
+            inventory.environment_metadata('EXTERNAL_WORKER_URL=https://private.example\nEXTERNAL_WORKER_ENGINE=private-secret')
+
     def test_file_metadata_uses_only_lstat_and_fixed_owner_categories(self):
         with tempfile.TemporaryDirectory() as directory:
             env = Path(directory) / 'env'; env.write_text('private-secret'); env.chmod(0o600)
