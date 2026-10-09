@@ -120,6 +120,11 @@ registry and France worker dispatch are provisioned, the dedicated Telegram UX W
 deployed, and a live Host fixture call succeeds end to end. Local Worker tests and mock probes
 do not prove real Agent execution, repository persistence, or Telegram delivery.
 
+The manual `Deploy Telegram UX Cloudflare Runner sandbox` workflow requires the matching
+`MCP_TEST_AUTH_TOKEN` and Ed25519 `MCP_TEST_RUNNER_PRIVATE_JWK` in the `sandbox` GitHub
+environment. It renews the pinned catalogue lease for 30 days on each deploy and installs
+the private key and bearer as Worker secrets; neither is a Wrangler variable.
+
 ## Retired deployment path
 
 `src/api/main.ts` remains the Node-compatible API implementation used by local tests and older

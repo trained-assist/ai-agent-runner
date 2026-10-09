@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { createHash, createHmac } from 'node:crypto';
+import { createHash, createHmac, createPrivateKey } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
 
@@ -10,6 +10,7 @@ const PUBLIC_URL = `https://${WORKER}.skillset-apply.workers.dev`;
 const PRINCIPAL_ID = 'integration-telegram-ux-v1';
 const PROFILE_ID = 'integration-telegram-ux-v1';
 const TENANT_ID = 'telegram-ux-sandbox-20261009';
+const MCP_CATALOGUE_VERSION = 'registry-fixture-catalogue-v1';
 
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, { encoding: 'utf8', maxBuffer: 1024 * 1024, ...options });
@@ -104,11 +105,17 @@ async function verifyDeployment(sourceSha, apiKey, delegationSecret) {
 }
 
 async function main() {
-  const [apiKey, delegationSecret, encryptionKey, franceUrl, franceToken, ladderToken] = [
+  const [apiKey, delegationSecret, encryptionKey, franceUrl, franceToken, ladderToken, mcpAuthToken, mcpRunnerPrivateJwk] = [
     required('RUNNER_API_KEY_AGENT_API', 32), required('AGENT_API_PROFILE_DELEGATION_SECRET', 32),
     required('RUN_LAUNCH_ENCRYPTION_KEY', 32), required('EU_VM_WORKER_URL', 1),
     required('EU_VM_WORKER_TOKEN', 24), required('LLM_LADDER_TOKEN', 1),
+    required('MCP_TEST_AUTH_TOKEN', 32), required('MCP_TEST_RUNNER_PRIVATE_JWK', 1),
   ];
+  let mcpPrivateKey;
+  try { mcpPrivateKey = createPrivateKey({ key: JSON.parse(mcpRunnerPrivateJwk), format: 'jwk' }); }
+  catch { throw new Error('runner_sandbox_mcp_private_jwk_invalid'); }
+  if (mcpPrivateKey.asymmetricKeyType !== 'ed25519') throw new Error('runner_sandbox_mcp_private_jwk_invalid');
+  const mcpExpiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
   // Non-secret fingerprint lets operators confirm the GitHub sandbox secret is
   // paired with the separately stored Worker credential without exposing it.
   console.log(JSON.stringify({ apiKeyFingerprint: createHash('sha256').update(apiKey).digest('hex').slice(0, 16) }));
@@ -135,7 +142,9 @@ async function main() {
     mcpBindings: ['registry-mcp-test-160-read'],
   }]);
 
-  run('npx', ['wrangler', 'deploy', '--config', CONFIG, '--var', `BUILD_SHA:${sourceSha}`], { stdio: 'inherit' });
+  run('npx', ['wrangler', 'deploy', '--config', CONFIG, '--var', `BUILD_SHA:${sourceSha}`,
+    '--var', `MCP_TEST_CATALOGUE_VERSION:${MCP_CATALOGUE_VERSION}`,
+    '--var', `MCP_TEST_EXPIRES_AT:${mcpExpiresAt}`], { stdio: 'inherit' });
   for (const [name, value] of [
     ['RUNNER_API_KEYS', registry],
     ['AGENT_API_PROFILE_DELEGATION_SECRET', delegationSecret],
@@ -143,6 +152,8 @@ async function main() {
     ['VM_WORKER_URL', workerUrl.toString().replace(/\/+$/, '')],
     ['VM_WORKER_TOKEN', franceToken],
     ['LLM_LADDER_TOKEN', ladderToken],
+    ['MCP_TEST_AUTH_TOKEN', mcpAuthToken],
+    ['MCP_TEST_RUNNER_PRIVATE_JWK', mcpRunnerPrivateJwk],
   ]) putSecret(name, value);
 
   await verifyDeployment(sourceSha, apiKey, delegationSecret);
