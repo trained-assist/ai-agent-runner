@@ -122,8 +122,9 @@ do not prove real Agent execution, repository persistence, or Telegram delivery.
 
 The manual `Deploy Telegram UX Cloudflare Runner sandbox` workflow requires the matching
 `MCP_TEST_AUTH_TOKEN` and Ed25519 `MCP_TEST_RUNNER_PRIVATE_JWK` in the `sandbox` GitHub
-environment. It renews the pinned catalogue lease for 30 days on each deploy and installs
-the private key and bearer as Worker secrets; neither is a Wrangler variable.
+environment. It renews the pinned catalogue lease through the end of the UTC day 30 days
+ahead and installs the private key and bearer as Worker secrets; neither is a Wrangler variable.
+Deploy the paired Host Worker on the same UTC date so both Workers enforce the identical lease.
 
 ## Retired deployment path
 

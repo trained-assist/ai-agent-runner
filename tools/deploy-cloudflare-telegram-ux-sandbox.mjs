@@ -115,7 +115,9 @@ async function main() {
   try { mcpPrivateKey = createPrivateKey({ key: JSON.parse(mcpRunnerPrivateJwk), format: 'jwk' }); }
   catch { throw new Error('runner_sandbox_mcp_private_jwk_invalid'); }
   if (mcpPrivateKey.asymmetricKeyType !== 'ed25519') throw new Error('runner_sandbox_mcp_private_jwk_invalid');
-  const mcpExpiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+  const mcpLeaseExpiry = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+  mcpLeaseExpiry.setUTCHours(23, 59, 59, 0);
+  const mcpExpiresAt = mcpLeaseExpiry.toISOString();
   // Non-secret fingerprint lets operators confirm the GitHub sandbox secret is
   // paired with the separately stored Worker credential without exposing it.
   console.log(JSON.stringify({ apiKeyFingerprint: createHash('sha256').update(apiKey).digest('hex').slice(0, 16) }));
