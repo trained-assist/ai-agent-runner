@@ -297,3 +297,33 @@ The bounded pair operation adds the same isolated route to both, in at most two
 canonical configuration files, then validates once and reloads once. Zero or more
 than two targets refuse before writing. Evidence reports only the matched server
 and changed file counts; private configuration contents and paths stay out of logs.
+
+### Configure the existing signed sandbox3 API for its native Worker
+
+`prepare-api-sandbox3.py --configure-native` updates only the already installed
+`ab8e7a3da4efa45c2154d67423542a6974576f22` process on `vmi3617957`. It requires
+the reviewed journal checker beside the script. Root-only JSON stdin supplies
+`schemaVersion: 1`, the fixed target, `workerSha`, `workerToken`,
+`profileGitHubToken`, the existing `storageBucket` and service-account JSON in
+`storageCredentials`. Never pass these credentials in argv or save the request
+as an evidence artifact. The signed candidate remains unchanged.
+
+The operator checks Worker source/auth, the exact mock-only namespace and its
+terminal journal. It backs up configuration privately, replaces only the known
+sandbox3 nginx blocks with HTTP503, waits for old nginx workers to exit, then
+checks admissions again. An admission accepted during draining refuses the
+service stop and leaves the fence held. Only the fresh service is stopped; the
+journal is checked again before configuration and restart. The operator preserves
+the existing intake key hash and delegation secret, adds the native engine and
+profile-provisioning scope, routes only the declared tenant to trained-assist,
+and copies only the Ladder credential from the old API's environment pool.
+Profile GitHub, Worker and GCS credentials remain host credentials.
+
+The existing GCS backend provides signed profile snapshots. Local-fs has no
+`shareUrl` implementation and cannot provide this cross-host profile chain.
+A private root-owned GCS credential file is readable only by the dedicated
+service group. No bucket, cloud key or paid resource is created by this operator.
+Failure after fencing keeps backups and the fence for operator recovery; it
+does not automatically roll back or restart an unknown run. Source/health checks
+must pass before reopening admission. Successful configuration is not agent,
+model, file-persistence or Telegram acceptance evidence.

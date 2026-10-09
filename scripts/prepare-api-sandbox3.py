@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """Prepare only the fixed fresh sandbox3 namespace; never start a service."""
 import json
+import fcntl
+import importlib.util
 import os
 from pathlib import Path
 import pwd
 import re
 import socket
+import shlex
 import stat
 import subprocess
 import time
@@ -22,6 +25,9 @@ UNIT = Path('/etc/systemd/system/agent-runner-api-sandbox3.service')
 STATE = Path('/var/lib/agent-runner/sandbox3')
 ROOT = Path('/opt/sb/ai-agent-runner-api-sandbox3')
 PATHS = {'environment': ENV, 'registry': REGISTRY, 'unit': UNIT, 'state': STATE, 'runtime': ROOT}
+NATIVE_URL = 'https://trained-assist-native-worker-sandbox3.skillset-apply.workers.dev'
+STORAGE_CREDENTIALS = Path('/etc/agent-runner/profile-storage-sandbox3.json')
+NATIVE_ENGINE = 'dynamic-ip-azure-agent-run'
 
 
 def validate_request(value):
@@ -394,6 +400,234 @@ def configure_proxy():
             'legacyConfigPreserved': True, 'serviceRestarted': False, 'publicRouteVerified': False}
 
 
+def validate_native_request(value):
+    keys = {'schemaVersion', 'target', 'workerToken', 'workerSha', 'profileGitHubToken',
+            'storageBucket', 'storageCredentials'}
+    if not isinstance(value, dict) or set(value) != keys or value.get('schemaVersion') != 1 or value.get('target') != TARGET:
+        raise ValueError('sandbox3_native_request_invalid')
+    for key in ['workerToken', 'profileGitHubToken']:
+        if not isinstance(value[key], str) or not re.fullmatch('[A-Za-z0-9_.-]{32,300}', value[key]):
+            raise ValueError('sandbox3_native_credential_invalid')
+    if not isinstance(value['workerSha'], str) or not re.fullmatch('[a-f0-9]{40}', value['workerSha']):
+        raise ValueError('sandbox3_native_source_invalid')
+    bucket = value['storageBucket']
+    if not isinstance(bucket, str) or not re.fullmatch('[a-z0-9][a-z0-9._-]{1,61}[a-z0-9]', bucket) or '..' in bucket:
+        raise ValueError('sandbox3_native_storage_target_invalid')
+    credential = value['storageCredentials']
+    if not isinstance(credential, dict) or credential.get('type') != 'service_account' \
+            or not re.fullmatch('[a-z][a-z0-9-]{4,61}[a-z0-9]', str(credential.get('project_id', ''))) \
+            or not re.fullmatch('[a-z0-9-]+@' + re.escape(credential['project_id']) + r'\.iam\.gserviceaccount\.com', str(credential.get('client_email', ''))) \
+            or credential.get('token_uri') != 'https://oauth2.googleapis.com/token' \
+            or not re.fullmatch(r'-----BEGIN PRIVATE KEY-----\n[A-Za-z0-9+/=\n]+-----END PRIVATE KEY-----\n?', str(credential.get('private_key', ''))):
+        raise ValueError('sandbox3_native_storage_credential_invalid')
+    return value
+
+
+def private_text(path, expected_uid=0, mode=0o600):
+    if path.parent.resolve(strict=True) != path.parent:
+        raise ValueError('sandbox3_native_path_invalid')
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, encoding='utf-8') as handle:
+        metadata = os.fstat(handle.fileno())
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != expected_uid \
+                or stat.S_IMODE(metadata.st_mode) != mode or metadata.st_nlink != 1 or metadata.st_size > 65536:
+            raise ValueError('sandbox3_native_file_invalid')
+        return handle.read(), metadata
+
+
+def parse_environment(text):
+    values = {}
+    for line in text.splitlines():
+        if not line.strip() or line.startswith('#'): continue
+        key, separator, value = line.partition('=')
+        if not separator or not re.fullmatch('[A-Z][A-Z0-9_]*', key) or key in values:
+            raise ValueError('sandbox3_native_environment_invalid')
+        quoted = value.strip().startswith(('"', "'"))
+        tokens = shlex.split(value) if quoted else []
+        if quoted and len(tokens) != 1: raise ValueError('sandbox3_native_environment_invalid')
+        values[key] = tokens[0] if quoted else value.strip()
+    return values
+
+
+def native_configuration(request, current_env, current_registry, ladder_token):
+    required = {'AGENT_API_HOST': '127.0.0.1', 'AGENT_API_PORT': '18883',
+        'AGENT_API_KEY_REGISTRY': str(REGISTRY), 'AGENT_API_ADMISSION_LOG': str(STATE / 'admissions.jsonl'),
+        'AGENT_API_ENVIRONMENT': 'sandbox', 'AGENT_API_ENABLE_MOCK_TEST': 'true'}
+    if any(current_env.get(key) != value for key, value in required.items()) \
+            or set(current_env) != set(required) | {'AGENT_API_PROFILE_DELEGATION_SECRET'} \
+            or not re.fullmatch('[A-Za-z0-9_-]{32,128}', current_env.get('AGENT_API_PROFILE_DELEGATION_SECRET', '')):
+        raise ValueError('sandbox3_native_existing_environment_mismatch')
+    if not re.fullmatch('[A-Za-z0-9_.-]{32,500}', ladder_token):
+        raise ValueError('sandbox3_native_ladder_credential_invalid')
+    principals = current_registry.get('principals') if isinstance(current_registry, dict) else None
+    if not isinstance(current_registry, dict) or current_registry.get('schemaVersion') != 1 or not isinstance(principals, list) or len(principals) != 1:
+        raise ValueError('sandbox3_native_registry_mismatch')
+    principal = principals[0]
+    if not isinstance(principal, dict) or principal.get('principalId') != 'sandbox3-agent-api-principal' \
+            or principal.get('tenantId') != 'sandbox3-acceptance-a-20261008' \
+            or principal.get('profileId') != 'integration-sandbox3-v1' \
+            or principal.get('engines') != ['mock-test'] \
+            or principal.get('scopes') != ['runs:read', 'runs:write'] \
+            or not re.fullmatch('[a-f0-9]{64}', str(principal.get('keyHash', ''))):
+        raise ValueError('sandbox3_native_registry_mismatch')
+    registry = {**current_registry, 'principals': [{**principal,
+        'engines': ['mock-test', NATIVE_ENGINE], 'scopes': ['runs:read', 'runs:write', 'profiles:provision']}]}
+    values = {**current_env,
+        'AGENT_API_WORKERS': json.dumps([{'engine': NATIVE_ENGINE, 'baseUrl': NATIVE_URL, 'token': request['workerToken']}]),
+        'AGENT_API_ENGINE_CHAIN': NATIVE_ENGINE,
+        'AGENT_API_PUBLIC_URL': 'https://169-58-15-230.sslip.io/runner-sandbox3',
+        'AGENT_API_ENV': json.dumps({'LLM_LADDER_TOKEN': ladder_token}),
+        'AGENT_API_PROFILE_WORKSPACE_ROOT': str(STATE / 'profiles'),
+        'AGENT_API_PROFILE_OBJECT_BACKEND': 'gcs',
+        'AGENT_API_PROFILE_REQUIRE_TENANT_ROUTE': 'true',
+        'AGENT_API_PROFILE_TENANT_ROUTES_JSON': json.dumps({'sandbox3-acceptance-a-20261008': {
+            'owner': 'trained-assist', 'tokenEnv': 'AGENT_API_PROFILE_GITHUB_TOKEN'}}),
+        'AGENT_API_PROFILE_GITHUB_TOKEN': request['profileGitHubToken'],
+        'GCS_BUCKET': request['storageBucket'], 'GOOGLE_APPLICATION_CREDENTIALS': str(STORAGE_CREDENTIALS)}
+    return ''.join(key + "='" + value + "'\n" for key, value in values.items()), json.dumps(registry) + '\n'
+
+
+FENCE_BLOCK = """
+    # trained-assist sandbox3 isolated route v1
+    location = /runner-sandbox3 { return 503; }
+    location ^~ /runner-sandbox3/ { return 503; }
+"""
+
+
+def native_fence_updates(dump, originals):
+    targets = nginx_route_targets(dump)
+    if not 1 <= len(targets) <= 2: raise ValueError('sandbox3_native_proxy_target_ambiguous')
+    counts = {}
+    for target in targets:
+        original = originals.get(target['path'])
+        if original is None or target['content'].rstrip('\n') != original.rstrip('\n') \
+                or PROXY_BLOCK not in original[target['server']['start']:target['server']['end']]:
+            raise ValueError('sandbox3_native_proxy_source_mismatch')
+        counts[target['path']] = counts.get(target['path'], 0) + 1
+    if set(counts) != set(originals) or any(originals[path].count(PROXY_BLOCK) != count for path, count in counts.items()):
+        raise ValueError('sandbox3_native_proxy_source_mismatch')
+    return {path: original.replace(PROXY_BLOCK, FENCE_BLOCK) for path, original in originals.items()}
+
+
+def require_terminal_journal():
+    # Import the reviewed checker beside this operator; never restart unknown runs.
+    spec = importlib.util.spec_from_file_location('sandbox3_journal', Path(__file__).with_name('check-api-sandbox-journal.py'))
+    checker = importlib.util.module_from_spec(spec); spec.loader.exec_module(checker)
+    journal = STATE / 'admissions.jsonl'
+    account = pwd.getpwnam(ACCOUNT)
+    private_text(journal, account.pw_uid)
+    if checker.unfinished_runs(journal): raise ValueError('sandbox3_native_admissions_unresolved')
+
+
+def nginx_workers():
+    result = subprocess.run(['systemctl', 'show', 'nginx.service', '-p', 'MainPID', '--value'], capture_output=True, text=True, timeout=10)
+    if result.returncode != 0 or not re.fullmatch('[1-9][0-9]*', result.stdout.strip()):
+        raise ValueError('sandbox3_native_proxy_process_invalid')
+    master = result.stdout.strip()
+    children = Path('/proc/' + master + '/task/' + master + '/children').read_text().split()
+    workers = set()
+    for pid in children:
+        try:
+            if Path('/proc/' + pid + '/cmdline').read_bytes().startswith(b'nginx: worker process'):
+                workers.add(pid)
+        except FileNotFoundError: pass
+    if not workers: raise ValueError('sandbox3_native_proxy_process_invalid')
+    return workers
+
+
+def wait_for_nginx_drain(workers):
+    deadline = time.monotonic() + 30
+    while any(Path('/proc/' + pid).exists() for pid in workers):
+        if time.monotonic() > deadline: raise ValueError('sandbox3_native_proxy_drain_timeout')
+        time.sleep(0.2)
+
+
+def verify_native_worker(request):
+    # Node uses the same bounded Worker transport as our live probes. Secrets
+    # travel only in the child environment, never argv or returned metadata.
+    script = """const base='https://trained-assist-native-worker-sandbox3.skillset-apply.workers.dev';
+try {
+  const healthResponse=await fetch(base+'/healthz',{signal:AbortSignal.timeout(8000)});
+  const h=await healthResponse.json();
+  if(healthResponse.status!==200 || h.buildSha!==process.env.EXPECTED_WORKER_SHA || h.sandboxPolicy!=='free-only-v1'
+      || h.configured!==true || h.repo!=='kobzevvv/opencode-gha-runner' || h.workflow!=='run-agent-sandbox3.yml') process.exit(1);
+  const path='/v1/runs/run_sandbox3_auth_probe/status';
+  const response=await fetch(base+path,{headers:{authorization:'Bearer '+process.env.NATIVE_WORKER_TOKEN},signal:AbortSignal.timeout(8000)});
+  const status=await response.json();
+  if(response.status!==200 || status.status!=='unknown') process.exit(1);
+} catch {process.exit(1);}
+"""
+    result = subprocess.run(['/usr/local/bin/node', '--input-type=module', '-e', script],
+        env={'EXPECTED_WORKER_SHA': request['workerSha'], 'NATIVE_WORKER_TOKEN': request['workerToken']},
+        capture_output=True, timeout=20)
+    if result.returncode != 0: raise ValueError('sandbox3_native_worker_source_or_auth_mismatch')
+
+
+def configure_native(request):
+    validate_native_request(request)
+    source, verified = runtime_proof()
+    if not verified or source != 'ab8e7a3da4efa45c2154d67423542a6974576f22':
+        raise ValueError('sandbox3_native_runtime_not_verified')
+    verify_native_worker(request)
+    account = pwd.getpwnam(ACCOUNT)
+    old_env, env_metadata = private_text(ENV)
+    old_registry, registry_metadata = private_text(REGISTRY, mode=0o640)
+    source_env, _ = private_text(Path('/etc/agent-runner/agent-runner-api-mcp-test.env'))
+    source_pool = json.loads(parse_environment(source_env).get('AGENT_API_ENV', '{}'))
+    new_env, new_registry = native_configuration(request, parse_environment(old_env), json.loads(old_registry), source_pool.get('LLM_LADDER_TOKEN', ''))
+    if os.path.lexists(STORAGE_CREDENTIALS): raise ValueError('sandbox3_native_storage_credential_exists')
+    require_terminal_journal()
+    dump = subprocess.run(['nginx', '-T'], capture_output=True, text=True, timeout=10)
+    if dump.returncode != 0 or len(dump.stdout.encode()) > 2 * 1024 * 1024:
+        raise ValueError('sandbox3_native_proxy_config_unavailable')
+    targets = nginx_route_targets(dump.stdout)
+    sources = {target['path']: read_proxy_source(target['path']) for target in targets}
+    if len({item[0] for item in sources.values()}) != len(sources):
+        raise ValueError('sandbox3_native_proxy_target_ambiguous')
+    updates = native_fence_updates(dump.stdout, {key: item[1] for key, item in sources.items()})
+    configs = [(sources[key][0], sources[key][1], value, sources[key][2]) for key, value in updates.items()]
+    backup = Path(tempfile.mkdtemp(prefix='sandbox3-native-backup-', dir='/etc/agent-runner'))
+    write_exclusive(backup / 'environment', old_env, 0o600)
+    write_exclusive(backup / 'registry', old_registry, 0o600)
+    for index, config in enumerate(configs): write_exclusive(backup / (str(index) + '.conf'), config[1], 0o600)
+    write_exclusive(backup / 'paths.json', json.dumps([str(config[0]) for config in configs]), 0o600)
+    workers = nginx_workers()
+    apply_proxy_configs(configs)
+    # A pre-fence request can still be admitted by an old nginx worker. Hold the
+    # fence until those workers exit, then inspect the durable journal again.
+    wait_for_nginx_drain(workers)
+    require_terminal_journal()
+    subprocess.run(['systemctl', 'stop', TARGET + '.service'], check=True, capture_output=True, timeout=30)
+    if subprocess.run(['systemctl', 'is-active', TARGET + '.service'], capture_output=True, timeout=10).returncode == 0:
+        raise ValueError('sandbox3_native_service_still_active')
+    require_terminal_journal()
+    # No automatic rollback/restart: a failure keeps the public admission fence
+    # and backups for an explicit operator repair; old shared services are untouched.
+    with socket.socket() as listener: listener.bind(('127.0.0.1', 18883))
+    if ENV.read_text() != old_env or REGISTRY.read_text() != old_registry:
+        raise ValueError('sandbox3_native_config_changed')
+    write_exclusive(STORAGE_CREDENTIALS, json.dumps(request['storageCredentials']) + '\n', 0o640, 0, account.pw_gid)
+    atomic_proxy_config(ENV, new_env, env_metadata)
+    atomic_proxy_config(REGISTRY, new_registry, registry_metadata)
+    subprocess.run(['systemctl', 'start', TARGET + '.service'], check=True, capture_output=True, timeout=20)
+    deadline = time.monotonic() + 15
+    while True:
+        source, verified = runtime_proof()
+        healthy = False
+        if verified and source == 'ab8e7a3da4efa45c2154d67423542a6974576f22':
+            try:
+                with urllib.request.urlopen('http://127.0.0.1:18883/healthz', timeout=2) as response:
+                    healthy = response.status == 200
+            except (OSError, urllib.error.URLError): pass
+        if healthy: break
+        if time.monotonic() > deadline: raise ValueError('sandbox3_native_started_source_or_health_failed')
+        time.sleep(0.2)
+    apply_proxy_configs([(path, fenced, original, metadata) for path, original, fenced, metadata in configs])
+    return {'schemaVersion': 1, 'target': TARGET, 'nativeConfigured': True, 'runtimeSourceSha': source,
+            'workerSourceSha': request['workerSha'], 'admissionFenceDrained': True,
+            'oldSharedServiceChanged': False, 'modelCalled': False, 'realTelegramE2E': False}
+
+
 def api_request(method, path, key, body=None, idempotency=None):
     headers = {'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json'}
     if idempotency:
@@ -456,6 +690,13 @@ def main():
     try:
         if os.geteuid() != 0 or socket.gethostname().split('.')[0] != 'vmi3617957':
             raise ValueError('sandbox3_prepare_operator_target_invalid')
+        if sys.argv[1:] == ['--configure-native']:
+            text = sys.stdin.read(65537)
+            if len(text.encode()) > 65536: raise ValueError('sandbox3_native_request_too_large')
+            lock = os.open('/etc/agent-runner/.sandbox3-native-config.lock', os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(lock, 'w') as handle:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                print(json.dumps(configure_native(json.loads(text)))); return 0
         if sys.argv[1:] == ['--configure-proxy']:
             print(json.dumps(configure_proxy())); return 0
         if sys.argv[1:] == ['--proxy-inspect']:
@@ -500,7 +741,7 @@ def main():
                           'serviceStarted': False, 'realExecutionEnabled': False}))
         return 0
     except Exception as error:
-        reason = str(error) if isinstance(error, ValueError) and re.fullmatch('sandbox3_(prepare|probe|proxy)_[a-z_]+', str(error)) else 'sandbox3_prepare_failed'
+        reason = str(error) if isinstance(error, ValueError) and re.fullmatch('sandbox3_(prepare|probe|proxy|native)_[a-z_]+', str(error)) else 'sandbox3_prepare_failed'
         print(json.dumps({'schemaVersion': 1, 'target': TARGET, 'reasonCode': reason})); return 1
 
 
