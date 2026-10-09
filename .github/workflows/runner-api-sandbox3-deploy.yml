@@ -1,0 +1,98 @@
+name: Deploy isolated sandbox3 Runner API
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_run_id:
+        description: Successful signed Runner API candidate workflow run
+        required: true
+        type: string
+      source_sha:
+        description: Exact 40-character candidate source commit
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  attestations: read
+  contents: read
+
+concurrency:
+  group: runner-api-sandbox3-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: runner-api-sandbox3
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+      - name: Verify target and deploy credentials
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+          SSH_HOST: ${{ secrets.VM2_SANDBOX3_SSH_HOST }}
+          SSH_USER: ${{ secrets.VM2_SANDBOX3_SSH_USER }}
+          SSH_KEY: ${{ secrets.VM2_SANDBOX3_SSH_PRIVATE_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.VM2_SANDBOX3_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$CANDIDATE_RUN_ID" =~ ^[0-9]{1,20}$ ]]
+          for value in "$SSH_HOST" "$SSH_USER" "$SSH_KEY" "$SSH_KNOWN_HOSTS"; do
+            [[ -n "$value" ]] || { echo 'sandbox3 SSH environment secret is missing' >&2; exit 1; }
+          done
+          [[ "$SSH_HOST" =~ ^[A-Za-z0-9.-]+$ && "$SSH_USER" =~ ^[a-z_][a-z0-9_-]*$ ]]
+          install -d -m 0700 "$HOME/.ssh"
+          printf '%s\n' "$SSH_KEY" > "$HOME/.ssh/id_sandbox3"
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 0600 "$HOME/.ssh/id_sandbox3" "$HOME/.ssh/known_hosts"
+      - name: Download and verify exact signed sandbox3 candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+        run: |
+          set -euo pipefail
+          gh run view "$CANDIDATE_RUN_ID" --repo "$GITHUB_REPOSITORY" --json conclusion,workflowName \
+            --jq 'select(.conclusion == "success" and .workflowName == "Runner API sandbox candidate")' | grep -q .
+          mkdir -p "$RUNNER_TEMP/candidate"
+          gh run download "$CANDIDATE_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --name "runner-api-sandbox-candidate-agent-runner-api-sandbox3-$SOURCE_SHA" \
+            --dir "$RUNNER_TEMP/candidate"
+          archive="$RUNNER_TEMP/candidate/runner-api-sandbox-candidate.tar.gz"
+          (cd "$RUNNER_TEMP/candidate" && sha256sum -c runner-api-sandbox-candidate.tar.gz.sha256)
+          gh attestation verify "$archive" --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/runner-api-sandbox-candidate.yml" >/dev/null
+          python3 - "$archive" "$SOURCE_SHA" <<'PY'
+          import json, sys, tarfile
+          with tarfile.open(sys.argv[1], 'r:gz') as archive:
+              manifest = json.load(archive.extractfile('candidate-manifest.json'))
+          if manifest.get('target') != 'agent-runner-api-sandbox3' or manifest.get('sourceSha') != sys.argv[2]:
+              raise SystemExit('candidate manifest does not match sandbox3 and requested source SHA')
+          PY
+          tar -tf "$archive" | grep -Fx scripts/install-api-sandbox3-candidate.sh >/dev/null
+      - name: Install only the dedicated sandbox3 API
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          SSH_HOST: ${{ secrets.VM2_SANDBOX3_SSH_HOST }}
+          SSH_USER: ${{ secrets.VM2_SANDBOX3_SSH_USER }}
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/candidate/runner-api-sandbox-candidate.tar.gz"
+          bundle_sha="$(sha256sum "$archive" | cut -d' ' -f1)"
+          remote_dir="/tmp/runner-api-sandbox3-$SOURCE_SHA"
+          remote_archive="$remote_dir/candidate.tar.gz"
+          remote_installer="$remote_dir/install.sh"
+          ssh_options=(-i "$HOME/.ssh/id_sandbox3" -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o BatchMode=yes)
+          ssh "${ssh_options[@]}" "$SSH_USER@$SSH_HOST" "install -d -m 0700 '$remote_dir'"
+          cleanup() { ssh "${ssh_options[@]}" "$SSH_USER@$SSH_HOST" "rm -f '$remote_installer' '$remote_archive'; rmdir '$remote_dir'" || true; }
+          trap cleanup EXIT
+          scp "${ssh_options[@]}" "$archive" "$SSH_USER@$SSH_HOST:$remote_archive"
+          scp "${ssh_options[@]}" scripts/install-api-sandbox3-candidate.sh "$SSH_USER@$SSH_HOST:$remote_installer"
+          ssh "${ssh_options[@]}" "$SSH_USER@$SSH_HOST" \
+            "sudo -n bash '$remote_installer' '$SOURCE_SHA' '$bundle_sha' '$remote_archive'"
+          printf 'Installed sandbox3 Runner API source %s to dedicated service.\n' "$SOURCE_SHA" >> "$GITHUB_STEP_SUMMARY"

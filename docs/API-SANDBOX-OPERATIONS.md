@@ -1,5 +1,46 @@
 # Isolated Runner API sandbox
 
+## Dedicated sandbox3 through GitHub Actions
+
+The second Telegram lane uses a **different** API target,
+`agent-runner-api-sandbox3.service` on port 18883. The candidate workflow now
+accepts `target=agent-runner-api-sandbox3`. Its signed artifact can be deployed
+with the manual `runner-api-sandbox3-deploy.yml` workflow, so the operator does
+not need local SSH access. This path never installs the shared `mcp-test` API.
+
+Before dispatching a deployment, an operator must bootstrap on `vm2`:
+
+- `/etc/systemd/system/agent-runner-api-sandbox3.service`, using only
+  `/etc/agent-runner/agent-runner-api-sandbox3.env` and a distinct writable state
+  directory;
+- a dedicated environment with `AGENT_API_PORT=18883`,
+  `AGENT_API_KEY_REGISTRY=/etc/agent-runner/key-registry-sandbox3.json`,
+  `AGENT_API_ADMISSION_LOG=/var/lib/agent-runner/sandbox3/admissions.jsonl`,
+  `AGENT_API_ENVIRONMENT=sandbox`, a real external worker, and no enabled
+  `mock-test` engine;
+- a separate key registry containing the scoped `integration-sandbox3-v1`
+  principal and a network route from the sandbox3 CP to this API;
+- GitHub environment `runner-api-sandbox3` with `VM2_SANDBOX3_SSH_HOST`,
+  `VM2_SANDBOX3_SSH_USER`, `VM2_SANDBOX3_SSH_PRIVATE_KEY`, and
+  `VM2_SANDBOX3_KNOWN_HOSTS` secrets. The SSH user must have narrowly scoped
+  passwordless sudo for the sandbox3 installer; protect the environment with
+  trusted reviewers. Do not reuse the production or shared test credentials.
+
+The installer checks the exact host, service, env file, port, registry,
+principal, empty admission journal, artifact checksum, and manifest target
+before changing code. It restarts only `agent-runner-api-sandbox3.service` and
+restores the previous release if health fails. A nonempty journal blocks an
+update until its accepted runs are reconciled. A successful deploy proves API
+liveness only; a Telegram task must still prove Runner admission, execution,
+result persistence, and delivery.
+
+Dispatch `runner-api-sandbox-candidate.yml` with the exact source ref and
+`target=agent-runner-api-sandbox3`. Record the successful run ID and source SHA.
+Then dispatch `runner-api-sandbox3-deploy.yml` with that run ID and SHA. The
+deploy job verifies the checksum, GitHub provenance, and target-specific
+manifest before opening SSH with pinned host keys. If any bootstrap item is
+missing, it fails without changing the shared API.
+
 This procedure deploys a signed Runner API candidate to the test-only
 `agent-runner-api-mcp-test.service` on SSH target `vm2`. It does not install the
 VM worker, deploy production, alter the legacy `agent-runner-api.service`, or

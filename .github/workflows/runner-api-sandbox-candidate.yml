@@ -8,6 +8,14 @@ on:
         required: true
         default: main
         type: string
+      target:
+        description: Isolated API service to package for
+        required: true
+        default: agent-runner-api-mcp-test
+        type: choice
+        options:
+          - agent-runner-api-mcp-test
+          - agent-runner-api-sandbox3
 
 permissions:
   contents: read
@@ -58,6 +66,7 @@ jobs:
         env:
           SOURCE_SHA: ${{ steps.source.outputs.sha }}
           SOURCE_REF: ${{ steps.source.outputs.ref }}
+          TARGET: ${{ inputs.target }}
           RUNNER_TEMP: ${{ runner.temp }}
         run: |
           set -euo pipefail
@@ -70,8 +79,10 @@ jobs:
           cp "$GITHUB_WORKSPACE/deployment-tools/scripts/rollback-api-sandbox-candidate.sh" "$STAGE/scripts/"
           cp "$GITHUB_WORKSPACE/deployment-tools/scripts/provision-api-sandbox-principal.sh" "$STAGE/scripts/"
           cp "$GITHUB_WORKSPACE/deployment-tools/scripts/enable-api-sandbox-mock-test.py" "$STAGE/scripts/"
-          printf '{"target":"agent-runner-api-mcp-test","sourceSha":"%s","sourceRef":"%s","packageVersion":"%s"}\n' \
-            "$SOURCE_SHA" "$SOURCE_REF" "$(node -p "require('$SOURCE_DIR/package.json').version")" > "$STAGE/candidate-manifest.json"
+          cp "$GITHUB_WORKSPACE/deployment-tools/scripts/install-api-sandbox3-candidate.sh" "$STAGE/scripts/"
+          [[ "$TARGET" == agent-runner-api-mcp-test || "$TARGET" == agent-runner-api-sandbox3 ]]
+          printf '{"target":"%s","sourceSha":"%s","sourceRef":"%s","packageVersion":"%s"}\n' \
+            "$TARGET" "$SOURCE_SHA" "$SOURCE_REF" "$(node -p "require('$SOURCE_DIR/package.json').version")" > "$STAGE/candidate-manifest.json"
           npm ci --omit=dev --prefix "$STAGE" --no-audit --no-fund
           tar -czf "$RUNNER_TEMP/runner-api-sandbox-candidate.tar.gz" -C "$STAGE" candidate-manifest.json package.json package-lock.json dist node_modules scripts
           tar -tzf "$RUNNER_TEMP/runner-api-sandbox-candidate.tar.gz" > "$RUNNER_TEMP/candidate-files.txt"
@@ -86,13 +97,14 @@ jobs:
               exit 1
             }
           done
+          grep -Fxq scripts/install-api-sandbox3-candidate.sh "$RUNNER_TEMP/candidate-files.txt"
           (cd "$RUNNER_TEMP" && sha256sum runner-api-sandbox-candidate.tar.gz > runner-api-sandbox-candidate.tar.gz.sha256)
       - uses: actions/attest-build-provenance@v2
         with:
           subject-path: ${{ runner.temp }}/runner-api-sandbox-candidate.tar.gz
       - uses: actions/upload-artifact@v4
         with:
-          name: runner-api-sandbox-candidate-${{ steps.source.outputs.sha }}
+          name: ${{ inputs.target == 'agent-runner-api-mcp-test' && format('runner-api-sandbox-candidate-{0}', steps.source.outputs.sha) || format('runner-api-sandbox-candidate-agent-runner-api-sandbox3-{0}', steps.source.outputs.sha) }}
           path: |
             ${{ runner.temp }}/runner-api-sandbox-candidate.tar.gz
             ${{ runner.temp }}/runner-api-sandbox-candidate.tar.gz.sha256
@@ -102,9 +114,10 @@ jobs:
         env:
           SOURCE_SHA: ${{ steps.source.outputs.sha }}
           SOURCE_REF: ${{ steps.source.outputs.ref }}
+          TARGET: ${{ inputs.target }}
         run: |
           {
             printf 'Candidate source: %s (%s)\n\n' "$SOURCE_REF" "$SOURCE_SHA"
-            printf 'Target: isolated agent-runner-api-mcp-test only.\n\n'
+            printf 'Target: isolated %s only.\n\n' "$TARGET"
             printf 'The artifact is signed and retained for 7 days. This workflow does not deploy it.\n'
           } >> "$GITHUB_STEP_SUMMARY"
