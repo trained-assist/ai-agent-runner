@@ -9,6 +9,7 @@ interface RunRecord {
   engine: string; state: State; sequence: number; createdAt: string; updatedAt: string; startedAt: string | null;
   finishedAt: string | null; answer: string | null; cancelRequested: boolean; launchCiphertext: string;
   launchAttempts: number; result?: Record<string, unknown>; workerReceipt?: Record<string, unknown>;
+  launchRejection?: { status: number; code: string };
   lastError?: string;
   artifacts: Array<Record<string, unknown>>; repo: Record<string, unknown> | null; logUrl: string | null;
   events: Array<Record<string, unknown>>;
@@ -38,6 +39,33 @@ function view(run: RunRecord): Record<string, unknown> {
   return { requestId: run.requestId, userTaskId: run.userTaskId, conversationId: run.conversationId, runId: run.runId,
     ownerGeneration: run.ownerGeneration, state: run.state, engine: run.engine, cancelRequested: run.cancelRequested, connectionLost: run.state === 'unknown',
     observedAt: run.updatedAt, sequence: run.sequence, fencing: { rejected: 0 }, answer: run.answer };
+}
+
+function workerRefusalCode(body: unknown, status: number): string {
+  if (body && typeof body === 'object' && !Array.isArray(body)) {
+    const value = body as Record<string, unknown>;
+    for (const candidate of [value.code, value.error]) {
+      if (typeof candidate === 'string' && /^[A-Z][A-Z0-9_]{0,79}$/.test(candidate)) return candidate;
+    }
+  }
+  return `HTTP_${status}`;
+}
+
+function refusedLaunchResult(run: RunRecord): Record<string, unknown> {
+  const status = run.launchRejection?.status ?? Number(run.lastError?.match(/HTTP (4\d\d)/)?.[1] ?? 400);
+  const code = run.launchRejection?.code ?? 'WORKER_LAUNCH_REJECTED';
+  return {
+    schemaVersion: 1, runId: run.runId, jobId: run.jobId, userTaskId: run.userTaskId,
+    profileId: run.profileId, ownerGeneration: run.ownerGeneration, outcome: 'failed',
+    exitReason: 'preflight_refused', exitCode: null, exitSignal: null, exitObserved: false,
+    startedAt: run.startedAt ?? run.createdAt, finishedAt: run.finishedAt ?? now(),
+    failure: { code: code.startsWith('WORKER_') ? code : `WORKER_${code}`, failureClass: 'preflight',
+      safeSummary: `The France execution worker refused the run before accepting it (HTTP ${status}, ${code}).`, retryable: false },
+    usage: { status: 'unknown' }, outputRefs: [], persistence: 'not_required',
+    persistenceReason: 'The execution worker did not accept the run; there is nothing to persist.',
+    cleanup: 'completed', cleanupReason: 'No execution receipt was issued by the worker.',
+    logPath: `runner-api://worker-launch-refusal/${run.runId}`,
+  };
 }
 
 function nextEvent(run: RunRecord, type: string, payload: unknown = {}): void {
@@ -86,7 +114,16 @@ export class RunnerRunCoordinator {
       case 'status': return request.method === 'GET' ? json(view(run)) : error('METHOD_NOT_ALLOWED', 'status supports GET only', 405);
       case 'result':
         if (request.method !== 'GET') return error('METHOD_NOT_ALLOWED', 'result supports GET only', 405);
-        return run.result ? json(run.result) : error('RESULT_NOT_READY', 'run result is not ready', 409);
+        if (run.result) return json(run.result);
+        // A 4xx launch refusal is terminal proof that France never accepted an
+        // execution. Keep old records compatible by materializing their result
+        // lazily when the status poller requests it after this code is deployed.
+        if (run.state === 'failed' && !run.workerReceipt && run.launchAttempts > 0) {
+          run.result = refusedLaunchResult(run);
+          await this.state.storage.put(stateKey, stored);
+          return json(run.result);
+        }
+        return error('RESULT_NOT_READY', 'run result is not ready', 409);
       case 'events': {
         if (request.method !== 'GET') return error('METHOD_NOT_ALLOWED', 'events supports GET only', 405);
         const cursor = Math.max(0, Number(url.searchParams.get('cursor') ?? 0) || 0);
@@ -318,7 +355,11 @@ export class RunnerRunCoordinator {
           const response = await this.worker('/v1/launch', 'POST', launch);
           if (!response.ok) {
             if (response.status < 500 || response.status === 503) {
-              transition(run, 'failed', { reason: `worker_rejected_${response.status}` });
+              const rejection = await response.clone().json().catch(() => null);
+              const code = workerRefusalCode(rejection, response.status);
+              run.launchRejection = { status: response.status, code };
+              run.result = refusedLaunchResult(run);
+              transition(run, 'failed', { reason: `worker_rejected_${response.status}`, code });
               run.lastError = `worker launch rejected with HTTP ${response.status}`;
               changed = true;
               continue;
