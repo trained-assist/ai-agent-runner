@@ -1,0 +1,19 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "trained-assist-runner-api-cp-sandbox3",
+  "main": "src/cloudflare/index.ts",
+  "compatibility_date": "2026-10-09",
+  "workers_dev": true,
+  "observability": { "enabled": true },
+  "durable_objects": {
+    "bindings": [{ "name": "RUNNER_RUNS", "class_name": "RunnerRunCoordinator" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["RunnerRunCoordinator"] }],
+  "vars": {
+    "RUNNER_API_PUBLIC_URL": "https://trained-assist-runner-api-cp-sandbox3.skillset-apply.workers.dev",
+    "RUNNER_ENGINE": "mock-test",
+    "MOCK_TEST_ENABLED": "true",
+    "ALLOWED_REPOSITORIES": "trained-assist/trained-assist-control-plane",
+    "ALLOWED_ENVIRONMENT_NAMES": ""
+  }
+}
