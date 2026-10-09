@@ -8,6 +8,7 @@ import pwd
 import re
 import socket
 import stat
+import subprocess
 import sys
 
 ENV_FILE = Path('/etc/agent-runner/agent-runner-api-mcp-test.env')
@@ -15,7 +16,7 @@ JOURNAL = Path('/var/lib/agent-runner/mcp-test/admissions.jsonl')
 
 
 @contextmanager
-def validated_file(path, expected_uid, component):
+def validated_file(path, expected_uids, component):
     fd = None
     try:
         path = Path(path)
@@ -25,7 +26,7 @@ def validated_file(path, expected_uid, component):
         metadata = os.fstat(fd)
         if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
             raise ValueError(f'sandbox_permissions_{component}_not_unique_regular_file')
-        if metadata.st_uid != expected_uid:
+        if expected_uids is not None and metadata.st_uid not in expected_uids:
             raise ValueError(f'sandbox_permissions_{component}_owner_mismatch')
         current = os.stat(path, follow_symlinks=False)
         if (current.st_dev, current.st_ino) != (metadata.st_dev, metadata.st_ino):
@@ -57,11 +58,18 @@ def validate_environment(fd):
         raise ValueError('sandbox_permissions_target_mismatch')
 
 
-def restrict_files(env_path, journal_path, env_uid, journal_uid, trusted_groups):
+def restrict_files(env_path, journal_path, env_uids, journal_uid, trusted_groups):
     with ExitStack() as stack:
-        # Validate both before changing either; root env and sandbox journal stay owned.
-        env = stack.enter_context(validated_file(env_path, env_uid, 'environment'))
-        journal = stack.enter_context(validated_file(journal_path, journal_uid, 'journal'))
+        # Validate both before changing either; root/service-owned env stays owned.
+        env = stack.enter_context(validated_file(env_path, None, 'environment'))
+        journal = stack.enter_context(validated_file(journal_path, {journal_uid}, 'journal'))
+        # A private existing EnvironmentFile needs no mutation: systemd reads it
+        # as root regardless of its operator owner. Ownership must be approved
+        # before any environment mode change; journal ownership stays strict.
+        env_mode = stat.S_IMODE(env[1].st_mode)
+        env_private = env_mode == 0o600 or (env_mode == 0o640 and env[1].st_gid in trusted_groups)
+        if not env_private and env[1].st_uid not in env_uids:
+            raise ValueError('sandbox_permissions_environment_owner_mismatch')
         validate_environment(env[0])
         result = {}
         for component, path, (fd, metadata) in [('environment', Path(env_path), env), ('journal', Path(journal_path), journal)]:
@@ -83,7 +91,11 @@ def main():
         if os.geteuid() != 0 or socket.gethostname().split('.')[0] != 'vmi3617957':
             raise ValueError('sandbox_permissions_operator_target_mismatch')
         sandbox = pwd.getpwnam('sandbox')
-        result = restrict_files(ENV_FILE, JOURNAL, 0, sandbox.pw_uid, {0, sandbox.pw_gid})
+        owner = subprocess.run(['systemctl', 'show', 'agent-runner-api-mcp-test.service',
+                                '-p', 'User', '--value'], capture_output=True, text=True, timeout=10)
+        if owner.returncode != 0 or owner.stdout.strip() != 'sandbox':
+            raise ValueError('sandbox_permissions_service_owner_mismatch')
+        result = restrict_files(ENV_FILE, JOURNAL, {0, sandbox.pw_uid}, sandbox.pw_uid, {0, sandbox.pw_gid})
         print(json.dumps({'schemaVersion': 1, 'target': 'agent-runner-api-mcp-test', 'components': result}))
         return 0
     except Exception as error:

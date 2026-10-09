@@ -91,6 +91,25 @@ AGENT_API_PROFILE_GITHUB_TOKEN=private-github-token
         with self.assertRaisesRegex(ValueError, '^sandbox_inventory_environment_invalid$'):
             inventory.environment_metadata('AGENT_API_WORKERS=[{"engine":"private-secret-name"}]')
 
+    def test_file_metadata_uses_only_lstat_and_fixed_owner_categories(self):
+        with tempfile.TemporaryDirectory() as directory:
+            env = Path(directory) / 'env'; env.write_text('private-secret'); env.chmod(0o600)
+            target = Path(directory) / 'journal'; target.write_text('private-user-content'); target.chmod(0o644)
+            account = type('Account', (), {'pw_uid': os.getuid(), 'pw_gid': os.getgid()})()
+            with patch.object(inventory.socket, 'gethostname', return_value='vmi3617957'), \
+                    patch.object(inventory.os, 'geteuid', return_value=0), \
+                    patch.object(inventory.pwd, 'getpwnam', return_value=account), \
+                    patch.object(inventory, 'ENV_FILE', env), patch.object(inventory, 'JOURNAL', target):
+                result = inventory.file_metadata()
+                self.assertTrue(result['environment']['privateMode'])
+                self.assertFalse(result['journal']['privateMode'])
+                self.assertTrue(result['journal']['serviceCanWrite'])
+                self.assertNotIn('private-', json.dumps(result))
+                target.unlink(); target.symlink_to(env)
+                self.assertFalse(inventory.file_metadata()['journal']['regular'])
+                target.unlink()
+                self.assertEqual(inventory.file_metadata()['journal'], {'exists': False})
+
     def test_private_regular_bounded_reads_and_missing_journal(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'journal'

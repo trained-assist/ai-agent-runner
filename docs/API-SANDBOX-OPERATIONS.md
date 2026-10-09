@@ -212,3 +212,17 @@ readiness. Those claims require a separately recorded end-to-end task result.
 - Production promotion: reviewed main change, signed `vm-worker-v*` release,
   then the production operator path. This sandbox workflow has no production
   target or credential.
+
+The permission helper verifies the fixed systemd service runs as `sandbox`.
+Its EnvironmentFile may be owned by root or that service account; both are
+valid existing installation layouts. Journal ownership remains pinned to
+`sandbox`, so restricting its mode cannot remove the service writer's access.
+Unrelated owners still fail before any mode change.
+
+On failed inventory, fixed-file metadata uses lstat only and reports regular-file,
+unique-file, root/sandbox/other owner category, private-mode and service access
+booleans. It emits no file bytes, numeric owner IDs, names or arbitrary paths.
+A private existing operator-owned EnvironmentFile remains untouched during
+permission repair, since systemd reads it as root. Changing an unsafe environment
+mode still requires root/sandbox ownership; journal ownership stays pinned to
+sandbox before restriction. No chown or service restart is performed.
