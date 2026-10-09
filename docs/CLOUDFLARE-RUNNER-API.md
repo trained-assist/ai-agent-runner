@@ -62,11 +62,13 @@ Worker secrets:
   bounded test lease matching the Host Worker.
 - `LLM_LADDER_TOKEN`: only if the lane's `envAllowlist` permits it.
 
-The repository-less exception is limited to principal and profile
+The Telegram UX test principal is bound in the API key registry to the isolated repository
+`vovalikessmoothy-png/cp-telegram-ux-runner-sandbox`; the request cannot supply or override
+that binding. This exception is limited to profile/principal
 `integration-telegram-ux-v1` with exactly one `mcpBindings` entry:
 `registry-mcp-test-160-read`. It only admits the pinned server
 `trained-assist-registry-test`, URL, tool `registry.fixture_read`, policy, catalogue and
-Registry digest in the Worker code. It does not grant arbitrary MCP access or a repository.
+Registry digest in the Worker code. It grants no other repository or MCP access.
 
 The France worker must allow the corresponding `workers.dev` origin in
 `VM_WORKER_ALLOWED_CALLBACK_ORIGINS`, and its approved repository/environment lists must
@@ -126,7 +128,9 @@ environment. It renews the pinned catalogue lease through the end of the UTC day
 ahead and installs the private key and bearer as Worker secrets; neither is a Wrangler variable.
 Health, key, delegation, and France Worker probes retry for up to two minutes while Cloudflare
 propagates a new secret version. Deploy the paired Host Worker on the same UTC date so both
-Workers enforce the identical lease.
+Workers enforce the identical lease. The generated API-key entry binds the Telegram UX profile
+to its one isolated sandbox repository; keep the CP RunSpec repository omitted so the Runner's
+authenticated binding remains authoritative.
 
 ## Retired deployment path
 
