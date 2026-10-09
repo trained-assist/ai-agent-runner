@@ -50,6 +50,14 @@ def read_regular(path, limit, private=True):
             os.close(fd)
 
 
+def read_component(path, limit, component, private=True):
+    try:
+        return read_regular(path, limit, private)
+    except ValueError as error:
+        suffix = str(error).removeprefix('sandbox_inventory_')
+        raise ValueError(f'sandbox_inventory_{component}_{suffix}') from None
+
+
 def environment_metadata(text):
     values = {}
     try:
@@ -134,12 +142,12 @@ def inventory():
         raise ValueError('sandbox_inventory_host_mismatch')
     if os.geteuid() != 0:
         raise ValueError('sandbox_inventory_requires_root')
-    env = environment_metadata(read_regular(ENV_FILE, 1024 * 1024))
+    env = environment_metadata(read_component(ENV_FILE, 1024 * 1024, 'environment'))
     if not all(env[name] for name in ('journalTargetMatches', 'registryTargetMatches', 'portMatches', 'sandboxMode')):
         raise ValueError('sandbox_inventory_target_mismatch')
-    journal = journal_metadata(read_regular(JOURNAL, 8 * 1024 * 1024))
+    journal = journal_metadata(read_component(JOURNAL, 8 * 1024 * 1024, 'journal'))
     try:
-        manifest = json.loads(read_regular(MANIFEST, 64 * 1024, private=False))
+        manifest = json.loads(read_component(MANIFEST, 64 * 1024, 'manifest', private=False))
         sha = manifest.get('sourceSha')
         if manifest.get('target') != TARGET or not isinstance(sha, str) or not re.fullmatch('[a-f0-9]{40}', sha):
             raise ValueError()
