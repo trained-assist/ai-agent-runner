@@ -169,6 +169,7 @@ trap rollback EXIT
 tar -xzf "$BUNDLE_PATH" -C "$STAGE" --no-same-owner
 [[ -f "$STAGE/dist/api/main.js" && -d "$STAGE/node_modules" ]] || die 'candidate runtime incomplete'
 chown -R root:root "$STAGE"
+chmod 0755 "$STAGE" # mktemp starts at 0700; the distinct service UID must traverse public code.
 mv "$STAGE" "$RELEASE"
 NEW_RELEASE_CREATED=1
 # The service was required to be inactive before the first check. Repeat the
