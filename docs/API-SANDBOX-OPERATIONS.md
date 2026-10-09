@@ -253,3 +253,18 @@ If admissions become unresolved during startup, rollback preserves this runtime.
 Expected public route: `https://169-58-15-230.sslip.io/runner-sandbox3`. Its proxy,
 TLS and CP reachability require separate proof. Initial mock stage is not bounded
 real worker/profile storage or Telegram acceptance.
+
+Initial contract diagnostics also support `--mock-probe` with a fixed-target
+API-key request on stdin and `--proxy-inspect` without secret input. The mock
+probe checks exact installed ab8e7a3 process identity, invalid-key refusal,
+normal explicit mock-test receipt/status/result/events and same-key replay.
+It never retries a nonterminal/unknown outcome or submits another run key.
+Only synthetic IDs/booleans survive; model calls and real Telegram E2E are false.
+Proxy inspection emits only global config marker booleans: those markers do not
+prove server selection, TLS routing, ownership or public API reachability.
+The namespace inspector includes allowlisted systemd failure result and bounded
+exit status, without raw journalctl or environment contents.
+
+Root-owned runtime staging is made 0755 explicitly: mktemp starts at 0700, which
+would prevent the distinct service UID from entering the installed code root.
+Private state/config permissions are unchanged.
