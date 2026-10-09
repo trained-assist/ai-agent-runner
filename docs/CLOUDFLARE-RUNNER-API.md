@@ -1,9 +1,10 @@
 # Cloudflare Runner API
 
 Status: implementation slice added 2026-10-09. The sandbox3 Worker was deployed on
-2026-10-09 (version `3c981002-600f-4a02-ad9f-3727f6c8c8e6`) and passed an authenticated
-Durable Object `mock-test` probe returning `pong`. Its API key registry is currently empty,
-so it does not accept runs. Telegram UX and real sandbox acceptance are not deployed.
+2026-10-09 (version `b5105990-eaee-4ec9-a9ce-d92d688c95dd`) with profile-scoped repository
+binding and passed an authenticated Durable Object `mock-test` probe returning `pong`. Its API
+key registry is currently empty, so it does not accept runs. France worker credentials are
+not configured. Telegram UX and real sandbox acceptance are not deployed.
 
 ## Runtime boundary
 
