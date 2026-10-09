@@ -197,3 +197,37 @@ readiness. Those claims require a separately recorded end-to-end task result.
 - Production promotion: reviewed main change, signed `vm-worker-v*` release,
   then the production operator path. This sandbox workflow has no production
   target or credential.
+
+## Fresh sandbox3 operator preparation
+
+The existing CP bootstrap supplies the proven SSH channel and verifies the
+already-signed ab8e7a3 bundle before transfer. Reviewed operator scripts are
+pinned separately from runtime source. `prepare-api-sandbox3.py --inspect` is
+read-only and reports fixed component presence/service/proxy booleans only.
+`--prepare` accepts a strict JSON request on stdin with the fixed target,
+API key hash and scoped delegation secret. It refuses any existing target
+component or aliased parent, checks port 18883 and creates only the fresh
+sandbox3 namespace. It does not start a service or copy old credentials/state.
+The caller must keep secret input out of arguments/logs.
+
+The dedicated `sandbox3-api` system account has no login shell and a distinct
+UID from the older sandbox service. Its registry permits `mock-test` only;
+there is no default engine chain, external worker/model credential or profile
+workspace yet. Ordinary real-agent requests remain unavailable. This is an
+initial authenticated API contract stage, before bounded free-only worker,
+profile workspace and real Telegram acceptance.
+
+The sandbox3 installer accepts the already-signed MCP artifact only with the
+explicit fourth argument `--existing-mcp-runtime`, and only the pinned ab8e7a3
+source plus checksum `42adc29e0ed20125c8703d661694c36fca59667e8294132c723cee0f0080ed4a`.
+Its install target remains exclusively sandbox3; the unchanged artifact target
+is recorded separately. It validates safe npm file symlinks, exact inactive
+unit/user/runtime, canonical protected env/registry/empty journal, and refuses
+shared aliases. Runtime files remain root-owned. On failed startup it restores
+only this fresh target; if an admission appeared it preserves the current
+runtime for reconciliation instead of restarting or rolling it back.
+
+The declared public route is
+`https://169-58-15-230.sslip.io/runner-sandbox3`; provisioning must verify its
+proxy/TLS path separately. A loopback health pass does not prove that route,
+CP reachability, profile storage, paid-spend policy or real Telegram execution.

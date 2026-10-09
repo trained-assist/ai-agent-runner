@@ -23,13 +23,14 @@ concurrency:
 
 jobs:
   deploy:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     environment: runner-api-sandbox3
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.repository.default_branch }}
+          ref: ${{ github.sha }}
       - name: Verify target and deploy credentials
         env:
           SOURCE_SHA: ${{ inputs.source_sha }}
