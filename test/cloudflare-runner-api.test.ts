@@ -4,6 +4,13 @@ import runnerApi, { sha256 } from '../src/cloudflare/runner-api.js';
 import type { RunnerWorkerEnv } from '../src/cloudflare/types.js';
 
 describe('Cloudflare Runner API Worker', () => {
+  it('reports the deployed Cloudflare Worker build identity', async () => {
+    const env = { BUILD_SHA: 'a'.repeat(40) } as unknown as RunnerWorkerEnv;
+    const response = await runnerApi.fetch(new Request('https://api.example/version'), env);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ runtime: 'cloudflare-worker', buildSha: 'a'.repeat(40) });
+  });
+
   it('authenticates hashed API keys and dispatches only to the Durable Object coordinator', async () => {
     const token = 'runner-api-secret';
     const keyHash = await sha256(token);
