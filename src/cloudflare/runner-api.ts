@@ -33,7 +33,7 @@ async function authenticate(request: Request, env: RunnerWorkerEnv): Promise<Api
   return record ? { principalId: record.principalId, profileId: record.profileId,
     ...(record.repository ? { repository: record.repository } : {}),
     ...(record.tenantId ? { tenantId: record.tenantId } : {}), scopes: record.scopes,
-    ...(record.engines ? { engines: record.engines } : {}), keyHash: record.keyHash } : null;
+    ...(record.engines ? { engines: record.engines } : {}), ...(record.mcpBindings ? { mcpBindings: record.mcpBindings } : {}), keyHash: record.keyHash } : null;
 }
 
 function validKeyConfig(value: unknown): value is KeyConfig {
@@ -50,7 +50,8 @@ function validKeyConfig(value: unknown): value is KeyConfig {
     && (record['tenantId'] === undefined || typeof record['tenantId'] === 'string' && !!record['tenantId'])
     && Array.isArray(record['scopes']) && record['scopes'].length > 0 && record['scopes'].every((scope) => ['runs:read', 'runs:write'].includes(String(scope)))
     && (engines === undefined || Array.isArray(engines) && engines.every((engine) => typeof engine === 'string'))
-    && (validRepository || mockOnly);
+    && (validRepository || mockOnly)
+    && (record['mcpBindings'] === undefined || Array.isArray(record['mcpBindings']) && record['mcpBindings'].every((binding) => typeof binding === 'string' && binding.length > 0 && binding.length <= 300));
 }
 
 function requireScope(principal: ApiPrincipal, scope: string): boolean { return principal.scopes.includes(scope); }
