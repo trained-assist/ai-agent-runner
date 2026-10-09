@@ -157,11 +157,66 @@ class ProxyUpdateTests(unittest.TestCase):
         self.assertEqual(len(prepare.nginx_nodes(updated)), 2)
 
     def test_conflict_ambiguity_and_changed_source_refuse(self):
-        for dump, original in [(self.dump(self.CONFIG * 2), self.CONFIG * 2),
+        for dump, original in [(self.dump(self.CONFIG * 3), self.CONFIG * 3),
                                (self.dump(self.CONFIG), self.CONFIG + '# changed'),
                                (self.dump(self.CONFIG + '# /runner-sandbox3'), self.CONFIG + '# /runner-sandbox3')]:
             with self.assertRaisesRegex(ValueError, 'sandbox3_proxy_'):
                 prepare.proxy_update(dump, original)
+
+    def test_two_servers_in_same_file_preserve_every_original_byte(self):
+        original = self.CONFIG * 2
+        _, updated = prepare.proxy_update(self.dump(original), original)
+        self.assertEqual(updated.count(prepare.PROXY_MARKER), 2)
+        self.assertEqual(updated.replace(prepare.PROXY_BLOCK, ''), original)
+
+    def test_two_source_files_are_updated_independently(self):
+        first = '/etc/nginx/sites-enabled/runner'
+        second = '/etc/nginx/sites-enabled/runner-ipv6'
+        other = self.CONFIG.replace('/runner-mcp-test/', '/preserved/')
+        dump = self.dump(self.CONFIG) + '# configuration file ' + second + ':\n' + other
+        updates = prepare.proxy_updates(dump, {first: self.CONFIG, second: other})
+        self.assertEqual(updates[first].replace(prepare.PROXY_BLOCK, ''), self.CONFIG)
+        self.assertEqual(updates[second].replace(prepare.PROXY_BLOCK, ''), other)
+
+    def test_two_file_validation_or_reload_failure_rolls_back_both(self):
+        process = lambda code: type('Process', (), {'returncode': code})()
+        for codes, reason in [([1, 0, 0], 'validation_failed'), ([0, 1, 0, 0], 'reload_failed')]:
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as directory:
+                paths = [Path(directory) / str(index) for index in range(2)]
+                for path in paths: path.write_text(self.CONFIG)
+                configs = [(path, self.CONFIG, self.CONFIG + '# update', path.stat()) for path in paths]
+                with patch.object(prepare.subprocess, 'run', side_effect=[process(code) for code in codes]):
+                    with self.assertRaisesRegex(ValueError, 'sandbox3_proxy_' + reason):
+                        prepare.apply_proxy_configs(configs)
+                self.assertTrue(all(path.read_text() == self.CONFIG for path in paths))
+
+    def test_second_write_failure_restores_first_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = [Path(directory) / str(index) for index in range(2)]
+            for path in paths: path.write_text(self.CONFIG)
+            configs = [(path, self.CONFIG, self.CONFIG + '# update', path.stat()) for path in paths]
+            real_write = prepare.atomic_proxy_config
+            def write(path, content, metadata):
+                if path == paths[1]: raise OSError('synthetic write failure')
+                real_write(path, content, metadata)
+            process = type('Process', (), {'returncode': 0})()
+            with patch.object(prepare, 'atomic_proxy_config', side_effect=write), patch.object(prepare.subprocess, 'run', return_value=process):
+                with self.assertRaises(OSError): prepare.apply_proxy_configs(configs)
+            self.assertTrue(all(path.read_text() == self.CONFIG for path in paths))
+
+    def test_conflicting_edit_is_preserved_and_other_file_restored(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = [Path(directory) / str(index) for index in range(2)]
+            for path in paths: path.write_text(self.CONFIG)
+            configs = [(path, self.CONFIG, self.CONFIG + '# update', path.stat()) for path in paths]
+            def changed(*args, **kwargs):
+                paths[1].write_text('operator edit')
+                return type('Process', (), {'returncode': 1})()
+            with patch.object(prepare.subprocess, 'run', side_effect=changed):
+                with self.assertRaisesRegex(ValueError, 'sandbox3_proxy_rollback_conflict'):
+                    prepare.apply_proxy_configs(configs)
+            self.assertEqual(paths[0].read_text(), self.CONFIG)
+            self.assertEqual(paths[1].read_text(), 'operator edit')
 
     def test_atomic_write_preserves_mode_and_replaces_only_target(self):
         with tempfile.TemporaryDirectory() as directory:
