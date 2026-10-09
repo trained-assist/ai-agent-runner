@@ -8,7 +8,7 @@ import tempfile
 import unittest
 
 SOURCE = 'a' * 40
-SCRIPT = (Path(__file__).parents[1] / 'scripts/install-api-sandbox3-candidate.sh').read_text()
+SCRIPT = (Path(__file__).parents[1] / 'scripts/install-api-sandbox-lane-candidate.sh').read_text()
 VERIFY = SCRIPT.split('import json, posixpath, sys, tarfile\n', 1)[1].split('\nPY', 1)[0]
 VERIFY = 'import json, posixpath, sys, tarfile\n' + VERIFY
 

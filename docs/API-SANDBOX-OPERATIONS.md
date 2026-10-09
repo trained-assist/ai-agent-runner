@@ -1,45 +1,60 @@
 # Isolated Runner API sandbox
 
-## Dedicated sandbox3 through GitHub Actions
+## Repeatable API sandbox creation through GitHub Actions
 
-The second Telegram lane uses a **different** API target,
-`agent-runner-api-sandbox3.service` on port 18883. The candidate workflow now
-accepts `target=agent-runner-api-sandbox3`. Its signed artifact can be deployed
-with the manual `runner-api-sandbox3-deploy.yml` workflow, so the operator does
-not need local SSH access. This path never installs the shared `mcp-test` API.
+The manual `runner-api-sandbox-deploy.yml` workflow creates or updates a named
+Runner API lane (`sandbox3` through `sandbox5`). A single signed candidate built
+with `target=agent-runner-api-sandbox` can be installed into several lanes.
+For lane `sandboxN`, the workflow uses a separate GitHub environment
+`runner-api-sandboxN` and the VM paths below:
 
-Before dispatching a deployment, an operator must bootstrap on `vm2`:
+| Resource | Per-lane value |
+|---|---|
+| API unit | `agent-runner-api-sandboxN.service` |
+| Port | `18880 + N` (`sandbox3` = `18883`) |
+| Environment | `/etc/agent-runner/agent-runner-api-sandboxN.env` |
+| Key registry | `/etc/agent-runner/key-registry-sandboxN.json` |
+| Admission journal | `/var/lib/agent-runner/sandboxN/admissions.jsonl` |
+| Profile workspace | `/var/lib/agent-runner/sandboxN/profiles` |
+| Release root | `/opt/sb/ai-agent-runner-api-sandboxN` |
+| API principal/profile | `integration-sandboxN-v1` |
 
-- `/etc/systemd/system/agent-runner-api-sandbox3.service`, using only
-  `/etc/agent-runner/agent-runner-api-sandbox3.env` and a distinct writable state
-  directory;
-- a dedicated environment with `AGENT_API_PORT=18883`,
-  `AGENT_API_KEY_REGISTRY=/etc/agent-runner/key-registry-sandbox3.json`,
-  `AGENT_API_ADMISSION_LOG=/var/lib/agent-runner/sandbox3/admissions.jsonl`,
-  `AGENT_API_ENVIRONMENT=sandbox`, a real external worker, and no enabled
-  `mock-test` engine;
-- a separate key registry containing the scoped `integration-sandbox3-v1`
-  principal and a network route from the sandbox3 CP to this API;
-- GitHub environment `runner-api-sandbox3` with `VM2_SANDBOX3_SSH_HOST`,
-  `VM2_SANDBOX3_SSH_USER`, `VM2_SANDBOX3_SSH_PRIVATE_KEY`, and
-  `VM2_SANDBOX3_KNOWN_HOSTS` secrets. The SSH user must have narrowly scoped
-  passwordless sudo for the sandbox3 installer; protect the environment with
-  trusted reviewers. Do not reuse the production or shared test credentials.
+Each GitHub environment has the **same secret names**, with lane-specific values:
+`VM2_SSH_HOST`, `VM2_SSH_USER`, `VM2_SSH_PRIVATE_KEY`, `VM2_KNOWN_HOSTS`,
+`RUNNER_API_ENV_FILE`, and `RUNNER_API_KEY_REGISTRY_JSON`. The API env must set
+that lane's exact port, registry and journal paths, `AGENT_API_ENVIRONMENT=sandbox`,
+a lane-specific `AGENT_API_PROFILE_WORKSPACE_ROOT`,
+a distinct delegation secret, and a real external worker. The registry must
+contain the matching lane principal with `runs:read` and `runs:write`. Keep
+these environment secrets restricted to the lane operators; the SSH user needs
+only the sandbox API bootstrap/install sudo path. The existing API's credential
+for calling a GHA worker does **not** grant GHA SSH or systemd access to `vm2`.
+Worker/provider access may use the same approved backend, but each CP→API
+principal, delegation secret, registry, journal and workspace path is distinct.
+For a later lane, `inherit_worker_from=sandboxN` copies only the existing API's
+worker routing and provider variables inside `vm2`; GitHub Actions never reads
+or logs their values. The source may be another named sandbox lane or the
+existing `mcp-test` API; if that service has no real worker route, bootstrap
+fails. The first lane can instead receive worker access through its own
+`RUNNER_API_ENV_FILE` secret. This option
+does not copy the source API principal, delegation secret, or run state.
 
-The installer checks the exact host, service, env file, port, registry,
-principal, empty admission journal, artifact checksum, and manifest target
-before changing code. It restarts only `agent-runner-api-sandbox3.service` and
-restores the previous release if health fails. A nonempty journal blocks an
-update until its accepted runs are reconciled. A successful deploy proves API
-liveness only; a Telegram task must still prove Runner admission, execution,
-result persistence, and delivery.
+For a new lane, dispatch `runner-api-sandbox-candidate.yml` with a reviewed
+source ref and `target=agent-runner-api-sandbox`. Record the successful run ID
+and source SHA. Dispatch `runner-api-sandbox-deploy.yml` with `lane`, that run ID,
+SHA, and `bootstrap=true` (optionally `inherit_worker_from`). The job verifies the artifact checksum, GitHub
+attestation and manifest before connecting to the pinned VM host. Bootstrap
+creates only the named lane's unit, env, registry and state directory, and
+refuses to overwrite an existing lane. On later code updates use
+`bootstrap=false`. The installer checks the named paths and principal, refuses
+a journal with unfinished runs, and rolls back to the
+previous code if health fails. No shared API or VM worker is restarted.
 
-Dispatch `runner-api-sandbox-candidate.yml` with the exact source ref and
-`target=agent-runner-api-sandbox3`. Record the successful run ID and source SHA.
-Then dispatch `runner-api-sandbox3-deploy.yml` with that run ID and SHA. The
-deploy job verifies the checksum, GitHub provenance, and target-specific
-manifest before opening SSH with pinned host keys. If any bootstrap item is
-missing, it fails without changing the shared API.
+A network route from each CP to its Runner API port and paired CP/Runner keys
+must be verified separately. API health alone does not prove a Telegram task,
+GHA execution, persistence or delivery. To rebuild a broken lane, first inspect
+and reconcile its accepted runs and preserve required evidence; do not remove
+its state or reuse another lane's credentials as part of the deploy workflow.
 
 This procedure deploys a signed Runner API candidate to the test-only
 `agent-runner-api-mcp-test.service` on SSH target `vm2`. It does not install the
@@ -198,36 +213,43 @@ readiness. Those claims require a separately recorded end-to-end task result.
   then the production operator path. This sandbox workflow has no production
   target or credential.
 
-## Fresh sandbox3 operator preparation
+The permission helper verifies the fixed systemd service runs as `sandbox`.
+Its EnvironmentFile may be owned by root or that service account; both are
+valid existing installation layouts. Journal ownership remains pinned to
+`sandbox`, so restricting its mode cannot remove the service writer's access.
+Unrelated owners still fail before any mode change.
 
-The existing CP bootstrap supplies the proven SSH channel and verifies the
-already-signed ab8e7a3 bundle before transfer. Reviewed operator scripts are
-pinned separately from runtime source. `prepare-api-sandbox3.py --inspect` is
-read-only and reports fixed component presence/service/proxy booleans only.
-`--prepare` accepts a strict JSON request on stdin with the fixed target,
-API key hash and scoped delegation secret. It refuses any existing target
-component or aliased parent, checks port 18883 and creates only the fresh
-sandbox3 namespace. It does not start a service or copy old credentials/state.
-The caller must keep secret input out of arguments/logs.
+On failed inventory, fixed-file metadata uses lstat only and reports regular-file,
+unique-file, root/sandbox/other owner category, private-mode and service access
+booleans. It emits no file bytes, numeric owner IDs, names or arbitrary paths.
+A private existing operator-owned EnvironmentFile remains untouched during
+permission repair, since systemd reads it as root. Changing an unsafe environment
+mode still requires root/sandbox ownership; journal ownership stays pinned to
+sandbox before restriction. No chown or service restart is performed.
 
-The dedicated `sandbox3-api` system account has no login shell and a distinct
-UID from the older sandbox service. Its registry permits `mock-test` only;
-there is no default engine chain, external worker/model credential or profile
-workspace yet. Ordinary real-agent requests remain unavailable. This is an
-initial authenticated API contract stage, before bounded free-only worker,
-profile workspace and real Telegram acceptance.
+## Initial sandbox3 contract stage through the existing bootstrap
 
-The sandbox3 installer accepts the already-signed MCP artifact only with the
-explicit fourth argument `--existing-mcp-runtime`, and only the pinned ab8e7a3
-source plus checksum `42adc29e0ed20125c8703d661694c36fca59667e8294132c723cee0f0080ed4a`.
-Its install target remains exclusively sandbox3; the unchanged artifact target
-is recorded separately. It validates safe npm file symlinks, exact inactive
-unit/user/runtime, canonical protected env/registry/empty journal, and refuses
-shared aliases. Runtime files remain root-owned. On failed startup it restores
-only this fresh target; if an admission appeared it preserves the current
-runtime for reconciliation instead of restarting or rolling it back.
+The CP #231 operator channel has proven SSH and read-only access to the existing
+signed ab8e7a3 candidate. `bootstrap-api-sandbox-lane.sh --contract-sandbox3
+PREPARER_PATH --inspect` delegates to the separately byte-verified fixed-target
+preparer and reports component/proxy-service booleans. `--prepare` accepts only
+fixed-target JSON on stdin (API key hash and delegation secret), refuses any
+existing namespace/alias/occupied port and creates a distinct `sandbox3-api`
+nonlogin account, private config/registry/journal and a root-owned runtime root.
+It does not start a service, copy old credentials/state or provision providers.
+Secrets stay out of arguments/logs. Initial registry engines are mock-test only;
+there is no default chain, real worker/model access or profile workspace yet.
 
-The declared public route is
-`https://169-58-15-230.sslip.io/runner-sandbox3`; provisioning must verify its
-proxy/TLS path separately. A loopback health pass does not prove that route,
-CP reachability, profile storage, paid-spend policy or real Telegram execution.
+The existing lane installer accepts the ab8e7a3 artifact only with the explicit
+sixth argument `--existing-mcp-runtime` and the pinned source/checksum, for
+sandbox3 exclusively. The unchanged artifact target and exclusive install
+target are separate identities. It accepts safe regular npm file symlinks and
+refuses escaping links/chains/ancestors/duplicates. Unit user/runtime, canonical
+private files and service-owned journal are checked; installed code is root-owned.
+It never stops an active API: a terminal snapshot alone is not an admission
+fence, so later updates require a separately verified operator quiescence path.
+If admissions become unresolved during startup, rollback preserves this runtime.
+
+Expected public route: `https://169-58-15-230.sslip.io/runner-sandbox3`. Its proxy,
+TLS and CP reachability require separate proof. Initial mock stage is not bounded
+real worker/profile storage or Telegram acceptance.

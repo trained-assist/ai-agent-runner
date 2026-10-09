@@ -1,0 +1,145 @@
+name: Create or update isolated Runner API sandbox
+
+on:
+  workflow_dispatch:
+    inputs:
+      lane:
+        description: Dedicated sandbox lane, sandbox3 through sandbox5
+        required: true
+        type: choice
+        options:
+          - sandbox3
+          - sandbox4
+          - sandbox5
+      candidate_run_id:
+        description: Successful signed Runner API candidate workflow run
+        required: true
+        type: string
+      source_sha:
+        description: Exact 40-character candidate source commit
+        required: true
+        type: string
+      bootstrap:
+        description: Create the dedicated sandbox-lane unit and config on first install
+        required: true
+        default: false
+        type: boolean
+      inherit_worker_from:
+        description: Optional existing sandbox lane whose API worker credentials are copied locally on VM
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  actions: read
+  attestations: read
+  contents: read
+
+concurrency:
+  group: runner-api-${{ inputs.lane }}-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/main' && contains(fromJSON('["sandbox3","sandbox4","sandbox5"]'), inputs.lane)
+    runs-on: ubuntu-latest
+    environment: runner-api-${{ inputs.lane }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - name: Verify target and deploy credentials
+        env:
+          LANE: ${{ inputs.lane }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+          SSH_HOST: ${{ secrets.VM2_SSH_HOST }}
+          SSH_USER: ${{ secrets.VM2_SSH_USER }}
+          SSH_KEY: ${{ secrets.VM2_SSH_PRIVATE_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.VM2_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          [[ "$LANE" =~ ^sandbox[3-5]$ ]]
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$CANDIDATE_RUN_ID" =~ ^[0-9]{1,20}$ ]]
+          for value in "$SSH_HOST" "$SSH_USER" "$SSH_KEY" "$SSH_KNOWN_HOSTS"; do
+            [[ -n "$value" ]] || { echo 'sandbox-lane SSH environment secret is missing' >&2; exit 1; }
+          done
+          [[ "$SSH_HOST" =~ ^[A-Za-z0-9.-]+$ && "$SSH_USER" =~ ^[a-z_][a-z0-9_-]*$ ]]
+          install -d -m 0700 "$HOME/.ssh"
+          printf '%s\n' "$SSH_KEY" > "$HOME/.ssh/id_sandbox_lane"
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 0600 "$HOME/.ssh/id_sandbox_lane" "$HOME/.ssh/known_hosts"
+      - name: Download and verify exact signed sandbox-lane candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LANE: ${{ inputs.lane }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+        run: |
+          set -euo pipefail
+          gh run view "$CANDIDATE_RUN_ID" --repo "$GITHUB_REPOSITORY" --json conclusion,workflowName \
+            --jq 'select(.conclusion == "success" and .workflowName == "Runner API sandbox candidate")' | grep -q .
+          mkdir -p "$RUNNER_TEMP/candidate"
+          gh run download "$CANDIDATE_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --name "runner-api-sandbox-candidate-agent-runner-api-sandbox-$SOURCE_SHA" \
+            --dir "$RUNNER_TEMP/candidate"
+          archive="$RUNNER_TEMP/candidate/runner-api-sandbox-candidate.tar.gz"
+          (cd "$RUNNER_TEMP/candidate" && sha256sum -c runner-api-sandbox-candidate.tar.gz.sha256)
+          gh attestation verify "$archive" --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/runner-api-sandbox-candidate.yml" >/dev/null
+          python3 - "$archive" "$SOURCE_SHA" <<'PY'
+          import json, sys, tarfile
+          with tarfile.open(sys.argv[1], 'r:gz') as archive:
+              manifest = json.load(archive.extractfile('candidate-manifest.json'))
+          if manifest.get('target') != 'agent-runner-api-sandbox' or manifest.get('sourceSha') != sys.argv[2]:
+              raise SystemExit('candidate manifest does not match sandbox-lane and requested source SHA')
+          PY
+          tar -tf "$archive" | grep -Fx scripts/install-api-sandbox-lane-candidate.sh >/dev/null
+      - name: Install only the dedicated sandbox-lane API
+        env:
+          LANE: ${{ inputs.lane }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          BOOTSTRAP: ${{ inputs.bootstrap }}
+          INHERIT_WORKER_FROM: ${{ inputs.inherit_worker_from }}
+          SSH_HOST: ${{ secrets.VM2_SSH_HOST }}
+          SSH_USER: ${{ secrets.VM2_SSH_USER }}
+          API_ENV_FILE: ${{ secrets.RUNNER_API_ENV_FILE }}
+          API_KEY_REGISTRY: ${{ secrets.RUNNER_API_KEY_REGISTRY_JSON }}
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/candidate/runner-api-sandbox-candidate.tar.gz"
+          bundle_sha="$(sha256sum "$archive" | cut -d' ' -f1)"
+          remote_dir="/tmp/runner-api-$LANE-$SOURCE_SHA"
+          remote_archive="$remote_dir/candidate.tar.gz"
+          remote_installer="$remote_dir/install.sh"
+          remote_bootstrap="$remote_dir/bootstrap.sh"
+          remote_journal_checker="$remote_dir/check-journal.py"
+          ssh_options=(-i "$HOME/.ssh/id_sandbox_lane" -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o BatchMode=yes)
+          ssh "${ssh_options[@]}" "$SSH_USER@$SSH_HOST" "install -d -m 0700 '$remote_dir'"
+          cleanup() {
+            rm -f "$RUNNER_TEMP/candidate/api.env" "$RUNNER_TEMP/candidate/registry.json"
+            ssh "${ssh_options[@]}" "$SSH_USER@$SSH_HOST" "rm -f '$remote_installer' '$remote_archive' '$remote_bootstrap' '$remote_journal_checker' '$remote_dir/api.env' '$remote_dir/registry.json'; rmdir '$remote_dir'" || true
+          }
+          trap cleanup EXIT
+          scp "${ssh_options[@]}" "$archive" "$SSH_USER@$SSH_HOST:$remote_archive"
+          scp "${ssh_options[@]}" scripts/install-api-sandbox-lane-candidate.sh "$SSH_USER@$SSH_HOST:$remote_installer"
+          scp "${ssh_options[@]}" scripts/check-api-sandbox-journal.py "$SSH_USER@$SSH_HOST:$remote_journal_checker"
+          if [[ "$BOOTSTRAP" == true ]]; then
+            if [[ -n "$INHERIT_WORKER_FROM" ]]; then
+              [[ ( "$INHERIT_WORKER_FROM" =~ ^sandbox[3-5]$ || "$INHERIT_WORKER_FROM" == mcp-test ) && "$INHERIT_WORKER_FROM" != "$LANE" ]]
+            fi
+            [[ -n "$API_ENV_FILE" && -n "$API_KEY_REGISTRY" ]] || { echo 'sandbox-lane API bootstrap secrets are missing' >&2; exit 1; }
+            printf '%s\n' "$API_ENV_FILE" > "$RUNNER_TEMP/candidate/api.env"
+            printf '%s\n' "$API_KEY_REGISTRY" > "$RUNNER_TEMP/candidate/registry.json"
+            chmod 0600 "$RUNNER_TEMP/candidate/api.env" "$RUNNER_TEMP/candidate/registry.json"
+            scp "${ssh_options[@]}" scripts/bootstrap-api-sandbox-lane.sh "$SSH_USER@$SSH_HOST:$remote_bootstrap"
+            scp "${ssh_options[@]}" "$RUNNER_TEMP/candidate/api.env" "$SSH_USER@$SSH_HOST:$remote_dir/api.env"
+            scp "${ssh_options[@]}" "$RUNNER_TEMP/candidate/registry.json" "$SSH_USER@$SSH_HOST:$remote_dir/registry.json"
+            ssh "${ssh_options[@]}" "$SSH_USER@$SSH_HOST" \
+              "sudo -n bash '$remote_bootstrap' '$LANE' '$remote_dir/api.env' '$remote_dir/registry.json' '$INHERIT_WORKER_FROM'"
+          fi
+          ssh "${ssh_options[@]}" "$SSH_USER@$SSH_HOST" \
+            "sudo -n bash '$remote_installer' '$LANE' '$SOURCE_SHA' '$bundle_sha' '$remote_archive' '$remote_journal_checker'"
+          printf 'Installed %s Runner API source %s to dedicated service.\n' "$LANE" "$SOURCE_SHA" >> "$GITHUB_STEP_SUMMARY"

@@ -2,6 +2,7 @@
 """Read-only metadata for the declared MCP test API; never emits stored values."""
 import json
 import os
+import pwd
 from pathlib import Path
 import re
 import shlex
@@ -137,6 +138,28 @@ def journal_metadata(text):
     }
 
 
+def file_metadata():
+    """lstat only: fixed-path permissions/access, never file bytes or owner names."""
+    if socket.gethostname().split('.')[0] != 'vmi3617957' or os.geteuid() != 0:
+        raise ValueError('sandbox_inventory_operator_target_mismatch')
+    sandbox = pwd.getpwnam('sandbox')
+    result = {}
+    for component, path in [('environment', ENV_FILE), ('journal', JOURNAL)]:
+        try:
+            value = path.lstat()
+        except OSError:
+            result[component] = {'exists': False}
+            continue
+        mode = stat.S_IMODE(value.st_mode)
+        owner = 'root' if value.st_uid == 0 else 'sandbox' if value.st_uid == sandbox.pw_uid else 'other'
+        mask = (mode >> 6) if value.st_uid == sandbox.pw_uid else (mode >> 3) if value.st_gid == sandbox.pw_gid else mode
+        result[component] = {'exists': True, 'regular': stat.S_ISREG(value.st_mode),
+                             'unique': value.st_nlink == 1, 'owner': owner,
+                             'privateMode': mode in (0o600, 0o640),
+                             'serviceCanRead': bool(mask & 4), 'serviceCanWrite': bool(mask & 2)}
+    return result
+
+
 def inventory():
     if socket.gethostname().split('.')[0] != 'vmi3617957':
         raise ValueError('sandbox_inventory_host_mismatch')
@@ -158,6 +181,13 @@ def inventory():
             'serviceActive': active.returncode == 0, **env, **journal}
 
 
+def safe_file_metadata():
+    try:
+        return file_metadata()
+    except Exception:
+        return None
+
+
 def main():
     try:
         if len(sys.argv) != 2 or sys.argv[1] not in {'--inventory', '--require-terminal-journal'}:
@@ -169,7 +199,8 @@ def main():
         return 0
     except Exception as error:
         reason = str(error) if isinstance(error, ValueError) and re.fullmatch('sandbox_inventory_[a-z_]+', str(error)) else 'sandbox_inventory_failed'
-        print(json.dumps({'schemaVersion': 1, 'target': TARGET, 'reasonCode': reason, 'journalTerminalOnly': False}))
+        print(json.dumps({'schemaVersion': 1, 'target': TARGET, 'reasonCode': reason, 'journalTerminalOnly': False,
+                          'fileMetadata': safe_file_metadata()}))
         return 1
 
 
