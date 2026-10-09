@@ -9,6 +9,7 @@ import socket
 import stat
 import subprocess
 import time
+import tempfile
 import urllib.error
 import urllib.request
 import sys
@@ -167,17 +168,31 @@ def nginx_tokens(text):
             while index < len(text) and text[index] != quote:
                 if text[index] == '\\':
                     index += 1
-                    if index >= len(text): raise ValueError('sandbox3_proxy_config_unsupported')
+                    if index >= len(text): raise ValueError('sandbox3_proxy_quote_incomplete')
                     escaped = text[index]
                     value += {'t': '\t', 'r': '\r', 'n': '\n', '\\': '\\', '"': '"', "'": "'"}.get(escaped, '\\' + escaped)
                     index += 1; continue
                 value += text[index]; index += 1
-            if index >= len(text): raise ValueError('sandbox3_proxy_config_unsupported')
+            if index >= len(text): raise ValueError('sandbox3_proxy_quote_incomplete')
             index += 1; tokens.append((value, start, index)); continue
-        while index < len(text) and not text[index].isspace() and text[index] not in ';{}':
-            if text[index] in "\"'\\": raise ValueError('sandbox3_proxy_config_unsupported')
-            index += 1
-        tokens.append((text[start:index], start, index))
+        value = ''; variable = False
+        while index < len(text) and not text[index].isspace():
+            char = text[index]
+            if char == '\\':
+                index += 1
+                if index >= len(text): raise ValueError('sandbox3_proxy_token_escape_incomplete')
+                escaped = text[index]
+                value += {'t': '\t', 'r': '\r', 'n': '\n', '\\': '\\', '"': '"', "'": "'"}.get(escaped, '\\' + escaped)
+                index += 1; continue
+            if char == '{' and value.endswith('$'):
+                variable = True
+            elif char == '}' and variable:
+                variable = False
+            elif char in ';{}':
+                break
+            value += char; index += 1
+        if variable: raise ValueError('sandbox3_proxy_variable_incomplete')
+        tokens.append((value, start, index))
     return tokens
 
 
@@ -188,10 +203,10 @@ def nginx_nodes(text):
         while index < len(tokens):
             value, begin, end = tokens[index]; index += 1
             if value == '}':
-                if not nested or words: raise ValueError('sandbox3_proxy_config_unsupported')
+                if not nested or words: raise ValueError('sandbox3_proxy_block_end_unexpected')
                 return nodes, index, end
             if value in (';', '{'):
-                if not words: raise ValueError('sandbox3_proxy_config_unsupported')
+                if not words: raise ValueError('sandbox3_proxy_directive_missing')
                 children = None
                 if value == '{': children, index, end = parse(index, True)
                 nodes.append({'name': words[0], 'args': words[1:], 'start': start, 'end': end, 'children': children})
@@ -199,7 +214,7 @@ def nginx_nodes(text):
             else:
                 if start is None: start = begin
                 words.append(value)
-        if nested or words: raise ValueError('sandbox3_proxy_config_unsupported')
+        if nested or words: raise ValueError('sandbox3_proxy_directive_incomplete')
         return nodes, index, len(text)
     return parse(0)[0]
 
@@ -207,7 +222,7 @@ def nginx_nodes(text):
 def nginx_route_targets(text):
     # nginx -T emits exact source boundaries. Raw content stays in memory.
     sources = re.split(r'^# configuration file ([^\n:]+):\n', text, flags=re.M)
-    if len(sources) < 3 or len(sources) > 401: raise ValueError('sandbox3_proxy_config_unsupported')
+    if len(sources) < 3 or len(sources) > 401: raise ValueError('sandbox3_proxy_source_boundaries_invalid')
     targets = []
     for index in range(1, len(sources), 2):
         path, content = sources[index:index + 2]
@@ -243,6 +258,104 @@ def proxy_inspect():
             'legacyPathMentioned': legacy_location, 'sandbox3PathMentioned': new_location,
             'sandbox3UpstreamMentioned': '127.0.0.1:18883' in text,
             'qualifiedRouteTargetCount': min(len(targets), 100), 'publicRouteVerified': False}
+
+
+PROXY_MARKER = '# trained-assist sandbox3 isolated route v1'
+PROXY_BLOCK = """
+    # trained-assist sandbox3 isolated route v1
+    location = /runner-sandbox3 { return 308 /runner-sandbox3/; }
+    location ^~ /runner-sandbox3/ {
+        proxy_pass http://127.0.0.1:18883/;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+"""
+
+
+def proxy_update(dump, original):
+    targets = nginx_route_targets(dump)
+    if len(targets) != 1: raise ValueError('sandbox3_proxy_target_ambiguous')
+    target = targets[0]
+    if target['content'].rstrip('\n') != original.rstrip('\n'):
+        raise ValueError('sandbox3_proxy_source_changed')
+    # Refuse regex or similarly prefixed legacy locations before selecting a file.
+    legacy = [item for item in target['server']['children'] or [] if item['name'] == 'location'
+              and item['args'] and item['args'][-1] in ('/runner-mcp-test', '/runner-mcp-test/')
+              and (len(item['args']) == 1 or item['args'][0] in ('^~', '='))]
+    if not legacy: raise ValueError('sandbox3_proxy_legacy_route_unsupported')
+    if '/runner-sandbox3' in dump or PROXY_MARKER in original:
+        raise ValueError('sandbox3_proxy_route_already_present')
+    offset = target['server']['end'] - 1
+    if offset >= len(original) or original[offset] != '}': raise ValueError('sandbox3_proxy_source_changed')
+    updated = original[:offset] + PROXY_BLOCK + original[offset:]
+    # Parse output before writing; preserve every original byte around one insertion.
+    nginx_nodes(updated)
+    return target['path'], updated
+
+
+def atomic_proxy_config(path, content, metadata):
+    fd, temporary = tempfile.mkstemp(prefix='.sandbox3-route-', dir=str(path.parent))
+    try:
+        os.fchmod(fd, stat.S_IMODE(metadata.st_mode)); os.fchown(fd, metadata.st_uid, metadata.st_gid)
+        with os.fdopen(fd, 'w') as handle:
+            fd = None; handle.write(content); handle.flush(); os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if fd is not None: os.close(fd)
+        if os.path.lexists(temporary): os.unlink(temporary)
+
+
+def apply_proxy_config(path, original, updated, metadata):
+    if path.read_bytes().decode('utf-8') != original: raise ValueError('sandbox3_proxy_source_changed')
+    atomic_proxy_config(path, updated, metadata)
+    try:
+        check = subprocess.run(['nginx', '-t'], capture_output=True, timeout=10)
+        if check.returncode != 0: raise ValueError('sandbox3_proxy_validation_failed')
+        reload = subprocess.run(['systemctl', 'reload', 'nginx.service'], capture_output=True, timeout=15)
+        if reload.returncode != 0: raise ValueError('sandbox3_proxy_reload_failed')
+    except Exception:
+        # Restore the original config only if this operation's bytes still own the file.
+        if path.read_bytes().decode('utf-8') != updated: raise ValueError('sandbox3_proxy_rollback_conflict') from None
+        atomic_proxy_config(path, original, metadata)
+        check = subprocess.run(['nginx', '-t'], capture_output=True, timeout=10)
+        if check.returncode == 0:
+            subprocess.run(['systemctl', 'reload', 'nginx.service'], capture_output=True, timeout=15)
+        raise
+
+def configure_proxy():
+    source, verified = runtime_proof()
+    if not verified or source != 'ab8e7a3da4efa45c2154d67423542a6974576f22':
+        raise ValueError('sandbox3_proxy_runtime_not_verified')
+    active = subprocess.run(['systemctl', 'is-active', 'nginx.service'], capture_output=True, timeout=10)
+    if active.returncode != 0: raise ValueError('sandbox3_proxy_service_inactive')
+    dump = subprocess.run(['nginx', '-T'], capture_output=True, text=True, timeout=10)
+    if dump.returncode != 0 or len(dump.stdout.encode('utf-8')) > 2 * 1024 * 1024:
+        raise ValueError('sandbox3_proxy_config_unavailable')
+    targets = nginx_route_targets(dump.stdout)
+    if len(targets) != 1: raise ValueError('sandbox3_proxy_target_ambiguous')
+    path = Path(targets[0]['path']).resolve(strict=True)
+    # nginx sites-enabled symlinks may resolve to sites-available; write only the canonical root-owned file.
+    if not str(path).startswith('/etc/nginx/') or path.parent.resolve(strict=True) != path.parent:
+        raise ValueError('sandbox3_proxy_config_path_unsafe')
+    for parent in [path.parent, *path.parent.parents]:
+        metadata = parent.stat()
+        if metadata.st_uid != 0 or metadata.st_mode & 0o022:
+            raise ValueError('sandbox3_proxy_config_path_unsafe')
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, newline='') as handle:
+        metadata = os.fstat(handle.fileno())
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != 0 or metadata.st_nlink != 1 \
+                or metadata.st_mode & 0o022 or metadata.st_size > 1024 * 1024:
+            raise ValueError('sandbox3_proxy_config_path_unsafe')
+        original = handle.read()
+    _, updated = proxy_update(dump.stdout, original)
+    # Root-only backup is exclusive, outside the service-owned state and never emitted.
+    backup = Path('/etc/agent-runner/sandbox3-proxy-original.conf')
+    write_exclusive(backup, original, 0o600, 0, 0)
+    apply_proxy_config(path, original, updated, metadata)
+    return {'schemaVersion': 1, 'target': TARGET, 'proxyConfigured': True,
+            'legacyConfigPreserved': True, 'serviceRestarted': False, 'publicRouteVerified': False}
 
 
 def api_request(method, path, key, body=None, idempotency=None):
@@ -307,6 +420,8 @@ def main():
     try:
         if os.geteuid() != 0 or socket.gethostname().split('.')[0] != 'vmi3617957':
             raise ValueError('sandbox3_prepare_operator_target_invalid')
+        if sys.argv[1:] == ['--configure-proxy']:
+            print(json.dumps(configure_proxy())); return 0
         if sys.argv[1:] == ['--proxy-inspect']:
             print(json.dumps(proxy_inspect())); return 0
         if sys.argv[1:] == ['--mock-probe']:

@@ -135,9 +135,81 @@ class ProxyGrammarTests(unittest.TestCase):
         valid = "# server { listen 443 ssl; }\nserver { listen 443 ssl; server_name '169-58-15-230.sslip.io'; add_header X-Test \"text with } # {\"; location /runner-mcp-test { proxy_pass http://127.0.0.1:18882; } }"
         self.assertEqual(len(prepare.nginx_route_targets(self.dump(valid))), 1)
         for invalid in ['server {', 'server { add_header X \"unfinished; }', 'server { listen 443 }']:
-            with self.assertRaisesRegex(ValueError, 'sandbox3_proxy_config_unsupported'):
+            with self.assertRaisesRegex(ValueError, 'sandbox3_proxy_'):
                 prepare.nginx_route_targets(self.dump(invalid))
 
     def test_quoted_unknown_escape_cannot_forge_exact_hostname(self):
         config = r"server { listen 443 ssl; server_name '169\-58-15-230.sslip.io'; location /runner-mcp-test { proxy_pass http://127.0.0.1:18882; } }"
         self.assertEqual(prepare.nginx_route_targets(self.dump(config)), [])
+
+
+class ProxyUpdateTests(unittest.TestCase):
+    CONFIG = "server { listen 443 ssl; server_name 169-58-15-230.sslip.io; location /runner-mcp-test/ { proxy_pass http://127.0.0.1:18882/; } }\nserver { listen 80; server_name other.invalid; return 404; }\n"
+    def dump(self, text):
+        return '# configuration file /etc/nginx/sites-enabled/runner:\n' + text + '\n'
+
+    def test_one_insertion_preserves_all_original_routes_and_bytes(self):
+        path, updated = prepare.proxy_update(self.dump(self.CONFIG), self.CONFIG)
+        self.assertEqual(path, '/etc/nginx/sites-enabled/runner')
+        self.assertEqual(updated.replace(prepare.PROXY_BLOCK, '', 1), self.CONFIG)
+        self.assertIn('proxy_pass http://127.0.0.1:18883/;', updated)
+        self.assertEqual(len(prepare.nginx_nodes(updated)), 2)
+
+    def test_conflict_ambiguity_changed_source_and_lookalike_route_refuse(self):
+        for dump, original in [(self.dump(self.CONFIG * 2), self.CONFIG * 2),
+                               (self.dump(self.CONFIG), self.CONFIG + '# changed'),
+                               (self.dump(self.CONFIG.replace('/runner-mcp-test/', '/runner-mcp-test-foreign/')), self.CONFIG.replace('/runner-mcp-test/', '/runner-mcp-test-foreign/')),
+                               (self.dump(self.CONFIG + '# /runner-sandbox3'), self.CONFIG + '# /runner-sandbox3')]:
+            with self.assertRaisesRegex(ValueError, 'sandbox3_proxy_'):
+                prepare.proxy_update(dump, original)
+
+    def test_atomic_write_preserves_mode_and_replaces_only_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'nginx.conf'; path.write_text(self.CONFIG); path.chmod(0o600)
+            other = Path(directory) / 'other'; other.write_text('unchanged')
+            metadata = path.stat()
+            prepare.atomic_proxy_config(path, 'updated', metadata)
+            self.assertEqual(path.read_text(), 'updated')
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(other.read_text(), 'unchanged')
+            self.assertEqual(sorted(p.name for p in path.parent.iterdir()), ['nginx.conf', 'other'])
+
+    def test_failed_validation_restores_exact_original_before_reload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'nginx.conf'; path.write_text(self.CONFIG)
+            process = lambda code: type('Process', (), {'returncode': code})()
+            with patch.object(prepare.subprocess, 'run', side_effect=[process(1), process(0), process(0)]) as run:
+                with self.assertRaisesRegex(ValueError, 'sandbox3_proxy_validation_failed'):
+                    prepare.apply_proxy_config(path, self.CONFIG, 'server { listen 80; }', path.stat())
+            self.assertEqual(path.read_text(), self.CONFIG)
+            self.assertEqual(run.call_args_list[0].args[0], ['nginx', '-t'])
+            self.assertEqual(run.call_args_list[-1].args[0], ['systemctl', 'reload', 'nginx.service'])
+
+    def test_rollback_never_overwrites_another_operator_change(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'nginx.conf'; path.write_text(self.CONFIG)
+            def changed(*args, **kwargs):
+                path.write_text('another-operator-content')
+                return type('Process', (), {'returncode': 1})()
+            with patch.object(prepare.subprocess, 'run', side_effect=changed):
+                with self.assertRaisesRegex(ValueError, 'sandbox3_proxy_rollback_conflict'):
+                    prepare.apply_proxy_config(path, self.CONFIG, 'server { listen 80; }', path.stat())
+            self.assertEqual(path.read_text(), 'another-operator-content')
+
+
+class ProxyRealisticLexingTests(unittest.TestCase):
+    def test_common_regex_and_braced_variables_preserve_server_scope(self):
+        config = r"""# configuration file /etc/nginx/nginx.conf:
+http { log_format main '$remote_addr - ${status}'; include /etc/nginx/sites-enabled/*; }
+# configuration file /etc/nginx/sites-enabled/runner:
+server { listen 443 ssl; server_name 169-58-15-230.sslip.io;
+location ~ /\.ht { deny all; }
+location /runner-mcp-test/ { proxy_pass http://127.0.0.1:18882/; proxy_set_header Host ${host}; }
+} """
+        self.assertEqual(len(prepare.nginx_route_targets(config)), 1)
+        tokens = prepare.nginx_tokens(r'location ~ /\.ht { return 403; }')
+        self.assertIn(r'/\.ht', [token[0] for token in tokens])
+        self.assertIn('${host}', [token[0] for token in prepare.nginx_tokens('proxy_set_header Host ${host};')])
+        for invalid in ['listen 443' + chr(92), 'proxy_set_header Host ${host;', 'server { listen 443 }']:
+            with self.assertRaisesRegex(ValueError, 'sandbox3_proxy_'):
+                prepare.nginx_nodes(invalid)
