@@ -137,3 +137,7 @@ class ProxyGrammarTests(unittest.TestCase):
         for invalid in ['server {', 'server { add_header X \"unfinished; }', 'server { listen 443 }']:
             with self.assertRaisesRegex(ValueError, 'sandbox3_proxy_config_unsupported'):
                 prepare.nginx_route_targets(self.dump(invalid))
+
+    def test_quoted_unknown_escape_cannot_forge_exact_hostname(self):
+        config = r"server { listen 443 ssl; server_name '169\-58-15-230.sslip.io'; location /runner-mcp-test { proxy_pass http://127.0.0.1:18882; } }"
+        self.assertEqual(prepare.nginx_route_targets(self.dump(config)), [])

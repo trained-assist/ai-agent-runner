@@ -168,6 +168,9 @@ def nginx_tokens(text):
                 if text[index] == '\\':
                     index += 1
                     if index >= len(text): raise ValueError('sandbox3_proxy_config_unsupported')
+                    escaped = text[index]
+                    value += {'t': '\t', 'r': '\r', 'n': '\n', '\\': '\\', '"': '"', "'": "'"}.get(escaped, '\\' + escaped)
+                    index += 1; continue
                 value += text[index]; index += 1
             if index >= len(text): raise ValueError('sandbox3_proxy_config_unsupported')
             index += 1; tokens.append((value, start, index)); continue
@@ -230,6 +233,7 @@ def proxy_inspect():
     if result.returncode != 0:
         raise ValueError('sandbox3_proxy_config_unavailable')
     text = result.stdout
+    if len(text.encode('utf-8')) > 2 * 1024 * 1024: raise ValueError('sandbox3_proxy_config_too_large')
     targets = nginx_route_targets(text)
     host = bool(re.search(r'server_name\s+[^;]*\b169-58-15-230\.sslip\.io\b', text))
     tls = bool(re.search(r'listen\s+[^;]*443[^;]*ssl', text))
