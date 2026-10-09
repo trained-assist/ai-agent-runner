@@ -16,3 +16,5 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
+      - name: Read-only sandbox API inventory regressions
+        run: python3 -m unittest discover -s test -p 'test_sandbox_api_inventory.py'
