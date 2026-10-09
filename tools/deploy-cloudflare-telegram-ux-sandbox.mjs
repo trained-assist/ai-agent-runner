@@ -57,7 +57,7 @@ async function verifyFranceWorker(url, token) {
 }
 
 function putSecret(name, value) {
-  const result = spawnSync('npx', ['wrangler', 'secret', 'put', name, '--config', CONFIG, '--env', ''], {
+  const result = spawnSync('npx', ['wrangler', 'secret', 'put', name, '--config', CONFIG], {
     input: `${value}\n`, encoding: 'utf8', maxBuffer: 1024 * 1024,
   });
   if (result.error || result.status !== 0) throw new Error(`runner_sandbox_secret_sync_failed:${name}`);
