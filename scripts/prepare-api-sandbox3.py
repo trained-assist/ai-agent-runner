@@ -168,17 +168,31 @@ def nginx_tokens(text):
             while index < len(text) and text[index] != quote:
                 if text[index] == '\\':
                     index += 1
-                    if index >= len(text): raise ValueError('sandbox3_proxy_config_unsupported')
+                    if index >= len(text): raise ValueError('sandbox3_proxy_quote_incomplete')
                     escaped = text[index]
                     value += {'t': '\t', 'r': '\r', 'n': '\n', '\\': '\\', '"': '"', "'": "'"}.get(escaped, '\\' + escaped)
                     index += 1; continue
                 value += text[index]; index += 1
-            if index >= len(text): raise ValueError('sandbox3_proxy_config_unsupported')
+            if index >= len(text): raise ValueError('sandbox3_proxy_quote_incomplete')
             index += 1; tokens.append((value, start, index)); continue
-        while index < len(text) and not text[index].isspace() and text[index] not in ';{}':
-            if text[index] in "\"'\\": raise ValueError('sandbox3_proxy_config_unsupported')
-            index += 1
-        tokens.append((text[start:index], start, index))
+        value = ''; variable = False
+        while index < len(text) and not text[index].isspace():
+            char = text[index]
+            if char == '\\':
+                index += 1
+                if index >= len(text): raise ValueError('sandbox3_proxy_token_escape_incomplete')
+                escaped = text[index]
+                value += {'t': '\t', 'r': '\r', 'n': '\n', '\\': '\\', '"': '"', "'": "'"}.get(escaped, '\\' + escaped)
+                index += 1; continue
+            if char == '{' and value.endswith('$'):
+                variable = True
+            elif char == '}' and variable:
+                variable = False
+            elif char in ';{}':
+                break
+            value += char; index += 1
+        if variable: raise ValueError('sandbox3_proxy_variable_incomplete')
+        tokens.append((value, start, index))
     return tokens
 
 
@@ -189,10 +203,10 @@ def nginx_nodes(text):
         while index < len(tokens):
             value, begin, end = tokens[index]; index += 1
             if value == '}':
-                if not nested or words: raise ValueError('sandbox3_proxy_config_unsupported')
+                if not nested or words: raise ValueError('sandbox3_proxy_block_end_unexpected')
                 return nodes, index, end
             if value in (';', '{'):
-                if not words: raise ValueError('sandbox3_proxy_config_unsupported')
+                if not words: raise ValueError('sandbox3_proxy_directive_missing')
                 children = None
                 if value == '{': children, index, end = parse(index, True)
                 nodes.append({'name': words[0], 'args': words[1:], 'start': start, 'end': end, 'children': children})
@@ -200,7 +214,7 @@ def nginx_nodes(text):
             else:
                 if start is None: start = begin
                 words.append(value)
-        if nested or words: raise ValueError('sandbox3_proxy_config_unsupported')
+        if nested or words: raise ValueError('sandbox3_proxy_directive_incomplete')
         return nodes, index, len(text)
     return parse(0)[0]
 
@@ -208,7 +222,7 @@ def nginx_nodes(text):
 def nginx_route_targets(text):
     # nginx -T emits exact source boundaries. Raw content stays in memory.
     sources = re.split(r'^# configuration file ([^\n:]+):\n', text, flags=re.M)
-    if len(sources) < 3 or len(sources) > 401: raise ValueError('sandbox3_proxy_config_unsupported')
+    if len(sources) < 3 or len(sources) > 401: raise ValueError('sandbox3_proxy_source_boundaries_invalid')
     targets = []
     for index in range(1, len(sources), 2):
         path, content = sources[index:index + 2]

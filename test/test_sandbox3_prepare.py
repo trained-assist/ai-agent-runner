@@ -135,7 +135,7 @@ class ProxyGrammarTests(unittest.TestCase):
         valid = "# server { listen 443 ssl; }\nserver { listen 443 ssl; server_name '169-58-15-230.sslip.io'; add_header X-Test \"text with } # {\"; location /runner-mcp-test { proxy_pass http://127.0.0.1:18882; } }"
         self.assertEqual(len(prepare.nginx_route_targets(self.dump(valid))), 1)
         for invalid in ['server {', 'server { add_header X \"unfinished; }', 'server { listen 443 }']:
-            with self.assertRaisesRegex(ValueError, 'sandbox3_proxy_config_unsupported'):
+            with self.assertRaisesRegex(ValueError, 'sandbox3_proxy_'):
                 prepare.nginx_route_targets(self.dump(invalid))
 
     def test_quoted_unknown_escape_cannot_forge_exact_hostname(self):
@@ -195,3 +195,21 @@ class ProxyUpdateTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'sandbox3_proxy_rollback_conflict'):
                     prepare.apply_proxy_config(path, self.CONFIG, 'server { listen 80; }', path.stat())
             self.assertEqual(path.read_text(), 'another-operator-content')
+
+
+class ProxyRealisticLexingTests(unittest.TestCase):
+    def test_common_regex_and_braced_variables_preserve_server_scope(self):
+        config = r"""# configuration file /etc/nginx/nginx.conf:
+http { log_format main '$remote_addr - ${status}'; include /etc/nginx/sites-enabled/*; }
+# configuration file /etc/nginx/sites-enabled/runner:
+server { listen 443 ssl; server_name 169-58-15-230.sslip.io;
+location ~ /\.ht { deny all; }
+location /runner-mcp-test/ { proxy_pass http://127.0.0.1:18882/; proxy_set_header Host ${host}; }
+} """
+        self.assertEqual(len(prepare.nginx_route_targets(config)), 1)
+        tokens = prepare.nginx_tokens(r'location ~ /\.ht { return 403; }')
+        self.assertIn(r'/\.ht', [token[0] for token in tokens])
+        self.assertIn('${host}', [token[0] for token in prepare.nginx_tokens('proxy_set_header Host ${host};')])
+        for invalid in ['listen 443' + chr(92), 'proxy_set_header Host ${host;', 'server { listen 443 }']:
+            with self.assertRaisesRegex(ValueError, 'sandbox3_proxy_'):
+                prepare.nginx_nodes(invalid)
