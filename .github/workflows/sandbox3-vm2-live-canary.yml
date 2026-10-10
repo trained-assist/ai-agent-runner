@@ -1,0 +1,23 @@
+name: Sandbox3 VM2 live canary
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  live-canary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: sandbox
+    env:
+      RUNNER_API_URL: https://trained-assist-runner-api-sandbox3.skillset-apply.workers.dev
+      RUNNER_API_KEY_AGENT_API: ${{ secrets.RUNNER_API_KEY_AGENT_API }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Submit and verify a read-only VM2 task
+        run: node scripts/sandbox3-vm2-live-canary.mjs
