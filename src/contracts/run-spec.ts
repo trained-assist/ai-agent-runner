@@ -108,6 +108,13 @@ export interface BudgetSpec {
   correlationRef: string;
   approved: boolean;
   reason?: string;
+  enforcement?: {
+    provider: string;
+    policyId: string;
+    maxInputTokens: number;
+    maxOutputTokens: number;
+    maxTotalTokens: number;
+  };
 }
 
 export interface RegionConstraints {
@@ -598,7 +605,7 @@ function validateMcp(value: unknown, path: string, collector: ErrorCollector): M
 
 function validateBudget(value: unknown, path: string, collector: ErrorCollector): BudgetSpec | undefined {
   if (!checkObject(value, path, collector)) return undefined;
-  checkKeys(value, ['correlationRef', 'approved', 'reason'], ['correlationRef', 'approved'], path, collector);
+  checkKeys(value, ['correlationRef', 'approved', 'reason', 'enforcement'], ['correlationRef', 'approved'], path, collector);
   const budget: BudgetSpec = { correlationRef: '', approved: false };
   checkString(value['correlationRef'], `${path}.correlationRef`, collector, 300);
   if (typeof value['correlationRef'] === 'string') budget.correlationRef = value['correlationRef'];
@@ -607,6 +614,29 @@ function validateBudget(value: unknown, path: string, collector: ErrorCollector)
   if (value['reason'] !== undefined) {
     checkString(value['reason'], `${path}.reason`, collector, 300);
     if (typeof value['reason'] === 'string') budget.reason = value['reason'];
+  }
+  if (value['enforcement'] !== undefined) {
+    const enforcement = value['enforcement'];
+    if (checkObject(enforcement, `${path}.enforcement`, collector)) {
+      checkKeys(enforcement, ['provider', 'policyId', 'maxInputTokens', 'maxOutputTokens', 'maxTotalTokens'], ['provider', 'policyId', 'maxInputTokens', 'maxOutputTokens', 'maxTotalTokens'], `${path}.enforcement`, collector);
+      checkString(enforcement['provider'], `${path}.enforcement.provider`, collector, 100);
+      checkString(enforcement['policyId'], `${path}.enforcement.policyId`, collector, 200);
+      checkPositiveInt(enforcement['maxInputTokens'], `${path}.enforcement.maxInputTokens`, collector);
+      checkPositiveInt(enforcement['maxOutputTokens'], `${path}.enforcement.maxOutputTokens`, collector);
+      checkPositiveInt(enforcement['maxTotalTokens'], `${path}.enforcement.maxTotalTokens`, collector);
+      if (typeof enforcement['maxTotalTokens'] === 'number' && enforcement['maxTotalTokens'] < Math.max(Number(enforcement['maxInputTokens']), Number(enforcement['maxOutputTokens']))) {
+        collector.push(`${path}.enforcement.maxTotalTokens: must be at least each per-call limit`);
+      }
+      if (typeof enforcement['provider'] === 'string' && typeof enforcement['policyId'] === 'string' && Number.isSafeInteger(enforcement['maxInputTokens']) && Number.isSafeInteger(enforcement['maxOutputTokens']) && Number.isSafeInteger(enforcement['maxTotalTokens'])) {
+        budget.enforcement = {
+          provider: enforcement['provider'],
+          policyId: enforcement['policyId'],
+          maxInputTokens: enforcement['maxInputTokens'] as number,
+          maxOutputTokens: enforcement['maxOutputTokens'] as number,
+          maxTotalTokens: enforcement['maxTotalTokens'] as number,
+        };
+      }
+    }
   }
   return budget;
 }

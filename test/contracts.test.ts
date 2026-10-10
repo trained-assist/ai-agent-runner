@@ -162,6 +162,23 @@ describe('validateRunSpec', () => {
     expect(result.ok).toBe(true);
   });
 
+  it('preserves the host budget enforcement policy through RunSpec validation', () => {
+    const enforcement = { provider: 'test-provider', policyId: 'sandbox-v1', maxInputTokens: 12000, maxOutputTokens: 2000, maxTotalTokens: 20000 };
+    const result = validateRunSpec(validSpec({ budget: { correlationRef: 'budget-1', approved: true, enforcement } }));
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.value.budget?.enforcement).toEqual(enforcement);
+  });
+
+  it.each([
+    { provider: 'test-provider', policyId: 'sandbox-v1', maxInputTokens: 0, maxOutputTokens: 2000, maxTotalTokens: 12000 },
+    { provider: 'test-provider', policyId: 'sandbox-v1', maxInputTokens: 100, maxOutputTokens: -1, maxTotalTokens: 500 },
+    { provider: 'test-provider', policyId: 'sandbox-v1', maxInputTokens: 100, maxOutputTokens: 1.5, maxTotalTokens: 200 },
+    { provider: 'test-provider', policyId: 'sandbox-v1', maxInputTokens: 100, maxOutputTokens: 2000, maxTotalTokens: 2000, callerOverride: true },
+    { provider: 'test-provider', policyId: 'sandbox-v1', maxInputTokens: 12000, maxOutputTokens: 2000, maxTotalTokens: 10000 },
+  ])('rejects malformed or caller-extended budget enforcement policy', (enforcement) => {
+    expect(validateRunSpec(validSpec({ budget: { correlationRef: 'budget-1', approved: true, enforcement } })).ok).toBe(false);
+  });
+
   it('accepts full groups from ARCHITECTURE §5', () => {
     const result = validateRunSpec(
       validSpec({

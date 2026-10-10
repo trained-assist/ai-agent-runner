@@ -1169,6 +1169,12 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
 
   private preflight(st: PersistedRunState): void {
     const spec = st.spec;
+    if (spec.budget && !spec.budget.approved) {
+      throw new PreflightError('BUDGET_UNAVAILABLE', spec.budget.reason ?? 'no approved budget for this run', { retryable: true });
+    }
+    if (spec.engine.name === 'opencode' && spec.budget?.enforcement) {
+      throw new PreflightError('BUDGET_UNAVAILABLE', 'OpenCode adapter cannot enforce the declared per-request token policy', { retryable: true });
+    }
     if (spec.profileWorkspace && !this.opts.profileWorkspace) {
       throw new PreflightError('WORKER_PROFILE_WORKSPACE_UNSUPPORTED', 'this Runner has no profile workspace checkout/publication lifecycle');
     }
@@ -1180,9 +1186,6 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
     }
     if (spec.profileWorkspace && !spec.profileWorkspace.savebackUrl && !spec.repository?.token) {
       throw new PreflightError('CREDENTIALS_UNAVAILABLE', 'legacy profile workspace requires a publication token');
-    }
-    if (spec.budget && !spec.budget.approved) {
-      throw new PreflightError('BUDGET_UNAVAILABLE', spec.budget.reason ?? 'no approved budget for this run', { retryable: true });
     }
     // Ран, запросивший границу, на хосте без провайдера отказывается: запуск под
     // service UID был бы расширением прав относительно запроса.
