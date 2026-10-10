@@ -19,4 +19,8 @@ const result = spawnSync('npx', [
   '--config', 'wrangler.sandbox3.jsonc',
 ], { input: JSON.stringify(records), encoding: 'utf8', stdio: ['pipe', 'ignore', 'pipe'] });
 if (result.error || result.status !== 0) throw new Error('failed to provision the additive sandbox3 canary principal');
-console.log('Provisioned the sandbox3 live canary principal without changing the protected base registry.');
+const deploy = spawnSync('npx', ['wrangler', 'deploy', '--config', 'wrangler.sandbox3.jsonc'], {
+  encoding: 'utf8', stdio: ['ignore', 'ignore', 'pipe'],
+});
+if (deploy.error || deploy.status !== 0) throw new Error('failed to deploy the sandbox3 Worker with additive registry support');
+console.log('Provisioned the additive sandbox3 canary principal and deployed the reviewed sandbox Worker without changing its base registry.');
