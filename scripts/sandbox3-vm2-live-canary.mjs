@@ -26,28 +26,64 @@ async function request(path, options = {}) {
   return body;
 }
 
+async function expectStatus(path, expectedStatus, options = {}) {
+  const response = await fetch(new URL(path, apiUrl), {
+    ...options,
+    headers: {
+      accept: 'application/json',
+      ...(options.body ? { 'content-type': 'application/json' } : {}),
+      ...options.headers,
+    },
+    signal: AbortSignal.timeout(20_000),
+  });
+  if (response.status !== expectedStatus) {
+    await response.body?.cancel();
+    throw new Error(`${path} returned HTTP ${response.status}; expected ${expectedStatus}`);
+  }
+  await response.body?.cancel();
+}
+
+await expectStatus('/v1/capabilities', 401);
+console.log('unauthenticated capabilities rejected');
+
 const capabilities = await request('/v1/capabilities');
 if (!capabilities.executionRegions?.includes('eu-vm-agent-run')) {
   throw new Error('sandbox3 API does not advertise the EU VM worker');
 }
 console.log('authenticated capabilities: EU VM worker advertised');
 
-const submitted = await request('/v1/runs', {
+const idempotencyKey = `sandbox3-vm2-${runId}`;
+const launchPayload = {
+  userTaskId: idempotencyKey,
+  engine: { name: 'eu-vm-agent-run', adapterVersion: '1' },
+  input: { inlinePrompt: 'Read package.json and report its name and version as one JSON object. Do not edit any files.' },
+  envAllowlist: ['LLM_LADDER_TOKEN'],
+  limits: { timeoutMs: 120_000, maxOutputBytes: 100_000, maxLogBytes: 200_000 },
+  repository: { fullName: 'trained-assist/ai-agent-runner', token: repositoryToken },
+};
+const launchOptions = {
   method: 'POST',
-  headers: { 'idempotency-key': `sandbox3-vm2-${runId}` },
-  body: JSON.stringify({
-    userTaskId: `sandbox3-vm2-${runId}`,
-    engine: { name: 'eu-vm-agent-run', adapterVersion: '1' },
-    input: { inlinePrompt: 'Read package.json and report its name and version as one JSON object. Do not edit any files.' },
-    envAllowlist: ['LLM_LADDER_TOKEN'],
-    limits: { timeoutMs: 120_000, maxOutputBytes: 100_000, maxLogBytes: 200_000 },
-    repository: { fullName: 'trained-assist/ai-agent-runner', token: repositoryToken },
-  }),
-});
+  headers: { 'idempotency-key': idempotencyKey },
+  body: JSON.stringify(launchPayload),
+};
+const submitted = await request('/v1/runs', launchOptions);
 if (typeof submitted.runId !== 'string' || !submitted.runId.startsWith('run_')) {
   throw new Error('sandbox3 API returned no valid run receipt');
 }
 console.log(`run accepted: ${submitted.runId}`);
+
+const repeated = await request('/v1/runs', launchOptions);
+if (repeated.runId !== submitted.runId) {
+  throw new Error('repeated idempotent submission returned a different run receipt');
+}
+console.log('idempotent retry returned the original run receipt');
+
+await expectStatus('/v1/runs', 409, {
+  method: 'POST',
+  headers: { authorization: `Bearer ${apiKey}`, 'idempotency-key': idempotencyKey },
+  body: JSON.stringify({ ...launchPayload, input: { inlinePrompt: 'Different payload under the same idempotency key.' } }),
+});
+console.log('conflicting idempotency-key reuse rejected');
 
 const terminal = new Set(['succeeded', 'failed', 'cancelled', 'timed_out']);
 let status;
