@@ -1,8 +1,9 @@
 const apiUrl = process.env.RUNNER_API_URL;
 const apiKey = process.env.RUNNER_API_KEY_AGENT_API;
 const runId = process.env.GITHUB_RUN_ID;
+const repositoryToken = process.env.GITHUB_TOKEN;
 
-if (!apiUrl || !apiKey || !runId) throw new Error('sandbox3 canary environment is incomplete');
+if (!apiUrl || !apiKey || !runId || !repositoryToken) throw new Error('sandbox3 canary environment is incomplete');
 
 async function request(path, options = {}) {
   const response = await fetch(new URL(path, apiUrl), {
@@ -37,7 +38,7 @@ const submitted = await request('/v1/runs', {
     input: { inlinePrompt: 'Read package.json and report its name and version as one JSON object. Do not edit any files.' },
     envAllowlist: ['LLM_LADDER_TOKEN'],
     limits: { timeoutMs: 120_000, maxOutputBytes: 100_000, maxLogBytes: 200_000 },
-    repository: { fullName: 'trained-assist/ai-agent-runner' },
+    repository: { fullName: 'trained-assist/ai-agent-runner', token: repositoryToken },
   }),
 });
 if (typeof submitted.runId !== 'string' || !submitted.runId.startsWith('run_')) {
@@ -58,6 +59,6 @@ if (!status || !terminal.has(status.state)) throw new Error('sandbox3 VM run did
 
 const result = await request(`/v1/runs/${encodeURIComponent(submitted.runId)}/result`);
 if (result.outcome !== 'succeeded' || !String(result.text ?? '').includes('0.3.4')) {
-  throw new Error(`sandbox3 VM run failed acceptance: ${JSON.stringify({ outcome: result.outcome, exitCode: result.exitCode, text: result.text })}`);
+  throw new Error(`sandbox3 VM run failed acceptance: ${JSON.stringify({ outcome: result.outcome, exitCode: result.exitCode })}`);
 }
 console.log('sandbox3 VM2 end-to-end canary succeeded; package version 0.3.4 confirmed');

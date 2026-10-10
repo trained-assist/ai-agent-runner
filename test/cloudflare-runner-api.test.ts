@@ -41,6 +41,23 @@ describe('Cloudflare Runner API Worker', () => {
     expect(get).not.toHaveBeenCalled();
   });
 
+  it('accepts principals from the additive registry while preserving the base registry', async () => {
+    const baseKey = 'base-registry-key';
+    const additionalKey = 'additional-registry-key';
+    const idFromName = vi.fn((name) => name);
+    const coordinatorFetch = vi.fn(async () => Response.json({ ok: true }));
+    const env = {
+      RUNNER_API_KEYS: JSON.stringify([{ keyHash: await sha256(baseKey), principalId: 'base', profileId: 'base-profile', repository: 'team/base', scopes: ['runs:read'] }]),
+      RUNNER_API_KEYS_ADDITIONAL: JSON.stringify([{ keyHash: await sha256(additionalKey), principalId: 'additional', profileId: 'additional-profile', repository: 'team/additional', scopes: ['runs:read'] }]),
+      RUNNER_RUNS: { idFromName, get: vi.fn().mockReturnValue({ fetch: coordinatorFetch }) },
+    } as unknown as RunnerWorkerEnv;
+
+    const baseResponse = await runnerApi.fetch(new Request('https://api.example/v1/capabilities', { headers: { authorization: `Bearer ${baseKey}` } }), env);
+    const additionalResponse = await runnerApi.fetch(new Request('https://api.example/v1/capabilities', { headers: { authorization: `Bearer ${additionalKey}` } }), env);
+    expect(baseResponse.status).toBe(200);
+    expect(additionalResponse.status).toBe(200);
+  });
+
   it('rejects a real execution principal without a trusted repository binding', async () => {
     const get = vi.fn();
     const env = {

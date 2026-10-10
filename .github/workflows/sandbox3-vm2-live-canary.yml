@@ -14,10 +14,18 @@ jobs:
     env:
       RUNNER_API_URL: https://trained-assist-runner-api-sandbox3.skillset-apply.workers.dev
       RUNNER_API_KEY_AGENT_API: ${{ secrets.RUNNER_API_KEY_AGENT_API }}
+      GITHUB_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+      - name: Install deployment tooling
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Provision an additive sandbox-only API principal
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          RUNNER_API_KEY_AGENT_API: ${{ secrets.RUNNER_API_KEY_AGENT_API }}
+        run: node scripts/provision-sandbox3-vm2-principal.mjs
       - name: Submit and verify a read-only VM2 task
         run: node scripts/sandbox3-vm2-live-canary.mjs
