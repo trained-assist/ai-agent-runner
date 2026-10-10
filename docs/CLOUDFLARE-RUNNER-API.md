@@ -25,6 +25,14 @@ the complete Control Plane/Telegram user workflow or production readiness.
 The separate Telegram UX Runner Worker has not been deployed, and the outstanding acceptance
 gaps below remain.
 
+The canonical CP→France VM fixture-tool probe currently fails at the VM launch boundary:
+CP resolves the pinned Registry binding and Runner API attaches it, but the VM HTTP adapter
+previously dropped `mcp` and `mcpSecrets` before OpenCode started. A narrow fix is in review
+preparation: the VM will accept only the pinned `integration-telegram-ux-v1` fixture binding,
+pass its bearer/proof through memory-only runtime variables, and reject caller-selected MCP
+endpoints. This remains unverified live until a signed sandbox VM-worker release is installed
+and the same CP fixture request returns `registry-fixture-marker-160-v1`.
+
 ## Runtime boundary
 
 The Control Plane sends authenticated HTTPS requests to its configured Cloudflare Runner API

@@ -86,6 +86,45 @@ describe('installable VM HTTP worker', () => {
     expect(fixture.runner.startCalls).toHaveLength(0);
   });
 
+  it('passes only the pinned test Registry MCP to OpenCode using memory-only secrets and config', async () => {
+    const fixture = await startFixture({ allowedEnvironmentNames: ['LLM_LADDER_TOKEN'] });
+    cleanups.push(fixture.close);
+    const request = launchRequest({
+      profileId: 'integration-telegram-ux-v1',
+      mcp: { servers: { 'trained-assist-registry-test': {
+        type: 'remote', url: 'https://trained-assist-mcp-host-test-160.skillset-apply.workers.dev/mcp', enabled: true,
+        headers: {
+          Authorization: 'Bearer {env:RUNNER_MCP_REGISTRY_TEST}',
+          'X-MCP-Operation': 'invocation', 'X-MCP-Scope': 'registry:fixture-read',
+          'X-MCP-User-Task-Id': 'task-vm-worker-test', 'X-MCP-Profile': 'integration-telegram-ux-v1',
+          'X-MCP-Run-Id': RUN_ID, 'X-MCP-Run-Binding': '{env:RUNNER_MCP_REGISTRY_TEST_PROOF}',
+        },
+      } } },
+      mcpSecrets: { RUNNER_MCP_REGISTRY_TEST: 'test-registry-bearer-token-123', RUNNER_MCP_REGISTRY_TEST_PROOF: 'signed-run-bound-proof-123456' },
+    });
+    const accepted = await launch(fixture.base, request);
+    expect(accepted.status, await accepted.clone().text()).toBe(202);
+    const { spec, runtimeEnv } = fixture.runner.startCalls[0]!;
+    expect(spec.envAllowlist).toContain('OPENCODE_CONFIG_CONTENT');
+    expect(runtimeEnv.RUNNER_MCP_REGISTRY_TEST).toBe('test-registry-bearer-token-123');
+    expect(runtimeEnv.RUNNER_MCP_REGISTRY_TEST_PROOF).toBe('signed-run-bound-proof-123456');
+    const config = JSON.parse(runtimeEnv.OPENCODE_CONFIG_CONTENT!) as { mcp: Record<string, { url: string; headers: Record<string, string> }> };
+    expect(config.mcp['trained-assist-registry-test']!.url).toBe('https://trained-assist-mcp-host-test-160.skillset-apply.workers.dev/mcp');
+    expect(config.mcp['trained-assist-registry-test']!.headers.Authorization).toBe('Bearer {env:RUNNER_MCP_REGISTRY_TEST}');
+    expect(JSON.stringify(spec)).not.toContain('test-registry-bearer-token-123');
+    expect(JSON.stringify(spec)).not.toContain('signed-run-bound-proof-123456');
+  });
+
+  it('rejects caller-selected MCP endpoints before Runner admission', async () => {
+    const fixture = await startFixture();
+    cleanups.push(fixture.close);
+    const response = await launch(fixture.base, launchRequest({ mcp: { servers: { attacker: {
+      type: 'remote', url: 'https://attacker.example/mcp', enabled: true, headers: {},
+    } } }, mcpSecrets: { token: 'attacker-selected-token-12345' } }));
+    expect(response.status).toBe(400);
+    expect(fixture.runner.startCalls).toHaveLength(0);
+  });
+
   it('accepts run-bound callbacks behind a trusted API path prefix and rejects path or run mismatches', async () => {
     const fixture = await startFixture({ profileWorkspaceEnabled: true, profileSavebackEnabled: true });
     cleanups.push(fixture.close);
@@ -229,7 +268,7 @@ async function launch(base: string, request: LaunchRequest): Promise<Response> {
   return fetch(`${base}/v1/launch`, { method: 'POST', headers: { ...authHeaders(), 'content-type': 'application/json' }, body: JSON.stringify(request) });
 }
 
-async function startFixture(input: { engineName?: string; cpuPercent?: number; bindingsInventory?: VmWorkerBindingsInventory; profileWorkspaceEnabled?: boolean; profileSavebackEnabled?: boolean } = {}): Promise<{
+async function startFixture(input: { engineName?: string; cpuPercent?: number; bindingsInventory?: VmWorkerBindingsInventory; profileWorkspaceEnabled?: boolean; profileSavebackEnabled?: boolean; allowedEnvironmentNames?: string[] } = {}): Promise<{
   base: string;
   dataDir: string;
   runner: FakeRunner;
@@ -254,7 +293,7 @@ async function startFixture(input: { engineName?: string; cpuPercent?: number; b
     token: TOKEN,
     dataDir,
     allowedRepositories: ['trained-assist/ai-agent-runner'],
-    allowedEnvironmentNames: ['LLM_LADDER_TOKEN'],
+    allowedEnvironmentNames: input.allowedEnvironmentNames ?? ['LLM_LADDER_TOKEN'],
     allowedCallbackOrigins: [API_ORIGIN],
     envelope: { cpuPercent: 10, memoryPercent: 10 },
     buildInfo: { schemaVersion: 1, version: '0.1.0-test', sourceCommit: 'a'.repeat(40), builtAt: new Date().toISOString() },

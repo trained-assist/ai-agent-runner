@@ -55,6 +55,17 @@ new process is not ready. `ai-agent-vm-worker.service` owns the long-running wor
 configuration templates, and updater. There is currently no automatic VM rollout or
 VM self-deployment: the operator invokes the updater after reviewing a release.
 
+### Pinned Registry test MCP
+
+The France VM worker accepts remote MCP launch data only for the fixed
+`integration-telegram-ux-v1` read-only Registry fixture binding and its exact
+test URL. It rejects caller-selected MCP servers and headers. Cloudflare sends
+the scoped bearer and run-bound proof as separate per-launch secrets; the worker
+turns them into OpenCode `{env:NAME}` header references and passes values only
+through Runner's memory-only runtime environment. Secret values are not added
+to `RunSpec` or worker state. This is a test integration path, not a general
+user-configurable remote MCP feature.
+
 Before enabling a worker, detect and record the full configuration group: region and
 worker ID; `VM_WORKER_PUBLIC_URL`, `VM_WORKER_ENGINE`, `VM_WORKER_TOKEN`; bind address
 and port; CPU/RAM admission limits; GCS bucket and attached workload identity; OpenCode

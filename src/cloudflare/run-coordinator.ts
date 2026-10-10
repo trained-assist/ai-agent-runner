@@ -335,12 +335,12 @@ export class RunnerRunCoordinator {
     const proof = `${signingInput}.${base64Url(new Uint8Array(signature))}`;
     return {
       servers: { [MCP_TEST.server]: { type: 'remote', url: MCP_TEST.url, enabled: true, headers: {
-        Authorization: `Bearer ${this.env.MCP_TEST_AUTH_TOKEN}`,
+        Authorization: `Bearer {env:${MCP_TEST.tokenEnv}}`,
         'X-MCP-Operation': 'invocation', 'X-MCP-Scope': MCP_TEST.scope,
         'X-MCP-User-Task-Id': context.taskId, 'X-MCP-Profile': context.profileId,
-        'X-MCP-Run-Id': context.runId, 'X-MCP-Run-Binding': proof,
+        'X-MCP-Run-Id': context.runId, 'X-MCP-Run-Binding': '{env:RUNNER_MCP_REGISTRY_TEST_PROOF}',
       } } },
-      mcpSecrets: { [MCP_TEST.tokenEnv]: this.env.MCP_TEST_AUTH_TOKEN },
+      mcpSecrets: { [MCP_TEST.tokenEnv]: this.env.MCP_TEST_AUTH_TOKEN, RUNNER_MCP_REGISTRY_TEST_PROOF: proof },
     };
   }
 

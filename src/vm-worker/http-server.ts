@@ -13,6 +13,15 @@ import type { VmWorkerBuildInfo } from './build-info.js';
 
 const MAX_REQUEST_BYTES = 2 * 1024 * 1024;
 const WORKER_ENGINES = new Set(['eu-vm-agent-run', 'rf-vm-agent-run']);
+const TEST_MCP = Object.freeze({
+  profile: 'integration-telegram-ux-v1',
+  server: 'trained-assist-registry-test',
+  url: 'https://trained-assist-mcp-host-test-160.skillset-apply.workers.dev/mcp',
+  scope: 'registry:fixture-read',
+  tokenEnv: 'RUNNER_MCP_REGISTRY_TEST',
+  proofEnv: 'RUNNER_MCP_REGISTRY_TEST_PROOF',
+  configEnv: 'OPENCODE_CONFIG_CONTENT',
+});
 
 export interface VmWorkerServerOptions {
   runner: Runner;
@@ -104,7 +113,7 @@ export function createVmWorkerServer(options: VmWorkerServerOptions): VmWorkerSe
         sendJson(res, 501, { accepted: false, code: 'WORKER_PROFILE_WORKSPACE_UNSUPPORTED' });
         return;
       }
-      const spec = toRunSpec(request, options);
+      const { spec, runtimeEnv } = toRunSpec(request, options);
       const fingerprint = createHash('sha256').update(JSON.stringify(request)).digest('hex');
       const admission = await options.capacity.start<LaunchReceiptLike>({
         operationId: request.operationId,
@@ -113,7 +122,7 @@ export function createVmWorkerServer(options: VmWorkerServerOptions): VmWorkerSe
         requestFingerprint: fingerprint,
         envelope: options.envelope,
         start: async () => {
-          options.runner.start(spec, request.operationId, request.env);
+          options.runner.start(spec, request.operationId, runtimeEnv);
           const receipt = makeReceipt(request, options.baseUrl);
           return { receipt, processTreeExited: waitUntilTerminal(options.runner, request.runId) };
         },
@@ -175,10 +184,10 @@ function makeReceipt(request: LaunchRequest, baseUrl: string): LaunchReceiptLike
   return { runId: request.runId, operationId: request.operationId, status: 'accepted', statusUrl: `${base}${suffix}/status`, resultUrl: `${base}${suffix}/result` };
 }
 
-function toRunSpec(request: LaunchRequest, options: VmWorkerServerOptions): RunSpec {
+function toRunSpec(request: LaunchRequest, options: VmWorkerServerOptions): { spec: RunSpec; runtimeEnv: Record<string, string> } {
   const repo = request.repository.fullName;
   const token = request.profileWorkspace?.savebackUrl ? undefined : request.publicationToken ?? process.env['RUNNER_GIT_TOKEN'];
-  return {
+  const spec: RunSpec = {
     contractVersion: 1,
     jobId: request.jobId,
     runId: request.runId,
@@ -198,6 +207,27 @@ function toRunSpec(request: LaunchRequest, options: VmWorkerServerOptions): RunS
     ...(request.ingressManifest ? { ingressManifest: request.ingressManifest } : {}),
     ...(request.outputs ? { outputs: request.outputs.map((output) => ({ ...output })) } : {}),
   };
+  const runtimeEnv = { ...request.env };
+  if (request.mcp) {
+    const secretValues = request.mcpSecrets!;
+    const server = request.mcp.servers[TEST_MCP.server]!;
+    const headers = {
+      Authorization: `Bearer {env:${TEST_MCP.tokenEnv}}`,
+      'X-MCP-Operation': 'invocation',
+      'X-MCP-Scope': TEST_MCP.scope,
+      'X-MCP-User-Task-Id': request.userTaskId,
+      'X-MCP-Profile': request.profileId,
+      'X-MCP-Run-Id': request.runId,
+      'X-MCP-Run-Binding': `{env:${TEST_MCP.proofEnv}}`,
+    };
+    runtimeEnv[TEST_MCP.tokenEnv] = secretValues[TEST_MCP.tokenEnv]!;
+    runtimeEnv[TEST_MCP.proofEnv] = secretValues[TEST_MCP.proofEnv]!;
+    runtimeEnv[TEST_MCP.configEnv] = JSON.stringify({ mcp: {
+      [TEST_MCP.server]: { type: 'remote', url: server.url, enabled: true, headers },
+    } });
+    spec.envAllowlist = [...new Set([...spec.envAllowlist, TEST_MCP.tokenEnv, TEST_MCP.proofEnv, TEST_MCP.configEnv])];
+  }
+  return { spec, runtimeEnv };
 }
 
 function parseLaunchRequest(value: unknown, options: VmWorkerServerOptions): { ok: true; value: LaunchRequest } | { ok: false; errors: string[] } {
@@ -219,6 +249,7 @@ function parseLaunchRequest(value: unknown, options: VmWorkerServerOptions): { o
   else for (const [key, envValue] of Object.entries(value['env'])) {
     if (!value['envAllowlist']?.includes(key) || typeof envValue !== 'string' || envValue.length > 100_000) errors.push(`env.${key} is invalid or not allowed`);
   }
+  validateTestMcp(value, errors);
   if (!isRecord(value['repository']) || typeof value['repository']['fullName'] !== 'string' || typeof value['repository']['branch'] !== 'string') errors.push('repository is invalid');
   else if (!options.allowedRepositories.includes(value['repository']['fullName'])) errors.push('repository is not approved on this host');
   if (!isRecord(value['isolation']) || typeof value['isolation']['mode'] !== 'string') errors.push('isolation is invalid');
@@ -244,6 +275,44 @@ function parseLaunchRequest(value: unknown, options: VmWorkerServerOptions): { o
   if (value['outputs'] !== undefined && (!Array.isArray(value['outputs']) || value['outputs'].some((entry) => !isRecord(entry) || typeof entry['path'] !== 'string'))) errors.push('outputs is invalid');
   if (errors.length) return { ok: false, errors };
   return { ok: true, value: value as unknown as LaunchRequest };
+}
+
+/** The VM worker accepts only the pinned read-only test MCP; no caller-chosen endpoints or headers. */
+function validateTestMcp(value: Record<string, any>, errors: string[]): void {
+  if (value['mcp'] === undefined && value['mcpSecrets'] === undefined) return;
+  const mcp = value['mcp'];
+  const secrets = value['mcpSecrets'];
+  if (!isRecord(mcp) || !isRecord(mcp['servers']) || Object.keys(mcp['servers']).length !== 1 || !isRecord(mcp['servers'][TEST_MCP.server])) {
+    errors.push('mcp is not the pinned test registry attachment');
+    return;
+  }
+  const server = mcp['servers'][TEST_MCP.server];
+  const headers = server['headers'];
+  const expectedHeaders: Record<string, string> = {
+    Authorization: `Bearer {env:${TEST_MCP.tokenEnv}}`,
+    'X-MCP-Operation': 'invocation',
+    'X-MCP-Scope': TEST_MCP.scope,
+    'X-MCP-User-Task-Id': String(value['userTaskId']),
+    'X-MCP-Profile': String(value['profileId']),
+    'X-MCP-Run-Id': String(value['runId']),
+    'X-MCP-Run-Binding': `{env:${TEST_MCP.proofEnv}}`,
+  };
+  if (server['type'] !== 'remote' || server['url'] !== TEST_MCP.url || server['enabled'] !== true || !isRecord(headers) ||
+      Object.keys(headers).length !== Object.keys(expectedHeaders).length || Object.entries(expectedHeaders).some(([key, expected]) => headers[key] !== expected)) {
+    errors.push('mcp server does not match the pinned test registry policy');
+  }
+  if (!isRecord(secrets) || Object.keys(secrets).length !== 2 ||
+      !validOpaqueSecret(secrets[TEST_MCP.tokenEnv]) || !validOpaqueSecret(secrets[TEST_MCP.proofEnv])) {
+    errors.push('mcpSecrets must contain only the scoped test token and run proof');
+  }
+  if (isRecord(value['env']) && [TEST_MCP.tokenEnv, TEST_MCP.proofEnv, TEST_MCP.configEnv].some((name) => Object.hasOwn(value['env'], name))) {
+    errors.push('mcp runtime variables are reserved');
+  }
+  if (value['profileId'] !== TEST_MCP.profile) errors.push('test registry MCP is restricted to its pinned profile');
+}
+
+function validOpaqueSecret(value: unknown): value is string {
+  return typeof value === 'string' && value.length >= 16 && value.length <= 16_384 && !/[\u0000-\u001f\u007f]/.test(value);
 }
 
 function validCallbackUrl(raw: string, runId: string, allowedOrigins: readonly string[]): boolean {
