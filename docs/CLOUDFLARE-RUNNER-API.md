@@ -11,7 +11,17 @@ read-only OpenCode task completed end to end through Cloudflare, VM2, the model 
 the callback path. The expanded canary also verified anonymous rejection (`401`), identical
 idempotent replay returning the original receipt, conflicting payload rejection (`409`), and
 terminal `succeeded` ([workflow run 38012362767](https://github.com/trained-assist/ai-agent-runner/actions/runs/38012362767)).
-This proves one real execution canary, not the complete user workflow or production readiness.
+Three further independent `ladder/free` OpenCode canaries completed successfully and returned
+the expected `package.json` version: [38081266996](https://github.com/trained-assist/ai-agent-runner/actions/runs/38081266996),
+[38081438672](https://github.com/trained-assist/ai-agent-runner/actions/runs/38081438672), and
+[38081511542](https://github.com/trained-assist/ai-agent-runner/actions/runs/38081511542). Their
+durations were 1m49s, 35s, and 43s. A preceding canary had reached terminal `failed` with
+`exitCode: null` ([38010575593](https://github.com/trained-assist/ai-agent-runner/actions/runs/38010575593));
+the available result did not identify whether Ladder, OpenCode, or the VM caused it. A separate
+earlier `401` was an API-key provisioning failure, not a model-provider failure. The missing
+upstream diagnostic is tracked in [trained-assist-llm-ladder#231](https://github.com/trained-assist/trained-assist-llm-ladder/issues/231).
+These runs verify the direct Runner API → France VM → OpenCode/Ladder → stored result path, not
+the complete Control Plane/Telegram user workflow or production readiness.
 The separate Telegram UX Runner Worker has not been deployed, and the outstanding acceptance
 gaps below remain.
 
