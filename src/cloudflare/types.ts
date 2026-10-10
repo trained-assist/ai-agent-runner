@@ -17,6 +17,8 @@ export interface RunnerWorkerEnv {
   FETCH?: typeof fetch;
   BUILD_SHA?: string;
   RUNNER_API_KEYS: string;
+  /** Additive principals provisioned independently from the protected base registry. */
+  RUNNER_API_KEYS_ADDITIONAL?: string;
   /** HMAC secret for short-lived Control Plane profile capabilities. */
   AGENT_API_PROFILE_DELEGATION_SECRET?: string;
   VM_WORKER_URL: string;
