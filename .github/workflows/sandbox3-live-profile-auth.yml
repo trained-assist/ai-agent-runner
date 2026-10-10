@@ -39,7 +39,11 @@ jobs:
           cache: npm
       - run: npm ci
       - name: Run repository checks before sandbox deployment
-        run: npm run check
+        run: |
+          npm test
+          npm run typecheck
+          npm run build
+          npm run worker:dry-run:sandbox3
       - name: Verify the target Cloudflare account
         run: |
           set -euo pipefail
