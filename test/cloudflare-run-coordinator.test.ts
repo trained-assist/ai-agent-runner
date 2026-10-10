@@ -132,6 +132,33 @@ describe('Cloudflare Runner run coordinator', () => {
     expect(storage.values.size).toBe(1);
   });
 
+  it('injects the repository read token only for the pinned Telegram UX principal, profile, and repository', async () => {
+    const { coordinator, launched, env, storage } = setup();
+    const token = 'scoped-repository-read-token-never-persist-this';
+    env.TELEGRAM_UX_REPOSITORY_READ_TOKEN = token;
+    env.ALLOWED_REPOSITORIES += ',vovalikessmoothy-png/cp-telegram-ux-runner-sandbox';
+    const pinnedPrincipal: ApiPrincipal = {
+      ...principal,
+      principalId: 'integration-telegram-ux-v1',
+      profileId: 'integration-telegram-ux-v1',
+      repository: 'vovalikessmoothy-png/cp-telegram-ux-runner-sandbox',
+    };
+    const response = await coordinator.fetch(call('/v1/runs', body, { 'idempotency-key': 'telegram-ux-repository-token' }, pinnedPrincipal));
+    expect(response.status).toBe(202);
+    await coordinator.alarm();
+    expect(launched[0]).toMatchObject({
+      repository: { fullName: 'vovalikessmoothy-png/cp-telegram-ux-runner-sandbox' },
+      publicationToken: token,
+    });
+    expect(JSON.stringify(storage.values.get('runner-v1'))).not.toContain(token);
+
+    const differentProfile = { ...pinnedPrincipal, principalId: 'another-principal', profileId: 'another-profile' };
+    const other = await coordinator.fetch(call('/v1/runs', { ...body, userTaskId: 'task-other' }, { 'idempotency-key': 'other-profile-no-repository-token' }, differentProfile));
+    expect(other.status).toBe(202);
+    await coordinator.alarm();
+    expect(launched[1]).not.toHaveProperty('publicationToken');
+  });
+
   it('fails closed when a real execution principal has no repository binding', async () => {
     const { coordinator, storage, launched } = setup();
     const unboundPrincipal: ApiPrincipal = { ...principal, repository: undefined };

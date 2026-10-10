@@ -122,6 +122,7 @@ async function main() {
     required('EU_VM_WORKER_TOKEN', 24), required('LLM_LADDER_TOKEN', 1),
     required('MCP_TEST_AUTH_TOKEN', 32), required('MCP_TEST_RUNNER_PRIVATE_JWK', 1),
   ];
+  const repositoryReadToken = process.env.TELEGRAM_UX_REPOSITORY_READ_TOKEN?.trim();
   let mcpPrivateKey;
   try { mcpPrivateKey = createPrivateKey({ key: JSON.parse(mcpRunnerPrivateJwk), format: 'jwk' }); }
   catch { throw new Error('runner_sandbox_mcp_private_jwk_invalid'); }
@@ -168,6 +169,7 @@ async function main() {
     ['LLM_LADDER_TOKEN', ladderToken],
     ['MCP_TEST_AUTH_TOKEN', mcpAuthToken],
     ['MCP_TEST_RUNNER_PRIVATE_JWK', mcpRunnerPrivateJwk],
+    ...(repositoryReadToken ? [['TELEGRAM_UX_REPOSITORY_READ_TOKEN', repositoryReadToken]] : []),
   ]);
 
   await verifyDeployment(sourceSha, apiKey, delegationSecret);
