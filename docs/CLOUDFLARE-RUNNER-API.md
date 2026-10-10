@@ -22,8 +22,9 @@ earlier `401` was an API-key provisioning failure, not a model-provider failure.
 upstream diagnostic is tracked in [trained-assist-llm-ladder#231](https://github.com/trained-assist/trained-assist-llm-ladder/issues/231).
 These runs verify the direct Runner API → France VM → OpenCode/Ladder → stored result path, not
 the complete Control Plane/Telegram user workflow or production readiness.
-The separate Telegram UX Runner Worker has not been deployed, and the outstanding acceptance
-gaps below remain.
+The canonical Telegram UX Runner Worker now includes a profile-gated cleanup route for E2E
+state. The fixture-tool answer path is proven through the sandbox; Telegram delivery and
+production readiness remain separate acceptance items.
 
 The canonical CP→Cloudflare Runner API→France VM fixture-tool scenario passed on 2026-10-10.
 The live CP task `ut-062b55a7eca0b5f6e5c8` produced successful Runner run
@@ -129,8 +130,8 @@ creates persistent Cloudflare state. Cloudflare Worker secrets are write-only. P
 must preserve the complete trusted `RUNNER_API_KEYS` source registry and update it atomically;
 never overwrite the secret from an unverified local copy. The existing `RUNNER_API_KEYS`
 value was preserved; the sandbox3 canary principal is provisioned additively through
-`RUNNER_API_KEYS_ADDITIONAL`, by the manual canary workflow. The separate Telegram UX Worker
-config still names a service binding to a Worker that does not exist yet.
+`RUNNER_API_KEYS_ADDITIONAL`, by the manual canary workflow. The Telegram UX Runner API is a
+separate Worker with its own task-keyed Durable Object namespace.
 
 The dedicated Telegram UX Runner Worker is deployed by
 `.github/workflows/deploy-cloudflare-telegram-ux-sandbox.yml` from protected `main` using the
@@ -143,6 +144,16 @@ environment secrets are `CF_API_TOKEN`, `RUNNER_API_KEY_AGENT_API`,
 and `LLM_LADDER_TOKEN` are supplied from the existing repository secrets. Keep the API key and
 delegation secret paired with the same-named Control Plane sandbox bindings; neither belongs in
 Wrangler vars or source.
+
+For the canonical Telegram UX sandbox only, `SANDBOX_CLEANUP_PROFILES` enables
+`POST /v1/sandbox/cleanup-task`. It requires `runs:write`, the signed effective profile to be
+listed in that variable, and a safe `userTaskId`; the API derives the same task-keyed Durable
+Object used by run submission. The Durable Object atomically refuses active, unknown, foreign,
+or mismatched state. For terminal runs it deletes the task's complete stored record (runs,
+idempotency keys, events, results, and owner generations) and clears its alarm. An already-empty
+task key is removed as well. Only `wrangler.telegram-ux-v1.jsonc` enables the profile; production
+and the other Runner Workers leave cleanup disabled. The CP E2E cleanup script calls this route
+before deleting corresponding CP rows.
 
 ## Verification
 
@@ -168,10 +179,10 @@ inside the encrypted launch and `mcpSecrets`. Other MCP descriptors fail closed.
 
 Profile workspace provisioning/saveback, ingress manifest materialization, input refs, binary
 artifact download, GCS log publication, SSE, the complete `/v1/capabilities` document, and
-multi-engine fallback remain unsupported. Do not report Telegram UX ready until the API key
-registry and France worker dispatch are provisioned, the dedicated Telegram UX Worker is
-deployed, and a live Host fixture call succeeds end to end. Local Worker tests and mock probes
-do not prove real Agent execution, repository persistence, or Telegram delivery.
+multi-engine fallback remain unsupported. A live Host fixture call through CP, this Worker,
+France VM2, OpenCode and Ladder has succeeded and persisted the expected answer. That run did not
+send a Telegram message and does not establish production readiness. Local Worker tests and
+mock probes do not prove real Agent execution, repository persistence, or Telegram delivery.
 
 The manual `Deploy Telegram UX Cloudflare Runner sandbox` workflow requires the matching
 `MCP_TEST_AUTH_TOKEN` and Ed25519 `MCP_TEST_RUNNER_PRIVATE_JWK` in the `sandbox` GitHub
