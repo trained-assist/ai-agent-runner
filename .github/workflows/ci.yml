@@ -16,5 +16,7 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
+      - name: VM worker WIF issuer security contract
+        run: node --test test/vm-worker-wif-issuer.test.mjs
       - name: Read-only sandbox API inventory regressions
         run: python3 -m unittest discover -s test -p 'test_sandbox*.py'

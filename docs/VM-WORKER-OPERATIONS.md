@@ -64,6 +64,19 @@ but publish only presence, source/store path, owner, and rotation metadata. Neve
 secret values. The updater requires `VM_WORKER_PUBLIC_URL` to be a valid HTTP(S) origin
 before it changes the active release.
 
+For the Contabo EU VM, GCS uses its dedicated `ta-eu-vm-worker-test` Workload Identity
+Federation provider and VM-local issuer. Install the `ta-vm-worker-wif-issuer` service
+with a signing key readable only by its dedicated system account; it binds only to
+`127.0.0.1:18080`. The HTTPS proxy
+publishes only `/.well-known/openid-configuration` and `/.well-known/jwks.json`, and must
+return 404 for `/token`. Generate the external-account credential file with
+`gcloud iam workload-identity-pools create-cred-config` using the provider's full audience,
+service account `ta-eu-vm-worker-test@alesa-personal-assistent.iam.gserviceaccount.com`,
+and credential source `http://127.0.0.1:18080/token`; install it root-owned at
+`/etc/ai-agent-runner/gcs-wif-credentials.json` and set
+`GOOGLE_APPLICATION_CREDENTIALS` in `worker.env`. The service account has access only to
+the dedicated EU VM2 sandbox bucket. Never make a service-account key.
+
 ## Start another machine
 
 For a replacement VM, install the same signed release and preserve the existing

@@ -48,6 +48,25 @@ currently share the `ai-agent` Unix identity, an agent process could request a s
 token. The federated identity is therefore restricted to the isolated test bucket.
 Do not grant it access to user data until per-run credential isolation is in place.
 
+## EU VM2 sandbox storage identity (provisioning 2026-10-10)
+
+VM2 `169.58.15.230` is being restored as the isolated EU sandbox worker. Its pre-existing
+provider `ta-vm-workers/eu-vm-worker-test` is pinned to issuer
+`https://eu-worker.169-58-15-230.sslip.io`, audience
+`https://iam.googleapis.com/projects/731388616698/locations/global/workloadIdentityPools/ta-vm-workers/providers/eu-vm-worker-test`, and subject `eu-vm-worker`. The service account
+`ta-eu-vm-worker-test@alesa-personal-assistent.iam.gserviceaccount.com` is granted only
+`roles/storage.objectUser` on `trained-assist-runner-eu-vm2-sandbox-731388616698`
+(`EUROPE-WEST9`, uniform access, public access prevention, versioning). It has no access
+to profile or production buckets. The generic external-account file belongs at
+`/etc/ai-agent-runner/gcs-wif-credentials.json`; `GOOGLE_APPLICATION_CREDENTIALS` points
+to it in the worker service environment.
+
+The EU service account previously had an unintended object-user binding on the RU test
+bucket. That binding was removed; the RU service account retains its own bucket access.
+The EU issuer service, TLS metadata endpoint, credential exchange, and GCS upload/read/delete
+roundtrip must all pass before VM2 is called ready. The subject-token endpoint is loopback
+only and must return 404 through the public reverse proxy.
+
 ## Worker authentication and model credentials
 
 `VM_WORKER_TOKEN` and `LLM_LADDER_TOKEN` serve different trust boundaries:

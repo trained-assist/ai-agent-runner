@@ -1,0 +1,5 @@
+eu-worker.169-58-15-230.sslip.io {
+	@subjectToken path /token
+	respond @subjectToken "" 404
+	reverse_proxy 127.0.0.1:18080
+}

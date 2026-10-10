@@ -1,0 +1,30 @@
+[Unit]
+Description=Trained Assist VM worker OIDC issuer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ta-wif-issuer
+Group=ta-wif-issuer
+WorkingDirectory=/opt/ta-vm-worker-wif-issuer/current
+EnvironmentFile=/etc/ai-agent-runner/wif-issuer.env
+ExecStart=/usr/bin/node /opt/ta-vm-worker-wif-issuer/current/wif-issuer.mjs
+Restart=on-failure
+RestartSec=3s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadOnlyPaths=/etc/ai-agent-runner
+
+[Install]
+WantedBy=multi-user.target
