@@ -1,13 +1,17 @@
 # Cloudflare Runner API
 
-Status: the isolated sandbox3 Cloudflare Worker was deployed on 2026-10-09 with
-profile-scoped repository binding and an authenticated `mock-test` probe returning `pong`.
-It was updated to version `a98c62ed-38d6-4f8d-987d-8b1d36a78de1`, which includes the pinned
-Telegram UX Registry MCP attachment path. `/healthz` and `/version` return 200. The current
-Cloudflare secret inventory contains only `RUN_LAUNCH_ENCRYPTION_KEY` and `RUNNER_API_KEYS`;
-no new principal, France worker URL/token, or MCP test secrets are provisioned. The separate
-Telegram UX Runner Worker has not been deployed. No live CP-to-Runner or real France execution
-has been accepted.
+Status (verified 2026-10-10): the isolated `trained-assist-runner-api-sandbox3` Cloudflare
+Worker is serverless and dispatches real jobs to the France VM2 execution worker. The VM runs
+signed release `vm-worker-v0.3.5` (`dcca4e4b225ad2489748946b5afec6106b337b9d`) at
+`https://eu-vm-worker.169-58-15-230.sslip.io`. Its readiness check passes. The sandbox Worker
+has `VM_WORKER_URL`, `VM_WORKER_TOKEN`, `LLM_LADDER_TOKEN`, and the additive
+`RUNNER_API_KEYS_ADDITIONAL` secret configured alongside its existing secrets; the canary
+principal is limited to `trained-assist/ai-agent-runner` and `eu-vm-agent-run`. A live
+read-only OpenCode task completed end to end through Cloudflare, VM2, the model ladder, and
+the callback path ([workflow run 38011605830](https://github.com/trained-assist/ai-agent-runner/actions/runs/38011605830)).
+This proves one real execution canary, not the complete user workflow or production readiness.
+The separate Telegram UX Runner Worker has not been deployed, and the outstanding acceptance
+gaps below remain.
 
 ## Runtime boundary
 
@@ -77,9 +81,10 @@ match the Runner configuration. Check `/readyz` on the France worker before a li
 The Wrangler configs use `workers_dev` and SQLite Durable Object migrations. Deployment
 creates persistent Cloudflare state. Cloudflare Worker secrets are write-only. Provisioning
 must preserve the complete trusted `RUNNER_API_KEYS` source registry and update it atomically;
-never overwrite the secret from an unverified local copy. The live sandbox3 registry has not
-been inspected and no new principal has been provisioned. The separate Telegram UX Worker
-config names a service binding to a Worker that does not exist yet.
+never overwrite the secret from an unverified local copy. The existing `RUNNER_API_KEYS`
+value was preserved; the sandbox3 canary principal is provisioned additively through
+`RUNNER_API_KEYS_ADDITIONAL`, by the manual canary workflow. The separate Telegram UX Worker
+config still names a service binding to a Worker that does not exist yet.
 
 The dedicated Telegram UX Runner Worker is deployed by
 `.github/workflows/deploy-cloudflare-telegram-ux-sandbox.yml` from protected `main` using the
