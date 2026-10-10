@@ -21,6 +21,7 @@
     {"name":"GCP_PROJECT","required":false,"secret":false,"source":"systemd:/etc/ai-agent-runner/worker.env or VM workload identity","owner":"UNASSIGNED — assign named owner"},
     {"name":"GOOGLE_APPLICATION_CREDENTIALS","required":true,"secret":false,"source":"systemd:/etc/ai-agent-runner/worker.env; WIF config /etc/ai-agent-runner/gcs-wif-credentials.json","owner":"UNASSIGNED — assign named owner"},
     {"name":"OPENCODE_BIN","required":true,"secret":false,"source":"systemd:/etc/ai-agent-runner/worker.env","owner":"UNASSIGNED — assign named owner"},
+    {"name":"AGENT_API_ENGINE_CONFIG_DIR","required":true,"secret":false,"source":"root-owned:/etc/ai-agent-runner/engine-config/opencode.json","owner":"trained-assist platform"},
     {"name":"RUNNER_GIT_TOKEN","required":false,"secret":true,"source":"systemd:/etc/ai-agent-runner/worker.env; provision via approved secret manager","owner":"UNASSIGNED — assign named owner"},
     {"name":"RUNNER_CONTROL_PLANE_URL","source":"systemd:/etc/ai-agent-runner/worker.env; CP ingress resolver","owner":"UNASSIGNED — assign named owner","required":false,"secret":false},
     {"name":"RUNNER_CONTROL_PLANE_PRINCIPAL","source":"systemd:/etc/ai-agent-runner/worker.env; CP ingress resolver","owner":"UNASSIGNED — assign named owner","required":false,"secret":false},

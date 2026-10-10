@@ -1,7 +1,10 @@
+import { readFile } from 'node:fs/promises';
+
 const apiUrl = process.env.RUNNER_API_URL;
 const apiKey = process.env.RUNNER_API_KEY_AGENT_API;
 const runId = process.env.GITHUB_RUN_ID;
 const repositoryToken = process.env.GITHUB_TOKEN;
+const expectedPackageVersion = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8')).version;
 
 if (!apiUrl || !apiKey || !runId || !repositoryToken) throw new Error('sandbox3 canary environment is incomplete');
 
@@ -58,7 +61,7 @@ while (Date.now() < deadline) {
 if (!status || !terminal.has(status.state)) throw new Error('sandbox3 VM run did not reach a terminal state within 180 seconds');
 
 const result = await request(`/v1/runs/${encodeURIComponent(submitted.runId)}/result`);
-if (result.outcome !== 'succeeded' || !String(result.text ?? '').includes('0.3.4')) {
+if (result.outcome !== 'succeeded' || !String(result.text ?? '').includes(expectedPackageVersion)) {
   throw new Error(`sandbox3 VM run failed acceptance: ${JSON.stringify({ outcome: result.outcome, exitCode: result.exitCode })}`);
 }
-console.log('sandbox3 VM2 end-to-end canary succeeded; package version 0.3.4 confirmed');
+console.log(`sandbox3 VM2 end-to-end canary succeeded; package version ${expectedPackageVersion} confirmed`);

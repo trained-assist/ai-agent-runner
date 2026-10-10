@@ -1,0 +1,17 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "ladder/free",
+  "provider": {
+    "ladder": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "trained-assist-llm-ladder",
+      "options": {
+        "baseURL": "https://llm-ladder.trainedassist.store/v1",
+        "apiKey": "{env:LLM_LADDER_TOKEN}"
+      },
+      "models": {
+        "free": { "name": "ladder free" }
+      }
+    }
+  }
+}

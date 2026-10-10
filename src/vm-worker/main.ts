@@ -14,6 +14,7 @@ import { createControlPlaneIngressResolverFromEnv } from '../storage/ingress-art
 import { resolveErrorPublisher } from '../contracts/error-publisher.js';
 import { createRunBranchWorker } from '../workspace/run-branch-worker.js';
 import { createVmProfileWorkspaceWorker } from './profile-workspace.js';
+import { loadEngineConfigTemplates } from '../isolation/engine-config.js';
 
 function required(name: string): string {
   const value = process.env[name]?.trim();
@@ -65,6 +66,10 @@ async function main(): Promise<void> {
   const profileWorkspace = createVmProfileWorkspaceWorker(dataDir, legacyProfileWorker);
 
   const errorPublisher = resolveErrorPublisher(process.env);
+  const engineConfigTemplates = loadEngineConfigTemplates(process.env['AGENT_API_ENGINE_CONFIG_DIR']);
+  if (!engineConfigTemplates?.engines.includes('opencode')) {
+    throw new Error('VM worker requires the host-owned OpenCode engine config template');
+  }
   const runner = new Runner({
     rootDir: join(dataDir, 'runner'),
     adapters: { opencode: engine },
@@ -72,6 +77,7 @@ async function main(): Promise<void> {
     exports,
     ingressResolver: createControlPlaneIngressResolverFromEnv(process.env),
     profileWorkspace,
+    engineConfigTemplates,
     resumeQueuedRuns: false,
     ...(errorPublisher ? { errorPublisher } : {}),
   });

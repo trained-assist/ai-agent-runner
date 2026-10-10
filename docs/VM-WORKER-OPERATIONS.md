@@ -131,6 +131,9 @@ or source SHA failure restores the previous symlink and restarts the previous re
 Do not deploy a checkout or manually replace files in `current`.
 
 Set the region-specific `VM_WORKER_ENGINE` to `eu-vm-agent-run` or `rf-vm-agent-run`.
+Set `AGENT_API_ENGINE_CONFIG_DIR` to the root-owned engine template directory. The France
+template pins OpenCode to `ladder/free`; only the run-scoped `LLM_LADDER_TOKEN` enters the
+agent environment. The worker refuses to start when its OpenCode template is absent.
 Set a unique `VM_WORKER_ID`, public HTTPS origin, a random `VM_WORKER_TOKEN` of at
 least 24 characters, the central API callback origin, approved repositories/environment
 names, GCS bucket, OpenCode path, and CPU/RAM reservation percentages. The configured
