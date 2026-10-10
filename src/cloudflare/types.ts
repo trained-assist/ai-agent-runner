@@ -19,6 +19,8 @@ export interface RunnerWorkerEnv {
   RUNNER_API_KEYS: string;
   /** Additive principals provisioned independently from the protected base registry. */
   RUNNER_API_KEYS_ADDITIONAL?: string;
+  /** Isolated principal registry for the dedicated sandbox3 Worker. */
+  RUNNER_API_KEYS_SANDBOX3?: string;
   /** HMAC secret for short-lived Control Plane profile capabilities. */
   AGENT_API_PROFILE_DELEGATION_SECRET?: string;
   VM_WORKER_URL: string;

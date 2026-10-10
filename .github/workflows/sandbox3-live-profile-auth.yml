@@ -1,0 +1,63 @@
+name: Deploy and pair isolated sandbox3 live profile auth
+
+on:
+  workflow_dispatch:
+    inputs:
+      provision_sandbox3_profile:
+        description: Deploy the reviewed Worker and provision its dedicated live CP profile identity
+        type: boolean
+        default: false
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: runner-api-sandbox3-profile-auth
+  cancel-in-progress: false
+
+jobs:
+  provision:
+    if: github.ref == 'refs/heads/main' && inputs.provision_sandbox3_profile == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: sandbox
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: d740a05e9442c1d0feacae2dfc673e93
+      CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+      SANDBOX3_RUNNER_API_KEY: ${{ secrets.SANDBOX3_RUNNER_API_KEY }}
+      SANDBOX3_PROFILE_DELEGATION_SECRET: ${{ secrets.SANDBOX3_PROFILE_DELEGATION_SECRET }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - name: Run repository checks before sandbox deployment
+        run: npm run check
+      - name: Verify the target Cloudflare account
+        run: |
+          set -euo pipefail
+          test -n "$CLOUDFLARE_API_TOKEN"
+          identity="$(npx wrangler whoami 2>&1)"
+          printf '%s\n' "$identity" | grep -F 'd740a05e9442c1d0feacae2dfc673e93' >/dev/null
+          printf '%s\n' "$identity" | grep -F "Typeformowner@gmail.com's Account" >/dev/null
+      - name: Deploy the reviewed serverless Runner API Worker source
+        run: npx wrangler deploy --config wrangler.sandbox3.jsonc --var BUILD_SHA:${GITHUB_SHA}
+      - name: Provision only the dedicated sandbox3 key registry and delegation secret
+        run: node scripts/sandbox3-profile-principal.mjs
+      - name: Verify the signed sandbox3 profile using read-only capabilities
+        run: node scripts/sandbox3-profile-auth-probe.mjs
+      - name: Upload sanitized profile-auth evidence
+        if: always() && hashFiles('sandbox3-profile-auth-evidence.json') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: sandbox3-profile-auth-${{ github.run_id }}
+          path: sandbox3-profile-auth-evidence.json
+          if-no-files-found: error
+          retention-days: 30
