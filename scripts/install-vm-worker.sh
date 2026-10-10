@@ -34,6 +34,8 @@ fi
 install -d -o ai-agent -g ai-agent -m 0700 /var/lib/ai-agent-runner
 install -d -o ai-agent -g ai-agent -m 0700 /var/lib/ai-agent-runner/capacity
 install -d -o root -g root -m 0755 /etc/ai-agent-runner /opt/ai-agent-vm-worker/releases
+install -d -o root -g root -m 0755 /etc/ai-agent-runner/engine-config
+install -o root -g root -m 0644 "${repo_dir}/deploy/vm-worker/engine-config/opencode.json" /etc/ai-agent-runner/engine-config/opencode.json
 install -o root -g root -m 0644 "${unit_source}" /etc/systemd/system/ai-agent-vm-worker.service
 install -o root -g root -m 0755 "${script_dir}/deploy-vm-worker-release.sh" /usr/local/sbin/ai-agent-vm-worker-update
 if [[ ! -e /etc/ai-agent-runner/worker.env ]]; then

@@ -9,6 +9,16 @@ import { ENGINE_CONFIG_LAYOUTS, loadEngineConfigTemplates, materializeEngineConf
 import { FakeEngine } from '../src/adapters/engine/fake-engine.js';
 import { CleanRoomError, type CleanRoom } from '../src/isolation/contract.js';
 
+describe('deployed VM worker OpenCode template', () => {
+  it('pins the VM worker to the free Ladder model and reads its token only from the run environment', () => {
+    const template = JSON.parse(readFileSync(new URL('../deploy/vm-worker/engine-config/opencode.json', import.meta.url), 'utf8'));
+    expect(template.model).toBe('ladder/free');
+    expect(template.provider.ladder.options.baseURL).toBe('https://llm-ladder.trainedassist.store/v1');
+    expect(template.provider.ladder.options.apiKey).toBe('{env:LLM_LADDER_TOKEN}');
+    expect(JSON.stringify(template)).not.toMatch(/(?:sk-[A-Za-z0-9_-]{12,}|Bearer\s+[A-Za-z0-9._-]{12,})/i);
+  });
+});
+
 const layout = ENGINE_CONFIG_LAYOUTS['opencode'] as { file: string };
 
 /**
