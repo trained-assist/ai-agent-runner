@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 import { createServer } from 'node:http';
 import { createPrivateKey, createPublicKey, createSign, randomUUID } from 'node:crypto';
+import { realpathSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
+import { pathToFileURL } from 'node:url';
 
 const MAX_TOKEN_LIFETIME_SECONDS = 600;
 
@@ -81,6 +83,15 @@ export function createWifIssuerServer({ privateKey, issuer, subject, audience, k
   });
 }
 
+export function isDirectExecution(scriptPath, moduleUrl = import.meta.url) {
+  if (typeof scriptPath !== 'string' || !scriptPath) return false;
+  try {
+    return pathToFileURL(realpathSync(scriptPath)).href === moduleUrl;
+  } catch {
+    return false;
+  }
+}
+
 async function main() {
   const issuer = requiredString(process.env['WIF_ISSUER_URL'], 'WIF_ISSUER_URL');
   const subject = requiredString(process.env['WIF_SUBJECT'], 'WIF_SUBJECT');
@@ -93,7 +104,7 @@ async function main() {
   server.listen(port, '127.0.0.1', () => process.stdout.write(`${JSON.stringify({ event: 'wif_issuer_listening', host: '127.0.0.1', port })}\n`));
 }
 
-if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).href) {
+if (isDirectExecution(process.argv[1])) {
   main().catch(() => {
     process.stderr.write('{"event":"wif_issuer_start_failed"}\n');
     process.exit(1);
