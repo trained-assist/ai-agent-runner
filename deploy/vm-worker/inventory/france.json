@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "workerId": "eu-vm-1",
+  "workerId": "eu-vm2-sandbox",
   "region": "eu",
   "bindings": [
     {"name":"VM_WORKER_BINDINGS_INVENTORY","required":true,"secret":false,"source":"systemd:/etc/ai-agent-runner/worker.env","owner":"UNASSIGNED — assign named owner"},
