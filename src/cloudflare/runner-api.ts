@@ -112,6 +112,19 @@ export default {
       if (!requireScope(principal, 'runs:read')) return error('FORBIDDEN', 'API key does not have the required scope', 403);
       return json({ schemaVersion: 1, contract: { name: 'ai-agent-runner/serverless-agent-api', version: 1 }, placement: 'cloudflare-worker', executionRegions: ['eu-vm-agent-run'] });
     }
+    if (url.pathname === '/v1/sandbox/cleanup-task') {
+      if (request.method !== 'POST') return error('METHOD_NOT_ALLOWED', 'method not allowed', 405);
+      const allowedProfiles = (env.SANDBOX_CLEANUP_PROFILES ?? '').split(',').map((value) => value.trim()).filter(Boolean);
+      if (!allowedProfiles.includes(principal.profileId)) return error('FORBIDDEN', 'sandbox cleanup is not enabled for this profile', 403);
+      if (!requireScope(principal, 'runs:write')) return error('FORBIDDEN', 'API key does not have the required scope', 403);
+      let submitted: { userTaskId?: unknown };
+      try { submitted = await request.clone().json() as { userTaskId?: unknown }; } catch { return error('INVALID_REQUEST', 'request body must be JSON', 400); }
+      if (typeof submitted.userTaskId !== 'string' || !SAFE_ID.test(submitted.userTaskId)) return error('INVALID_REQUEST', 'userTaskId is required and must be a safe id', 400);
+      const objectName = `task-${await sha256(`${principal.principalId}\0${principal.profileId}\0${submitted.userTaskId}`)}`;
+      const object = env.RUNNER_RUNS.get(env.RUNNER_RUNS.idFromName(objectName));
+      const headers = new Headers({ 'x-runner-principal': JSON.stringify(principal), 'content-type': 'application/json' });
+      return object.fetch(new Request('https://runner-runs.internal/v1/sandbox/cleanup-task', { method: 'POST', headers, body: JSON.stringify({ userTaskId: submitted.userTaskId }) }));
+    }
     const path = url.pathname.split('/').filter(Boolean);
     if (path[0] !== 'v1' || path[1] !== 'runs') return error('ROUTE_NOT_FOUND', `no route for ${url.pathname}`, 404);
     if ((path.length === 2 && request.method !== 'POST') || (path.length > 2 && !['GET', 'POST'].includes(request.method))) return error('METHOD_NOT_ALLOWED', 'method not allowed', 405);

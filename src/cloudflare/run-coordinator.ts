@@ -122,6 +122,7 @@ export class RunnerRunCoordinator {
     if (!principal) return error('UNAUTHENTICATED', 'authenticated principal missing', 401);
     const url = new URL(request.url);
     const segments = url.pathname.split('/').filter(Boolean);
+    if (url.pathname === '/v1/sandbox/cleanup-task') return request.method === 'POST' ? this.cleanupTask(request, principal) : error('METHOD_NOT_ALLOWED', 'method not allowed', 405);
     if (segments.length === 2 && request.method === 'POST') return this.submit(request, principal);
     if (segments.length !== 4) return error('ROUTE_NOT_FOUND', `no route for ${url.pathname}`, 404);
     let runId: string;
@@ -158,6 +159,25 @@ export class RunnerRunCoordinator {
       case 'cancel': return request.method === 'POST' ? this.cancel(request, runId, principal) : error('METHOD_NOT_ALLOWED', 'cancel supports POST only', 405);
       default: return error('ROUTE_NOT_FOUND', `no route for ${url.pathname}`, 404);
     }
+  }
+
+  private async cleanupTask(request: Request, principal: ApiPrincipal): Promise<Response> {
+    let body: { userTaskId?: unknown };
+    try { body = await request.json() as { userTaskId?: unknown }; } catch { return error('INVALID_REQUEST', 'request body must be JSON', 400); }
+    if (typeof body.userTaskId !== 'string' || !SAFE_ID.test(body.userTaskId)) return error('INVALID_REQUEST', 'userTaskId is required and must be a safe id', 400);
+    return this.state.storage.transaction(async (tx) => {
+      const stored = await tx.get<Stored>(stateKey) ?? structuredClone(INIT);
+      const entries = Object.values(stored.runs).filter((run) => run.userTaskId === body.userTaskId);
+      if (Object.keys(stored.runs).length !== entries.length) return error('TASK_STATE_MISMATCH', 'Durable Object contains state for a different task', 409);
+      if (!entries.length) return json({ status: 'already-empty', userTaskId: body.userTaskId, deletedRuns: 0 });
+      if (entries.some((run) => !owns(run, principal))) return error('FORBIDDEN', 'task state is not owned by this principal', 403);
+      if (entries.some((run) => ACTIVE.has(run.state) || run.state === 'unknown' || !TERMINAL.has(run.state))) return error('RUN_NOT_TERMINAL', 'active or unknown runs cannot be cleaned up', 409);
+      // This Durable Object is keyed to one task ID. Remove the whole record so
+      // idempotency keys, owner generations, events, and results are reset too.
+      await tx.delete(stateKey);
+      await this.state.storage.deleteAlarm();
+      return json({ status: 'cleaned', userTaskId: body.userTaskId, deletedRuns: entries.length });
+    });
   }
 
   private async submit(request: Request, principal: ApiPrincipal): Promise<Response> {

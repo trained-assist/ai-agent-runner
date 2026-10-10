@@ -52,6 +52,37 @@ const body = { userTaskId: 'task-a', input: { inlinePrompt: 'say done' }, envAll
 const testMcp = { servers: [{ serverId: 'trained-assist-registry-test', transport: 'remote', url: 'https://trained-assist-mcp-host-test-160.skillset-apply.workers.dev/mcp', bindingRef: 'registry-mcp-test-160-read', allowedTools: ['registry.fixture_read'], policyVersion: 'registry-fixture-policy-v1', catalogueVersion: 'registry-fixture-catalogue-v1' }] };
 
 describe('Cloudflare Runner run coordinator', () => {
+  it('cleans terminal task state and refuses active, unknown, or foreign runs', async () => {
+    const { coordinator, storage } = setup();
+    const submitted = await coordinator.fetch(call('/v1/runs', body, { 'idempotency-key': 'cleanup-terminal' }));
+    expect(submitted.status).toBe(202);
+    const receipt = await submitted.json() as { runId: string };
+    const active = await coordinator.fetch(call('/v1/sandbox/cleanup-task', { userTaskId: body.userTaskId }));
+    expect(active.status).toBe(409);
+
+    const stored = storage.values.get('runner-v1') as { runs: Record<string, { state: string }> };
+    stored.runs[receipt.runId]!.state = 'succeeded';
+    const cleaned = await coordinator.fetch(call('/v1/sandbox/cleanup-task', { userTaskId: body.userTaskId }));
+    expect(cleaned.status).toBe(200);
+    expect(await cleaned.json()).toMatchObject({ status: 'cleaned', deletedRuns: 1 });
+    expect(storage.values.has('runner-v1')).toBe(false);
+    expect(storage.alarmAt).toBeNull();
+    const repeated = await coordinator.fetch(call('/v1/sandbox/cleanup-task', { userTaskId: body.userTaskId }));
+    expect(await repeated.json()).toMatchObject({ status: 'already-empty', deletedRuns: 0 });
+  });
+
+  it('does not clean unknown or foreign task state', async () => {
+    const { coordinator, storage } = setup();
+    const submitted = await coordinator.fetch(call('/v1/runs', body, { 'idempotency-key': 'cleanup-foreign' }));
+    const receipt = await submitted.json() as { runId: string };
+    const stored = storage.values.get('runner-v1') as { runs: Record<string, { state: string; principalId: string }> };
+    stored.runs[receipt.runId]!.state = 'unknown';
+    expect((await coordinator.fetch(call('/v1/sandbox/cleanup-task', { userTaskId: body.userTaskId }))).status).toBe(409);
+    stored.runs[receipt.runId]!.state = 'succeeded';
+    stored.runs[receipt.runId]!.principalId = 'other-principal';
+    expect((await coordinator.fetch(call('/v1/sandbox/cleanup-task', { userTaskId: body.userTaskId }))).status).toBe(403);
+  });
+
   it('durably deduplicates submissions and never stores a publication token as plaintext', async () => {
     const { coordinator, storage } = setup();
     const response = await coordinator.fetch(call('/v1/runs', { ...body, repository: { fullName: 'trained-assist/ai-agent-runner', token: 'publication-secret' } }, { 'idempotency-key': 'attempt-1' }));

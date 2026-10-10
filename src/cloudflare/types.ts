@@ -29,6 +29,8 @@ export interface RunnerWorkerEnv {
   RUN_LAUNCH_ENCRYPTION_KEY: string;
   RUNNER_ENGINE?: string;
   MOCK_TEST_ENABLED?: string;
+  /** Comma-separated test-only profiles whose terminal Durable Object state may be reset. */
+  SANDBOX_CLEANUP_PROFILES?: string;
   ALLOWED_REPOSITORIES: string;
   ALLOWED_ENVIRONMENT_NAMES?: string;
   LLM_LADDER_TOKEN?: string;
