@@ -14,7 +14,7 @@ import { betaKey, testKeyRegistry } from './api-http-harness.js';
  * `operationId` при переходе не меняется — иначе дедупликация воркера вернёт второй запуск.
  */
 
-const GHA = 'azure-dynamic-ip-agent-run';
+const GHA = 'azure-cloud';
 const EU = 'eu-vm-agent-run';
 const RF = 'rf-vm-agent-run';
 

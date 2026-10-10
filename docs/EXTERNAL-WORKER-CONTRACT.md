@@ -7,17 +7,26 @@
 ## Приоритетная цепочка движков (issue #100)
 
 У API может быть несколько воркеров — по одному на движок. Порядок проб задаёт конфиг
-`AGENT_API_ENGINE_CHAIN` (для текущей очереди `eu-vm-agent-run,rf-vm-agent-run,azure-dynamic-ip-agent-run`),
+`AGENT_API_ENGINE_CHAIN` (например, `eu-vm-agent-run,rf-vm-agent-run,azure-cloud`),
 а не сортировка имён: приоритет — решение владельца, и алфавит его не выражает.
 
 | Шаг | Движок | Где | Роль |
 |---|---|---|---|
 | 1 | `eu-vm-agent-run` | наша France VM | основной VM worker |
 | 2 | `rf-vm-agent-run` | наша Russia VM | следующий VM worker |
-| 3 | `azure-dynamic-ip-agent-run` | GitHub Actions, внешний Azure worker | serverless резерв |
+| sandbox direct test | `azure-cloud` | GitHub Actions compute cluster через его API gateway | явный тестовый выбор |
 
-Capacity response `WORKER_CAPACITY` from either regional VM preserves 40% host headroom
-and cuts the new run directly over to GHA, skipping any remaining regional VM.
+Рабочая France/Russia очередь остаётся отдельной конфигурацией. GHA следует добавлять в неё
+как резерв только отдельным изменением и после проверки fallback.
+
+Старые имена `dynamic-ip-azure-agent-run` и `azure-dynamic-ip-agent-run` остаются
+поддерживаемыми для уже настроенных клиентов. Новые sandbox-конфигурации используют
+`azure-cloud`. Прямой тест указывает `engine.name = "azure-cloud"`; он вызывает только
+зарегистрированный под этим именем worker и не проходит через очередь. Не добавляйте его
+в рабочую цепочку автоматически, пока отдельный acceptance не подтвердит fallback.
+
+Capacity response `WORKER_CAPACITY` from a regional VM preserves host headroom and can cut
+the new run over to a configured GHA engine, skipping any remaining regional VM.
 `WORKER_CAPACITY_UNKNOWN` and `WORKER_ADMISSION_UNAVAILABLE` do not prove saturation, so
 they follow the configured regional order. Once any worker accepts, the run is not moved.
 
