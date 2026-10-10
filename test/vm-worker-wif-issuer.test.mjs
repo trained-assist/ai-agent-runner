@@ -1,7 +1,11 @@
 import { after, before, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { generateKeyPairSync, verify } from 'node:crypto';
-import { createWifIssuerServer, signSubjectToken } from '../scripts/vm-worker/wif-issuer.mjs';
+import { mkdtemp, rm, symlink } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { createWifIssuerServer, isDirectExecution, signSubjectToken } from '../scripts/vm-worker/wif-issuer.mjs';
 
 const issuer = 'https://eu-worker.169-58-15-230.sslip.io';
 const audience = 'https://iam.googleapis.com/projects/731388616698/locations/global/workloadIdentityPools/ta-vm-workers/providers/eu-vm-worker-test';
@@ -55,4 +59,18 @@ test('unknown paths and non-GET methods do not return credentials', async () => 
 test('token lifetime is bounded and issuer/audience must be HTTPS', () => {
   assert.throws(() => signSubjectToken({ privateKey: pair.privateKey, issuer, subject: 'eu-vm-worker', audience, keyId, lifetimeSeconds: 601 }), /lifetimeSeconds/);
   assert.throws(() => signSubjectToken({ privateKey: pair.privateKey, issuer: 'http://issuer.invalid', subject: 'eu-vm-worker', audience, keyId }), /HTTPS/);
+});
+
+test('direct execution detection follows the current-release symlink', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'vm-worker-wif-test-'));
+  const source = resolve(fileURLToPath(new URL('../scripts/vm-worker/wif-issuer.mjs', import.meta.url)));
+  const current = join(directory, 'current');
+  try {
+    await symlink(source, current);
+    assert.equal(isDirectExecution(current, pathToFileURL(source).href), true);
+    assert.equal(isDirectExecution(source, pathToFileURL(source).href), true);
+    assert.equal(isDirectExecution(current, 'file:///another-module.mjs'), false);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });
