@@ -270,7 +270,7 @@ export class RunnerRunCoordinator {
           repository: { fullName: repository ?? '', branch: `agent-run/${runId}`, ...(body.repository?.revision ? { revision: body.repository.revision } : {}) },
           ...(repositoryToken ? { publicationToken: repositoryToken } : {}),
           resultUrl, isolation: body.isolation ?? { mode: 'none' }, outputs: Array.isArray(body.outputs) ? body.outputs : [],
-          ...(mcp.length ? { mcp: await this.testRegistryAttachment(mcp[0], { runId, taskId, profileId: principal.profileId, timeoutMs: clampInteger(limits.timeoutMs, 300_000, 1_000, 86_400_000) }) } : {}) };
+          ...(mcp.length ? await this.testRegistryAttachment(mcp[0], { runId, taskId, profileId: principal.profileId, timeoutMs: clampInteger(limits.timeoutMs, 300_000, 1_000, 86_400_000) }) : {}) };
       record = { requestId, runId, userTaskId: taskId, conversationId, jobId, ownerGeneration, principalId: principal.principalId, profileId: principal.profileId,
         ...(principal.tenantId ? { tenantId: principal.tenantId } : {}), idempotencyKey: idemKey, payloadHash, engine, state: 'queued', sequence: 0,
         createdAt: time, updatedAt: time, startedAt: null, finishedAt: null, answer: null, cancelRequested: false, launchAttempts: 0, events: [], artifacts: [], repo: null, logUrl: null, launchCiphertext: await encrypt(JSON.stringify(launch), this.env.RUN_LAUNCH_ENCRYPTION_KEY) };
@@ -334,12 +334,12 @@ export class RunnerRunCoordinator {
     const signature = await crypto.subtle.sign({ name: 'Ed25519' }, key, new TextEncoder().encode(signingInput));
     const proof = `${signingInput}.${base64Url(new Uint8Array(signature))}`;
     return {
-      servers: { [MCP_TEST.server]: { type: 'remote', url: MCP_TEST.url, enabled: true, headers: {
+      mcp: { servers: { [MCP_TEST.server]: { type: 'remote', url: MCP_TEST.url, enabled: true, headers: {
         Authorization: `Bearer {env:${MCP_TEST.tokenEnv}}`,
         'X-MCP-Operation': 'invocation', 'X-MCP-Scope': MCP_TEST.scope,
         'X-MCP-User-Task-Id': context.taskId, 'X-MCP-Profile': context.profileId,
         'X-MCP-Run-Id': context.runId, 'X-MCP-Run-Binding': '{env:RUNNER_MCP_REGISTRY_TEST_PROOF}',
-      } } },
+      } } } },
       mcpSecrets: { [MCP_TEST.tokenEnv]: this.env.MCP_TEST_AUTH_TOKEN, RUNNER_MCP_REGISTRY_TEST_PROOF: proof },
     };
   }

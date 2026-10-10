@@ -221,8 +221,11 @@ describe('Cloudflare Runner run coordinator', () => {
     const receipt = await response.json() as { runId: string };
     await coordinator.alarm();
     const launch = launched[0]!;
-    const attachment = launch.mcp as { servers: Record<string, { headers: Record<string, string> }> ; mcpSecrets: Record<string, string> };
-    const server = attachment.servers['trained-assist-registry-test']!;
+    const attachment = { mcp: launch.mcp as { servers: Record<string, { headers: Record<string, string> }> },
+      mcpSecrets: launch.mcpSecrets as Record<string, string> };
+    expect(Object.keys(launch).sort()).toContain('mcpSecrets');
+    expect(Object.keys(attachment.mcp.servers)).toEqual(['trained-assist-registry-test']);
+    const server = attachment.mcp.servers['trained-assist-registry-test']!;
     expect(server.headers['X-MCP-Run-Binding']).toBe('{env:RUNNER_MCP_REGISTRY_TEST_PROOF}');
     const proof = attachment.mcpSecrets['RUNNER_MCP_REGISTRY_TEST_PROOF']!;
     const [header, payload, signature] = proof.split('.');
