@@ -25,13 +25,21 @@ the complete Control Plane/Telegram user workflow or production readiness.
 The separate Telegram UX Runner Worker has not been deployed, and the outstanding acceptance
 gaps below remain.
 
-The canonical CP→France VM fixture-tool probe currently fails at the VM launch boundary:
-CP resolves the pinned Registry binding and Runner API attaches it, but the VM HTTP adapter
-previously dropped `mcp` and `mcpSecrets` before OpenCode started. A narrow fix is in review
-preparation: the VM will accept only the pinned `integration-telegram-ux-v1` fixture binding,
-pass its bearer/proof through memory-only runtime variables, and reject caller-selected MCP
-endpoints. This remains unverified live until a signed sandbox VM-worker release is installed
-and the same CP fixture request returns `registry-fixture-marker-160-v1`.
+The canonical CP→Cloudflare Runner API→France VM fixture-tool scenario passed on 2026-10-10.
+The live CP task `ut-062b55a7eca0b5f6e5c8` produced successful Runner run
+`run_9c5b0757e542980296c9a96356ca03980e155c3f750036797d71f15f815f331e_bdfbcecdd6954266959ccf4d`
+and persisted the Registry fixture response `registry-fixture-marker-160-v1`; CP `/trace`
+reported task `done` and run `success`. VM release `0.3.6` (source `0f4284f`, release run
+[38083959225](https://github.com/trained-assist/ai-agent-runner/actions/runs/38083959225)) now
+accepts only the pinned profile/server and passes scoped bearer/proof through memory-only
+runtime variables. Runner API merge `00df4a6` fixes the wire shape so `mcp` and `mcpSecrets`
+are siblings; sandbox API deployment [38084618775](https://github.com/trained-assist/ai-agent-runner/actions/runs/38084618775)
+installed it. Caller-selected MCP endpoints remain rejected.
+
+This proves the test fixture call and answer persistence through CP, Cloudflare Runner API,
+France VM2, OpenCode/Ladder and the isolated MCP Host. It does not prove a Telegram message was
+sent to a real chat or production readiness. The separate Telegram delivery scenario remains
+unverified.
 
 ## Runtime boundary
 

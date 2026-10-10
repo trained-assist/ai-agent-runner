@@ -69,9 +69,9 @@ reverse proxy.
 
 VM2 `169.58.15.230` runs worker `eu-vm2-sandbox`, region `eu`, through
 `https://eu-vm-worker.169-58-15-230.sslip.io`. The active `ai-agent-vm-worker.service` runs
-signed release `vm-worker-v0.3.5`, source commit
-`dcca4e4b225ad2489748946b5afec6106b337b9d`; release workflow
-[38011481689](https://github.com/trained-assist/ai-agent-runner/actions/runs/38011481689)
+signed release `vm-worker-v0.3.6`, source commit
+`0f4284f73c69610b15076972280c8a6a3d73e142`; release workflow
+[38083959225](https://github.com/trained-assist/ai-agent-runner/actions/runs/38083959225)
 passed artifact checksum and attestation verification. `/readyz` reports ready with no missing
 required bindings. The successful read-only end-to-end sandbox canary is recorded in
 [workflow run 38012362767](https://github.com/trained-assist/ai-agent-runner/actions/runs/38012362767),
@@ -89,8 +89,14 @@ and remained ready.
 | Post-run cleanup | Canary finished successfully; `activeRuns` was 0, no `opencode` process remained, and no `run_*` directory remained in the worker workspace. |
 
 This verifies one real sandbox execution and the isolated EU bucket path. It does not prove the
-Control Plane/Telegram product flow, profile storage/saveback, general user repository access,
-or production readiness. Optional secret ownership/rotation metadata still needs to be assigned.
+real Telegram delivery path, profile storage/saveback, general user repository access, or
+production readiness. Optional secret ownership/rotation metadata still needs to be assigned.
+
+The canonical CP→Runner API→France VM MCP test also passed on 2026-10-10: CP task
+`ut-062b55a7eca0b5f6e5c8` dispatched Runner run
+`run_9c5b0757e542980296c9a96356ca03980e155c3f750036797d71f15f815f331e_bdfbcecdd6954266959ccf4d`,
+which completed successfully and returned the pinned fixture marker. After the run,
+`/readyz` reported `activeRuns=0` and `activeReservations=0`.
 
 ## Worker authentication and model credentials
 
