@@ -21,11 +21,6 @@ const ACTIVE = new Set<State>(['queued', 'starting', 'running']);
 const TERMINAL = new Set<State>(['succeeded', 'failed', 'cancelled']);
 const now = (): string => new Date().toISOString();
 const stateKey = 'runner-v1';
-const TELEGRAM_UX_REPOSITORY = Object.freeze({
-  principal: 'integration-telegram-ux-v1',
-  profile: 'integration-telegram-ux-v1',
-  repository: 'vovalikessmoothy-png/cp-telegram-ux-runner-sandbox',
-});
 const MCP_TEST = Object.freeze({
   profile: 'integration-telegram-ux-v1', principal: 'integration-telegram-ux-v1',
   server: 'trained-assist-registry-test', binding: 'registry-mcp-test-160-read',
@@ -89,13 +84,8 @@ function refusedLaunchResult(run: RunRecord): Record<string, unknown> {
   };
 }
 
-function repositoryAccessToken(env: RunnerWorkerEnv, principal: ApiPrincipal, repository: string, requestedToken: unknown): string | undefined {
-  if (typeof requestedToken === 'string' && requestedToken.trim().length > 0) return requestedToken;
-  if (principal.principalId !== TELEGRAM_UX_REPOSITORY.principal
-    || principal.profileId !== TELEGRAM_UX_REPOSITORY.profile
-    || repository !== TELEGRAM_UX_REPOSITORY.repository) return undefined;
-  const token = env.TELEGRAM_UX_REPOSITORY_READ_TOKEN?.trim();
-  return token || undefined;
+function requestedRepositoryAccessToken(requestedToken: unknown): string | undefined {
+  return typeof requestedToken === 'string' && requestedToken.trim().length > 0 ? requestedToken : undefined;
 }
 
 function nextEvent(run: RunRecord, type: string, payload: unknown = {}): void {
@@ -228,7 +218,7 @@ export class RunnerRunCoordinator {
     const repository = mockTest ? '' : principal.repository!;
     if (repository && !allowedRepositories.has(repository)) return error('INVALID_REPOSITORY', 'repository is not approved on this Runner API', 400);
     if (body.repository?.token !== undefined && (typeof body.repository.token !== 'string' || body.repository.token.length > 500)) return error('INVALID_REQUEST', 'repository.token is invalid', 400);
-    const repositoryToken = repositoryAccessToken(this.env, principal, repository, body.repository?.token);
+    const repositoryToken = requestedRepositoryAccessToken(body.repository?.token);
     const requestedEnv = Array.isArray(body.envAllowlist) ? body.envAllowlist : [];
     const allowedEnv = new Set((this.env.ALLOWED_ENVIRONMENT_NAMES ?? '').split(',').map((item) => item.trim()).filter(Boolean));
     if (requestedEnv.some((name: unknown) => typeof name !== 'string' || !allowedEnv.has(name))) return error('FORBIDDEN', 'envAllowlist requests a name not approved for this Runner API', 403);

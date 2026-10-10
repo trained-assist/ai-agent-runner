@@ -70,9 +70,11 @@ Worker secrets:
   bounded test lease matching the Host Worker.
 - `LLM_LADDER_TOKEN`: only if the lane's `envAllowlist` permits it.
 
-The Telegram UX test principal is bound in the API key registry to the isolated repository
-`vovalikessmoothy-png/cp-telegram-ux-runner-sandbox`; the request cannot supply or override
-that binding. This exception is limited to profile/principal
+The Telegram UX test principal is bound in the API key registry to the canonical task repository
+`trained-assist/ai-agent-runner`; the request cannot supply or override that binding. The Runner
+API does not know or read the private GHA environment/config repository. Only the GHA worker may
+check out that separate non-secret configuration repository; it is never a task workspace,
+artifact destination, or France-worker dependency. This test principal is limited to profile/principal
 `integration-telegram-ux-v1` with exactly one `mcpBindings` entry:
 `registry-mcp-test-160-read`. It only admits the pinned server
 `trained-assist-registry-test`, URL, tool `registry.fixture_read`, policy, catalogue and
