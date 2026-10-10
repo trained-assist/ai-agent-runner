@@ -7,12 +7,19 @@ const PRINCIPAL_ID = 'sandbox3-agent-api-principal';
 const TENANT_ID = 'sandbox3-acceptance-a-20261008';
 const PROFILE_ID = 'integration-sandbox3-v1';
 
+export function normalizeSandbox3ProfileDelegationSecret(secret) {
+  const normalized = typeof secret === 'string' ? secret.trim() : '';
+  if (Buffer.byteLength(normalized) < 32) throw new Error('sandbox3_profile_delegation_secret_invalid');
+  return normalized;
+}
+
 export function sandbox3ProfilePrincipalRecord(apiKey) {
-  if (typeof apiKey !== 'string' || Buffer.byteLength(apiKey) < 32 || apiKey.length > 500) {
+  const normalizedApiKey = typeof apiKey === 'string' ? apiKey.trim() : '';
+  if (Buffer.byteLength(normalizedApiKey) < 32 || normalizedApiKey.length > 500) {
     throw new Error('sandbox3_profile_api_key_invalid');
   }
   return {
-    keyHash: createHash('sha256').update(apiKey).digest('hex'),
+    keyHash: createHash('sha256').update(normalizedApiKey).digest('hex'),
     principalId: PRINCIPAL_ID,
     tenantId: TENANT_ID,
     profileId: PROFILE_ID,
@@ -33,11 +40,8 @@ function provisionSecret(name, value) {
 }
 
 export function provisionSandbox3ProfilePrincipal(env = process.env) {
-  const apiKey = env.SANDBOX3_RUNNER_API_KEY;
-  const delegationSecret = env.SANDBOX3_PROFILE_DELEGATION_SECRET;
-  if (typeof delegationSecret !== 'string' || Buffer.byteLength(delegationSecret) < 32) {
-    throw new Error('sandbox3_profile_delegation_secret_invalid');
-  }
+  const apiKey = env.SANDBOX3_RUNNER_API_KEY?.trim();
+  const delegationSecret = normalizeSandbox3ProfileDelegationSecret(env.SANDBOX3_PROFILE_DELEGATION_SECRET);
   if (typeof env.CF_API_TOKEN !== 'string' || env.CF_API_TOKEN.length < 20) {
     throw new Error('sandbox3_cloudflare_token_missing');
   }
