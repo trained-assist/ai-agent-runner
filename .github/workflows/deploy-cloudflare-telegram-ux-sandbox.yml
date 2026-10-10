@@ -26,7 +26,6 @@ jobs:
       LLM_LADDER_TOKEN: ${{ secrets.LLM_LADDER_TOKEN }}
       MCP_TEST_AUTH_TOKEN: ${{ secrets.MCP_TEST_AUTH_TOKEN }}
       MCP_TEST_RUNNER_PRIVATE_JWK: ${{ secrets.MCP_TEST_RUNNER_PRIVATE_JWK }}
-      TELEGRAM_UX_REPOSITORY_READ_TOKEN: ${{ secrets.TELEGRAM_UX_REPOSITORY_READ_TOKEN }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

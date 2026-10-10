@@ -35,8 +35,6 @@ export interface RunnerWorkerEnv {
   MCP_TEST_RUNNER_PRIVATE_JWK?: string;
   MCP_TEST_CATALOGUE_VERSION?: string;
   MCP_TEST_EXPIRES_AT?: string;
-  /** Read-only credential bound to one Telegram UX sandbox principal/profile/repository. */
-  TELEGRAM_UX_REPOSITORY_READ_TOKEN?: string;
   [binding: string]: unknown;
   RUNNER_RUNS: { idFromName(name: string): unknown; get(id: unknown): { fetch(request: Request): Promise<Response> } };
 }
