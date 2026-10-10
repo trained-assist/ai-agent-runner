@@ -8,16 +8,20 @@ has `VM_WORKER_URL`, `VM_WORKER_TOKEN`, `LLM_LADDER_TOKEN`, and the additive
 `RUNNER_API_KEYS_ADDITIONAL` secret configured alongside its existing secrets; the canary
 principal is limited to `trained-assist/ai-agent-runner` and `eu-vm-agent-run`. A live
 read-only OpenCode task completed end to end through Cloudflare, VM2, the model ladder, and
-the callback path ([workflow run 38011605830](https://github.com/trained-assist/ai-agent-runner/actions/runs/38011605830)).
+the callback path. The expanded canary also verified anonymous rejection (`401`), identical
+idempotent replay returning the original receipt, conflicting payload rejection (`409`), and
+terminal `succeeded` ([workflow run 38012362767](https://github.com/trained-assist/ai-agent-runner/actions/runs/38012362767)).
 This proves one real execution canary, not the complete user workflow or production readiness.
 The separate Telegram UX Runner Worker has not been deployed, and the outstanding acceptance
 gaps below remain.
 
 ## Runtime boundary
 
-The Control Plane calls the Runner API through a private Cloudflare service binding. The
-Runner API is a Cloudflare Worker. A task-keyed Durable Object owns idempotency records, run
-state, events, and alarms that reconcile dispatch and poll the VM worker. The Worker alone knows
+The Control Plane sends authenticated HTTPS requests to its configured Cloudflare Runner API
+Worker URL (`RUNNER_API_URL` in the current CP sandbox). That CP config has no execution-VM or
+launcher endpoint. The Runner API is a Cloudflare Worker. A task-keyed Durable Object owns
+idempotency records, run state, events, and alarms that reconcile dispatch and poll the VM
+worker. The Worker alone knows
 `VM_WORKER_URL` and `VM_WORKER_TOKEN`. The France VM runs the OpenCode execution worker; it
 does not host the Runner API. The Control Plane has no VM URL or VM credential.
 
