@@ -33,6 +33,33 @@ describe('Cloudflare Runner API Worker', () => {
     expect(coordinatorFetch).toHaveBeenCalledOnce();
   });
 
+  it('routes sandbox cleanup only for an explicitly enabled profile and write scope', async () => {
+    const token = 'runner-api-cleanup';
+    const keyHash = await sha256(token);
+    const coordinatorFetch = vi.fn(async (request: Request) => {
+      expect(request.url).toBe('https://runner-runs.internal/v1/sandbox/cleanup-task');
+      expect(await request.json()).toEqual({ userTaskId: 'task-cleanup' });
+      return Response.json({ status: 'cleaned', deletedRuns: 1 });
+    });
+    const env = {
+      RUNNER_API_KEYS: JSON.stringify([{ keyHash, principalId: 'test-principal', profileId: 'test-profile', repository: 'team/test', scopes: ['runs:write'] }]),
+      SANDBOX_CLEANUP_PROFILES: 'test-profile',
+      RUNNER_RUNS: { idFromName: vi.fn((name) => name), get: vi.fn().mockReturnValue({ fetch: coordinatorFetch }) },
+    } as unknown as RunnerWorkerEnv;
+    const response = await runnerApi.fetch(new Request('https://api.example/v1/sandbox/cleanup-task', {
+      method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' }, body: JSON.stringify({ userTaskId: 'task-cleanup' }),
+    }), env);
+    expect(response.status).toBe(200);
+    expect(env.RUNNER_RUNS.idFromName).toHaveBeenCalledWith(expect.stringMatching(/^task-[0-9a-f]{64}$/));
+    expect(coordinatorFetch).toHaveBeenCalledOnce();
+
+    const disabled = await runnerApi.fetch(new Request('https://api.example/v1/sandbox/cleanup-task', {
+      method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' }, body: JSON.stringify({ userTaskId: 'task-cleanup' }),
+    }), { ...env, SANDBOX_CLEANUP_PROFILES: '' });
+    expect(disabled.status).toBe(403);
+    expect(coordinatorFetch).toHaveBeenCalledOnce();
+  });
+
   it('rejects an invalid key before any coordinator call', async () => {
     const get = vi.fn();
     const env = { RUNNER_API_KEYS: '[]', RUNNER_RUNS: { idFromName: vi.fn(), get } } as unknown as RunnerWorkerEnv;
