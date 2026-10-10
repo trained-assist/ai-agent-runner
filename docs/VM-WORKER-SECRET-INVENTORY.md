@@ -74,8 +74,10 @@ signed release `vm-worker-v0.3.5`, source commit
 [38011481689](https://github.com/trained-assist/ai-agent-runner/actions/runs/38011481689)
 passed artifact checksum and attestation verification. `/readyz` reports ready with no missing
 required bindings. The successful read-only end-to-end sandbox canary is recorded in
-[workflow run 38011605830](https://github.com/trained-assist/ai-agent-runner/actions/runs/38011605830).
-After that run, the worker had no active OpenCode process or run workspace and remained ready.
+[workflow run 38012362767](https://github.com/trained-assist/ai-agent-runner/actions/runs/38012362767),
+which also verified anonymous rejection, idempotent replay, conflicting-key rejection, and
+terminal success. After that run, the worker had no active OpenCode process or run workspace
+and remained ready.
 
 | Binding / resource | Verified location and scope |
 |---|---|
