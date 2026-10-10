@@ -34,6 +34,6 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run typecheck
-      - run: npx vitest run test/cloudflare-runner-api.test.ts test/cloudflare-run-coordinator.test.ts
+      - run: npx vitest run test/cloudflare-runner-api.test.ts test/cloudflare-run-coordinator.test.ts test/cloudflare-sandbox-deploy.test.ts
       - run: npm run worker:dry-run:telegram-ux
       - run: node tools/deploy-cloudflare-telegram-ux-sandbox.mjs

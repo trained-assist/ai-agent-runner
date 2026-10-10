@@ -2,6 +2,7 @@
 import { createHash, createHmac, createPrivateKey } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
+import { pathToFileURL } from 'node:url';
 
 const CONFIG = 'wrangler.telegram-ux-v1.jsonc';
 const ACCOUNT_ID = 'd740a05e9442c1d0feacae2dfc673e93';
@@ -12,6 +13,13 @@ const PROFILE_ID = 'integration-telegram-ux-v1';
 const TENANT_ID = 'telegram-ux-sandbox-20261009';
 const PROFILE_REPOSITORY = 'vovalikessmoothy-png/cp-telegram-ux-runner-sandbox';
 const MCP_CATALOGUE_VERSION = 'registry-fixture-catalogue-v1';
+const API_CONTRACT_NAME = 'ai-agent-runner/serverless-agent-api';
+
+export function hasExpectedApiCapabilities(body) {
+  return body?.contract?.name === API_CONTRACT_NAME
+    && Array.isArray(body?.executionRegions)
+    && body.executionRegions.includes('eu-vm-agent-run');
+}
 
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, { encoding: 'utf8', maxBuffer: 1024 * 1024, ...options });
@@ -82,8 +90,7 @@ async function verifyDeployment(sourceSha, apiKey, delegationSecret) {
     const { response, body } = await fetchJson(`${PUBLIC_URL}/v1/capabilities`, {
       headers: { authorization: `Bearer ${apiKey}` },
     });
-    return response.ok && body?.contract?.name === 'trained-assist-runner/serverless-agent-api'
-      && body?.executionRegions?.includes('eu-vm-agent-run');
+    return response.ok && hasExpectedApiCapabilities(body);
   })) throw new Error('runner_sandbox_api_key_probe_failed');
 
   const taskId = 'telegram-ux-delegation-health-probe';
@@ -169,8 +176,10 @@ async function main() {
     profileId: PROFILE_ID, delegatedIdentityVerified: true, franceWorkerReadiness: 'ready' }));
 }
 
-main().catch((error) => {
-  const message = error instanceof Error ? error.message : '';
-  console.error(/^[a-z0-9_:.-]+$/.test(message) ? message : 'runner_sandbox_deploy_failed');
-  process.exitCode = 1;
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch((error) => {
+    const message = error instanceof Error ? error.message : '';
+    console.error(/^[a-z0-9_:.-]+$/.test(message) ? message : 'runner_sandbox_deploy_failed');
+    process.exitCode = 1;
+  });
+}
