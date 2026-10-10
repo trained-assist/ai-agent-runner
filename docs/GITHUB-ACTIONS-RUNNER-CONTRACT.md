@@ -1,20 +1,22 @@
 # Контракт: подключение раннера на GitHub Actions
 
-**Статус:** проект, 04.10.2026. Реализация — отдельной задачей.
+**Статус:** реализовано в `opencode-gha-runner` и проверено успешным workflow run
+[`37859213470`](https://github.com/vovalikessmoothy-png/opencode-gha-runner/actions/runs/37859213470)
+(8 октября 2026). Новый API engine label — `azure-cloud`; старые labels остаются совместимыми.
 
-**Короткий ответ:** раннер на GitHub Actions подключается **тем же контрактом**, что и
-Azure-воркер (`LaunchRequest` / `LaunchResult`, issue #73). Наш API не знает и не должен
-знать, где живёт воркер. Единственная новая деталь — **получатель (receiver)**: тонкий
-HTTP-сервис перед воркером, потому что в CI нет входящих портов.
+**Короткий ответ:** GHA gateway принимает тот же `LaunchRequest` и возвращает тот же
+`LaunchResult`, что и остальные внешние workers. Он размещён как Cloudflare Worker; GitHub
+Actions выполняет только эфемерную job. API выбирает этот путь явным engine name
+`azure-cloud`.
 
 ---
 
 ## 1. Почему не «workflow как воркер напрямую»
 
-Наш API вызывает `POST {worker}/v1/launch` и **ждёт ответ в том же соединении** — контракт
-синхронный, весь ран проходит в одном HTTP-запросе. Для воркера на долгоживущей VM это
-естественно. Для GitHub Actions — нет, и причины измерены, а не предположены
-(`docs/GITHUB-ACTIONS-CAPABILITY.md`, раздел «Чего НЕТ / что НЕЛЬЗЯ в CI»):
+Job не имеет входящего порта. Cloudflare gateway принимает запуск, сохраняет квитанцию и
+short-lived claim/report токены, затем сам вызывает GitHub API. Job забирает run specification
+исходящим claim-запросом. Это позволяет API и job общаться через короткие запросы без
+долгого открытого HTTP-соединения:
 
 | Ограничение | Замер | Следствие для контракта |
 |---|---|---|
@@ -24,9 +26,8 @@ HTTP-сервис перед воркером, потому что в CI нет 
 | Reboot невозможен | `systemctl reboot` убивает раннер вместе с job | проверять только на песочной VM |
 | Нет KVM | `/dev/kvm` отсутствует | изоляция — только на уровне процессов |
 
-Из первого пункта следует главное: **workflow умеет только исходящие вызовы** (так он
-разговаривает с GitHub). Значит связь «наш API → workflow» должна идти через посредника,
-который принимает запрос и сам дёргает workflow.
+Остальные измеренные ограничения CI приведены здесь для выбора подходящих тестовых задач;
+они не требуют VM-hosted receiver.
 
 ---
 
@@ -34,45 +35,42 @@ HTTP-сервис перед воркером, потому что в CI нет 
 
 ```
 Клиент
-  │  POST /v1/runs  { engine: "github-actions-agent-run", repository: { fullName }, … }
+  │  POST /v1/runs  { engine: "azure-cloud", repository: { fullName }, … }
   ▼
 Наш API (stateless, без диска)
-  │  POST {receiver}/v1/launch  { LaunchRequest }        ← держит соединение до конца рана
+  │  POST {gateway}/v1/launch  { LaunchRequest }         ← возвращает receipt сразу
   ▼
-Получатель (receiver) — долгоживущий сервис, НЕ CI
+Cloudflare Worker gateway + KV
   │  POST /repos/{owner}/{repo}/actions/workflows/agent-run.yml/dispatches
-  │  { ref: "agent-run/<runId>", inputs: { launchRequest } }
+  │  { ref, inputs: { run_id, claim_token } }
   ▼
 GitHub Actions workflow (эфемерный runner)
+  │  исходящий claim → полный run spec + llmKey (одноразово)
   │  1. checkout repository.fullName в ветку agent-run/<runId>
   │  2. opencode run "<prompt>" в cwd
   │  3. коммит outputs в ветку, пуш
   │  4. лог сессии → Google Storage
-  │  5. POST {receiver}/v1/launch/{runId}/result  { LaunchResult }   ← исходящий вызов
+  │  5. POST gateway report с LaunchResult            ← исходящий вызов
   ▼
-Получатель отвечает на висящий запрос нашего API
+Gateway пересылает результат в API callback; API также может poll status/result
   ▼
 Наш API → клиенту: RunResult + ссылки на ветку и merge
 ```
 
-**Почему receiver, а не асинхронный launch.** Можно было бы сделать `launch` асинхронным
-(`202 {runId}` + polling) и обойтись без долгоживущей машины — тогда receiver мог бы быть
-Cloudflare Worker'ом. Но это меняет контракт для **всех** воркеров ради одного и ломает
-единый порт: наш API перестаёт знать, синхронный воркер перед ним или асинхронный. Синхронный
-контракт проще проверять, у него один таймаут и один код ошибок. Поэтому контракт остаётся
-синхронным, а асинхронность живёт внутри receiver'а.
+Gateway is a Cloudflare Worker. The API contract is asynchronous: `POST /v1/launch` returns
+an acceptance receipt; the API polls status/result and accepts the result callback. No
+long-lived receiver process is required.
 
 ---
 
 ## 3. Что меняется в контракте (issue #73)
 
-**Ничего.** Это и есть ответ на вопрос «как подрубить»: тот же `LaunchRequest`, тот же
-`LaunchResult`, тот же `POST {worker}/v1/launch`. Меняется только **имя движка** и то, кто
-стоит за `EXTERNAL_WORKER_URL`.
+Контракт использует те же `LaunchRequest` и `LaunchResult`, что и другие внешние workers.
+Для GHA меняются engine name и адрес worker gateway.
 
 | Поле | Значение для GH Actions |
 |---|---|
-| `engine.name` | `github-actions-agent-run` |
+| `engine.name` | `azure-cloud` (legacy names remain accepted) |
 | `engine.adapterVersion` | `1` |
 | `repository.fullName` | `owner/name` — как обычно |
 | `repository.branch` | `agent-run/<runId>` — как обычно, генерирует API |
@@ -84,36 +82,23 @@ merge — клиенту неважно, где отработал ран.
 
 ---
 
-## 4. Требования к получателю (receiver)
+## 4. Gateway contract
 
-Получатель — единственный новый компонент, и он **не в CI**: ему нужно держать входящее
-соединение столько, сколько идёт ран.
+Gateway implements the same asynchronous worker endpoints: `POST /v1/launch` returns a
+receipt; `GET /v1/runs/{runId}/status` and `/result` expose progress and output; cancel is
+forwarded to the corresponding GitHub Actions run. The workflow receives only `run_id` and
+one-time `claim_token` as dispatch inputs. The model key, repository publication token, prompt,
+and remaining run specification are delivered after claim, never in workflow metadata.
 
-1. **Реализует тот же контракт**, что и любой воркер: `POST /v1/launch` → `LaunchResult`,
-   `POST /v1/runs/{runId}/cancel` → `{status: "cancelled" | "rejected" | "unknown_run"}`.
-2. **Держит соединение открытым** до получения `LaunchResult` от workflow. Таймаут — тот же,
-   что у нашего API (`EXTERNAL_WORKER_LAUNCH_DEADLINE_MS`), чтобы клиент видел один и тот же
-   отказ независимо от того, где отработал ран.
-3. **Диспетчерит workflow** через GitHub API:
-   `POST /repos/{owner}/{repo}/actions/workflows/{id}/dispatches` с `ref` = ветка рана и
-   `inputs.launchRequest` = тело запроса.
-4. **Принимает результат** от workflow: `POST /v1/launch/{runId}/result` с `LaunchResult`.
-   Это исходящий вызов из CI, поэтому работает без входящих портов.
-5. **Отмена**: по `POST /v1/runs/{runId}/cancel` — либо убить запущенный workflow
-   (`POST /repos/…/actions/runs/{runId}/cancel`), либо вернуть `rejected`, если ран уже
-   закончился.
-6. **Stateless**: состояние висящего запроса живёт в памяти процесса. Рестарт receiver'а =
-   потеря рана, как и рестарт нашего API. Это тот же задокументированный контракт, что и у
-   stateless API.
-
-**Где живёт receiver:** та же VM, что и наш API, либо отдельная долгоживущая машина.
-Cloudflare Worker не подходит: он не может держать соединение десятки минут.
+The gateway stores run state in Cloudflare KV and sends the result callback to the API. API
+polling of status/result is the recovery path when callback delivery fails. There is no extra
+VM, France dependency, or task-workspace dependency on `gha-env-config`.
 
 ---
 
 ## 5. Требования к workflow `agent-run.yml`
 
-1. **Триггер:** `workflow_dispatch` с входом `launchRequest` (JSON-строка или объект).
+1. **Триггер:** `workflow_dispatch` только с входами `run_id` и одноразовым `claim_token`.
 2. **Клон:** `repository.fullName` в `cwd`, ветка `repository.branch` уже создана нашим API
    как имя — workflow делает `git checkout <branch>` (ветку создаёт GitHub из `ref` при
    dispatch).
@@ -122,7 +107,8 @@ Cloudflare Worker не подходит: он не может держать с�
 4. **Выходы:** коммитит объявленные `outputs` в ветку рана и пушит её. Не коммитит в ветку
    по умолчанию.
 5. **Лог:** загружает лог сессии в Google Storage, получает `logUrl`.
-6. **Результат:** `POST {receiver}/v1/launch/{runId}/result` с `LaunchResult` по контракту.
+6. **Результат:** отправляет `LaunchResult` на gateway report endpoint; gateway сохраняет
+   результат и передаёт его в API callback.
 7. **Таймаут job'ы:** `timeout-minutes` должен быть ≥ `limits.timeoutMs` + запас на checkout,
    старт opencode и финализацию. Практический потолок — 30 минут для стандартных раннеров.
 8. **Память:** держать потребление ниже ~15 GiB, иначе job умирает с exit 143 без внятной
@@ -157,21 +143,30 @@ new AgentApi({ workers: [azureWorker, ghActionsWorker] });
 | `EXTERNAL_WORKER_LAUNCH_DEADLINE_MS` / `..._CANCEL_DEADLINE_MS` | таймауты, применяются ко всем воркерам |
 | `EXTERNAL_WORKER_ACCEPT_DEADLINE_MS` | бюджет ожидания квитанции на движок (по умолчанию 30 000) |
 
-Добавление второго движка — это **одна запись в конфиге**, без правок кода:
+Прямой sandbox-вызов GHA добавляет worker gateway под `azure-cloud`. Используйте sandbox
+API key, ограниченный `engines: ["azure-cloud"]`; оставьте production/queue engine chain
+без изменений. `baseUrl` — gateway URL, а token — его `WORKER_TOKEN`, сохранённый в secret
+store (не в vars или запросе):
 
 ```json
 AGENT_API_WORKERS=[
-  {"engine":"dynamic-ip-azure-agent-run","baseUrl":"https://azure-worker.example","token":"…","acceptDeadlineMs":30000},
-  {"engine":"github-actions-agent-run","baseUrl":"https://receiver.example","token":"…"}
+  {"engine":"azure-cloud","baseUrl":"https://opencode-gha-runner-gateway.skillset-apply.workers.dev","token":"<gateway WORKER_TOKEN>","acceptDeadlineMs":30000}
 ]
 ```
 
+Поскольку клиент явно передаёт `engine.name = "azure-cloud"`, Agent API идёт напрямую в
+этот gateway и не пробует France/Russia VM. GHA job получает `llmKey` только после
+одноразового claim; prompt и ключ модели не попадают в `workflow_dispatch` inputs.
+
 Всё остальное — маршруты, идемпотентность, события, артефакты, ветка рана — не меняется.
 
-### Приоритетная цепочка движков (issue #100)
+### Необязательная цепочка fallback (issue #100)
+
+Эта цепочка включается только отдельной sandbox-конфигурацией после проверки fallback; она
+не требуется для прямого теста `azure-cloud`.
 
 ```bash
-AGENT_API_ENGINE_CHAIN=eu-vm-agent-run,rf-vm-agent-run,azure-dynamic-ip-agent-run
+AGENT_API_ENGINE_CHAIN=eu-vm-agent-run,rf-vm-agent-run,azure-cloud
 ```
 
 Ран без `engine` в заявке пробует движки по порядку цепочки. Следующий берётся только если
@@ -190,11 +185,12 @@ AGENT_API_ENGINE_CHAIN=eu-vm-agent-run,rf-vm-agent-run,azure-dynamic-ip-agent-ru
 ## 7. Ограничения, которые надо принять заранее
 
 1. **Длинные раны в CI невозможны.** Потолок — таймаут job'ы (до 30 минут на стандартных
-   раннерах). Раны длиннее остаются за Azure-воркером.
+   раннерах). Раны длиннее остаются за France VM worker.
 2. **Память ≈ 15 GiB.** Тяжёлые агенты не влезают.
 3. **Нет изоляции уровня ОС.** В CI нет root, нет KVM, нет входящих портов. Граница — только
-   процесс и отдельный checkout. Для чувствительных задач остаётся Azure.
-4. **Нужна ещё одна машина** под receiver (или он живёт на той же VM, что и API).
+   процесс и отдельный checkout. Для задач, которым нужна VM isolation, остаётся France VM.
+4. **GHA — менее изолированная и ограниченная среда**: обычный hosted runner, лимит job и
+   process-level isolation. Использовать для тестов и подходящих задач.
 5. **Креды на push** у воркера — свои (deploy key / GitHub App), как и для Azure-воркера.
    Клиентский `repository.token` по-прежнему наружу не уходит: воркер берёт токен публикации
    из `LaunchRequest.publicationToken`, который приходит в claim-ответе, а не в `inputs`
@@ -204,15 +200,16 @@ AGENT_API_ENGINE_CHAIN=eu-vm-agent-run,rf-vm-agent-run,azure-dynamic-ip-agent-ru
 
 ## 8. Приёмка
 
-- [x] `POST /v1/runs` с `engine: "github-actions-agent-run"` принимается, `capabilities().engines`
-      содержит оба движка — реестр движков реализован и покрыт тестом.
-- [ ] Receiver отдаёт `LaunchResult` по контракту, наш API возвращает ссылки на файл,
-      ветку и merge.
+- [x] Engine API допускает отдельную регистрацию и явный вызов `azure-cloud`; unit-тесты
+      проверяют прямой выбор и приоритет GHA в sandbox fleet.
+- [x] Успешный live GHA workflow run: [37859213470](https://github.com/vovalikessmoothy-png/opencode-gha-runner/actions/runs/37859213470).
+- [ ] Свежий end-to-end submit через Agent API `azure-cloud` возвращает результат, ссылки на
+      выход и ветку. Нужна sandbox-конфигурация с gateway `WORKER_TOKEN`.
 - [ ] Ветка `agent-run/<runId>` создана, `outputs` закоммичены в неё, ветка запушена.
 - [ ] Ран длиннее `limits.timeoutMs` завершается честным отказом, а не обрывом job'ы.
 - [ ] Отмена доходит до workflow и даёт `outcome: cancelled`.
 - [ ] Лог сессии в GCS, `logUrl` возвращается.
-- [ ] Рестарт receiver'а теряет ран — и это задокументировано как контракт, а не авария.
+- [x] Gateway размещён как Cloudflare Worker и хранит состояние в KV; дополнительный VM receiver не нужен.
 - [ ] Память job'ы ниже 15 GiB на типовом ран'е.
 
 ## 9. Связанные документы

@@ -78,7 +78,9 @@ function remainingFinalOutput(finalOutput: string, streamedOutput: string): stri
 }
 
 function isGhaEngine(name: string): boolean {
-  return name === 'dynamic-ip-azure-agent-run' || name === 'azure-dynamic-ip-agent-run';
+  return name === 'azure-cloud'
+    || name === 'dynamic-ip-azure-agent-run'
+    || name === 'azure-dynamic-ip-agent-run';
 }
 
 export type RunCancelStatus = 'stopped' | 'stop_pending' | 'already_terminal' | 'too_late' | 'rejected' | 'unknown_run';
