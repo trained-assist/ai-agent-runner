@@ -58,6 +58,28 @@ describe('Cloudflare Runner API Worker', () => {
     expect(additionalResponse.status).toBe(200);
   });
 
+  it('loads a dedicated sandbox3 registry without changing the base or additive registries', async () => {
+    const baseKey = 'base-registry-key';
+    const canaryKey = 'existing-canary-key';
+    const sandbox3Key = 'sandbox3-profile-key';
+    const env = {
+      RUNNER_API_KEYS: JSON.stringify([{ keyHash: await sha256(baseKey), principalId: 'base', profileId: 'base-profile', repository: 'team/base', scopes: ['runs:read'] }]),
+      RUNNER_API_KEYS_ADDITIONAL: JSON.stringify([{ keyHash: await sha256(canaryKey), principalId: 'existing-canary', profileId: 'canary-profile', repository: 'team/canary', scopes: ['runs:read'] }]),
+      RUNNER_API_KEYS_SANDBOX3: JSON.stringify([{ keyHash: await sha256(sandbox3Key), principalId: 'sandbox3-cp-principal', tenantId: 'sandbox3-tenant', profileId: 'service-profile', repository: 'trained-assist/ai-agent-runner', scopes: ['runs:read', 'runs:write'], engines: ['eu-vm-agent-run'] }]),
+    } as unknown as RunnerWorkerEnv;
+
+    for (const key of [baseKey, canaryKey, sandbox3Key]) {
+      const response = await runnerApi.fetch(new Request('https://api.example/v1/capabilities', { headers: { authorization: `Bearer ${key}` } }), env);
+      expect(response.status).toBe(200);
+    }
+  });
+
+  it('fails closed when the dedicated sandbox3 registry is malformed', async () => {
+    const env = { RUNNER_API_KEYS: '[]', RUNNER_API_KEYS_SANDBOX3: '{bad-json' } as unknown as RunnerWorkerEnv;
+    const response = await runnerApi.fetch(new Request('https://api.example/v1/capabilities', { headers: { authorization: 'Bearer any-key' } }), env);
+    expect(response.status).toBe(503);
+  });
+
   it('rejects a real execution principal without a trusted repository binding', async () => {
     const get = vi.fn();
     const env = {

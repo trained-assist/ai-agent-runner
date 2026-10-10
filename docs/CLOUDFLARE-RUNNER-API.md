@@ -53,6 +53,12 @@ Worker secrets:
   Repository is authoritative and cannot be overridden by requests; a repository is required
   for real execution except for the exact pinned Telegram UX Registry test principal described
   below. The list stores hashes, never raw API keys.
+- `RUNNER_API_KEYS_ADDITIONAL`: independently provisioned additive principals. The sandbox3
+  VM2 canary uses this binding; do not replace it when provisioning another sandbox identity.
+- `RUNNER_API_KEYS_SANDBOX3`: dedicated additional registry for the live CP profile on the
+  `trained-assist-runner-api-sandbox3` Worker. It is separate from both the base registry and
+  the canary registry and contains only the sandbox3 CP principal, with its own API-key hash,
+  tenant, repository, scopes, and `eu-vm-agent-run` engine grant.
 - `AGENT_API_PROFILE_DELEGATION_SECRET`: HMAC secret used only when the trusted Control Plane
   sends the complete `x-agent-profile-*` capability header set. The Worker checks the signature,
   configured API-key tenant, profile ID and short expiry before changing the effective profile.
@@ -69,6 +75,14 @@ Worker secrets:
 - `MCP_TEST_CATALOGUE_VERSION` and `MCP_TEST_EXPIRES_AT`: pinned catalogue version and
   bounded test lease matching the Host Worker.
 - `LLM_LADDER_TOKEN`: only if the lane's `envAllowlist` permits it.
+
+The manual `Deploy and pair isolated sandbox3 live profile auth` workflow runs only from
+protected `main` after an explicit confirmation input. It deploys the reviewed Worker source,
+updates only `RUNNER_API_KEYS_SANDBOX3` and `AGENT_API_PROFILE_DELEGATION_SECRET`, then sends
+a signed read-only `GET /v1/capabilities` probe. It does not submit a task or call the VM/model.
+The GitHub `sandbox` environment must provide `SANDBOX3_RUNNER_API_KEY` and
+`SANDBOX3_PROFILE_DELEGATION_SECRET`; the CP sandbox must use the same pair. Existing base,
+canary, mock-only, and Telegram UX registries remain separate.
 
 The Telegram UX test principal is bound in the API key registry to the canonical task repository
 `trained-assist/ai-agent-runner`; the request cannot supply or override that binding. The Runner
