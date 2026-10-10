@@ -169,7 +169,11 @@ export class RunnerRunCoordinator {
       const stored = await tx.get<Stored>(stateKey) ?? structuredClone(INIT);
       const entries = Object.values(stored.runs).filter((run) => run.userTaskId === body.userTaskId);
       if (Object.keys(stored.runs).length !== entries.length) return error('TASK_STATE_MISMATCH', 'Durable Object contains state for a different task', 409);
-      if (!entries.length) return json({ status: 'already-empty', userTaskId: body.userTaskId, deletedRuns: 0 });
+      if (!entries.length) {
+        await tx.delete(stateKey);
+        await this.state.storage.deleteAlarm();
+        return json({ status: 'already-empty', userTaskId: body.userTaskId, deletedRuns: 0 });
+      }
       if (entries.some((run) => !owns(run, principal))) return error('FORBIDDEN', 'task state is not owned by this principal', 403);
       if (entries.some((run) => ACTIVE.has(run.state) || run.state === 'unknown' || !TERMINAL.has(run.state))) return error('RUN_NOT_TERMINAL', 'active or unknown runs cannot be cleaned up', 409);
       // This Durable Object is keyed to one task ID. Remove the whole record so
