@@ -1,11 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import { createHash } from 'node:crypto';
-import { sandbox3ProfilePrincipalRecord, provisionSandbox3ProfilePrincipal } from '../scripts/sandbox3-profile-principal.mjs';
+import { sandbox3ProfilePrincipalRecord, normalizeSandbox3ProfileDelegationSecret, provisionSandbox3ProfilePrincipal } from '../scripts/sandbox3-profile-principal.mjs';
 
 describe('sandbox3 live profile principal provisioning', () => {
   it('creates a minimally scoped hash-only record in the isolated tenant registry', () => {
     const apiKey = 'ak_' + 'a'.repeat(48);
-    const record = sandbox3ProfilePrincipalRecord(apiKey);
+    const record = sandbox3ProfilePrincipalRecord(`${apiKey}\n`);
     expect(record).toEqual({
       keyHash: createHash('sha256').update(apiKey).digest('hex'),
       principalId: 'sandbox3-agent-api-principal',
@@ -20,6 +20,7 @@ describe('sandbox3 live profile principal provisioning', () => {
 
   it('validates both credentials before making any Cloudflare calls', () => {
     expect(() => sandbox3ProfilePrincipalRecord('short')).toThrow('sandbox3_profile_api_key_invalid');
+    expect(normalizeSandbox3ProfileDelegationSecret('b'.repeat(48) + '\n')).toBe('b'.repeat(48));
     expect(() => provisionSandbox3ProfilePrincipal({
       SANDBOX3_RUNNER_API_KEY: 'ak_' + 'a'.repeat(48),
       SANDBOX3_PROFILE_DELEGATION_SECRET: 'short',

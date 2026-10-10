@@ -24,6 +24,7 @@ const evidence = {
   route: '/v1/capabilities',
   runCreated: false,
   workerOrModelCalled: false,
+  bareApiKeyStatus: null,
   status: null,
   result: 'failed',
 };
@@ -34,6 +35,12 @@ try {
   if (Buffer.byteLength(apiKey) < 32 || apiKey.length > 500 || Buffer.byteLength(delegationSecret) < 32) {
     throw new Error('sandbox3_profile_credentials_invalid');
   }
+  const bareResponse = await fetch(URL, {
+    redirect: 'error', signal: AbortSignal.timeout(10_000),
+    headers: { authorization: `Bearer ${apiKey}`, 'cache-control': 'no-store' },
+  });
+  evidence.bareApiKeyStatus = bareResponse.status;
+  if (bareResponse.status !== 200) throw new Error('sandbox3_profile_api_key_refused');
   const expiresAt = String(Date.now() + 60_000);
   const message = `${PRINCIPAL_ID}\0${TENANT_ID}\0${PROFILE_ID}\0${expiresAt}`;
   const signature = createHmac('sha256', delegationSecret).update(message).digest('hex');

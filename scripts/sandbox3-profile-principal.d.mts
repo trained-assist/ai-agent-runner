@@ -9,6 +9,7 @@ export interface Sandbox3ProfilePrincipalRecord {
 }
 
 export function sandbox3ProfilePrincipalRecord(apiKey: string): Sandbox3ProfilePrincipalRecord;
+export function normalizeSandbox3ProfileDelegationSecret(secret: string): string;
 export function provisionSandbox3ProfilePrincipal(env?: Record<string, string | undefined>): {
   worker: string;
   principalId: string;
