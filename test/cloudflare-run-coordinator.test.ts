@@ -172,6 +172,29 @@ describe('Cloudflare Runner run coordinator', () => {
     expect(await status.json()).toMatchObject({ state: 'unknown', connectionLost: true });
   });
 
+  it('does not redispatch when launch delivery is ambiguous and reconciliation is unknown', async () => {
+    const { coordinator, env } = setup();
+    let launchCalls = 0;
+    env.FETCH = async (input) => {
+      const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+      if (url.pathname === '/v1/launch') {
+        launchCalls += 1;
+        throw new Error('connection reset after launch write');
+      }
+      if (url.pathname.endsWith('/status')) return Response.json({ status: 'unknown_run' });
+      return Response.json({ error: 'unexpected worker call' }, { status: 500 });
+    };
+    const response = await coordinator.fetch(call('/v1/runs', body, { 'idempotency-key': 'ambiguous-launch-does-not-retry' }));
+    const receipt = await response.json() as { runId: string };
+
+    await coordinator.alarm();
+    await coordinator.alarm();
+
+    expect(launchCalls).toBe(1);
+    const status = await coordinator.fetch(call(`/v1/runs/${receipt.runId}/status`));
+    expect(await status.json()).toMatchObject({ state: 'unknown', connectionLost: true });
+  });
+
   it('uses the authenticated principal repository and rejects request attempts to override it', async () => {
     const boundPrincipal: ApiPrincipal = { ...principal, repository: 'team/profile-one' };
     const { coordinator, launched, storage } = setup();
