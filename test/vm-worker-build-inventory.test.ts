@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -37,5 +37,20 @@ describe('VM worker build and binding inventory', () => {
     expect(() => readVmWorkerBindingsInventory(path)).toThrow('duplicate VM_WORKER_TOKEN');
     writeFileSync(path, JSON.stringify({ ...valid, bindings: [{ ...valid.bindings[0], value: 'must-not-be-here' }] }));
     expect(() => readVmWorkerBindingsInventory(path)).toThrow('entry 0 is invalid');
+  });
+
+  it('declares every startup-required VM binding in each deploy inventory', () => {
+    const requiredAtStartup = [
+      'VM_WORKER_BINDINGS_INVENTORY', 'VM_WORKER_ENGINE', 'VM_WORKER_PUBLIC_URL', 'VM_WORKER_TOKEN',
+      'VM_WORKER_ALLOWED_REPOSITORIES', 'VM_WORKER_ALLOWED_ENV', 'VM_WORKER_ALLOWED_CALLBACK_ORIGINS',
+      'VM_WORKER_CPU_RESERVATION_PCT', 'VM_WORKER_MEMORY_RESERVATION_PCT', 'STORAGE_BACKEND',
+      'OPENCODE_BIN', 'AGENT_API_ENGINE_CONFIG_DIR',
+    ];
+    for (const name of ['france.json', 'russia.json']) {
+      const path = new URL(`../deploy/vm-worker/inventory/${name}`, import.meta.url);
+      const inventory = readVmWorkerBindingsInventory(path.pathname);
+      const bindings = new Map(inventory.bindings.map((binding) => [binding.name, binding]));
+      for (const binding of requiredAtStartup) expect(bindings.get(binding)?.required, `${name}: ${binding}`).toBe(true);
+    }
   });
 });
