@@ -168,6 +168,8 @@ npm run worker:dry-run:telegram-ux
 The Worker handles authenticated submit, status, result, events, artifact metadata, and cancel.
 It encrypts launch data at rest, deduplicates idempotency keys, increments `ownerGeneration`
 for later attempts, and reconciles lost launch responses using the same France worker run ID.
+When mapping a France result, it preserves the worker's explicit `exitObserved` fact separately
+from exit code/signal; older worker results remain compatible through the legacy inference.
 Durable Objects are sharded by principal, profile, and task hash.
 
 ## Current acceptance gaps

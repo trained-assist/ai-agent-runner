@@ -209,6 +209,8 @@ export interface LaunchResult {
   pid?: number | null;
   exitCode: number | null;
   exitSignal: string | null;
+  /** Whether the worker observed process termination, even when no code/signal was available. */
+  exitObserved?: boolean;
   exitReason: ExitReason;
   stdout: string;
   stderr: string;
@@ -311,6 +313,7 @@ const LAUNCH_RESULT_KEYS = [
   'pid',
   'exitCode',
   'exitSignal',
+  'exitObserved',
   'exitReason',
   'stdout',
   'stderr',
@@ -532,7 +535,7 @@ export function validateLaunchResult(input: unknown, expectedRunId: string): Val
   // настоящий opencode-шлюз его не присылает вовсе. Отсутствие этих полей — не повод
   // выбросить результат целого рана: живая проба #100 показала, что реальный ответ
   // отвергался как WORKER_PROTOCOL_INVALID, и рана с артефактами у клиента не было.
-  const OPTIONAL_RESULT_KEYS = ['failure', 'pid', 'answer', 'profileChanges'] as const;
+  const OPTIONAL_RESULT_KEYS = ['failure', 'pid', 'answer', 'profileChanges', 'exitObserved'] as const;
   checkKeys(
     input,
     LAUNCH_RESULT_KEYS,
@@ -553,6 +556,8 @@ export function validateLaunchResult(input: unknown, expectedRunId: string): Val
   }
   if (input['exitCode'] !== null && typeof input['exitCode'] !== 'number') collector.push('launch.exitCode: expected number or null');
   if (input['exitSignal'] !== null && typeof input['exitSignal'] !== 'string') collector.push('launch.exitSignal: expected string or null');
+  if (input['exitObserved'] !== undefined && typeof input['exitObserved'] !== 'boolean') collector.push('launch.exitObserved: expected boolean when present');
+  if (input['exitObserved'] === false && (input['exitCode'] !== null || input['exitSignal'] !== null)) collector.push('launch.exitObserved: false conflicts with an exit code or signal');
   if (typeof input['exitReason'] !== 'string' || !(EXIT_REASONS as readonly string[]).includes(input['exitReason'])) {
     collector.push(`launch.exitReason: expected one of ${EXIT_REASONS.join(', ')}`);
   }
@@ -758,7 +763,7 @@ export function mapLaunchResult(
     exitReason: launch.exitReason,
     exitCode: launch.exitCode,
     exitSignal: launch.exitSignal,
-    exitObserved: launch.exitCode !== null || launch.exitSignal !== null,
+    exitObserved: launch.exitObserved ?? (launch.exitCode !== null || launch.exitSignal !== null),
     startedAt: times.startedAt,
     finishedAt: times.finishedAt,
     ...(typeof launch.answer === 'string' ? { text: launch.answer } : {}),

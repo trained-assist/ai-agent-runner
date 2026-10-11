@@ -178,6 +178,11 @@ for rollback.
   `GET .../result` returns the terminal result; `GET .../logs?after={sequence}` provides
   replayable stdout/stderr SSE; `POST .../cancel` requests cancellation.
 
+The result includes `exitObserved` independently from `exitCode` and `exitSignal`. During
+cancellation, OS process-tree polling can confirm that the process ended even if the engine's
+exit callback was lost and no code or signal is available. Do not infer process termination
+from `exitReason: cancelled` by itself.
+
 Example operator checks (run on the VM; use the public HTTPS host for external checks):
 
 ```bash

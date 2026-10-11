@@ -287,4 +287,31 @@ describe('lifecycle рана: persist → проверенная уборка (i
     expect(result.cleanup).toBe('completed');
     expect(checkpointOnDisk(cancelling.rootDir, cancelled.receipt.runId)).toMatchObject({ engine: { exitObserved: true } });
   });
+
+  it('records process death when cancellation loses the engine exit callback', async () => {
+    const engine = new (class extends SilentEngine {
+      override async start(ctx: EngineStartContext): Promise<EngineHandle> {
+        this.startCalls += 1;
+        const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000);'], {
+          cwd: ctx.cwd,
+          env: ctx.env,
+          detached: true,
+          stdio: 'ignore',
+        });
+        // Simulate a lost engine callback: OS process-tree polling remains the
+        // independent evidence that cancellation actually stopped the process.
+        return handleForChild(child, { onLog: ctx.onLog, onExit: () => undefined });
+      }
+    })();
+    const h = createHarness({ adapters: { fake: engine }, artifactExport: true });
+    const { receipt } = h.start({ limits: { timeoutMs: 10_000 } });
+    await waitFor(() => h.runner.getRun(receipt.runId)?.state === 'running', 8000, 'run to start');
+
+    const cancel = await h.runner.cancel(receipt.runId, 1);
+    const result = await h.runner.waitFor(receipt.runId);
+
+    expect(cancel.status).toBe('stopped');
+    expect(result).toMatchObject({ outcome: 'cancelled', exitObserved: true, exitCode: null, exitSignal: null });
+    expect(h.runner.getRun(receipt.runId)?.checkpoint?.engine).toMatchObject({ exitObserved: true, exitCode: null, exitSignal: null });
+  });
 });

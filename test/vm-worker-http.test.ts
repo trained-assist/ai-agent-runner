@@ -60,7 +60,8 @@ describe('installable VM HTTP worker', () => {
     const resultResponse = await fetch(`${fixture.base}/v1/runs/${RUN_ID}/result`, { headers: authHeaders() });
     const result = await resultResponse.json();
     expect(resultResponse.status).toBe(200);
-    expect(result).toMatchObject({ runId: RUN_ID, status: 'started', stdout: 'worker says hello', repo: { branch: `agent-run/${RUN_ID}`, commit: null } });
+    expect(result).toMatchObject({ runId: RUN_ID, status: 'started', exitObserved: true,
+      stdout: 'worker says hello', repo: { branch: `agent-run/${RUN_ID}`, commit: null } });
   });
 
   it('refuses a saturated host before Runner.start with the exact capacity code', async () => {

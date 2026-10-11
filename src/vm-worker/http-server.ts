@@ -378,6 +378,7 @@ function toLaunchResult(options: VmWorkerServerOptions, snapshot: NonNullable<Re
     ...(snapshot.pid ? { pid: snapshot.pid } : { pid: null }),
     exitCode: result.exitCode,
     exitSignal: result.exitSignal,
+    exitObserved: result.exitObserved,
     exitReason: result.exitReason,
     stdout,
     stderr,
