@@ -7,6 +7,7 @@ export interface VmWorkerBindingDefinition {
   source: string;
   owner: string;
   rotatedAt?: string;
+  restoreClass?: 'regenerate-empty-only' | 'rotate-as-pair' | 'restore-exact-version' | 'import-or-reissue';
 }
 
 export interface VmWorkerBindingsInventory {
@@ -29,11 +30,13 @@ export function readVmWorkerBindingsInventory(path: string): VmWorkerBindingsInv
   }
   const seen = new Set<string>();
   const bindings = raw.bindings.map((entry, index) => {
-    if (!isRecord(entry) || Object.keys(entry).some((key) => !['name', 'required', 'secret', 'source', 'owner', 'rotatedAt'].includes(key))
+    if (!isRecord(entry) || Object.keys(entry).some((key) => !['name', 'required', 'secret', 'source', 'owner', 'rotatedAt', 'restoreClass'].includes(key))
       || !isEnvName(entry.name) || typeof entry.required !== 'boolean'
       || typeof entry.secret !== 'boolean' || typeof entry.source !== 'string' || !entry.source.trim()
       || typeof entry.owner !== 'string' || !entry.owner.trim()
-      || (entry.rotatedAt !== undefined && (typeof entry.rotatedAt !== 'string' || !Number.isFinite(Date.parse(entry.rotatedAt))))) {
+      || (entry.rotatedAt !== undefined && (typeof entry.rotatedAt !== 'string' || !Number.isFinite(Date.parse(entry.rotatedAt))))
+      || (entry.restoreClass !== undefined && !['regenerate-empty-only', 'rotate-as-pair', 'restore-exact-version', 'import-or-reissue'].includes(String(entry.restoreClass)))
+      || (entry.secret && entry.restoreClass === undefined)) {
       throw new Error(`worker bindings inventory entry ${index} is invalid`);
     }
     if (seen.has(entry.name)) throw new Error(`worker bindings inventory has duplicate ${entry.name}`);
@@ -45,6 +48,7 @@ export function readVmWorkerBindingsInventory(path: string): VmWorkerBindingsInv
       source: entry.source,
       owner: entry.owner,
       ...(typeof entry.rotatedAt === 'string' ? { rotatedAt: entry.rotatedAt } : {}),
+      ...(typeof entry.restoreClass === 'string' ? { restoreClass: entry.restoreClass as VmWorkerBindingDefinition['restoreClass'] } : {}),
     };
   });
   return { schemaVersion: 1, workerId: raw.workerId, region: raw.region, bindings };

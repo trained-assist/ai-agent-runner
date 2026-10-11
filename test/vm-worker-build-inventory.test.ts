@@ -14,7 +14,7 @@ describe('VM worker build and binding inventory', () => {
       workerId: 'france-worker',
       region: 'eu' as const,
       bindings: [
-        { name: 'VM_WORKER_TOKEN', required: true, secret: true, source: 'systemd:worker.env', owner: 'UNASSIGNED — assign named owner' },
+      { name: 'VM_WORKER_TOKEN', required: true, secret: true, source: 'systemd:worker.env', owner: 'UNASSIGNED — assign named owner', restoreClass: 'rotate-as-pair' as const },
         { name: 'GCS_BUCKET', required: true, secret: false, source: 'systemd:worker.env', owner: 'platform' },
       ],
     };
@@ -31,7 +31,7 @@ describe('VM worker build and binding inventory', () => {
     tempDirs.push(dir);
     const path = join(dir, 'bindings.json');
     const valid = { schemaVersion: 1, workerId: 'ru-worker', region: 'ru', bindings: [
-      { name: 'VM_WORKER_TOKEN', required: true, secret: true, source: 'file', owner: 'ops' },
+      { name: 'VM_WORKER_TOKEN', required: true, secret: true, source: 'file', owner: 'ops', restoreClass: 'rotate-as-pair' },
     ] };
     writeFileSync(path, JSON.stringify({ ...valid, bindings: [...valid.bindings, ...valid.bindings] }));
     expect(() => readVmWorkerBindingsInventory(path)).toThrow('duplicate VM_WORKER_TOKEN');
