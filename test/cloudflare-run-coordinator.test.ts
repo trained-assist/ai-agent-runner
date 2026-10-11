@@ -187,6 +187,41 @@ describe('Cloudflare Runner run coordinator', () => {
     expect(await result.json()).toMatchObject({ outcome: 'cancelled', exitObserved: true, exitCode: null, exitSignal: null });
   });
 
+  it('forwards a task-scoped ingress manifest pin enriched with the admitted run identity', async () => {
+    const { coordinator, launched, storage } = setup();
+    const pin = { contractVersion: 1, manifestRef: 'cp-input-manifest:task-file', manifestVersion: 'd'.repeat(64) };
+    const response = await coordinator.fetch(call('/v1/runs', {
+      ...body, userTaskId: 'task-file', ingressManifest: pin,
+    }, { 'idempotency-key': 'file-ingress-admission' }));
+    expect(response.status).toBe(202);
+    const receipt = await response.json() as { runId: string };
+    await coordinator.alarm();
+
+    expect(launched).toHaveLength(1);
+    expect(launched[0]?.['ingressManifest']).toEqual({
+      ...pin, userTaskId: 'task-file', profileId: principal.profileId,
+      runId: receipt.runId, ownerGeneration: 1,
+    });
+    expect(JSON.stringify(storage.values.get('runner-v1'))).not.toContain('manifestVersion');
+  });
+
+  it('rejects malformed or cross-task ingress manifest pins before storing or launching', async () => {
+    const { coordinator, launched, storage } = setup();
+    const invalidPins = [
+      { contractVersion: 2, manifestRef: 'cp-input-manifest:task-a', manifestVersion: 'e'.repeat(64) },
+      { contractVersion: 1, manifestRef: 'cp-input-manifest:other-task', manifestVersion: 'e'.repeat(64) },
+      { contractVersion: 1, manifestRef: 'cp-input-manifest:task-a', manifestVersion: 'bad' },
+      { contractVersion: 1, manifestRef: 'cp-input-manifest:task-a', manifestVersion: 'e'.repeat(64), runId: 'caller-chosen' },
+    ];
+    for (const [index, ingressManifest] of invalidPins.entries()) {
+      const response = await coordinator.fetch(call('/v1/runs', { ...body, ingressManifest }, { 'idempotency-key': `bad-ingress-${index}` }));
+      expect(response.status).toBe(400);
+      expect(await response.json()).toMatchObject({ error: { code: 'INVALID_INGRESS_MANIFEST' } });
+    }
+    expect(storage.values.get('runner-v1')).toMatchObject({ runs: {}, idempotency: {} });
+    expect(launched).toHaveLength(0);
+  });
+
   it('returns a terminal preflight result when France refuses the launch before admission', async () => {
     const { coordinator, env, storage } = setup();
     env.FETCH = async (input) => {
