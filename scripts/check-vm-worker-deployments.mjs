@@ -40,6 +40,13 @@ for (const [region, prefix] of [['France', 'EU'], ['Russia', 'RU']]) {
       process.stdout.write(`${region}: deployed main ${deployedCommit} (${version?.build?.version ?? 'unknown'}).\n`);
     }
     if (version?.bindings?.ready === false) warn(`${region} required bindings missing`, `Missing required variable names: ${(version.bindings.missingRequired ?? []).join(', ') || 'unknown'}`);
+    const ingressBindingNames = ['RUNNER_CONTROL_PLANE_URL', 'RUNNER_CONTROL_PLANE_PRINCIPAL', 'RUNNER_CONTROL_PLANE_PRINCIPAL_SECRET'];
+    const inventory = Array.isArray(version?.bindings?.inventory) ? version.bindings.inventory : [];
+    const ingressBindings = ingressBindingNames.map((name) => {
+      const binding = inventory.find((entry) => entry?.name === name);
+      return `${name}=${typeof binding?.configured === 'boolean' ? binding.configured : 'unknown'}`;
+    });
+    process.stdout.write(`${region}: ingress resolver binding presence ${ingressBindings.join(', ')}.\n`);
     for (const message of version?.bindings?.warnings ?? []) warn(`${region} binding inventory`, message);
     if (!readyResponse.ok) warn(`${region} worker not ready`, `readyz HTTP ${readyResponse.status}; checks=${JSON.stringify(ready.checks ?? {})}`);
     else process.stdout.write(`${region}: readiness is ready.\n`);
