@@ -418,8 +418,11 @@ export class RunnerRunCoordinator {
           const statusResponse = await this.worker(`/v1/runs/${run.runId}/status`);
           const workerStatus = statusResponse.ok ? await statusResponse.json() as { status?: string } : null;
           if (workerStatus?.status === 'unknown' || workerStatus?.status === 'unknown_run') {
-            if (run.launchAttempts < 3) { run.workerReceipt = undefined; run.state = 'queued'; }
-            else transition(run, 'unknown', { reason: 'worker_no_longer_knows_run' });
+            // The worker already issued an admission receipt. Its later lack of
+            // knowledge is not proof that execution did not start, so a fresh
+            // launch could run the task twice. Reconciliation/fencing owns the
+            // next decision; the coordinator must preserve this uncertainty.
+            transition(run, 'unknown', { reason: 'worker_no_longer_knows_run' });
           } else if (workerStatus?.status === 'running' || workerStatus?.status === 'accepted') {
             if (run.state !== 'running') transition(run, 'running');
           } else if (['succeeded', 'failed', 'cancelled'].includes(workerStatus?.status ?? '')) {
@@ -451,11 +454,9 @@ export class RunnerRunCoordinator {
             if (observed?.status && !['unknown', 'unknown_run'].includes(observed.status)) {
               run.workerReceipt = { runId: run.runId, status: 'accepted', operationId: 'reconciled' };
               transition(run, ['succeeded', 'failed', 'cancelled'].includes(observed.status) ? observed.status as State : 'running', { reconciled: true });
-            } else if (run.launchAttempts >= 5) transition(run, 'unknown', { reason: 'worker_acceptance_could_not_be_confirmed' });
-            else { run.state = 'queued'; run.updatedAt = now(); }
+            } else transition(run, 'unknown', { reason: 'worker_acceptance_could_not_be_confirmed' });
           } catch {
-            if (run.launchAttempts >= 5) transition(run, 'unknown', { reason: 'worker_acceptance_could_not_be_confirmed' });
-            else { run.state = 'queued'; run.updatedAt = now(); }
+            transition(run, 'unknown', { reason: 'worker_acceptance_could_not_be_confirmed' });
           }
         } else { run.state = 'running'; run.updatedAt = now(); }
         run['lastError'] = message.slice(0, 200);

@@ -149,6 +149,29 @@ describe('Cloudflare Runner run coordinator', () => {
       failure: { code: 'WORKER_LAUNCH_REJECTED', failureClass: 'preflight' } });
   });
 
+  it('does not redispatch an execution after the worker reports an unknown run', async () => {
+    const { coordinator, env, launched } = setup();
+    env.FETCH = async (input, init) => {
+      const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+      if (url.pathname === '/v1/launch') {
+        launched.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        return Response.json({ runId: launched.at(-1)?.['runId'], operationId: 'op-test', status: 'accepted' }, { status: 202 });
+      }
+      if (url.pathname.endsWith('/status')) return Response.json({ status: 'unknown_run' });
+      return Response.json({ error: 'unexpected worker call' }, { status: 500 });
+    };
+    const response = await coordinator.fetch(call('/v1/runs', body, { 'idempotency-key': 'unknown-does-not-retry' }));
+    const receipt = await response.json() as { runId: string };
+
+    await coordinator.alarm(); // receipt from launch
+    await coordinator.alarm(); // worker no longer knows the run
+    await coordinator.alarm(); // unknown runs are not eligible for dispatch
+
+    expect(launched).toHaveLength(1);
+    const status = await coordinator.fetch(call(`/v1/runs/${receipt.runId}/status`));
+    expect(await status.json()).toMatchObject({ state: 'unknown', connectionLost: true });
+  });
+
   it('uses the authenticated principal repository and rejects request attempts to override it', async () => {
     const boundPrincipal: ApiPrincipal = { ...principal, repository: 'team/profile-one' };
     const { coordinator, launched, storage } = setup();
