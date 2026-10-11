@@ -97,6 +97,58 @@ describe('Cloudflare Runner run coordinator', () => {
     expect(conflict.status).toBe(409);
   });
 
+  it('fences cancellation before admission and prevents a late submit from launching', async () => {
+    const { coordinator, storage, launched } = setup();
+    const cancelBody = { userTaskId: body.userTaskId, idempotencyKey: 'late-submit', ownerGeneration: 1 };
+    const cancelled = await coordinator.fetch(call('/v1/runs/cancel-by-idempotency-key', cancelBody));
+    expect(cancelled.status).toBe(200);
+    expect(await cancelled.json()).toMatchObject({ status: 'cancelled_before_admission', userTaskId: body.userTaskId, ownerGeneration: 1, runId: null });
+
+    const submit = await coordinator.fetch(call('/v1/runs', body, { 'idempotency-key': 'late-submit' }));
+    expect(submit.status).toBe(409);
+    expect(await submit.json()).toMatchObject({ error: { code: 'CANCELLED_BEFORE_ADMISSION' } });
+    await coordinator.alarm();
+    expect(launched).toHaveLength(0);
+
+    // Cleanup may clear the test run state, but it must not open the late-submit race.
+    await coordinator.fetch(call('/v1/sandbox/cleanup-task', { userTaskId: body.userTaskId }));
+    const lateRetry = await coordinator.fetch(call('/v1/runs', body, { 'idempotency-key': 'late-submit' }));
+    expect(lateRetry.status).toBe(409);
+    expect(launched).toHaveLength(0);
+    expect(storage.values.get('runner-v1')).toMatchObject({ cancellationFences: expect.any(Object) });
+
+    const nextGeneration = await coordinator.fetch(call('/v1/runs', body, { 'idempotency-key': 'next-generation' }));
+    expect(nextGeneration.status).toBe(202);
+    const nextReceipt = await nextGeneration.json() as { runId: string };
+    await coordinator.alarm();
+    const stored = storage.values.get('runner-v1') as { runs: Record<string, { state: string }> };
+    stored.runs[nextReceipt.runId]!.state = 'succeeded';
+    await storage.put('runner-v1', stored);
+    await coordinator.fetch(call('/v1/sandbox/cleanup-task', { userTaskId: body.userTaskId }));
+    const staleReplayAfterLaterGeneration = await coordinator.fetch(call('/v1/runs', body, { 'idempotency-key': 'late-submit' }));
+    expect(staleReplayAfterLaterGeneration.status).toBe(409);
+    expect(await staleReplayAfterLaterGeneration.json()).toMatchObject({ error: { code: 'CANCELLED_BEFORE_ADMISSION' } });
+    expect(launched).toHaveLength(1);
+  });
+
+  it('cancels the exact admitted generation by idempotency key and rejects identity mismatches', async () => {
+    const { coordinator, launched } = setup();
+    const submit = await coordinator.fetch(call('/v1/runs', body, { 'idempotency-key': 'admitted-run' }));
+    const receipt = await submit.json() as { runId: string };
+    await coordinator.alarm();
+    expect(launched).toHaveLength(1);
+
+    const mismatch = await coordinator.fetch(call('/v1/runs/cancel-by-idempotency-key', { userTaskId: body.userTaskId, idempotencyKey: 'admitted-run', ownerGeneration: 2 }));
+    expect(mismatch.status).toBe(409);
+    expect(await mismatch.json()).toMatchObject({ error: { code: 'CANCEL_IDENTITY_MISMATCH' } });
+
+    const cancelled = await coordinator.fetch(call('/v1/runs/cancel-by-idempotency-key', { userTaskId: body.userTaskId, idempotencyKey: 'admitted-run', ownerGeneration: 1 }));
+    expect(cancelled.status).toBe(200);
+    expect(await cancelled.json()).toMatchObject({ status: 'stop_pending', runId: receipt.runId, ownerGeneration: 1 });
+    const status = await coordinator.fetch(call(`/v1/runs/${receipt.runId}/status`));
+    expect(await status.json()).toMatchObject({ runId: receipt.runId, cancelRequested: true });
+  });
+
   it('launches through the configured VM worker and persists status/result across alarm cycles', async () => {
     const { coordinator, launched } = setup();
     const response = await coordinator.fetch(call('/v1/runs', body, { 'idempotency-key': 'attempt-2' }));
