@@ -214,6 +214,14 @@ export class RunnerRunCoordinator {
     const instructions = typeof body.instructions === 'string' ? body.instructions.trim() : '';
     if (!taskId || (typeof inputPrompt !== 'string' || !inputPrompt.trim()) && !instructions) return error('INVALID_REQUEST', 'userTaskId and a non-empty prompt or instructions are required', 400, { errors: ['userTaskId: expected safe id', 'input.inlinePrompt: expected non-empty string'] });
     if ((typeof inputPrompt === 'string' && inputPrompt.length > 100_000) || instructions.length > 10_000) return error('INVALID_REQUEST', 'prompt or instructions exceed their size limit', 400);
+    const ingressManifest = body.ingressManifest;
+    if (ingressManifest !== undefined && (!ingressManifest || typeof ingressManifest !== 'object' || Array.isArray(ingressManifest)
+      || Object.keys(ingressManifest).sort().join(',') !== 'contractVersion,manifestRef,manifestVersion'
+      || ingressManifest.contractVersion !== 1
+      || ingressManifest.manifestRef !== `cp-input-manifest:${taskId}`
+      || typeof ingressManifest.manifestVersion !== 'string' || !/^[0-9a-f]{64}$/.test(ingressManifest.manifestVersion))) {
+      return error('INVALID_INGRESS_MANIFEST', 'ingressManifest must be a task-scoped Control Plane manifest pin', 400);
+    }
     if (Array.isArray(body.input?.refs) && body.input.refs.length) return error('INPUT_REFS_UNSUPPORTED', 'input refs need a durable workspace and are not supported by this Worker API yet', 422);
     const mcp = body.mcp?.servers?.length ? body.mcp.servers : [];
     if (!Array.isArray(mcp) || mcp.length > 1) return error('MCP_HOST_POLICY_MISSING', 'only the pinned test Registry MCP server is supported by this Worker API', 422);
@@ -235,7 +243,7 @@ export class RunnerRunCoordinator {
         return error('MCP_BINDING_UNAVAILABLE', 'pinned test Registry MCP secrets or lease are not configured', 503);
       }
     }
-    if (body.profileWorkspace || body.ingressManifest || body.credentialBindings?.length) return error('FEATURE_UNSUPPORTED', 'profile workspace, ingress manifests, and credential bindings are not supported by this Worker API yet', 422);
+    if (body.profileWorkspace || body.credentialBindings?.length) return error('FEATURE_UNSUPPORTED', 'profile workspace and credential bindings are not supported by this Worker API yet', 422);
     if (body.isolation !== undefined && body.isolation?.mode !== 'none') return error('ISOLATION_UNSUPPORTED', 'the France VM worker currently supports isolation.mode=none only', 422);
     if (body.regionConstraints?.allowedRegions && !body.regionConstraints.allowedRegions.includes('eu')) return error('REGION_UNAVAILABLE', 'this Runner API only dispatches to the France EU worker', 422);
     const engine = typeof body.engine?.name === 'string' ? body.engine.name : (this.env.RUNNER_ENGINE || DEFAULT_ENGINE);
@@ -305,6 +313,7 @@ export class RunnerRunCoordinator {
       const launch = { runId, jobId, userTaskId: taskId, profileId: principal.profileId, conversationId, operationId: `op_${await digest(`${taskId}:${ownerGeneration}`).then((h) => h.slice(0, 24))}`,
           ownerGeneration, engine: { name: engine, adapterVersion: body.engine?.adapterVersion ?? '1', ...(body.engine?.modelSettings?.model ? { modelSettings: { model: body.engine.modelSettings.model } } : {}) },
           input: { inlinePrompt: `${typeof inputPrompt === 'string' ? inputPrompt : ''}${instructions ? `${inputPrompt ? '\n\nAdditional instructions: ' : ''}${instructions}` : ''}` }, cwd: `/tmp/runner/${runId}`, envAllowlist, env: launchEnv, limits: { timeoutMs: clampInteger(limits.timeoutMs, 300_000, 1_000, 86_400_000), maxOutputBytes: clampInteger(limits.maxOutputBytes, 5_000_000, 1, 100_000_000), maxLogBytes: clampInteger(limits.maxLogBytes, 5_000_000, 1, 100_000_000) },
+          ...(ingressManifest ? { ingressManifest: { ...ingressManifest, userTaskId: taskId, profileId: principal.profileId, runId, ownerGeneration } } : {}),
           repository: { fullName: repository ?? '', branch: `agent-run/${runId}`, ...(body.repository?.revision ? { revision: body.repository.revision } : {}) },
           ...(repositoryToken ? { publicationToken: repositoryToken } : {}),
           resultUrl, isolation: body.isolation ?? { mode: 'none' }, outputs: Array.isArray(body.outputs) ? body.outputs : [],
