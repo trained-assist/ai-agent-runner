@@ -190,12 +190,20 @@ Telegram UX principal/profile with its exact API-key `mcpBindings` grant. It cre
 proof after allocating `runId`, bounds it by `MCP_TEST_EXPIRES_AT`, and keeps the Host Bearer
 inside the encrypted launch and `mcpSecrets`. Other MCP descriptors fail closed.
 
-Profile workspace provisioning/saveback, ingress manifest materialization, input refs, binary
-artifact download, GCS log publication, SSE, the complete `/v1/capabilities` document, and
-multi-engine fallback remain unsupported. A live Host fixture call through CP, this Worker,
-France VM2, OpenCode and Ladder has succeeded and persisted the expected answer. That run did not
-send a Telegram message and does not establish production readiness. Local Worker tests and
-mock probes do not prove real Agent execution, repository persistence, or Telegram delivery.
+Profile workspace provisioning/saveback, generic input refs, binary artifact download,
+GCS log publication, SSE, the complete `/v1/capabilities` document, and multi-engine fallback
+remain unsupported. Task-scoped `ingressManifest` pins are accepted only in the exact
+`cp-input-manifest:<userTaskId>` form with a lowercase SHA-256 version, then enriched with the
+admitted profile/run/generation and forwarded to the France VM launch request. The VM must have
+the complete trusted `RUNNER_CONTROL_PLANE_*` resolver configuration to fetch and materialize
+the manifest; without it, the run fails closed before OpenCode starts. `/readyz` does not
+currently report this optional capability, so a healthy response alone does not prove that
+file-intake runs are ready. The live sandbox file scenario remains the proof gate for this path.
+
+A live Host fixture call through CP, this Worker, France VM2, OpenCode and Ladder has succeeded
+and persisted the expected answer. That run did not send a Telegram message and does not establish
+production readiness. Local Worker tests and mock probes do not prove real Agent execution,
+repository persistence, or Telegram delivery.
 
 The manual `Deploy Telegram UX Cloudflare Runner sandbox` workflow requires the matching
 `MCP_TEST_AUTH_TOKEN` and Ed25519 `MCP_TEST_RUNNER_PRIVATE_JWK` in the `sandbox` GitHub
