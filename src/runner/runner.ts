@@ -699,7 +699,11 @@ export class Runner {
     }
 
     if (!isTerminalState(st.state) && !run.exitReceived) {
-      st.exit = { code: null, signal: null, observed: false, at: this.nowIso() };
+      // `awaitStop` only succeeds here if the process tree is no longer alive.
+      // Trust that OS observation only while this worker still owns the local
+      // process handle. After restart, a persisted PID is not enough to claim
+      // observed exit because process identity may have been lost or reused.
+      st.exit = { code: null, signal: null, observed: run.handle !== null, at: this.nowIso() };
       this.store.saveState(st);
       this.emit(st, 'exit', { code: null, signal: null });
       if (st.state === 'running' && this.transition(st, 'finalizing')) {

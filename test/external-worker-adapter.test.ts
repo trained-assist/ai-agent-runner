@@ -164,6 +164,21 @@ describe('валидация LaunchResult', () => {
     expect(validated.ok).toBe(true);
   });
 
+  it('preserves explicit process-exit evidence when a cancelled process has no code or signal', () => {
+    const raw = launchResult({ exitCode: null, exitSignal: null, exitObserved: true, exitReason: 'cancelled' });
+    const validated = validateLaunchResult(raw, 'run-1');
+    expect(validated.ok).toBe(true);
+    if (!validated.ok) return;
+    const mapping = mapLaunchResult(makeRunSpec({ runId: 'run-1' }), validated.value, TIMES);
+    expect(mapping.result).toMatchObject({ outcome: 'cancelled', exitObserved: true, exitCode: null, exitSignal: null });
+  });
+
+  it('rejects explicit no-exit evidence when an exit code or signal is present', () => {
+    const validated = validateLaunchResult(launchResult({ exitObserved: false }), 'run-1');
+    expect(validated.ok).toBe(false);
+    expect(validated.ok ? [] : validated.errors).toContain('launch.exitObserved: false conflicts with an exit code or signal');
+  });
+
   it('ANSI и управляющие символы в stderr вычищаются, а не роняют результат', () => {
     // Реальный opencode печатает цветом: раньше такой stderr отвергал весь результат.
     const validated = validateLaunchResult(

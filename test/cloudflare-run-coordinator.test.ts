@@ -112,6 +112,29 @@ describe('Cloudflare Runner run coordinator', () => {
     expect(await result.json()).toMatchObject({ outcome: 'succeeded', text: 'done' });
   });
 
+  it('preserves worker process-exit evidence for cancellation without code or signal', async () => {
+    const { coordinator, env } = setup();
+    env.FETCH = async (input, init) => {
+      const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+      if (url.pathname === '/v1/launch') {
+        const launch = JSON.parse(String(init?.body)) as { runId: string };
+        return Response.json({ runId: launch.runId, operationId: 'op-cancel', status: 'accepted',
+          statusUrl: `https://france.example/v1/runs/${launch.runId}/status`, resultUrl: `https://france.example/v1/runs/${launch.runId}/result` }, { status: 202 });
+      }
+      if (url.pathname.endsWith('/status')) return Response.json({ status: 'cancelled' });
+      if (url.pathname.endsWith('/result')) return Response.json({ exitReason: 'cancelled', exitCode: null,
+        exitSignal: null, exitObserved: true, artifacts: [], logUrl: '', repo: null });
+      return Response.json({ status: 'stopped' });
+    };
+    const response = await coordinator.fetch(call('/v1/runs', body, { 'idempotency-key': 'cancel-exit-evidence' }));
+    const receipt = await response.json() as { runId: string };
+    await coordinator.alarm(); // dispatch
+    await coordinator.alarm(); // reconcile terminal worker result
+
+    const result = await coordinator.fetch(call(`/v1/runs/${receipt.runId}/result`));
+    expect(await result.json()).toMatchObject({ outcome: 'cancelled', exitObserved: true, exitCode: null, exitSignal: null });
+  });
+
   it('returns a terminal preflight result when France refuses the launch before admission', async () => {
     const { coordinator, env, storage } = setup();
     env.FETCH = async (input) => {

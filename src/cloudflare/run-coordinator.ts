@@ -438,7 +438,9 @@ export class RunnerRunCoordinator {
               const outcome = launchResult.exitReason === 'completed' ? 'succeeded' : launchResult.exitReason === 'cancelled' ? 'cancelled' : 'failed';
               run.result = { schemaVersion: 1, runId: run.runId, jobId: run.jobId, userTaskId: run.userTaskId, profileId: run.profileId, ownerGeneration: run.ownerGeneration,
                 outcome, exitReason: launchResult.exitReason ?? 'worker_crash', exitCode: launchResult.exitCode ?? null, exitSignal: launchResult.exitSignal ?? null,
-                exitObserved: launchResult.exitCode != null || launchResult.exitSignal != null, startedAt: run.startedAt ?? run.createdAt, finishedAt: now(),
+                exitObserved: typeof launchResult.exitObserved === 'boolean' ? launchResult.exitObserved
+                  : launchResult.exitCode != null || launchResult.exitSignal != null,
+                startedAt: run.startedAt ?? run.createdAt, finishedAt: now(),
                 ...(run.answer !== null ? { text: run.answer } : {}), ...(launchResult.failure ? { failure: launchResult.failure } : {}), usage: { status: 'unknown' },
                 outputRefs: run.artifacts.map((artifact) => String(artifact['url'])), persistence: run.artifacts.length ? 'persisted' : 'not_required', persistenceReason: run.artifacts.length ? `artifacts are committed to ${String(repo?.['fullName'] ?? 'the repository')}` : 'the worker reported no artifacts', cleanup: 'completed', cleanupReason: 'execution workspace is owned by the France VM worker', logPath: run.logUrl ?? `vm-run:${run.runId}` };
               transition(run, outcome, { exitReason: launchResult.exitReason });
