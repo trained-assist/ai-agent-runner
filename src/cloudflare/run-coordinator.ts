@@ -14,7 +14,8 @@ interface RunRecord {
   artifacts: Array<Record<string, unknown>>; repo: Record<string, unknown> | null; logUrl: string | null;
   events: Array<Record<string, unknown>>;
 }
-interface Stored { runs: Record<string, RunRecord>; idempotency: Record<string, string>; latestOwnerGeneration: number; requestId?: string; jobId?: string }
+interface CancellationFence { userTaskId: string; ownerGeneration: number; principalId: string; profileId: string; tenantId?: string; createdAt: string }
+interface Stored { runs: Record<string, RunRecord>; idempotency: Record<string, string>; cancellationFences?: Record<string, CancellationFence>; latestOwnerGeneration: number; requestId?: string; jobId?: string }
 
 const INIT: Stored = { runs: {}, idempotency: {}, latestOwnerGeneration: 0 };
 const ACTIVE = new Set<State>(['queued', 'starting', 'running']);
@@ -123,6 +124,7 @@ export class RunnerRunCoordinator {
     const url = new URL(request.url);
     const segments = url.pathname.split('/').filter(Boolean);
     if (url.pathname === '/v1/sandbox/cleanup-task') return request.method === 'POST' ? this.cleanupTask(request, principal) : error('METHOD_NOT_ALLOWED', 'method not allowed', 405);
+    if (url.pathname === '/v1/runs/cancel-by-idempotency-key') return request.method === 'POST' ? this.cancelByIdempotencyKey(request, principal) : error('METHOD_NOT_ALLOWED', 'method not allowed', 405);
     if (segments.length === 2 && request.method === 'POST') return this.submit(request, principal);
     if (segments.length !== 4) return error('ROUTE_NOT_FOUND', `no route for ${url.pathname}`, 404);
     let runId: string;
@@ -170,7 +172,9 @@ export class RunnerRunCoordinator {
       const entries = Object.values(stored.runs).filter((run) => run.userTaskId === body.userTaskId);
       if (Object.keys(stored.runs).length !== entries.length) return error('TASK_STATE_MISMATCH', 'Durable Object contains state for a different task', 409);
       if (!entries.length) {
-        await tx.delete(stateKey);
+        const fences = Object.fromEntries(Object.entries(stored.cancellationFences ?? {}).filter(([, fence]) => fence.userTaskId === body.userTaskId));
+        if (Object.keys(fences).length) await tx.put(stateKey, { ...structuredClone(INIT), cancellationFences: fences, latestOwnerGeneration: stored.latestOwnerGeneration });
+        else await tx.delete(stateKey);
         await this.state.storage.deleteAlarm();
         return json({ status: 'already-empty', userTaskId: body.userTaskId, deletedRuns: 0 });
       }
@@ -178,7 +182,9 @@ export class RunnerRunCoordinator {
       if (entries.some((run) => ACTIVE.has(run.state) || run.state === 'unknown' || !TERMINAL.has(run.state))) return error('RUN_NOT_TERMINAL', 'active or unknown runs cannot be cleaned up', 409);
       // This Durable Object is keyed to one task ID. Remove the whole record so
       // idempotency keys, owner generations, events, and results are reset too.
-      await tx.delete(stateKey);
+      const fences = Object.fromEntries(Object.entries(stored.cancellationFences ?? {}).filter(([, fence]) => fence.userTaskId === body.userTaskId));
+      if (Object.keys(fences).length) await tx.put(stateKey, { ...structuredClone(INIT), cancellationFences: fences, latestOwnerGeneration: stored.latestOwnerGeneration });
+      else await tx.delete(stateKey);
       await this.state.storage.deleteAlarm();
       return json({ status: 'cleaned', userTaskId: body.userTaskId, deletedRuns: entries.length });
     });
@@ -256,6 +262,7 @@ export class RunnerRunCoordinator {
     let record!: RunRecord;
     let deduplicated = false;
     let conflict = false;
+    let cancelledBeforeAdmission = false;
     await this.state.storage.transaction(async (tx) => {
       const stored = await tx.get<Stored>(stateKey) ?? structuredClone(INIT);
       const expiration = Date.now() - 24 * 60 * 60 * 1000;
@@ -281,6 +288,13 @@ export class RunnerRunCoordinator {
         return;
       }
       const ownerGeneration = Math.max(prior?.ownerGeneration ?? 0, stored.latestOwnerGeneration) + 1;
+      const cancellationFence = stored.cancellationFences?.[idemKey];
+      if (cancellationFence && cancellationFence.userTaskId === taskId &&
+          cancellationFence.principalId === principal.principalId && cancellationFence.profileId === principal.profileId && cancellationFence.tenantId === principal.tenantId) {
+        conflict = true;
+        cancelledBeforeAdmission = true;
+        return;
+      }
       const taskHash = await digest(`${principal.principalId}\0${principal.profileId}\0${taskId}`);
       const runId = `run_${taskHash}_${crypto.randomUUID().replaceAll('-', '').slice(0, 24)}`;
       const requestId = prior?.requestId ?? stored.requestId ?? `req_${crypto.randomUUID().replaceAll('-', '').slice(0, 24)}`;
@@ -306,11 +320,79 @@ export class RunnerRunCoordinator {
       stored.jobId = jobId;
       await tx.put(stateKey, stored);
     });
-    if (conflict) return error(record && ACTIVE.has(record.state) ? 'TASK_ATTEMPT_ACTIVE' : 'IDEMPOTENCY_CONFLICT', record && ACTIVE.has(record.state) ? `task ${record.userTaskId} already has an active attempt` : 'the same Idempotency-Key was already used with a different request', 409, record && ACTIVE.has(record.state) ? { runId: record.runId, state: record.state } : undefined);
+    if (conflict) return error(cancelledBeforeAdmission ? 'CANCELLED_BEFORE_ADMISSION' : record && ACTIVE.has(record.state) ? 'TASK_ATTEMPT_ACTIVE' : 'IDEMPOTENCY_CONFLICT', cancelledBeforeAdmission ? 'the attempt was durably cancelled before admission' : record && ACTIVE.has(record.state) ? `task ${record.userTaskId} already has an active attempt` : 'the same Idempotency-Key was already used with a different request', 409, record && ACTIVE.has(record.state) ? { runId: record.runId, state: record.state } : undefined);
     if (!deduplicated) await this.state.storage.setAlarm(Date.now() + 100);
     if (!record!) return error('INTERNAL', 'run could not be admitted', 500);
     if (deduplicated) return json({ requestId: record.requestId, userTaskId: record.userTaskId, runId: record.runId, deduplicated: true }, 200);
     return json({ requestId: record.requestId, userTaskId: record.userTaskId, runId: record.runId, deduplicated: false }, 202);
+  }
+
+  private async cancelByIdempotencyKey(request: Request, principal: ApiPrincipal): Promise<Response> {
+    let body: { userTaskId?: unknown; idempotencyKey?: unknown; ownerGeneration?: unknown };
+    try { body = await request.json() as typeof body; } catch { return error('INVALID_REQUEST', 'cancel body must be valid JSON', 400); }
+    if (typeof body.userTaskId !== 'string' || !SAFE_ID.test(body.userTaskId) ||
+        typeof body.idempotencyKey !== 'string' || !body.idempotencyKey.trim() || body.idempotencyKey.length > 200 ||
+        !Number.isSafeInteger(body.ownerGeneration) || Number(body.ownerGeneration) < 1) {
+      return error('INVALID_REQUEST', 'userTaskId, idempotencyKey, and a positive ownerGeneration are required', 400);
+    }
+    const taskId = body.userTaskId;
+    const idempotencyKey = body.idempotencyKey.trim();
+    const ownerGeneration = Number(body.ownerGeneration);
+    const idemKey = `${principal.principalId}\0${idempotencyKey}`;
+    let response: Record<string, unknown> | undefined;
+    let failure: Response | undefined;
+    let runToCancel: RunRecord | undefined;
+    await this.state.storage.transaction(async (tx) => {
+      const stored = await tx.get<Stored>(stateKey) ?? structuredClone(INIT);
+      const mappedRunId = stored.idempotency[idemKey];
+      const run = mappedRunId ? stored.runs[mappedRunId] : undefined;
+      if (run) {
+        if (!owns(run, principal)) { failure = error('FORBIDDEN', 'run is not owned by this principal', 403); return; }
+        if (run.userTaskId !== taskId || run.ownerGeneration !== ownerGeneration) {
+          failure = error('CANCEL_IDENTITY_MISMATCH', 'idempotency key belongs to a different task or owner generation', 409); return;
+        }
+        if (TERMINAL.has(run.state)) {
+          response = { status: 'already_terminal', userTaskId: run.userTaskId, ownerGeneration: run.ownerGeneration, runId: run.runId, state: run.state };
+          return;
+        }
+        run.cancelRequested = true;
+        run.updatedAt = now();
+        stored.runs[run.runId] = run;
+        await tx.put(stateKey, stored);
+        runToCancel = run;
+        response = { status: 'stop_pending', userTaskId: run.userTaskId, ownerGeneration: run.ownerGeneration, runId: run.runId, state: run.state };
+        return;
+      }
+      const fences = stored.cancellationFences ??= {};
+      const existingFence = fences[idemKey];
+      if (existingFence && (existingFence.userTaskId !== taskId || existingFence.ownerGeneration !== ownerGeneration ||
+          existingFence.principalId !== principal.principalId || existingFence.profileId !== principal.profileId || existingFence.tenantId !== principal.tenantId)) {
+        failure = error('CANCEL_IDENTITY_MISMATCH', 'idempotency key is already fenced for a different task or owner generation', 409); return;
+      }
+      if (!existingFence) {
+        const taskRuns = Object.values(stored.runs).filter((candidate) => candidate.principalId === principal.principalId &&
+          candidate.profileId === principal.profileId && candidate.userTaskId === taskId);
+        if (taskRuns.some((candidate) => ACTIVE.has(candidate.state) || candidate.state === 'unknown')) {
+          failure = error('TASK_ATTEMPT_ACTIVE', 'task has an admitted attempt that must be cancelled by run id', 409); return;
+        }
+        const expectedGeneration = Math.max(stored.latestOwnerGeneration, ...taskRuns.map((candidate) => candidate.ownerGeneration), 0) + 1;
+        if (ownerGeneration !== expectedGeneration) {
+          failure = error('STALE_OWNER_GENERATION', 'cancel does not name the next task owner generation', 409, { ownerGeneration: expectedGeneration }); return;
+        }
+        fences[idemKey] = { userTaskId: taskId, ownerGeneration, principalId: principal.principalId,
+          profileId: principal.profileId, ...(principal.tenantId ? { tenantId: principal.tenantId } : {}), createdAt: now() };
+        stored.latestOwnerGeneration = Math.max(stored.latestOwnerGeneration, ownerGeneration);
+        await tx.put(stateKey, stored);
+      }
+      response = { status: 'cancelled_before_admission', userTaskId: taskId, ownerGeneration, runId: null };
+    });
+    if (failure) return failure;
+    if (runToCancel?.workerReceipt) {
+      try { await this.worker(`/v1/runs/${runToCancel.runId}/cancel`, 'POST', {}); }
+      catch { /* durable cancelRequested is reconciled by the alarm */ }
+    }
+    if (runToCancel) await this.state.storage.setAlarm(Date.now() + 100);
+    return json(response);
   }
 
   private async cancel(request: Request, runId: string, principal: ApiPrincipal): Promise<Response> {

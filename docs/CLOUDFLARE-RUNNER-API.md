@@ -172,6 +172,17 @@ When mapping a France result, it preserves the worker's explicit `exitObserved` 
 from exit code/signal; older worker results remain compatible through the legacy inference.
 Durable Objects are sharded by principal, profile, and task hash.
 
+### Cancel when the submit receipt is missing
+
+`POST /v1/runs/cancel-by-idempotency-key` accepts `{ userTaskId, idempotencyKey, ownerGeneration }`
+under `runs:write`. It routes to the same task Durable Object as submit. If admission already
+exists, it validates the exact task and generation, requests cancellation, and returns the exact
+`runId` with `stop_pending` (or terminal state). If admission does not yet exist, it writes a
+principal-scoped cancellation fence atomically with the lookup and returns
+`cancelled_before_admission`; any later submit with that key and generation is rejected before
+dispatch. Repeated matching cancellation is idempotent, while task/generation mismatches fail
+closed. Sandbox cleanup retains these fences so it cannot reopen a delayed-submit race.
+
 ## Current acceptance gaps
 
 The sandbox3 Worker supports only the pinned test Registry MCP descriptor for the exact

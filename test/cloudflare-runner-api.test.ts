@@ -60,6 +60,36 @@ describe('Cloudflare Runner API Worker', () => {
     expect(coordinatorFetch).toHaveBeenCalledOnce();
   });
 
+  it('routes cancel-by-idempotency-key to the task coordinator and requires write scope', async () => {
+    const token = 'runner-api-cancel-by-key';
+    const keyHash = await sha256(token);
+    const coordinatorFetch = vi.fn(async (request: Request) => {
+      expect(request.url).toBe('https://runner-runs.internal/v1/runs/cancel-by-idempotency-key');
+      expect(await request.json()).toEqual({ userTaskId: 'task-cancel-by-key', idempotencyKey: 'attempt-key', ownerGeneration: 3 });
+      return Response.json({ status: 'cancelled_before_admission', userTaskId: 'task-cancel-by-key', ownerGeneration: 3, runId: null });
+    });
+    const env = {
+      RUNNER_API_KEYS: JSON.stringify([{ keyHash, principalId: 'cancel-principal', profileId: 'cancel-profile', repository: 'team/test', scopes: ['runs:write'] }]),
+      RUNNER_RUNS: { idFromName: vi.fn((name) => name), get: vi.fn().mockReturnValue({ fetch: coordinatorFetch }) },
+    } as unknown as RunnerWorkerEnv;
+    const response = await runnerApi.fetch(new Request('https://api.example/v1/runs/cancel-by-idempotency-key', {
+      method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ userTaskId: 'task-cancel-by-key', idempotencyKey: 'attempt-key', ownerGeneration: 3 }),
+    }), env);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ status: 'cancelled_before_admission' });
+    expect(env.RUNNER_RUNS.idFromName).toHaveBeenCalledWith(expect.stringMatching(/^task-[0-9a-f]{64}$/));
+    expect(coordinatorFetch).toHaveBeenCalledOnce();
+
+    const readOnlyEnv = { ...env, RUNNER_API_KEYS: JSON.stringify([{ keyHash, principalId: 'cancel-principal', profileId: 'cancel-profile', repository: 'team/test', scopes: ['runs:read'] }]) };
+    const denied = await runnerApi.fetch(new Request('https://api.example/v1/runs/cancel-by-idempotency-key', {
+      method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ userTaskId: 'task-cancel-by-key', idempotencyKey: 'attempt-key', ownerGeneration: 3 }),
+    }), readOnlyEnv);
+    expect(denied.status).toBe(403);
+    expect(coordinatorFetch).toHaveBeenCalledOnce();
+  });
+
   it('rejects an invalid key before any coordinator call', async () => {
     const get = vi.fn();
     const env = { RUNNER_API_KEYS: '[]', RUNNER_RUNS: { idFromName: vi.fn(), get } } as unknown as RunnerWorkerEnv;
