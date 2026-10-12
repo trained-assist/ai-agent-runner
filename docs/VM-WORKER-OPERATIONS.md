@@ -54,6 +54,11 @@ new process is not ready. `ai-agent-vm-worker.service` owns the long-running wor
 `install-vm-worker.sh` is only a one-time bootstrap for the service account, unit,
 configuration templates, and updater. There is currently no automatic VM rollout or
 VM self-deployment: the operator invokes the updater after reviewing a release.
+France bootstrap also installs the host shared libraries required by headless
+Playwright Chromium. It does not install a browser or restart the worker service;
+the agent may install a pinned Playwright package and browser inside its run workspace.
+Run `scripts/install-playwright-runtime.sh` once as root on an existing France VM to
+apply the same dependency set without replacing the active worker release.
 
 ### Pinned Registry test MCP
 
