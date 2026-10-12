@@ -53,6 +53,7 @@ if (!capabilities.executionRegions?.includes('eu-vm-agent-run')) {
 console.log('authenticated capabilities: EU VM worker advertised');
 
 const idempotencyKey = `sandbox3-vm2-${runId}`;
+const terminal = new Set(['succeeded', 'failed', 'cancelled', 'timed_out']);
 const launchPayload = {
   userTaskId: idempotencyKey,
   engine: { name: 'eu-vm-agent-run', adapterVersion: '1' },
@@ -72,32 +73,50 @@ if (typeof submitted.runId !== 'string' || !submitted.runId.startsWith('run_')) 
 }
 console.log(`run accepted: ${submitted.runId}`);
 
-const repeated = await request('/v1/runs', launchOptions);
-if (repeated.runId !== submitted.runId) {
-  throw new Error('repeated idempotent submission returned a different run receipt');
-}
-console.log('idempotent retry returned the original run receipt');
-
-await expectStatus('/v1/runs', 409, {
-  method: 'POST',
-  headers: { authorization: `Bearer ${apiKey}`, 'idempotency-key': idempotencyKey },
-  body: JSON.stringify({ ...launchPayload, input: { inlinePrompt: 'Different payload under the same idempotency key.' } }),
-});
-console.log('conflicting idempotency-key reuse rejected');
-
-const terminal = new Set(['succeeded', 'failed', 'cancelled', 'timed_out']);
 let status;
-const deadline = Date.now() + 180_000;
-while (Date.now() < deadline) {
-  status = await request(`/v1/runs/${encodeURIComponent(submitted.runId)}/status`);
-  console.log(`run state: ${status.state}`);
-  if (terminal.has(status.state)) break;
-  await new Promise(resolve => setTimeout(resolve, 3_000));
-}
-if (!status || !terminal.has(status.state)) throw new Error('sandbox3 VM run did not reach a terminal state within 180 seconds');
+try {
+  const repeated = await request('/v1/runs', launchOptions);
+  if (repeated.runId !== submitted.runId) {
+    throw new Error('repeated idempotent submission returned a different run receipt');
+  }
+  console.log('idempotent retry returned the original run receipt');
 
-const result = await request(`/v1/runs/${encodeURIComponent(submitted.runId)}/result`);
-if (result.outcome !== 'succeeded' || !String(result.text ?? '').includes(expectedPackageVersion)) {
-  throw new Error(`sandbox3 VM run failed acceptance: ${JSON.stringify({ outcome: result.outcome, exitCode: result.exitCode })}`);
+  await expectStatus('/v1/runs', 409, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${apiKey}`, 'idempotency-key': idempotencyKey },
+    body: JSON.stringify({ ...launchPayload, input: { inlinePrompt: 'Different payload under the same idempotency key.' } }),
+  });
+  console.log('conflicting idempotency-key reuse rejected');
+
+  const deadline = Date.now() + 180_000;
+  while (Date.now() < deadline) {
+    status = await request(`/v1/runs/${encodeURIComponent(submitted.runId)}/status`);
+    console.log(`run state: ${status.state}`);
+    if (terminal.has(status.state)) break;
+    await new Promise(resolve => setTimeout(resolve, 3_000));
+  }
+  if (!status || !terminal.has(status.state)) throw new Error('sandbox3 VM run did not reach a terminal state within 180 seconds');
+
+  const result = await request(`/v1/runs/${encodeURIComponent(submitted.runId)}/result`);
+  if (result.outcome !== 'succeeded' || !String(result.text ?? '').includes(expectedPackageVersion)) {
+    throw new Error(`sandbox3 VM run failed acceptance: ${JSON.stringify({ outcome: result.outcome, exitCode: result.exitCode })}`);
+  }
+  console.log(`sandbox3 VM2 end-to-end canary succeeded; package version ${expectedPackageVersion} confirmed`);
+} finally {
+  // Keep active or unknown runs for diagnosis. Remove state once terminal proof exists.
+  if (!status || !terminal.has(status.state)) {
+    try { status = await request(`/v1/runs/${encodeURIComponent(submitted.runId)}/status`); }
+    catch { status = undefined; }
+  }
+  if (status && terminal.has(status.state)) {
+    const cleanup = await request('/v1/sandbox/cleanup-task', {
+      method: 'POST', body: JSON.stringify({ userTaskId: idempotencyKey }),
+    });
+    if (cleanup.status !== 'cleaned' || cleanup.deletedRuns < 1) {
+      throw new Error('sandbox3 VM canary cleanup did not remove its terminal Runner state');
+    }
+    console.log('terminal sandbox3 VM canary Runner state cleaned');
+  } else {
+    console.error('sandbox3 VM canary is not confirmed terminal; Runner state is preserved for inspection');
+  }
 }
-console.log(`sandbox3 VM2 end-to-end canary succeeded; package version ${expectedPackageVersion} confirmed`);
