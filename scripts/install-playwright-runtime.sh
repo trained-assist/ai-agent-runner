@@ -61,7 +61,8 @@ for pair in "${package_pairs[@]}"; do
   resolved=""
   IFS='|' read -r -a candidates <<<"${pair}"
   for candidate in "${candidates[@]}"; do
-    if apt-cache show "${candidate}" >/dev/null 2>&1; then
+    candidate_version="$(apt-cache policy "${candidate}" | awk '/^[[:space:]]*Candidate:/ { print $2; exit }')"
+    if [[ -n "${candidate_version}" && "${candidate_version}" != "(none)" ]]; then
       resolved="${candidate}"
       break
     fi
