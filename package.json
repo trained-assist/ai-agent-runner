@@ -18,6 +18,7 @@
     "worker:dry-run:sandbox3": "wrangler deploy --dry-run -c wrangler.sandbox3.jsonc",
     "worker:dry-run:cp-sandbox3": "wrangler deploy --dry-run -c wrangler.cp-sandbox3.jsonc",
     "worker:dry-run:telegram-ux": "wrangler deploy --dry-run -c wrangler.telegram-ux-v1.jsonc",
+    "worker:dry-run:production": "wrangler deploy --dry-run -c wrangler.production.jsonc",
     "test": "vitest run",
     "test:watch": "vitest"
   },
