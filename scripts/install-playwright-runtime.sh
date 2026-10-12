@@ -61,7 +61,9 @@ for pair in "${package_pairs[@]}"; do
   resolved=""
   IFS='|' read -r -a candidates <<<"${pair}"
   for candidate in "${candidates[@]}"; do
-    candidate_version="$(apt-cache policy "${candidate}" | awk '/^[[:space:]]*Candidate:/ { print $2; exit }')"
+    # Do not exit awk early: with pipefail enabled that can close the pipe
+    # while apt-cache is writing and make the command substitution fail (141).
+    candidate_version="$(apt-cache policy "${candidate}" | awk '/^[[:space:]]*Candidate:/ { version=$2 } END { print version }')"
     if [[ -n "${candidate_version}" && "${candidate_version}" != "(none)" ]]; then
       resolved="${candidate}"
       break

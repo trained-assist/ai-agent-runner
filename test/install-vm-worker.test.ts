@@ -19,6 +19,8 @@ describe('VM worker installer data directories', () => {
     expect(runtime).toContain("grep -F 'libatk-1.0.so.0'");
     expect(runtime).toContain('apt-get install -y --no-install-recommends');
     expect(runtime).toContain('apt-cache policy "${candidate}"');
+    expect(runtime).toContain('END { print version }');
+    expect(runtime).not.toContain('{ print $2; exit }');
     expect(runtime).toContain('"${candidate_version}" != "(none)"');
   });
 });
