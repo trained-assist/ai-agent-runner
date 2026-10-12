@@ -172,15 +172,16 @@ and `LLM_LADDER_TOKEN` are supplied from the existing repository secrets. Keep t
 delegation secret paired with the same-named Control Plane sandbox bindings; neither belongs in
 Wrangler vars or source.
 
-For the canonical Telegram UX sandbox only, `SANDBOX_CLEANUP_PROFILES` enables
-`POST /v1/sandbox/cleanup-task`. It requires `runs:write`, the signed effective profile to be
-listed in that variable, and a safe `userTaskId`; the API derives the same task-keyed Durable
-Object used by run submission. The Durable Object atomically refuses active, unknown, foreign,
-or mismatched state. For terminal runs it deletes the task's complete stored record (runs,
-idempotency keys, events, results, and owner generations) and clears its alarm. An already-empty
-task key is removed as well. Only `wrangler.telegram-ux-v1.jsonc` enables the profile; production
-and the other Runner Workers leave cleanup disabled. The CP E2E cleanup script calls this route
-before deleting corresponding CP rows.
+`SANDBOX_CLEANUP_PROFILES` enables `POST /v1/sandbox/cleanup-task` for explicitly listed test
+profiles. It requires `runs:write`, the signed effective profile to be listed in that variable,
+and a safe `userTaskId`; the API derives the same task-keyed Durable Object used by run
+submission. The Durable Object atomically refuses active, unknown, foreign, or mismatched state.
+For terminal runs it deletes the task's complete stored record (runs, idempotency keys, events,
+results, and owner generations) and clears its alarm. An already-empty task key is removed as
+well. The canonical Telegram UX Worker enables its dedicated profile, and `wrangler.sandbox3.jsonc`
+enables only `sandbox3-vm2-live-canary`; the canary script cleans up only after terminal proof.
+Production and the mock-only Runner Worker leave cleanup disabled. The CP E2E cleanup script
+calls this route before deleting corresponding CP rows.
 
 ## Verification
 
