@@ -48,9 +48,13 @@ The Control Plane sends authenticated HTTPS requests to its configured Cloudflar
 Worker URL (`RUNNER_API_URL` in the current CP sandbox). That CP config has no execution-VM or
 launcher endpoint. The Runner API is a Cloudflare Worker. A task-keyed Durable Object owns
 idempotency records, run state, events, and alarms that reconcile dispatch and poll the VM
-worker. The Worker alone knows
-`VM_WORKER_URL` and `VM_WORKER_TOKEN`. The France VM runs the OpenCode execution worker; it
-does not host the Runner API. The Control Plane has no VM URL or VM credential.
+worker. The France VM runs the OpenCode execution worker; it does not host the Runner API.
+The intended boundary is that only Runner knows `VM_WORKER_URL` and `VM_WORKER_TOKEN`. The
+current production bootstrap has a documented legacy exception: the France token is also held
+in the CP production secret store and passed through the existing bootstrap path. This violates
+the target ownership boundary. Do not extend that handoff; move provisioning to Runner-owned
+production secrets and remove the CP copy only after Runner readiness and CP authentication are
+verified. See architecture [#208](https://github.com/trained-assist/trained-agent-architecture/issues/208).
 
 `eu-vm-agent-run` is the default and only engine in these sandbox configurations. A GHA runner
 is not a fallback. If France cannot accept the job, the task reports an error or unknown
@@ -63,31 +67,32 @@ engine returns fixed `pong` without calling the VM or a model.
 
 `wrangler.production.jsonc` defines the dedicated `trained-assist-runner-api-production`
 Worker and its own `RunnerRunCoordinator` Durable Object namespace. Its default engine is
-France (`eu-vm-agent-run`), mock execution is disabled, and real admission allows only the
-canonical `trained-assist/ai-agent-runner` repository plus `LLM_LADDER_TOKEN`. CP pilot and
-router gates are enabled for all profiles. This bounded admission config still requires a
-valid production API-key registry, matching CP key/delegation bindings, and France worker
-credentials before a request can execute. A Worker health response alone does not verify
-those bindings.
+France (`eu-vm-agent-run`), mock execution is disabled, and real admission allows the canonical
+`trained-assist/ai-agent-runner` repository plus `LLM_LADDER_TOKEN`. CP production pilot and
+router gates are enabled for all profiles. Real execution also requires a production API-key
+registry, matching CP key/delegation bindings, and ready France worker credentials. A Worker
+health response alone does not verify those bindings.
 
 The manual `Deploy isolated production Cloudflare Runner API` workflow runs only from
 `main`. The GitHub `production` environment is restricted to `main`. The workflow requires a
 successful `sandbox3-live-profile-auth` workflow run for the exact same source SHA, a production
 GitHub environment secret named `CF_API_TOKEN`, and an environment variable `CF_ACCOUNT_ID`
-identifying the intended Cloudflare account. It verifies the account
-before deploying, then checks `/healthz` and that `/version` reports the deployed SHA. It does
-not provision an API principal or route CP traffic. The normal Control Plane protected-main
-release deploys this Worker before CP. The first deployment creates a separate production
-Durable Object namespace; subsequent code
-deploys must keep the Worker name, DO class, and namespace stable.
+identifying the intended Cloudflare account. Before deploying, it checks the exact staging SHA,
+secret presence, Cloudflare account, and France `/readyz`. After deployment,
+`tools/deploy-cloudflare-production.mjs` derives a one-principal
+production registry from the environment-held API key, writes only the declared Runner secrets,
+and verifies exact Worker SHA, authenticated capabilities, and delegated-profile authentication
+without creating a run. Required production environment secrets are `CF_API_TOKEN`,
+`EU_VM_WORKER_TOKEN`, `RUNNER_API_KEY_AGENT_API`, `RUNNER_PROFILE_DELEGATION_SECRET`, and
+`RUN_LAUNCH_ENCRYPTION_KEY`; `EU_VM_WORKER_URL` and `LLM_LADDER_TOKEN` come from the Runner
+repository secret store. CP keeps its paired API key and delegation secret. The France token
+currently duplicated in CP is the legacy exception described above.
 
-Provision the production VM URL/token, API-key registry, paired CP API key/delegation secret,
-and launch-encryption key from the production CP principal/profile mapping. Keep the encryption
-key stable for the lifetime of any ciphertext in the production DO. A
-recovery backup must preserve the exact key together with the corresponding encrypted run
-state; restoring either side alone cannot recover launch bodies. Do not rotate or regenerate
-that key while encrypted runs may still need recovery. The production config intentionally
-contains no sandbox cleanup profile.
+The workflow does not route CP traffic or create a CP profile. The first deployment creates a
+separate production Durable Object namespace; subsequent code deploys must keep the Worker
+name, DO class, namespace, and encryption key stable. Preserve the exact encryption key
+together with ciphertext during backup/recovery; restoring either side alone cannot recover
+launch bodies. Production cleanup remains disabled.
 
 Separate Worker configurations and Durable Object namespaces are defined for sandbox3 and
 Telegram UX. A dedicated, mock-only Worker is provisioned for the CP sandbox3 admission

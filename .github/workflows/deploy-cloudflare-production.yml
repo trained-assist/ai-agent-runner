@@ -25,8 +25,14 @@ jobs:
     env:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ vars.CF_ACCOUNT_ID }}
+      CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+      RUNNER_API_KEY_AGENT_API: ${{ secrets.RUNNER_API_KEY_AGENT_API }}
+      RUNNER_PROFILE_DELEGATION_SECRET: ${{ secrets.RUNNER_PROFILE_DELEGATION_SECRET }}
+      RUN_LAUNCH_ENCRYPTION_KEY: ${{ secrets.RUN_LAUNCH_ENCRYPTION_KEY }}
+      EU_VM_WORKER_URL: ${{ secrets.EU_VM_WORKER_URL }}
+      EU_VM_WORKER_TOKEN: ${{ secrets.EU_VM_WORKER_TOKEN }}
+      LLM_LADDER_TOKEN: ${{ secrets.LLM_LADDER_TOKEN }}
       GH_TOKEN: ${{ github.token }}
-      PRODUCTION_RUNNER_API_URL: https://trained-assist-runner-api-production.skillset-apply.workers.dev
     steps:
       - uses: actions/checkout@v4
         with:
@@ -41,6 +47,12 @@ jobs:
         env:
           SANDBOX_RUN_ID: ${{ inputs.sandbox_run_id }}
           SOURCE_SHA: ${{ github.sha }}
+          RUNNER_API_KEY_AGENT_API: ${{ secrets.RUNNER_API_KEY_AGENT_API }}
+          RUNNER_PROFILE_DELEGATION_SECRET: ${{ secrets.RUNNER_PROFILE_DELEGATION_SECRET }}
+          RUN_LAUNCH_ENCRYPTION_KEY: ${{ secrets.RUN_LAUNCH_ENCRYPTION_KEY }}
+          EU_VM_WORKER_URL: ${{ secrets.EU_VM_WORKER_URL }}
+          EU_VM_WORKER_TOKEN: ${{ secrets.EU_VM_WORKER_TOKEN }}
+          LLM_LADDER_TOKEN: ${{ secrets.LLM_LADDER_TOKEN }}
         run: |
           set -euo pipefail
           [[ "$SANDBOX_RUN_ID" =~ ^[0-9]{1,20}$ ]]
@@ -64,27 +76,15 @@ jobs:
             echo 'Cloudflare credential does not target the configured production account' >&2
             exit 1
           }
+          node tools/deploy-cloudflare-production.mjs --preflight-only
       - name: Run source checks and production dry-run
         run: |
           npm run typecheck
           npm test
           npm run worker:dry-run:production
-      - name: Deploy isolated, admission-closed production Worker
+      - name: Deploy isolated production Worker
         run: npx wrangler deploy --config wrangler.production.jsonc --var BUILD_SHA:${GITHUB_SHA}
-      - name: Verify deployed Worker health and exact source SHA
-        run: |
-          set -euo pipefail
-          curl --fail --silent --show-error --max-time 10 "$PRODUCTION_RUNNER_API_URL/healthz" > "$RUNNER_TEMP/runner-health.json"
-          curl --fail --silent --show-error --max-time 10 "$PRODUCTION_RUNNER_API_URL/version" > "$RUNNER_TEMP/runner-version.json"
-          python3 - "$RUNNER_TEMP/runner-health.json" "$RUNNER_TEMP/runner-version.json" "$GITHUB_SHA" <<'PY'
-          import json, sys
-          with open(sys.argv[1], encoding='utf-8') as handle:
-              health = json.load(handle)
-          with open(sys.argv[2], encoding='utf-8') as handle:
-              version = json.load(handle)
-          if health.get('status') != 'ok' or health.get('placement') != 'cloudflare-worker':
-              raise SystemExit('production Worker health response did not match the expected service')
-          if version.get('buildSha') != sys.argv[3]:
-              raise SystemExit('production Worker build SHA did not match the deployed source')
-          print('Production Worker health and exact source SHA verified; run admission remains disabled.')
-          PY
+      - name: Provision Runner-owned production bindings and verify readiness
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+        run: node tools/deploy-cloudflare-production.mjs
