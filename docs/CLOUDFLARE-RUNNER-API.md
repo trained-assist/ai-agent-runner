@@ -63,10 +63,12 @@ engine returns fixed `pong` without calling the VM or a model.
 
 `wrangler.production.jsonc` defines the dedicated `trained-assist-runner-api-production`
 Worker and its own `RunnerRunCoordinator` Durable Object namespace. Its default engine is
-France (`eu-vm-agent-run`), mock execution is disabled, and both repository and environment
-allowlists are empty. This intentionally keeps user runs closed until production profile
-routing and the CP binding are approved. A Worker health response is not evidence that a
-production user can submit work.
+France (`eu-vm-agent-run`), mock execution is disabled, and real admission allows only the
+canonical `trained-assist/ai-agent-runner` repository plus `LLM_LADDER_TOKEN`. CP pilot and
+router gates are enabled for all profiles. This bounded admission config still requires a
+valid production API-key registry, matching CP key/delegation bindings, and France worker
+credentials before a request can execute. A Worker health response alone does not verify
+those bindings.
 
 The manual `Deploy isolated production Cloudflare Runner API` workflow runs only from
 `main`. The GitHub `production` environment is restricted to `main`. The workflow requires a
@@ -74,13 +76,14 @@ successful `sandbox3-live-profile-auth` workflow run for the exact same source S
 GitHub environment secret named `CF_API_TOKEN`, and an environment variable `CF_ACCOUNT_ID`
 identifying the intended Cloudflare account. It verifies the account
 before deploying, then checks `/healthz` and that `/version` reports the deployed SHA. It does
-not configure an API principal, enable repository admission, route CP traffic, or submit a run.
-The first deployment creates a separate production Durable Object namespace; subsequent code
+not provision an API principal or route CP traffic. The normal Control Plane protected-main
+release deploys this Worker before CP. The first deployment creates a separate production
+Durable Object namespace; subsequent code
 deploys must keep the Worker name, DO class, and namespace stable.
 
-Before opening admission, provision the production VM URL/token, API-key registry, profile
-delegation secret, and launch-encryption key from the approved CP principal/profile mapping.
-Keep the encryption key stable for the lifetime of any ciphertext in the production DO. A
+Provision the production VM URL/token, API-key registry, paired CP API key/delegation secret,
+and launch-encryption key from the production CP principal/profile mapping. Keep the encryption
+key stable for the lifetime of any ciphertext in the production DO. A
 recovery backup must preserve the exact key together with the corresponding encrypted run
 state; restoring either side alone cannot recover launch bodies. Do not rotate or regenerate
 that key while encrypted runs may still need recovery. The production config intentionally
