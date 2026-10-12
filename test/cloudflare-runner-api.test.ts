@@ -4,6 +4,21 @@ import runnerApi, { sha256 } from '../src/cloudflare/runner-api.js';
 import type { RunnerWorkerEnv } from '../src/cloudflare/types.js';
 
 describe('Cloudflare Runner API Worker', () => {
+  it('uses the dedicated production registry without replacing or reading other registries', async () => {
+    const productionKey = 'production-only-key';
+    const env = {
+      DEPLOYMENT_ENV: 'production',
+      RUNNER_API_KEYS: '{preserved-but-not-used}',
+      RUNNER_API_KEYS_ADDITIONAL: '{also-preserved}',
+      RUNNER_API_KEYS_PRODUCTION: JSON.stringify([{ keyHash: await sha256(productionKey), principalId: 'production', profileId: 'production-base', tenantId: 'production-tenant', repository: 'trained-assist/ai-agent-runner', scopes: ['runs:read'], engines: ['eu-vm-agent-run'] }]),
+      RUNNER_RUNS: { idFromName: vi.fn(), get: vi.fn() },
+    } as unknown as RunnerWorkerEnv;
+    const admitted = await runnerApi.fetch(new Request('https://api.example/v1/capabilities', { headers: { authorization: `Bearer ${productionKey}` } }), env);
+    const ignored = await runnerApi.fetch(new Request('https://api.example/v1/capabilities', { headers: { authorization: 'preserved-key' } }), env);
+    expect(admitted.status).toBe(200);
+    expect(ignored.status).toBe(401);
+  });
+
   it('reports the deployed Cloudflare Worker build identity', async () => {
     const env = { BUILD_SHA: 'a'.repeat(40) } as unknown as RunnerWorkerEnv;
     const response = await runnerApi.fetch(new Request('https://api.example/version'), env);

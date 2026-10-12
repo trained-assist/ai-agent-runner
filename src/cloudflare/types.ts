@@ -17,6 +17,8 @@ export interface RunnerWorkerEnv {
   FETCH?: typeof fetch;
   BUILD_SHA?: string;
   RUNNER_API_KEYS: string;
+  /** Registry used only by the dedicated production Worker; never overwrites base principals. */
+  RUNNER_API_KEYS_PRODUCTION?: string;
   /** Additive principals provisioned independently from the protected base registry. */
   RUNNER_API_KEYS_ADDITIONAL?: string;
   /** Isolated principal registry for the dedicated sandbox3 Worker. */

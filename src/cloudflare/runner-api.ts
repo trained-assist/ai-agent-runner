@@ -23,24 +23,32 @@ async function authenticate(request: Request, env: RunnerWorkerEnv): Promise<Api
   if (!match?.[1]) return null;
   if (match[1].length > 500) return null;
   let configured: KeyConfig[];
-  try {
-    const raw: unknown = JSON.parse(env.RUNNER_API_KEYS);
-    if (!Array.isArray(raw) || raw.some((item) => !validKeyConfig(item))) throw new Error('invalid key records');
-    configured = raw as KeyConfig[];
-  } catch { throw new Error('RUNNER_API_KEYS must be a valid JSON array of key hash records'); }
-  if (env.RUNNER_API_KEYS_ADDITIONAL !== undefined) {
+  if (env.DEPLOYMENT_ENV === 'production') {
     try {
-      const raw: unknown = JSON.parse(env.RUNNER_API_KEYS_ADDITIONAL);
+      const raw: unknown = JSON.parse(env.RUNNER_API_KEYS_PRODUCTION ?? 'null');
       if (!Array.isArray(raw) || raw.some((item) => !validKeyConfig(item))) throw new Error('invalid key records');
-      configured = [...configured, ...(raw as KeyConfig[])];
-    } catch { throw new Error('RUNNER_API_KEYS_ADDITIONAL must be a valid JSON array of key hash records'); }
-  }
-  if (env.RUNNER_API_KEYS_SANDBOX3 !== undefined) {
+      configured = raw as KeyConfig[];
+    } catch { throw new Error('RUNNER_API_KEYS_PRODUCTION must be a valid JSON array of key hash records'); }
+  } else {
     try {
-      const raw: unknown = JSON.parse(env.RUNNER_API_KEYS_SANDBOX3);
+      const raw: unknown = JSON.parse(env.RUNNER_API_KEYS);
       if (!Array.isArray(raw) || raw.some((item) => !validKeyConfig(item))) throw new Error('invalid key records');
-      configured = [...configured, ...(raw as KeyConfig[])];
-    } catch { throw new Error('RUNNER_API_KEYS_SANDBOX3 must be a valid JSON array of key hash records'); }
+      configured = raw as KeyConfig[];
+    } catch { throw new Error('RUNNER_API_KEYS must be a valid JSON array of key hash records'); }
+    if (env.RUNNER_API_KEYS_ADDITIONAL !== undefined) {
+      try {
+        const raw: unknown = JSON.parse(env.RUNNER_API_KEYS_ADDITIONAL);
+        if (!Array.isArray(raw) || raw.some((item) => !validKeyConfig(item))) throw new Error('invalid key records');
+        configured = [...configured, ...(raw as KeyConfig[])];
+      } catch { throw new Error('RUNNER_API_KEYS_ADDITIONAL must be a valid JSON array of key hash records'); }
+    }
+    if (env.RUNNER_API_KEYS_SANDBOX3 !== undefined) {
+      try {
+        const raw: unknown = JSON.parse(env.RUNNER_API_KEYS_SANDBOX3);
+        if (!Array.isArray(raw) || raw.some((item) => !validKeyConfig(item))) throw new Error('invalid key records');
+        configured = [...configured, ...(raw as KeyConfig[])];
+      } catch { throw new Error('RUNNER_API_KEYS_SANDBOX3 must be a valid JSON array of key hash records'); }
+    }
   }
   const digest = await sha256(match[1]);
   const record = configured.find((entry) => entry.keyHash === digest);
