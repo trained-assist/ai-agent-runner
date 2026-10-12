@@ -69,10 +69,10 @@ routing and the CP binding are approved. A Worker health response is not evidenc
 production user can submit work.
 
 The manual `Deploy isolated production Cloudflare Runner API` workflow runs only from
-`main`. The GitHub `production` environment must be configured with required reviewers before
-it is used for a live deployment. It requires a successful `sandbox3-live-profile-auth` workflow run for the exact same
-source SHA, a production GitHub environment secret named `CF_API_TOKEN`, and an environment
-variable `CF_ACCOUNT_ID` identifying the intended Cloudflare account. It verifies the account
+`main`. The GitHub `production` environment is restricted to `main`. The workflow requires a
+successful `sandbox3-live-profile-auth` workflow run for the exact same source SHA, a production
+GitHub environment secret named `CF_API_TOKEN`, and an environment variable `CF_ACCOUNT_ID`
+identifying the intended Cloudflare account. It verifies the account
 before deploying, then checks `/healthz` and that `/version` reports the deployed SHA. It does
 not configure an API principal, enable repository admission, route CP traffic, or submit a run.
 The first deployment creates a separate production Durable Object namespace; subsequent code
