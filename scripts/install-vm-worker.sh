@@ -28,6 +28,10 @@ fi
 command -v gh >/dev/null || { echo "Install GitHub CLI (gh) before verifying signed releases" >&2; exit 1; }
 command -v systemctl >/dev/null || { echo "systemd is required" >&2; exit 1; }
 
+if [[ "${region}" == "france" ]]; then
+  "${script_dir}/install-playwright-runtime.sh"
+fi
+
 if ! id ai-agent >/dev/null 2>&1; then
   useradd --system --home-dir /var/lib/ai-agent-runner --create-home --shell /usr/sbin/nologin ai-agent
 fi
