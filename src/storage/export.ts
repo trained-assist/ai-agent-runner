@@ -99,6 +99,21 @@ export class RunExportStore {
     return parseRunExportManifest(readFileSync(path, 'utf8'), path);
   }
 
+  /** Read an exported output only through its exact path in the committed run manifest. */
+  async readArtifact(runId: string, sourcePath: string): Promise<{ manifest: ArtifactManifest; bytes: Buffer }> {
+    const current = this.read(runId);
+    const entry = current?.entries.find((candidate) => candidate.sourcePath === sourcePath);
+    if (!entry || entry.status !== 'exported' || !entry.artifactId || !entry.sha256) {
+      throw new StorageError('BLOB_NOT_FOUND', `no exported artifact for path in run ${runId}`);
+    }
+    const artifact = await this.artifacts.read(runId, entry.artifactId);
+    if (artifact.manifest.name !== entry.name || artifact.manifest.mime !== entry.mime
+      || artifact.manifest.size !== entry.size || artifact.manifest.sha256 !== entry.sha256) {
+      throw new StorageError('BLOB_SHA_MISMATCH', `artifact metadata does not match the committed export manifest for run ${runId}`);
+    }
+    return artifact;
+  }
+
   readVersion(runId: string, version: number): RunExportManifest | null {
     const path = this.versionPath(runId, version);
     if (!existsSync(path)) return null;

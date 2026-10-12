@@ -157,6 +157,20 @@ export class RunnerRunCoordinator {
       }
       case 'artifacts':
         if (request.method !== 'GET') return error('METHOD_NOT_ALLOWED', 'artifacts supports GET only', 405);
+        if (url.searchParams.has('path')) {
+          if (!TERMINAL.has(run.state)) return error('RESULT_NOT_READY', 'run outputs are not available before completion', 409);
+          const sourcePath = url.searchParams.get('path') ?? '';
+          if (!sourcePath || sourcePath.length > 512 || /[\x00-\x1f\x7f]/.test(sourcePath)) return error('INVALID_REQUEST', 'a valid artifact path is required', 400);
+          if (!run.artifacts.some((artifact) => artifact['path'] === sourcePath)) return error('NOT_FOUND', 'artifact path is not part of this run', 404);
+          const query = new URLSearchParams({ path: sourcePath });
+          const response = await this.worker(`/v1/runs/${encodeURIComponent(run.runId)}/artifacts?${query.toString()}`, 'GET', undefined, 30_000);
+          const headers = new Headers({ 'cache-control': 'private, no-store', 'x-content-type-options': 'nosniff' });
+          for (const name of ['content-type', 'content-length', 'content-disposition', 'x-content-sha256']) {
+            const value = response.headers.get(name);
+            if (value) headers.set(name, value);
+          }
+          return new Response(response.body, { status: response.status, headers });
+        }
         return json({ runId, conversationId: run.conversationId, userTaskId: run.userTaskId, repo: run.repo, branchUrl: null, mergeUrl: null, count: run.artifacts.length, artifacts: run.artifacts, logUrl: run.logUrl, note: run.artifacts.length ? 'artifacts are committed by the VM worker to the run branch' : 'the VM worker reported no artifacts' });
       case 'cancel': return request.method === 'POST' ? this.cancel(request, runId, principal) : error('METHOD_NOT_ALLOWED', 'cancel supports POST only', 405);
       default: return error('ROUTE_NOT_FOUND', `no route for ${url.pathname}`, 404);
@@ -560,11 +574,11 @@ export class RunnerRunCoordinator {
     if (Object.values(stored.runs).some((run) => ACTIVE.has(run.state))) await this.state.storage.setAlarm(Date.now() + 5_000);
   }
 
-  private async worker(path: string, method = 'GET', body?: unknown): Promise<Response> {
+  private async worker(path: string, method = 'GET', body?: unknown, timeoutMs = 8_000): Promise<Response> {
     const base = this.env.VM_WORKER_URL.replace(/\/+$/, '');
     if (!/^https:\/\//.test(base)) throw new Error('VM_WORKER_URL must be an https origin');
     const send = this.env.FETCH ?? fetch;
-    return send(`${base}${path}`, { method, headers: { authorization: `Bearer ${this.env.VM_WORKER_TOKEN}`, ...(body === undefined ? {} : { 'content-type': 'application/json' }) }, ...(body === undefined ? {} : { body: JSON.stringify(body) }), signal: AbortSignal.timeout(8_000) });
+    return send(`${base}${path}`, { method, headers: { authorization: `Bearer ${this.env.VM_WORKER_TOKEN}`, ...(body === undefined ? {} : { 'content-type': 'application/json' }) }, ...(body === undefined ? {} : { body: JSON.stringify(body) }), signal: AbortSignal.timeout(timeoutMs) });
   }
 
   private async read(): Promise<Stored> { return await this.state.storage.get<Stored>(stateKey) ?? structuredClone(INIT); }

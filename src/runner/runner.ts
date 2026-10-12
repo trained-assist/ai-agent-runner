@@ -546,6 +546,12 @@ export class Runner {
     return this.opts.exports.read(runId);
   }
 
+  /** Read one completed exported output by its exact manifest path. */
+  async readExportedArtifact(runId: string, sourcePath: string) {
+    if (!this.opts.exports) throw new Error('run artifact storage is unavailable');
+    return this.opts.exports.readArtifact(runId, sourcePath);
+  }
+
   /**
    * Повторный commit экспорта без запуска движка: engine уже завершён, повторно
    * исполнять его нельзя (P07 — «повторный commit не запускает движок заново»).

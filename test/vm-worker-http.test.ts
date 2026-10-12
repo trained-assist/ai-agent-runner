@@ -1,6 +1,7 @@
 import { chmodSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { createHash } from 'node:crypto';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { LaunchRequest } from '../src/adapters/external-worker-adapter.js';
 import { CapacityAdmission, type HostUsageSample, type HostUsageSampler } from '../src/vm-worker/capacity-admission.js';
@@ -9,6 +10,7 @@ import { createVmWorkerServer } from '../src/vm-worker/http-server.js';
 import type { VmWorkerBindingsInventory } from '../src/vm-worker/bindings-inventory.js';
 import type { Runner } from '../src/runner/runner.js';
 import type { RunSpec } from '../src/contracts/run-spec.js';
+import { StorageError } from '../src/storage/errors.js';
 
 const TOKEN = 'vm-worker-test-secret-that-is-long-enough';
 const API_ORIGIN = 'https://api.example.test';
@@ -159,6 +161,30 @@ describe('installable VM HTTP worker', () => {
     const wrongRun = await launch(fixture.base, launchRequest({ resultUrl: `${API_ORIGIN}/v1/runs/another-run/result` }));
     expect(wrongRun.status).toBe(400);
     expect(fixture.runner.startCalls).toHaveLength(1);
+  });
+
+  it('serves only a completed run output declared in its export manifest', async () => {
+    const fixture = await startFixture();
+    cleanups.push(fixture.close);
+    fixture.runner.completeAfterMs = 250;
+    expect((await launch(fixture.base, launchRequest())).status).toBe(202);
+
+    const early = await fetch(`${fixture.base}/v1/runs/${RUN_ID}/artifacts?path=outputs%2Fagent-note.md`, { headers: authHeaders() });
+    expect(early.status).toBe(409);
+
+    await new Promise((resolve) => setTimeout(resolve, 280));
+    const missingAuth = await fetch(`${fixture.base}/v1/runs/${RUN_ID}/artifacts?path=outputs%2Fagent-note.md`);
+    expect(missingAuth.status).toBe(401);
+
+    const undeclared = await fetch(`${fixture.base}/v1/runs/${RUN_ID}/artifacts?path=outputs%2Fother.md`, { headers: authHeaders() });
+    expect(undeclared.status).toBe(404);
+
+    const response = await fetch(`${fixture.base}/v1/runs/${RUN_ID}/artifacts?path=outputs%2Fagent-note.md`, { headers: authHeaders() });
+    const bytes = Buffer.from(await response.arrayBuffer());
+    expect(response.status).toBe(200);
+    expect(bytes.toString()).toBe('sandbox artifact bytes');
+    expect(response.headers.get('content-disposition')).toContain('agent-note.md');
+    expect(response.headers.get('x-content-sha256')).toBe(createHash('sha256').update(bytes).digest('hex'));
   });
 
   it('preserves a trusted ingress pin for Runner and rejects a pin bound to another run', async () => {
@@ -326,6 +352,7 @@ class FakeRunner {
   private readonly dataDir: string;
   private readonly profileWorkspaceEnabled: boolean;
   private readonly profileSavebackEnabled: boolean;
+  completeAfterMs = 60;
 
   constructor(dataDir: string, profileWorkspaceEnabled = false, profileSavebackEnabled = false) { this.dataDir = dataDir; this.profileWorkspaceEnabled = profileWorkspaceEnabled; this.profileSavebackEnabled = profileSavebackEnabled; }
 
@@ -348,7 +375,7 @@ class FakeRunner {
         persistence: 'not_required', cleanup: 'completed', cleanupReason: 'cleaned', logPath: 'runs/test/events.jsonl',
       };
       this.snapshot!.checkpoint = { answer: { text: 'worker says hello', source: 'engine_stdout' } };
-    }, 60);
+    }, this.completeAfterMs);
   }
 
   getRun(runId: string): Record<string, any> | null { return this.snapshot?.runId === runId ? this.snapshot : null; }
@@ -358,6 +385,17 @@ class FakeRunner {
   profileWorkspaceCommit(): string | null { return null; }
   events(runId: string, after = 0): Array<Record<string, any>> { return this.snapshot?.runId === runId ? this.eventList.filter((event) => event.sequence > after) : []; }
   exportManifest(): null { return null; }
+  async readExportedArtifact(runId: string, sourcePath: string) {
+    if (runId !== RUN_ID || sourcePath !== 'outputs/agent-note.md') throw new StorageError('BLOB_NOT_FOUND', 'no exported artifact for path');
+    const bytes = Buffer.from('sandbox artifact bytes');
+    const sha256 = createHash('sha256').update(bytes).digest('hex');
+    return {
+      manifest: { artifactId: 'artifact-test', name: 'agent-note.md', mime: 'text/markdown', size: bytes.length, sha256,
+        storageKey: `runs/${RUN_ID}/artifacts/artifact-test`, createdAt: new Date().toISOString(), runId: RUN_ID,
+        userTaskId: 'task-vm-worker-test', profileId: 'profile-test' },
+      bytes,
+    };
+  }
   health(): { ready: boolean; droppedLogCount: number; activeRuns: number; runs: number } { return { ready: true, droppedLogCount: 0, activeRuns: this.state === 'running' ? 1 : 0, runs: this.snapshot ? 1 : 0 }; }
   cancel(runId: string): { runId: string; status: 'stopped'; state: 'cancelled' } { this.state = 'cancelled'; return { runId, status: 'stopped', state: 'cancelled' }; }
   dispose(): void { void this.dataDir; }
