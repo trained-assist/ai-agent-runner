@@ -14,11 +14,11 @@ describe('production Cloudflare Runner config', () => {
     ]);
   });
 
-  it('defaults to France and fails closed for runs until production profiles are explicitly approved', () => {
+  it('admits real France runs for the canonical agent repository and Ladder credential', () => {
     expect(config.vars.RUNNER_ENGINE).toBe('eu-vm-agent-run');
     expect(config.vars.MOCK_TEST_ENABLED).toBe('false');
-    expect(config.vars.ALLOWED_REPOSITORIES).toBe('');
-    expect(config.vars.ALLOWED_ENVIRONMENT_NAMES).toBe('');
+    expect(config.vars.ALLOWED_REPOSITORIES).toBe('trained-assist/ai-agent-runner');
+    expect(config.vars.ALLOWED_ENVIRONMENT_NAMES).toBe('LLM_LADDER_TOKEN');
     expect(config.vars.RUNNER_API_PUBLIC_URL).toBe(
       'https://trained-assist-runner-api-production.skillset-apply.workers.dev',
     );
