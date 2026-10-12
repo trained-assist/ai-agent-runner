@@ -110,6 +110,8 @@ Worker secrets:
   Repository is authoritative and cannot be overridden by requests; a repository is required
   for real execution except for the exact pinned Telegram UX Registry test principal described
   below. The list stores hashes, never raw API keys.
+- `RUNNER_API_KEYS_PRODUCTION`: isolated registry used only by the dedicated production
+  Worker. It does not overwrite or load the base, additive, or sandbox3 registries.
 - `RUNNER_API_KEYS_ADDITIONAL`: independently provisioned additive principals. The sandbox3
   VM2 canary uses this binding; do not replace it when provisioning another sandbox identity.
 - `RUNNER_API_KEYS_SANDBOX3`: dedicated additional registry for the live CP profile on the
