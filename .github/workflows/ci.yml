@@ -16,6 +16,8 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
+      - name: Validate production Runner Worker bundle
+        run: npm run worker:dry-run:production
       - name: VM worker WIF issuer security contract
         run: node --test test/vm-worker-wif-issuer.test.mjs
       - name: Read-only sandbox API inventory regressions
