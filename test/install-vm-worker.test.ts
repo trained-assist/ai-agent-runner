@@ -18,5 +18,7 @@ describe('VM worker installer data directories', () => {
     expect(runtime).toContain('"libatk-bridge2.0-0|libatk-bridge2.0-0t64"');
     expect(runtime).toContain("grep -F 'libatk-1.0.so.0'");
     expect(runtime).toContain('apt-get install -y --no-install-recommends');
+    expect(runtime).toContain('apt-cache policy "${candidate}"');
+    expect(runtime).toContain('"${candidate_version}" != "(none)"');
   });
 });
