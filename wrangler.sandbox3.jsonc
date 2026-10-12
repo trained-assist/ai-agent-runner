@@ -14,6 +14,7 @@
     "RUNNER_ENGINE": "eu-vm-agent-run",
     "MOCK_TEST_ENABLED": "true",
     "ALLOWED_REPOSITORIES": "trained-assist/ai-agent-runner",
-    "ALLOWED_ENVIRONMENT_NAMES": "LLM_LADDER_TOKEN"
+    "ALLOWED_ENVIRONMENT_NAMES": "LLM_LADDER_TOKEN",
+    "SANDBOX_CLEANUP_PROFILES": "sandbox3-vm2-live-canary"
   }
 }
