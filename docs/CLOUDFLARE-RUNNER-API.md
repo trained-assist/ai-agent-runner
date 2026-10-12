@@ -59,6 +59,33 @@ engine returns fixed `pong` without calling the VM or a model.
 
 ## Configuration
 
+### Isolated production target
+
+`wrangler.production.jsonc` defines the dedicated `trained-assist-runner-api-production`
+Worker and its own `RunnerRunCoordinator` Durable Object namespace. Its default engine is
+France (`eu-vm-agent-run`), mock execution is disabled, and both repository and environment
+allowlists are empty. This intentionally keeps user runs closed until production profile
+routing and the CP binding are approved. A Worker health response is not evidence that a
+production user can submit work.
+
+The manual `Deploy isolated production Cloudflare Runner API` workflow runs only from
+`main`. The GitHub `production` environment must be configured with required reviewers before
+it is used for a live deployment. It requires a successful `sandbox3-live-profile-auth` workflow run for the exact same
+source SHA, a production GitHub environment secret named `CF_API_TOKEN`, and an environment
+variable `CF_ACCOUNT_ID` identifying the intended Cloudflare account. It verifies the account
+before deploying, then checks `/healthz` and that `/version` reports the deployed SHA. It does
+not configure an API principal, enable repository admission, route CP traffic, or submit a run.
+The first deployment creates a separate production Durable Object namespace; subsequent code
+deploys must keep the Worker name, DO class, and namespace stable.
+
+Before opening admission, provision the production VM URL/token, API-key registry, profile
+delegation secret, and launch-encryption key from the approved CP principal/profile mapping.
+Keep the encryption key stable for the lifetime of any ciphertext in the production DO. A
+recovery backup must preserve the exact key together with the corresponding encrypted run
+state; restoring either side alone cannot recover launch bodies. Do not rotate or regenerate
+that key while encrypted runs may still need recovery. The production config intentionally
+contains no sandbox cleanup profile.
+
 Separate Worker configurations and Durable Object namespaces are defined for sandbox3 and
 Telegram UX. A dedicated, mock-only Worker is provisioned for the CP sandbox3 admission
 contract so it can have an independent key registry and run store:
