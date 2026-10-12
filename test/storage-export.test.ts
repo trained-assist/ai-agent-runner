@@ -319,5 +319,9 @@ describe('run export store', () => {
     expect(existsSync(join(rootDir, 'blobs', 'runs', 'run-1', 'artifacts', `${manifest.artifactId}`))).toBe(true);
     const readBack = await exports.artifacts.read('run-1', manifest.artifactId);
     expect(readBack.bytes.toString('utf8')).toBe('console.log(1)');
+    const byPath = await exports.readArtifact('run-1', 'source.js');
+    expect(byPath.bytes.toString('utf8')).toBe('console.log(1)');
+    expect(byPath.manifest).toMatchObject({ name: 'source.js', mime: 'application/javascript', sha256: sha256Hex('console.log(1)') });
+    await expect(exports.readArtifact('run-1', 'other.js')).rejects.toThrow(/no exported artifact/);
   });
 });

@@ -10,8 +10,10 @@ import type { CapacityAdmission, CapacityEnvelope, CapacityReservationStore, Hos
 import { redactSecrets } from '../redact.js';
 import { checkVmWorkerBindings, type VmWorkerBindingsInventory } from './bindings-inventory.js';
 import type { VmWorkerBuildInfo } from './build-info.js';
+import { StorageError } from '../storage/errors.js';
 
 const MAX_REQUEST_BYTES = 2 * 1024 * 1024;
+const MAX_ARTIFACT_RESPONSE_BYTES = 20 * 1024 * 1024;
 const WORKER_ENGINES = new Set(['eu-vm-agent-run', 'rf-vm-agent-run']);
 const TEST_MCP = Object.freeze({
   profile: 'integration-telegram-ux-v1',
@@ -142,7 +144,7 @@ export function createVmWorkerServer(options: VmWorkerServerOptions): VmWorkerSe
       return;
     }
 
-    const runPath = /^\/v1\/runs\/([^/]+)(?:\/(status|result|cancel|logs))?$/.exec(url.pathname);
+    const runPath = /^\/v1\/runs\/([^/]+)(?:\/(status|result|cancel|logs|artifacts))?$/.exec(url.pathname);
     if (!runPath) { sendJson(res, 404, { error: 'NOT_FOUND' }); return; }
     let runId: string;
     try { runId = decodeURIComponent(runPath[1]!); } catch { sendJson(res, 400, { error: 'INVALID_REQUEST' }); return; }
@@ -159,6 +161,38 @@ export function createVmWorkerServer(options: VmWorkerServerOptions): VmWorkerSe
       const result = toLaunchResult(options, snapshot);
       if (!result) { sendJson(res, 409, { error: 'RESULT_NOT_READY' }); return; }
       sendJson(res, 200, result);
+      return;
+    }
+    if (endpoint === 'artifacts' && method === 'GET') {
+      if (!isTerminalState(snapshot.state)) { sendJson(res, 409, { error: 'RESULT_NOT_READY' }); return; }
+      const sourcePath = url.searchParams.get('path');
+      if (!sourcePath || sourcePath.length > 512 || /[\x00-\x1f\x7f]/.test(sourcePath)) {
+        sendJson(res, 400, { error: 'INVALID_REQUEST', message: 'a valid exported artifact path is required' });
+        return;
+      }
+      let artifact: Awaited<ReturnType<Runner['readExportedArtifact']>>;
+      try {
+        artifact = await options.runner.readExportedArtifact(runId, sourcePath);
+      } catch (error) {
+        if (error instanceof StorageError && error.code === 'BLOB_NOT_FOUND') {
+          sendJson(res, 404, { error: 'ARTIFACT_NOT_FOUND' });
+          return;
+        }
+        throw error;
+      }
+      const { manifest, bytes } = artifact;
+      if (bytes.length > MAX_ARTIFACT_RESPONSE_BYTES) { sendJson(res, 413, { error: 'ARTIFACT_TOO_LARGE' }); return; }
+      const filename = manifest.name.replace(/[^A-Za-z0-9._-]/g, '_') || 'artifact';
+      const encodedFilename = encodeURIComponent(manifest.name).replace(/['()*]/g, (char) => `%${char.charCodeAt(0).toString(16).toUpperCase()}`);
+      res.writeHead(200, {
+        'content-type': manifest.mime || 'application/octet-stream',
+        'content-length': String(bytes.length),
+        'content-disposition': `attachment; filename="${filename}"; filename*=UTF-8''${encodedFilename}`,
+        'cache-control': 'private, no-store',
+        'x-content-sha256': manifest.sha256,
+        'x-content-type-options': 'nosniff',
+      });
+      res.end(bytes);
       return;
     }
     if (endpoint === 'cancel' && method === 'POST') {

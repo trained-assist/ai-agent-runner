@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { RunnerRunCoordinator } from '../src/cloudflare/run-coordinator.js';
 import type { ApiPrincipal, DurableObjectStateLike, DurableStorage, RunnerWorkerEnv } from '../src/cloudflare/types.js';
-import { generateKeyPairSync, verify } from 'node:crypto';
+import { createHash, generateKeyPairSync, verify } from 'node:crypto';
 
 class MemoryStorage implements DurableStorage {
   values = new Map<string, unknown>();
@@ -162,6 +162,50 @@ describe('Cloudflare Runner run coordinator', () => {
     expect(await status.json()).toMatchObject({ state: 'succeeded', answer: 'done' });
     const result = await coordinator.fetch(call(`/v1/runs/${receipt.runId}/result`));
     expect(await result.json()).toMatchObject({ outcome: 'succeeded', text: 'done' });
+  });
+
+  it('proxies only a completed run output path to the VM worker', async () => {
+    const { coordinator, env, storage } = setup();
+    const bytes = Buffer.from('artifact bytes');
+    const sha256 = createHash('sha256').update(bytes).digest('hex');
+    const workerCalls: string[] = [];
+    env.FETCH = async (input, init) => {
+      const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+      workerCalls.push(`${init?.method ?? 'GET'} ${url.pathname}${url.search}`);
+      expect(new Headers(init?.headers).get('authorization')).toBe('Bearer worker-secret');
+      if (url.pathname === '/v1/launch') {
+        const launch = JSON.parse(String(init?.body)) as { runId: string };
+        return Response.json({ runId: launch.runId, operationId: 'op-artifact', status: 'accepted', statusUrl: '', resultUrl: '' }, { status: 202 });
+      }
+      if (url.pathname.endsWith('/status')) return Response.json({ status: 'succeeded' });
+      if (url.pathname.endsWith('/result')) return Response.json({ exitReason: 'completed', exitCode: 0, exitSignal: null,
+        answer: 'done', artifacts: [{ path: 'outputs/agent-note.md', name: 'agent-note.md', mime: 'text/markdown', size: bytes.length, sha256 }],
+        logUrl: '', repo: { fullName: 'team/private-profile', branch: 'agent-run/artifact-run' } });
+      if (url.pathname.endsWith('/artifacts') && url.searchParams.get('path') === 'outputs/agent-note.md') {
+        return new Response(bytes, { status: 200, headers: { 'content-type': 'text/markdown', 'content-length': String(bytes.length),
+          'content-disposition': 'attachment; filename="agent-note.md"', 'x-content-sha256': sha256, 'x-content-type-options': 'nosniff' } });
+      }
+      return Response.json({ error: 'ARTIFACT_NOT_FOUND' }, { status: 404 });
+    };
+
+    const accepted = await coordinator.fetch(call('/v1/runs', body, { 'idempotency-key': 'artifact-download' }));
+    const receipt = await accepted.json() as { runId: string };
+    await coordinator.alarm(); // dispatch to France VM
+    const pendingDownload = await coordinator.fetch(call(`/v1/runs/${receipt.runId}/artifacts?path=outputs%2Fagent-note.md`));
+    expect(pendingDownload.status).toBe(409);
+    await coordinator.alarm(); // save terminal result and artifact metadata
+
+    const foreign = await coordinator.fetch(call(`/v1/runs/${receipt.runId}/artifacts?path=outputs%2Fagent-note.md`, undefined, {}, { ...principal, principalId: 'foreign' }));
+    expect(foreign.status).toBe(404);
+    const wrongPath = await coordinator.fetch(call(`/v1/runs/${receipt.runId}/artifacts?path=outputs%2Fother.md`));
+    expect(wrongPath.status).toBe(404);
+
+    const response = await coordinator.fetch(call(`/v1/runs/${receipt.runId}/artifacts?path=outputs%2Fagent-note.md`));
+    expect(response.status).toBe(200);
+    expect(Buffer.from(await response.arrayBuffer()).toString()).toBe('artifact bytes');
+    expect(response.headers.get('x-content-sha256')).toBe(sha256);
+    expect(workerCalls).toContain(`GET /v1/runs/${receipt.runId}/artifacts?path=outputs%2Fagent-note.md`);
+    expect(storage.values.get('runner-v1')).not.toBeUndefined();
   });
 
   it('preserves worker process-exit evidence for cancellation without code or signal', async () => {
