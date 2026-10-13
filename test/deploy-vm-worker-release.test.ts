@@ -16,6 +16,18 @@ describe('VM worker release updater safety contract', () => {
     expect(updater).toContain('"${public_url%/}/readyz" -o /dev/null');
   });
 
+  it('verifies the bundled OpenCode version and binary hash before switching, then reports both identities', async () => {
+    const updater = await readFile(updaterPath, 'utf8');
+    const verifyBinary = updater.indexOf('Bundled OpenCode version or SHA-256 does not match');
+    const switchRelease = updater.indexOf('mv -Tf "${root}/.current.$$" "${root}/current"');
+    expect(verifyBinary).toBeGreaterThanOrEqual(0);
+    expect(verifyBinary).toBeLessThan(switchRelease);
+    expect(updater).toContain('sha256sum "${opencode_file}"');
+    expect(updater).toContain('"${opencode_file}" --version');
+    expect(updater).toContain('b?.opencode?.binarySha256!==process.argv[5]');
+    expect(updater).toContain('VM_WORKER_OPENCODE_PATH:-/usr/local/bin/opencode');
+  });
+
   it('rolls back both restart and health failures and documents readiness', async () => {
     const updater = await readFile(updaterPath, 'utf8');
     const operations = await readFile(operationsPath, 'utf8');

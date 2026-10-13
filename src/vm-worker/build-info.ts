@@ -8,6 +8,7 @@ export interface VmWorkerBuildInfo {
   sourceCommit: string;
   builtAt: string;
   buildUrl?: string;
+  opencode?: { version: string; sourceCommit: string; binarySha256: string };
 }
 
 const EMPTY_BUILD: VmWorkerBuildInfo = {
@@ -29,6 +30,12 @@ export function readVmWorkerBuildInfo(): VmWorkerBuildInfo {
       sourceCommit: raw.sourceCommit,
       builtAt: raw.builtAt,
       ...(typeof raw.buildUrl === 'string' ? { buildUrl: raw.buildUrl } : {}),
+      ...(isRecord(raw.opencode)
+        && typeof raw.opencode.version === 'string'
+        && typeof raw.opencode.sourceCommit === 'string' && /^[0-9a-f]{40}$/.test(raw.opencode.sourceCommit)
+        && typeof raw.opencode.binarySha256 === 'string' && /^[0-9a-f]{64}$/.test(raw.opencode.binarySha256)
+        ? { opencode: { version: raw.opencode.version, sourceCommit: raw.opencode.sourceCommit, binarySha256: raw.opencode.binarySha256 } }
+        : {}),
     };
   } catch { return EMPTY_BUILD; }
 }
