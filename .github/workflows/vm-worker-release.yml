@@ -24,6 +24,28 @@ jobs:
         run: |
           git fetch origin main
           git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+      - name: Download and verify pinned OpenCode fork
+        env:
+          OPENCODE_RELEASE_TAG: mem-v20261013-native-trace-57ac57b7e9
+          OPENCODE_VERSION: 0.0.0-native-trace-57ac57b7e9-20261013
+          OPENCODE_SOURCE_SHA: 57ac57b7e9bcf755f0131fd04ab05b0b5c4bb653
+          OPENCODE_ARCHIVE_SHA256: d58da99bbd4d945820ed1b6f0ffca3f866a9aeb0dc9b52a23d8c48d40bee9034
+          OPENCODE_BINARY_SHA256: f9b4ba796afe49cc8c17d205d616ed03e93014dd8abf1fb1a1a35951c628d696
+        run: |
+          set -euo pipefail
+          asset="opencode-linux-x64.tar.gz"
+          curl --fail --location --silent --show-error \
+            "https://github.com/gpt-mem/opencode-mem/releases/download/${OPENCODE_RELEASE_TAG}/${asset}" \
+            --output "$RUNNER_TEMP/$asset"
+          echo "$OPENCODE_ARCHIVE_SHA256  $RUNNER_TEMP/$asset" | sha256sum --check --status
+          mkdir -p "$RUNNER_TEMP/opencode-fork"
+          tar -xzf "$RUNNER_TEMP/$asset" -C "$RUNNER_TEMP/opencode-fork"
+          test -x "$RUNNER_TEMP/opencode-fork/opencode"
+          echo "$OPENCODE_BINARY_SHA256  $RUNNER_TEMP/opencode-fork/opencode" | sha256sum --check --status
+          test "$("$RUNNER_TEMP/opencode-fork/opencode" --version)" = "$OPENCODE_VERSION"
+          echo "OPENCODE_VERSION=$OPENCODE_VERSION" >> "$GITHUB_ENV"
+          echo "OPENCODE_SOURCE_SHA=$OPENCODE_SOURCE_SHA" >> "$GITHUB_ENV"
+          echo "OPENCODE_BINARY_SHA256=$OPENCODE_BINARY_SHA256" >> "$GITHUB_ENV"
       - run: npm ci
       - run: npm run build
       - name: Assemble immutable Linux VM worker bundle
@@ -35,6 +57,7 @@ jobs:
           mkdir -p "$STAGE"
           cp package.json package-lock.json "$STAGE/"
           cp -R dist "$STAGE/dist"
+          install -m 0755 "$RUNNER_TEMP/opencode-fork/opencode" "$STAGE/opencode"
           mkdir -p "$STAGE/scripts"
           cp scripts/deploy-vm-worker-release.sh "$STAGE/scripts/"
           (cd "$STAGE" && npm ci --omit=dev)

@@ -50,7 +50,11 @@ workspace publication are separate capabilities.
 Release delivery and service lifecycle are separate processes. GitHub Actions builds
 and signs an immutable release; `ai-agent-vm-worker-update <tag>` verifies and installs
 that release, switches the versioned symlink, restarts systemd, and rolls back if the
-new process is not ready. `ai-agent-vm-worker.service` owns the long-running worker.
+new process is not ready. The signed bundle also carries the pinned OpenCode Linux x64
+binary; the updater verifies its version and SHA-256 and points `/usr/local/bin/opencode`
+through the same `current` symlink, so rollback restores the matching binary. `/version`
+reports the Runner source commit and the OpenCode version, source commit, and binary SHA.
+`ai-agent-vm-worker.service` owns the long-running worker.
 `install-vm-worker.sh` is only a one-time bootstrap for the service account, unit,
 configuration templates, and updater. There is currently no automatic VM rollout or
 VM self-deployment: the operator invokes the updater after reviewing a release.
