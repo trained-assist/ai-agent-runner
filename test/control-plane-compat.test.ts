@@ -18,7 +18,7 @@ import {
 //   C01 receipt {requestId,userTaskId,acceptedAt,durable}  → наш receipt {requestId,userTaskId,runId,deduplicated}
 //   C02 events ?taskId&after&limit, nextCursor/hasMore     → наш /v1/runs/{id}/events?cursor&limit, cursor/hasMore
 //   C02 envelope … occurredAt …                          → наше поле timestamp (адаптер)
-//   C03 cancel_requested → cancelled после подтверждения  → наш stop_pending(202) → терминальный cancelled
+//   C03 cancel_requested → cancelled после подтверждения  → наш stopped(200)/stop_pending(202) → терминальный cancelled
 //   P06 outcome unknown при потере воркера                 → WORKER_UNREACHABLE, outcome=failed, retryable
 //   AC-69 resume: новый runId, тот же userTaskId, поколение+1 → наша семантика продолжения (capabilities)
 

@@ -100,7 +100,8 @@ describe('объявленные выходы через внешнего вор
     const h = await startHttpHarness({ worker: { delayMs: 300 } });
     const submit = await postSubmit(h.base, alphaKey, 'idem-cancel-inflight', submitBody());
     const receipt = (await submit.json()) as { runId: string };
-    expect((await postCancel(h.base, alphaKey, receipt.runId, {})).status).toBe(202);
+    // Воркер подтверждает отмену — cancel возвращает stopped (HTTP 200, #112).
+    expect((await postCancel(h.base, alphaKey, receipt.runId, {})).status).toBe(200);
     expect(await waitForTerminal(h.base, alphaKey, receipt.runId)).toBe('cancelled');
   }, 30000);
 });

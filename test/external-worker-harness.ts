@@ -46,6 +46,11 @@ export interface MockWorkerOptions {
   statusHttpStatus?: number;
   /** Ответить HTTP-ошибкой на получение результата. */
   resultHttpStatus?: number;
+  /**
+   * Что воркер отвечает на cancel (#112): по умолчанию подтверждает `cancelled`;
+   * `rejected` — воркер знает ран, но отказывает в отмене; `unknown_run` — воркер ран не видел.
+   */
+  cancelResponse?: 'cancelled' | 'rejected' | 'unknown_run';
   /** Ответить кодами по очереди на получение результата, после чего отдавать штатный результат. */
   resultHttpStatusSequence?: number[];
   /** Задержать ответ на статус: воркер жив, но отвечает дольше бюджета reconcile. */
@@ -249,6 +254,16 @@ export async function startMockWorker(options: MockWorkerOptions = {}): Promise<
       if (cancelMatch) {
         const runId = cancelMatch[1]!;
         cancels.push(runId);
+        if (settings.cancelResponse === 'rejected') {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ status: 'rejected', reason: 'mock refuses the cancellation' }));
+          return;
+        }
+        if (settings.cancelResponse === 'unknown_run') {
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ status: 'unknown_run' }));
+          return;
+        }
         const record = [...live].find((entry) => entry.runId === runId);
         if (!record || record.pending) {
           res.writeHead(200, { 'content-type': 'application/json' });

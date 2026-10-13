@@ -544,14 +544,18 @@ export class AgentApi {
     try {
       receipt = await worker.cancel(runId);
     } catch (err) {
+      // Отмена не состоялась: флаг cancelRequested не должен врать клиенту (#112).
+      this.store.clearCancelRequested(runId);
       this.log({ event: 'cancel_failed', runId, message: err instanceof Error ? err.message : String(err) });
       return { runId, status: 'rejected', reason: 'cancel request did not reach the worker' };
     }
     if (receipt.status === 'unknown_run') {
       // Ран есть в нашей памяти, но воркер его не видел — это отказ отмены, а не 404.
+      this.store.clearCancelRequested(runId);
       return { runId, status: 'rejected', reason: 'the worker has not registered this run; the cancellation could not be delivered' };
     }
     if (receipt.status === 'rejected') {
+      this.store.clearCancelRequested(runId);
       return { runId, status: 'rejected', reason: receipt.reason ?? 'the worker rejected the cancellation' };
     }
     // Ран мог финализироваться, пока отмена шла к воркеру.
@@ -560,7 +564,9 @@ export class AgentApi {
       return { runId, status: 'already_terminal', state: current.state };
     }
     this.log({ event: 'cancel', principalId: principal.principalId, runId, status: receipt.status, ownerGeneration: record.ownerGeneration });
-    return { runId, status: 'stop_pending', state: current?.state ?? run.state };
+    // Воркер подтвердил отмену (`cancelled`) — подтверждение уже есть в ответе, клиенту не
+    // нужно опрашивать статус: возвращаем `stopped`, а не `stop_pending` (#112).
+    return { runId, status: receipt.status === 'cancelled' ? 'stopped' : 'stop_pending', state: current?.state ?? run.state };
   }
 
   /** Provision a trusted profile workspace without admitting or launching an Agent Run. */
@@ -663,6 +669,8 @@ export class AgentApi {
           },
         },
       },
+      // terminalConfirmation — правда: подтверждение воркера возвращается в самом ответе
+      // cancel как `stopped` (#112), отдельный опрос статуса для подтверждения не нужен.
       cancel: { requestedReceipt: true, terminalConfirmation: true },
       mcp: {
         perRunStdioProxy: false,

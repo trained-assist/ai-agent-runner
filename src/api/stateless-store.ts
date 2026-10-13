@@ -411,6 +411,14 @@ export class StatelessStore {
     run.updatedAt = run.events.length > 0 ? run.events[run.events.length - 1]!.timestamp : run.updatedAt;
   }
 
+  /** Отмена не состоялась (воркер отверг или не знает ран) — флаг не должен врать (#112). */
+  clearCancelRequested(runId: string): void {
+    const run = this.progress.get(runId);
+    if (!run) return;
+    run.cancelRequested = null;
+    run.updatedAt = run.events.length > 0 ? run.events[run.events.length - 1]!.timestamp : run.updatedAt;
+  }
+
   /** Выбросить терминальные раны, которые пережили свой TTL. Возвращает число выброшенных. */
   sweep(now: Date = new Date()): number {
     const deadlineMs = now.getTime() - this.limits.terminalRunTtlMs;

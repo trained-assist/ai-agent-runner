@@ -317,7 +317,9 @@ describe('http submit, status, result, artifacts, events and cancel', () => {
     expect(((await early.json()) as { error: { code: string } }).error.code).toBe('RESULT_NOT_READY');
 
     const cancel = await postCancel(h.base, alphaKey, receipt.runId, {});
-    expect(cancel.status).toBe(202);
+    // Воркер подтвердил отмену — cancel сам подтверждает остановку (200 stopped, #112).
+    expect(cancel.status).toBe(200);
+    expect((await cancel.json()) as Record<string, unknown>).toMatchObject({ status: 'stopped' });
     expect(h.worker.cancels).toContain(receipt.runId);
 
     await waitForTerminal(h.base, alphaKey, receipt.runId);
