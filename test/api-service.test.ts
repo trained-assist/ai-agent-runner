@@ -613,3 +613,55 @@ describe('идемпотентность переживает sweep и выте�
     expect(beyond.runId).not.toBe(first.runId);
   });
 });
+
+describe('журнал событий восстанавливается после рестарта (#117)', () => {
+  it('после рестарта events() содержит claimed и inputs_materialized (seq 1,2), повторный resume не дублирует', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'runner-events-resume-'));
+    onTestFinished(() => rmSync(dir, { recursive: true, force: true }));
+    const logPath = join(dir, 'admissions.jsonl');
+
+    const worker = await startMockWorker({});
+    onTestFinished(() => worker.close());
+
+    // Первый процесс: принимаем ран и умираем сразу после передачи воркеру,
+    // до того как поллер довёл его до терминального состояния.
+    const first = new AgentApi({ workers: [adapterFor(worker)], admissionLogPath: logPath });
+    onTestFinished(() => first.dispose());
+    const submitted = first.submit(alpha, 'idem-events-resume', body());
+    await waitForCondition(
+      () => first.store.dispatchedRuns().some((entry) => entry.runId === submitted.runId),
+      5000,
+      'dispatched journal entry',
+    );
+    expect(first.store.progressOf(submitted.runId)?.events.map((event) => event.type)).toEqual([
+      'claimed',
+      'inputs_materialized',
+    ]);
+    // Умираем: больше никаких записей в журнал.
+    first.dispose();
+
+    // Второй процесс читает тот же журнал.
+    const revived = new StatelessStore({}, logPath);
+    expect(revived.dispatchedRuns().map((entry) => entry.runId)).toContain(submitted.runId);
+
+    const second = new AgentApi({ workers: [adapterFor(worker)], store: revived, admissionLogPath: logPath });
+    onTestFinished(() => second.dispose());
+
+    expect(second.resumeDispatched()).toBeGreaterThanOrEqual(1);
+    await waitForCondition(
+      () => (second.events(alpha, submitted.runId).events?.length ?? 0) >= 2,
+      5000,
+      'restored admission events',
+    );
+
+    const page = second.events(alpha, submitted.runId);
+    expect(page.events.map((event) => event.type)).toEqual(['claimed', 'inputs_materialized']);
+    expect(page.events.map((event) => event.sequence)).toEqual([1, 2]);
+    expect(page.cursor).toBe(2);
+
+    // Повторный resume не размножает события приёма.
+    const before = page.events.length;
+    second.resumeDispatched();
+    expect(second.events(alpha, submitted.runId).events).toHaveLength(before);
+  }, 30000);
+});
