@@ -25,7 +25,7 @@ import type { RunResult } from '../contracts/result.js';
 import { RUNNER_EVENT_SCHEMA_VERSION, type RunnerEvent } from '../contracts/events.js';
 import { PreflightError } from '../contracts/validate.js';
 import { validateRunSpec, type EngineSpec, type InputSpec, type RunSpec } from '../contracts/run-spec.js';
-import { DEFAULT_STATELESS_LIMITS, isTerminalApiState, STATELESS_STORE_SCHEMA_VERSION, StatelessStore, type AdmissionRecord } from './stateless-store.js';
+import { DEFAULT_STATELESS_LIMITS, formatRetentionMs, isTerminalApiState, STATELESS_STORE_SCHEMA_VERSION, StatelessStore, type AdmissionRecord } from './stateless-store.js';
 import {
   API_CAPABILITIES_SCHEMA_VERSION,
   API_CONTRACT_VERSION,
@@ -615,6 +615,7 @@ export class AgentApi {
         header: 'Idempotency-Key',
         repeatWithSameKey: 'same_receipt',
         newAttemptRequires: 'new_idempotency_key',
+        retention: formatRetentionMs(this.store.idempotencyRetentionMs),
       },
       states: API_RUN_STATES,
       events: { cursor: true, replay: true, sse: true, lastEventId: true },

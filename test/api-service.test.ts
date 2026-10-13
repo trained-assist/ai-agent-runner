@@ -565,3 +565,51 @@ describe('stateless AgentApi: capabilities отчитываются честно
     expect(() => api.status(alpha, receipt.runId)).toThrowError(expect.objectContaining({ code: 'NOT_FOUND' }));
   });
 });
+
+describe('идемпотентность переживает sweep и вытеснение (#116)', () => {
+  it('sweep: повтор того же ключа в окне хранения даёт ту же квитанцию', async () => {
+    const store = new StatelessStore({ terminalRunTtlMs: 0 });
+    const api = await makeApi({}, store);
+    const first = api.submit(alpha, 'idem-survive-sweep', body());
+    await waitForState(api, alpha, first.runId, 'succeeded');
+    expect(store.sweep(new Date(Date.now() + 1000))).toBe(1);
+    const again = api.submit(alpha, 'idem-survive-sweep', body());
+    expect(again.deduplicated).toBe(true);
+    expect(again.runId).toBe(first.runId);
+    expect(again.requestId).toBe(first.requestId);
+  });
+
+  it('evictIfNeeded: повтор вытесненной квитанции возвращает тот же runId', async () => {
+    const store = new StatelessStore({ maxRuns: 1 });
+    const api = await makeApi({}, store);
+    const first = api.submit(alpha, 'idem-survive-evict', body());
+    await waitForState(api, alpha, first.runId, 'succeeded');
+    api.submit(alpha, 'idem-survive-evict-2', body({ input: { inlinePrompt: 'second' } }));
+    const again = api.submit(alpha, 'idem-survive-evict', body());
+    expect(again.deduplicated).toBe(true);
+    expect(again.runId).toBe(first.runId);
+  });
+
+  it('capabilities объявляет окно идемпотентности, и поведение API ему соответствует', async () => {
+    const api = await makeApi();
+    expect(api.capabilities().idempotency.retention).toBe('24h');
+
+    const store = new StatelessStore({ terminalRunTtlMs: 0, idempotencyRetentionMs: 5000 });
+    const api2 = await makeApi({}, store);
+    const first = api2.submit(alpha, 'idem-retention-boundary', body());
+    await waitForState(api2, alpha, first.runId, 'succeeded');
+    expect(store.sweep(new Date(Date.now() + 1000))).toBe(1);
+
+    // inside the declared window — same receipt survives sweep (stateless idempotency a=).
+    const within = api2.submit(alpha, 'idem-retention-boundary', body());
+    expect(within.deduplicated).toBe(true);
+    expect(within.runId).toBe(first.runId);
+    expect(within.requestId).toBe(first.requestId);
+
+    // beyond the window: advanced 'now' purges the tombstone — the key is free.
+    store.sweep(new Date(Date.now() + 100_000));
+    const beyond = api2.submit(alpha, 'idem-retention-boundary', body());
+    expect(beyond.deduplicated).toBe(false);
+    expect(beyond.runId).not.toBe(first.runId);
+  });
+});

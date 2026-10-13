@@ -259,7 +259,9 @@ describe('stateless store: приёмные записи только в пам�
     expect(store.sweep(new Date(Date.now() + 1000))).toBe(1);
     expect(store.progressOf(entry.runId)).toBeNull();
     expect(store.getByRun(entry.runId)).toBeNull();
-    expect(store.getByAdmission('p-alpha', 'idem-1')).toBeNull();
+    // После #116 адмиссия не теряется целиком на sweep(): квитанция живёт в retired-индексе
+    // для `idempotencyRetentionMs`, поэтому повтор в окне всё ещё возвращает тот же runId.
+    expect(store.getByAdmission('p-alpha', 'idem-1')).toMatchObject({ runId: entry.runId });
   });
 });
 

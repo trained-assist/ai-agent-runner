@@ -146,6 +146,9 @@ export interface ApiCapabilities {
     header: 'Idempotency-Key';
     repeatWithSameKey: 'same_receipt';
     newAttemptRequires: 'new_idempotency_key';
+    /** Дедупликация по Idempotency-Key гарантирована не меньше этого окна после приёма.
+     *  После его истечения ключ может быть переиспользован (issue #116, #115). */
+    retention: string;
   };
   states: readonly ApiRunState[];
   events: { cursor: true; replay: true; sse: true; lastEventId: true };

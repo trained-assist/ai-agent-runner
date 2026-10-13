@@ -102,6 +102,13 @@ export interface StatelessStoreLimits {
   maxEventsPerRun: number;
   /** Через сколько после финализации терминальный ран выбрасывается из памяти. */
   terminalRunTtlMs: number;
+  /**
+   * Горизонт идемпотентности (issue #116): пока after drop (sweep/evict) запись удерживается
+   * как compact fingerprint; в течение этого окна повтор с тем же Idempotency-Key возвращает ту же
+   * квитанцию. 24 часа — типичный горизонт (Stripe и т.п.); оператор может уменьшить (и ‑ только
+   * уменьшить безопасно для контракта «не меньше, чем»).
+   */
+  idempotencyRetentionMs: number;
 }
 
 export const DEFAULT_STATELESS_LIMITS: StatelessStoreLimits = {
@@ -109,6 +116,7 @@ export const DEFAULT_STATELESS_LIMITS: StatelessStoreLimits = {
   maxActiveRuns: 200,
   maxEventsPerRun: 2000,
   terminalRunTtlMs: 60 * 60 * 1000,
+  idempotencyRetentionMs: 24 * 60 * 60 * 1000,
 };
 
 const TERMINAL_API_STATES: readonly ApiRunState[] = ['succeeded', 'failed', 'cancelled'];
@@ -117,8 +125,23 @@ export function isTerminalApiState(state: ApiRunState): boolean {
   return TERMINAL_API_STATES.includes(state);
 }
 
+
+
+export interface IdempotencyReceipt {
+  requestId: string;
+  userTaskId: string;
+  runId: string;
+  payloadHash: string;
+  ownerGeneration: number;
+}
+
 export class StatelessStore {
   private readonly byAdmission = new Map<string, AdmissionRecord>();
+  /** Компактные отпечатки вытесненных приёмных записей: ключ больше не ведёт в новый ран,
+    * но всё ещё возвращает ту же квитанцию в пределах `idempotencyRetentionMs`. В отличие от
+    * AdmissionRecord, отпечаток не содержит RunSpec — десятки байт вместо потенциально больших
+    * списков входов/артефактов. Привязан к сроку жизни, а не к памяти процесса. */
+  private readonly retiredAdmissions = new Map<string, IdempotencyReceipt & { expiresAt: number }>();
   private readonly byRun = new Map<string, AdmissionRecord>();
   private readonly byPrincipalTask = new Map<string, AdmissionRecord[]>();
   private readonly progress = new Map<string, RunProgress>();
@@ -280,6 +303,7 @@ export class StatelessStore {
   /** Перестроить индексы из записи без проверки лимита (восстановление при старте). */
   private index(record: AdmissionRecord): void {
     this.byAdmission.set(admissionKey(record.principalId, record.idempotencyKey), record);
+    this.retiredAdmissions.delete(admissionKey(record.principalId, record.idempotencyKey));
     this.byRun.set(record.runId, record);
     const indexKey = taskKey(record.principalId, record.userTaskId);
     const attempts = this.byPrincipalTask.get(indexKey) ?? [];
@@ -294,8 +318,24 @@ export class StatelessStore {
     this.evictIfNeeded();
   }
 
-  getByAdmission(principalId: string, idempotencyKey: string): AdmissionRecord | null {
-    return this.byAdmission.get(admissionKey(principalId, idempotencyKey)) ?? null;
+  /** Окно идемпотентности, в течение которого повтор с тем же ключом гарантированно возвращает ту же квитанцию. */
+  get idempotencyRetentionMs(): number {
+    return this.limits.idempotencyRetentionMs;
+  }
+
+  getByAdmission(principalId: string, idempotencyKey: string): IdempotencyReceipt | null {
+    const key = admissionKey(principalId, idempotencyKey);
+    const t0 = Date.now();
+    const live = this.byAdmission.get(key);
+    if (live) return live;
+    const retired = this.retiredAdmissions.get(key);
+    if (!retired) return null;
+    if (retired.expiresAt <= Date.now()) {
+      this.retiredAdmissions.delete(key);
+      return null;
+    }
+    const { expiresAt: _expiresAt, ...receipt } = retired;
+    return receipt;
   }
 
   getByRun(runId: string): AdmissionRecord | null {
@@ -429,6 +469,9 @@ export class StatelessStore {
       this.drop(runId);
       dropped += 1;
     }
+    for (const [key, retired] of this.retiredAdmissions) {
+      if (retired.expiresAt <= now.getTime()) this.retiredAdmissions.delete(key);
+    }
     return dropped;
   }
 
@@ -473,6 +516,23 @@ export class StatelessStore {
     this.progress.delete(runId);
     const record = this.byRun.get(runId);
     if (!record) return;
+    // Компактный отпечаток сохраняет дедупликацию по Idempotency-Key после выпадения
+    // записи из памяти (issue #116): память на отпечаток — десятки байт вместо всего
+    // RunSpec. Без него повтор с тем же ключом через час создавал бы второй ран, что
+    // неверно: клиент, повторивший submit после lost HTTP-ответа, должен получить ту же
+    // квитанцию (contract.idempotency.repeatWithSameKey = same_receipt) в пределах окна.
+    const retired = this.retiredAdmissions.get(admissionKey(record.principalId, record.idempotencyKey));
+    const expiresAt = Date.now() + this.limits.idempotencyRetentionMs;
+    if (!retired || retired.expiresAt < expiresAt) {
+      this.retiredAdmissions.set(admissionKey(record.principalId, record.idempotencyKey), {
+        requestId: record.requestId,
+        userTaskId: record.userTaskId,
+        runId: record.runId,
+        payloadHash: record.payloadHash,
+        ownerGeneration: record.ownerGeneration,
+        expiresAt,
+      });
+    }
     this.byRun.delete(runId);
     this.byAdmission.delete(admissionKey(record.principalId, record.idempotencyKey));
     const indexKey = taskKey(record.principalId, record.userTaskId);
@@ -492,4 +552,15 @@ function taskKey(principalId: string, userTaskId: string): string {
 
 function isTerminalEvent(event: RunnerEvent): boolean {
   return (TERMINAL_EVENT_TYPES as readonly string[]).includes(event.type);
+}
+
+/**
+ * Читаемое представление окна идемпотентности для декларации в /v1/capabilities
+ * (issue #116). Делит миллисекунды на удобные единицы.
+ */
+export function formatRetentionMs(ms: number): string {
+  if (ms % 3_600_000 === 0) return `${ms / 3_600_000}h`;
+  if (ms % 60_000 === 0) return `${ms / 60_000}m`;
+  if (ms % 1000 === 0) return `${ms / 1000}s`;
+  return `${ms}ms`;
 }
