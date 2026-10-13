@@ -56,6 +56,7 @@ const idempotencyKey = `sandbox3-vm2-${runId}`;
 const terminal = new Set(['succeeded', 'failed', 'cancelled', 'timed_out']);
 const launchPayload = {
   userTaskId: idempotencyKey,
+  traceId: `sandbox3-vm2-${runId}`,
   engine: { name: 'eu-vm-agent-run', adapterVersion: '1' },
   input: { inlinePrompt: 'Read package.json and report its name and version as one JSON object. Do not edit any files.' },
   envAllowlist: ['LLM_LADDER_TOKEN'],
@@ -72,6 +73,7 @@ if (typeof submitted.runId !== 'string' || !submitted.runId.startsWith('run_')) 
   throw new Error('sandbox3 API returned no valid run receipt');
 }
 console.log(`run accepted: ${submitted.runId}`);
+console.log(`diagnostic trace id: sandbox3-vm2-${runId}`);
 
 let status;
 try {

@@ -1589,6 +1589,12 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
       // конфиг и кэш ни своего профиля, ни соседнего рана, ни Runner'а.
       for (const [name, value] of Object.entries(room.env)) env[name] = value;
     }
+    if (spec.engine.name === 'opencode') {
+      // The OpenCode host template forwards these through the Ladder provider's custom headers.
+      // Keep the metadata runner-owned so callers cannot spoof another run's correlation ids.
+      env.RUNNER_LADDER_TRACE_ID = spec.traceId ?? spec.runId;
+      env.RUNNER_LADDER_RUN_ID = spec.runId;
+    }
     const config = run.mcpConfigPath;
     if (config) env[MCP_CONFIG_ENV] = config;
     return env;

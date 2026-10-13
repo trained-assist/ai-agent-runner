@@ -15,6 +15,10 @@ describe('deployed VM worker OpenCode template', () => {
     expect(template.model).toBe('ladder/free');
     expect(template.provider.ladder.options.baseURL).toBe('https://llm-ladder.trainedassist.store/v1');
     expect(template.provider.ladder.options.apiKey).toBe('{env:LLM_LADDER_TOKEN}');
+    expect(template.provider.ladder.options.headers).toEqual({
+      'x-ladder-trace': '{env:RUNNER_LADDER_TRACE_ID}',
+      'x-ladder-run': '{env:RUNNER_LADDER_RUN_ID}',
+    });
     expect(JSON.stringify(template)).not.toMatch(/(?:sk-[A-Za-z0-9_-]{12,}|Bearer\s+[A-Za-z0-9._-]{12,})/i);
   });
 });
@@ -29,10 +33,17 @@ const layout = ENGINE_CONFIG_LAYOUTS['opencode'] as { file: string };
 const opencodeSpec = { engine: { name: 'opencode', adapterVersion: '1' } };
 function opencodeHarness(options: { templatesDir?: string; scenario?: 'success' | 'timeout' } = {}) {
   const launcher = new RecordingLauncher();
+  const opencode = new class extends FakeEngine {
+    lastEnv?: Record<string, string>;
+    override async start(ctx: Parameters<FakeEngine['start']>[0]) {
+      this.lastEnv = ctx.env;
+      return super.start(ctx);
+    }
+  }(options.scenario ?? 'success');
   let provider!: StubCleanRoomProvider;
   const h = createHarness({
     scenario: options.scenario ?? 'success',
-    adapters: { fake: new FakeEngine(options.scenario ?? 'success'), opencode: new FakeEngine(options.scenario ?? 'success') },
+    adapters: { fake: new FakeEngine(options.scenario ?? 'success'), opencode },
     isolation: (rootDir: string) => {
       provider = new StubCleanRoomProvider({ rootDir }, launcher);
       return provider;
@@ -41,7 +52,7 @@ function opencodeHarness(options: { templatesDir?: string; scenario?: 'success' 
       ? {}
       : { engineConfigTemplates: loadEngineConfigTemplates(options.templatesDir) }),
   });
-  return { h, launcher, provider: () => provider };
+  return { h, launcher, opencode, provider: () => provider };
 }
 
 /**
@@ -52,6 +63,17 @@ function opencodeHarness(options: { templatesDir?: string; scenario?: 'success' 
  * движка (иначе движок ушёл бы на платный профиль по умолчанию молча).
  */
 describe('конфиг движка в run-scoped clean room', () => {
+  it('передаёт принадлежащие Runner идентификаторы в OpenCode provider env', async () => {
+    const { h, opencode } = opencodeHarness();
+    const { receipt } = h.start({ ...opencodeSpec, traceId: 'trace-sandbox-77' });
+    const result = await h.runner.waitFor(receipt.runId);
+    expect(result.outcome).toBe('succeeded');
+    expect(opencode.lastEnv).toMatchObject({
+      RUNNER_LADDER_TRACE_ID: 'trace-sandbox-77',
+      RUNNER_LADDER_RUN_ID: receipt.runId,
+    });
+  });
+
   it('хостовый шаблон копируется в XDG_CONFIG_HOME рана, 0600, и не меняет сам шаблон', async () => {
     const templatesDir = mkdtempSync(join(tmpdir(), 'engine-config-templates-'));
     const template = { model: 'openrouter/qwen/qwen3.8-27b:free' };
