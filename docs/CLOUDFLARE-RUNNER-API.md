@@ -13,6 +13,14 @@ and conflicting-key rejection and returned the repository package version. The p
 build was rejected by Ladder because its `0.0.0-*` build label failed the free-tier minimum-version
 check; the stable `1.18.34` build fixes that compatibility issue.
 
+That canary took about 31 seconds from API acceptance to the API client observing `succeeded`.
+The France worker's durable events place engine start at 19:04:29.416Z, process exit at
+19:04:48.328Z and terminal worker state at 19:04:50.261Z; the API client first observed
+`succeeded` at 19:04:57.678Z. This is one sample and includes Ladder latency. The roughly
+7-second gap after the worker terminal event is consistent with the Cloudflare coordinator's
+5-second status alarm plus the canary's 3-second status poll, and is a measurable non-model
+latency candidate rather than proof of a stable average.
+
 The sandbox Worker
 has `VM_WORKER_URL`, `VM_WORKER_TOKEN`, `LLM_LADDER_TOKEN`, and the additive
 `RUNNER_API_KEYS_ADDITIONAL` secret configured alongside its existing secrets; the canary
