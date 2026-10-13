@@ -346,6 +346,45 @@ describe('stateless AgentApi: финализация', () => {
   }, 20000);
 });
 
+describe('stateless AgentApi: контракт отмены честен (#112)', () => {
+  it('воркер подтвердил отмену — cancel возвращает stopped, а не stop_pending', async () => {
+    const api = await makeApi({ delayMs: 300 });
+    const receipt = api.submit(alpha, 'idem-cancel-stopped', body());
+    const cancel = await api.cancel(alpha, receipt.runId);
+    expect(cancel.status).toBe('stopped');
+    await waitForState(api, alpha, receipt.runId, 'cancelled');
+  }, 20000);
+
+  it('воркер отверг отмену — cancelRequested сбрасывается, а не врёт, что отмена в силе', async () => {
+    const api = await makeApi({ delayMs: 300, cancelResponse: 'rejected' });
+    const receipt = api.submit(alpha, 'idem-cancel-rejected-flag', body());
+    const cancel = await api.cancel(alpha, receipt.runId);
+    expect(cancel.status).toBe('rejected');
+    expect(cancel.reason).toContain('mock refuses');
+    expect(api.status(alpha, receipt.runId).cancelRequested).toBe(false);
+  }, 20000);
+
+  it('воркер не знает ран — cancelRejected-путь, а не залипший cancelRequested', async () => {
+    const api = await makeApi({ delayMs: 300, cancelResponse: 'unknown_run' });
+    const receipt = api.submit(alpha, 'idem-cancel-unknown-flag', body());
+    const cancel = await api.cancel(alpha, receipt.runId);
+    // Сервис не выдаёт 404 клиенту: ран есть в его памяти, отказ — от доставки отмены.
+    expect(cancel.status).toBe('rejected');
+    expect(cancel.reason).toContain('has not registered');
+    expect(api.status(alpha, receipt.runId).cancelRequested).toBe(false);
+  }, 20000);
+
+  it('capabilities().cancel: terminalConfirmation — правда, подтверждение реально приходит в ответе cancel', async () => {
+    const api = await makeApi({ delayMs: 300 });
+    expect(api.capabilities().cancel).toEqual({ requestedReceipt: true, terminalConfirmation: true });
+    const receipt = api.submit(alpha, 'idem-cancel-caps', body());
+    // terminalConfirmation честен, только если cancel сам подтверждает остановку (stopped), #112.
+    const cancel = await api.cancel(alpha, receipt.runId);
+    expect(cancel.status).toBe('stopped');
+    await waitForState(api, alpha, receipt.runId, 'cancelled');
+  }, 20000);
+});
+
 describe('stateless AgentApi: capabilities отчитываются честно (#74, шаг 7)', () => {
   it('изоляции на хосте нет, движок один, байты API не отдаёт', async () => {
     const api = await makeApi();
