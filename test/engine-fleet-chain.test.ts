@@ -293,7 +293,8 @@ describe('приоритетная цепочка движков (#100)', () => 
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
     const receipt = await fleet.service.cancel(fleetPrincipal, runId);
-    expect(receipt.status).toBe('stop_pending');
+    // Второй движок (принявший ран) подтверждает отмену — stopped, а не stop_pending (#112).
+    expect(receipt.status).toBe('stopped');
     await waitFor(fleet, runId, 'cancelled');
 
     expect(fleet.gha.cancels).not.toContain(runId);

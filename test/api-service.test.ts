@@ -302,7 +302,8 @@ describe('stateless AgentApi: финализация', () => {
     const api = await makeApi({ delayMs: 300 });
     const receipt = api.submit(alpha, 'idem-cancel', body());
     const cancel = await api.cancel(alpha, receipt.runId);
-    expect(cancel.status).toBe('stop_pending');
+    // Воркер подтвердил отмену — подтверждение в ответе cancel, а не «ждите сами» (#112).
+    expect(cancel.status).toBe('stopped');
     await waitForState(api, alpha, receipt.runId, 'cancelled');
     expect(api.result(alpha, receipt.runId).outcome).toBe('cancelled');
   });
@@ -321,7 +322,7 @@ describe('stateless AgentApi: финализация', () => {
     const api = await makeApi({ delayMs: 150 });
     const receipt = api.submit(alpha, 'idem-cancel-after-accept', body());
     const cancel = await api.cancel(alpha, receipt.runId);
-    expect(cancel.status).toBe('stop_pending');
+    expect(cancel.status).toBe('stopped');
     await waitForState(api, alpha, receipt.runId, 'cancelled');
   }, 20000);
 
