@@ -18,7 +18,7 @@ import {
 interface Capabilities {
   contract: { name: string; version: number };
   profileWorkspaceProvisioning: { enabled: boolean; method: string; path: string; scope: string; requiresSignedProfileCapability: boolean; launchesAgent: boolean };
-  idempotency: { header: string; repeatWithSameKey: string; newAttemptRequires: string };
+  idempotency: { header: string; repeatWithSameKey: string; newAttemptRequires: string; retention: string };
   states: string[];
   events: { cursor: boolean; replay: boolean; sse: boolean; lastEventId: boolean };
   disconnect: { connectionLostIsNotFailed: boolean; autoRerunOnDisconnect: boolean; outcomeUnknown: boolean };
@@ -50,6 +50,7 @@ describe('GET /v1/capabilities: декларация, а не догадки (#7
       header: 'Idempotency-Key',
       repeatWithSameKey: 'same_receipt',
       newAttemptRequires: 'new_idempotency_key',
+      retention: '24h',
     });
     expect(caps.events).toMatchObject({ cursor: true, replay: true, sse: true, lastEventId: true });
     expect(caps.disconnect.outcomeUnknown).toBe(true);

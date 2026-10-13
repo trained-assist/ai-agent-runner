@@ -323,6 +323,7 @@ POST /v1/runs   → 202 receipt              память: AdmissionRecord + с�
   `upload.enabled: false`, `snapshot.enabled: false` — байт в API нет;
 - `promotion.releaseEndpoint: "absent"` — контура промоушена в stateless-сервисе нет;
 - `events: {cursor, replay, sse, lastEventId}` — работают, журнал в памяти.
+- `idempotency.retention: '24h'` - minimal window within which `Idempotency-Key` repeats return the same receipt (survives `sweep()`/`evictIfNeeded()`); after expiry a repeat may start a new attempt. On-disk journal may extend this further (#115 compaction will define the durable horizon).
 
 ---
 
