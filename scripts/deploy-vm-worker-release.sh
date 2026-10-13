@@ -71,7 +71,7 @@ if [[ ! "${public_url}" =~ ^https?://[^/]+/?$ ]]; then
   exit 1
 fi
 if ! curl --silent --show-error --fail --max-time 5 "${public_url%/}/readyz" -o "${tmp}/preflight-ready.json" \
-  || ! node -e 'const r=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")); const c=r.checks; if(!r.ready || c?.capacity?.activeReservations!==0 || c?.runner?.activeRuns!==0) process.exit(1)' "${tmp}/preflight-ready.json"; then
+  || ! VM_WORKER_UPDATE_READINESS_FILE="${tmp}/preflight-ready.json" node "${script_dir}/assert-vm-worker-update-ready.mjs"; then
   echo "Refusing VM worker update while readiness is unknown or runs/reservations are active" >&2
   exit 1
 fi
