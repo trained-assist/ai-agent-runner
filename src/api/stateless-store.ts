@@ -410,7 +410,7 @@ export class StatelessStore {
     const run = this.progress.get(runId);
     if (!run) return;
     for (const event of events) {
-      run.sequence = event.sequence;
+      run.sequence = Math.max(run.sequence, event.sequence);
       if (run.events.length >= this.limits.maxEventsPerRun) {
         if (isTerminalEvent(event)) {
           const victim = run.events.findIndex((stored) => !isTerminalEvent(stored));

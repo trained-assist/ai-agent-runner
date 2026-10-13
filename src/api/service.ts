@@ -772,7 +772,15 @@ export class AgentApi {
       // движком цепочки, и поллер обязан спрашивать именно его (issue #100).
       const worker = this.workerFor(entry.engine);
       if (!worker) continue;
-      this.store.open(record.runId, record.createdAt, entry.engine);
+      const restored = this.store.open(record.runId, record.createdAt, entry.engine);
+      // Восстановление журнала приёма после рестарта (issue #117): store.open() создаёт
+      // RunProgress с пустыми events/sequence=0, иначе events() после рестарта оказывается
+      // пустым. Дописываем те же admissionEvents, что и execute() — claimed и
+      // inputs_materialized с последовательностями 1 и 2, — но только если журнал ещё не
+      // восстановлен, чтобы повторный вызов не размножал события.
+      if (restored.events.length === 0) {
+        this.store.append(record.runId, admissionEvents(record.spec, record.createdAt));
+      }
       this.startWorkerLogStream(record, worker);
       this.log({ event: 'poll_resumed', runId: record.runId, engine: entry.engine, operationId: record.spec.operationId });
       this.resuming.add(record.runId);
