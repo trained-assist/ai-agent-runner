@@ -136,6 +136,29 @@ unset GH_TOKEN
 sudo systemctl enable --now ai-agent-vm-worker
 ```
 
+### Updating the separately installed OpenCode binary
+
+The signed `vm-worker-v*` release contains the worker service, not the OpenCode executable.
+Pin OpenCode separately in `OPENCODE_BIN` and update it from an immutable release asset with
+`scripts/update-opencode-binary.sh`. Review the release tag, embedded version and SHA-256 first;
+the script refuses active reservations, verifies the downloaded checksum and CLI version, saves
+the previous worker configuration, and restores it if worker readiness or its source identity
+changes after restart. It does not change the worker source release.
+
+For the current personal MEM preview on the France VM:
+
+```bash
+sudo scripts/update-opencode-binary.sh \
+  mem-preview-20261013-semver-aedf7fb77570 \
+  1.18.34 \
+  bfd79068ce5a1c6ed75c6a82b7b0defbeaa3061afbf625691a7d134553f33eec
+```
+
+The script installs into a versioned directory under `/opt/opencode/releases/`, changes only
+`OPENCODE_BIN`, then checks `/healthz`, `/readyz`, and `/version`. Run a read-only end-to-end
+canary through the configured Runner API after the update. Do not replace the binary in place or
+use a floating npm `latest` tag for the France worker.
+
 Use `russia` for the Russia host. The bootstrap creates separate France/Russia templates,
 installs the systemd unit and updater, and stops before deployment while placeholders
 remain. `GH_TOKEN` is needed only for an update command; keep it in an operator secret

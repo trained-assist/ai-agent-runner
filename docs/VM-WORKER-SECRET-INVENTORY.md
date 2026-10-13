@@ -65,15 +65,17 @@ The EU issuer service, TLS metadata endpoint, credential exchange, and GCS uploa
 roundtrip passed. The subject-token endpoint is loopback only and returns 404 through the public
 reverse proxy.
 
-## EU VM2 sandbox worker (verified deployment 2026-10-10)
+## EU VM2 sandbox worker (verified deployment 2026-10-13)
 
 VM2 `169.58.15.230` runs worker `eu-vm2-sandbox`, region `eu`, through
 `https://eu-vm-worker.169-58-15-230.sslip.io`. The active `ai-agent-vm-worker.service` runs
-signed release `vm-worker-v0.3.6`, source commit
-`0f4284f73c69610b15076972280c8a6a3d73e142`; release workflow
-[38083959225](https://github.com/trained-assist/ai-agent-runner/actions/runs/38083959225)
-passed artifact checksum and attestation verification. `/readyz` reports ready with no missing
-required bindings. The successful read-only end-to-end sandbox canary is recorded in
+signed release `vm-worker-v0.3.8`, source commit
+`de051f5f2ed63e00d3dcd2db8a54c2965c9f01b1`; `/readyz` reports ready with no missing
+required bindings. Its separately installed OpenCode binary is MEM preview `1.18.34` at
+`/opt/opencode/releases/mem-preview-20261013-semver-aedf7fb77570/opencode`, SHA-256
+`bfd79068ce5a1c6ed75c6a82b7b0defbeaa3061afbf625691a7d134553f33eec`. The release was built
+from OpenCode source commit `aedf7fb775709c4bd3c82cf7dded76878cebb03a` and checked on the VM.
+The successful read-only end-to-end sandbox canary is recorded in
 [workflow run 38012362767](https://github.com/trained-assist/ai-agent-runner/actions/runs/38012362767),
 which also verified anonymous rejection, idempotent replay, conflicting-key rejection, and
 terminal success. After that run, the worker had no active OpenCode process or run workspace
@@ -85,8 +87,16 @@ and remained ready.
 | `VM_WORKER_URL` | Cloudflare sandbox Worker secret, set to the VM2 HTTPS worker route above. |
 | `LLM_LADDER_TOKEN` | Cloudflare sandbox Worker secret. It is allowlisted and passed to OpenCode only as a per-run model credential; never stored in the checked-in engine template. |
 | OpenCode engine config | `/etc/ai-agent-runner/engine-config/opencode.json`, root-owned; derived from the checked-in template. Pins `ladder/free` and reads the API credential from `{env:LLM_LADDER_TOKEN}`. |
+| OpenCode binary | Versioned binary under `/opt/opencode/releases/`; `OPENCODE_BIN` in the root-owned worker environment pins the active release. Update with `scripts/update-opencode-binary.sh`, which verifies the release SHA, refuses active reservations and rolls back if the worker fails readiness. |
 | Canary principal | Added through the write-only `RUNNER_API_KEYS_ADDITIONAL` Cloudflare secret. Scoped to repository `trained-assist/ai-agent-runner`, run read/write, and engine `eu-vm-agent-run`. The existing `RUNNER_API_KEYS` registry was preserved. |
 | Post-run cleanup | Canary finished successfully; `activeRuns` was 0, no `opencode` process remained, and no `run_*` directory remained in the worker workspace. |
+
+After the OpenCode MEM binary update, read-only end-to-end canary
+[38451862176](https://github.com/trained-assist/ai-agent-runner/actions/runs/38451862176)
+completed successfully in 53 seconds total (about 30 seconds from acceptance to terminal success),
+reported the repository package version, and left the worker ready with zero active reservations.
+An initial preview with build version `0.0.0-mem-preview.*` failed because Ladder's free tier
+requires OpenCode `1.18.0` or newer. The replacement binary embeds stable version `1.18.34`.
 
 This verifies one real sandbox execution and the isolated EU bucket path. It does not prove the
 real Telegram delivery path, profile storage/saveback, general user repository access, or
