@@ -14,6 +14,7 @@ jobs:
     env:
       RUNNER_API_URL: https://trained-assist-runner-api-sandbox3.skillset-apply.workers.dev
       RUNNER_API_KEY_AGENT_API: ${{ secrets.RUNNER_API_KEY_AGENT_API }}
+      GHA_WORKER_TOKEN: ${{ secrets.GHA_WORKER_TOKEN }}
       GITHUB_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4

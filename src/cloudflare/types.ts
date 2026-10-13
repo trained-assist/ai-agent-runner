@@ -27,6 +27,9 @@ export interface RunnerWorkerEnv {
   AGENT_API_PROFILE_DELEGATION_SECRET?: string;
   VM_WORKER_URL: string;
   VM_WORKER_TOKEN: string;
+  /** Optional GHA/Azure route; used only after a confirmed pre-admission capacity refusal in France. */
+  GHA_WORKER_URL?: string;
+  GHA_WORKER_TOKEN?: string;
   RUNNER_API_PUBLIC_URL: string;
   RUN_LAUNCH_ENCRYPTION_KEY: string;
   RUNNER_ENGINE?: string;

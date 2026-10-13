@@ -56,10 +56,16 @@ the target ownership boundary. Do not extend that handoff; move provisioning to 
 production secrets and remove the CP copy only after Runner readiness and CP authentication are
 verified. See architecture [#208](https://github.com/trained-assist/trained-agent-architecture/issues/208).
 
-`eu-vm-agent-run` is the default and only engine in these sandbox configurations. A GHA runner
-is not a fallback. If France cannot accept the job, the task reports an error or unknown
-outcome; the API does not silently move execution elsewhere. The sandbox-only `mock-test`
-engine returns fixed `pong` without calling the VM or a model.
+`eu-vm-agent-run` remains the default and primary execution route. The sandbox3 Worker knows
+the GHA/Azure gateway URL as a secondary route, but capacity cutover is enabled only when the
+Runner-owned `GHA_WORKER_TOKEN` secret is provisioned. It occurs only after France returns the
+typed pre-admission refusal `503 { accepted: false, code: "WORKER_CAPACITY" }`; the same run
+and operation identity is then persisted against `azure-cloud` before dispatch. Other refusals
+do not trigger this cutover. An accepted or ambiguous France launch is reconciled on France and
+never started again on GHA. The GHA token must be the gateway's worker credential, stored only
+in the Runner API environment. Production remains France-only until a separately reviewed
+promotion provisions that credential. The sandbox-only `mock-test` engine returns fixed `pong`
+without calling a worker or model.
 
 ## Configuration
 
@@ -131,6 +137,11 @@ Worker secrets:
   any partial or delegated capability is rejected.
 - `VM_WORKER_URL`: HTTPS address of the France execution worker route.
 - `VM_WORKER_TOKEN`: the France worker's current Bearer credential.
+- `GHA_WORKER_URL`: non-secret HTTPS address of the GHA/Azure gateway; configured as a Worker var
+  only in sandbox3 for this rollout.
+- `GHA_WORKER_TOKEN`: the gateway's Bearer credential, stored as a Runner Worker secret. The
+  sandbox Actions environment may provision it from a secret of the same name; if absent, the
+  API remains France-only. Never send this credential to CP, France, or task input.
 - `RUN_LAUNCH_ENCRYPTION_KEY`: stable random value of at least 32 characters. The Durable
   Object stores encrypted launch bodies; keep this key stable while any run is active.
 - `MCP_TEST_AUTH_TOKEN`: test-only Bearer shared with `trained-assist-mcp-host-test-160`.

@@ -22,6 +22,8 @@ const ACTIVE = new Set<State>(['queued', 'starting', 'running']);
 const TERMINAL = new Set<State>(['succeeded', 'failed', 'cancelled']);
 const now = (): string => new Date().toISOString();
 const stateKey = 'runner-v1';
+const FRANCE_ENGINE = 'eu-vm-agent-run';
+const GHA_ENGINE = 'azure-cloud';
 const MCP_TEST = Object.freeze({
   profile: 'integration-telegram-ux-v1', principal: 'integration-telegram-ux-v1',
   server: 'trained-assist-registry-test', binding: 'registry-mcp-test-160-read',
@@ -52,6 +54,12 @@ function workerRefusalCode(body: unknown, status: number): string {
   return `HTTP_${status}`;
 }
 
+function isConfirmedCapacityRefusal(body: unknown, status: number): boolean {
+  return status === 503 && !!body && typeof body === 'object' && !Array.isArray(body)
+    && (body as Record<string, unknown>)['accepted'] === false
+    && (body as Record<string, unknown>)['code'] === 'WORKER_CAPACITY';
+}
+
 function workerRefusalFields(body: unknown): string[] {
   if (!body || typeof body !== 'object' || Array.isArray(body)) return [];
   const value = body as Record<string, unknown>;
@@ -77,7 +85,7 @@ function refusedLaunchResult(run: RunRecord): Record<string, unknown> {
     exitReason: 'preflight_refused', exitCode: null, exitSignal: null, exitObserved: false,
     startedAt: run.startedAt ?? run.createdAt, finishedAt: run.finishedAt ?? now(),
     failure: { code: code.startsWith('WORKER_') ? code : `WORKER_${code}`, failureClass: 'preflight',
-      safeSummary: `The France execution worker refused the run before accepting it (HTTP ${status}, ${code}${fieldSummary}).`, retryable: false },
+      safeSummary: `The ${run.engine} execution worker refused the run before accepting it (HTTP ${status}, ${code}${fieldSummary}).`, retryable: false },
     usage: { status: 'unknown' }, outputRefs: [], persistence: 'not_required',
     persistenceReason: 'The execution worker did not accept the run; there is nothing to persist.',
     cleanup: 'completed', cleanupReason: 'No execution receipt was issued by the worker.',
@@ -163,7 +171,7 @@ export class RunnerRunCoordinator {
           if (!sourcePath || sourcePath.length > 512 || /[\x00-\x1f\x7f]/.test(sourcePath)) return error('INVALID_REQUEST', 'a valid artifact path is required', 400);
           if (!run.artifacts.some((artifact) => artifact['path'] === sourcePath)) return error('NOT_FOUND', 'artifact path is not part of this run', 404);
           const query = new URLSearchParams({ path: sourcePath });
-          const response = await this.worker(`/v1/runs/${encodeURIComponent(run.runId)}/artifacts?${query.toString()}`, 'GET', undefined, 30_000);
+          const response = await this.worker(run.engine, `/v1/runs/${encodeURIComponent(run.runId)}/artifacts?${query.toString()}`, 'GET', undefined, 30_000);
           const headers = new Headers({ 'cache-control': 'private, no-store', 'x-content-type-options': 'nosniff' });
           for (const name of ['content-type', 'content-length', 'content-disposition', 'x-content-sha256']) {
             const value = response.headers.get(name);
@@ -411,7 +419,7 @@ export class RunnerRunCoordinator {
     });
     if (failure) return failure;
     if (runToCancel?.workerReceipt) {
-      try { await this.worker(`/v1/runs/${runToCancel.runId}/cancel`, 'POST', {}); }
+      try { await this.worker(runToCancel.engine, `/v1/runs/${runToCancel.runId}/cancel`, 'POST', {}); }
       catch { /* durable cancelRequested is reconciled by the alarm */ }
     }
     if (runToCancel) await this.state.storage.setAlarm(Date.now() + 100);
@@ -437,7 +445,7 @@ export class RunnerRunCoordinator {
     if (failure) return failure;
     if (!run) return error('NOT_FOUND', `unknown run ${runId}`, 404);
     if (TERMINAL.has(run.state)) return json({ runId, status: 'already_terminal', state: run.state });
-    if (run.workerReceipt) await this.worker(`/v1/runs/${runId}/cancel`, 'POST', {});
+    if (run.workerReceipt) await this.worker(run.engine, `/v1/runs/${runId}/cancel`, 'POST', {});
     await this.state.storage.setAlarm(Date.now() + 100);
     return json({ runId, status: run.workerReceipt ? 'stop_pending' : 'stopped', state: run.state }, run.workerReceipt ? 202 : 200);
   }
@@ -497,30 +505,46 @@ export class RunnerRunCoordinator {
           changed = true;
           continue;
         }
-        if (run.cancelRequested && run.workerReceipt) await this.worker(`/v1/runs/${run.runId}/cancel`, 'POST', {});
+        if (run.cancelRequested && run.workerReceipt) await this.worker(run.engine, `/v1/runs/${run.runId}/cancel`, 'POST', {});
         if (!run.workerReceipt) {
-          run.launchAttempts += 1;
-          transition(run, 'starting');
-          const launch = JSON.parse(await decrypt(run.launchCiphertext, this.env.RUN_LAUNCH_ENCRYPTION_KEY)) as Record<string, unknown>;
-          const response = await this.worker('/v1/launch', 'POST', launch);
-          if (!response.ok) {
-            if (response.status < 500 || response.status === 503) {
+          for (;;) {
+            run.launchAttempts += 1;
+            transition(run, 'starting');
+            const launch = JSON.parse(await decrypt(run.launchCiphertext, this.env.RUN_LAUNCH_ENCRYPTION_KEY)) as Record<string, unknown>;
+            const response = await this.worker(run.engine, '/v1/launch', 'POST', launch);
+            if (!response.ok) {
               const rejection = await response.clone().json().catch(() => null);
               const code = workerRefusalCode(rejection, response.status);
-              const fields = workerRefusalFields(rejection);
-              run.launchRejection = { status: response.status, code, fields };
-              run.result = refusedLaunchResult(run);
-              transition(run, 'failed', { reason: `worker_rejected_${response.status}`, code, ...(fields.length ? { fields } : {}) });
-              run.lastError = `worker launch rejected with HTTP ${response.status}`;
-              changed = true;
-              continue;
+              if (run.engine === FRANCE_ENGINE && isConfirmedCapacityRefusal(rejection, response.status) && this.hasGhaWorker()) {
+                const engine = launch['engine'] as Record<string, unknown> | undefined;
+                if (!engine || engine['name'] !== FRANCE_ENGINE) throw new Error('France launch engine does not match its persisted route');
+                launch['engine'] = { ...engine, name: GHA_ENGINE };
+                run.engine = GHA_ENGINE;
+                run.launchCiphertext = await encrypt(JSON.stringify(launch), this.env.RUN_LAUNCH_ENCRYPTION_KEY);
+                run.lastError = 'France refused before admission: WORKER_CAPACITY';
+                transition(run, 'queued', { reason: 'capacity_cutover', from: FRANCE_ENGINE, to: GHA_ENGINE, code });
+                // Persist route and updated launch before contacting the next worker. A crash
+                // after this write resumes against GHA with the same run/operation identity.
+                await this.writeRun(run);
+                continue;
+              }
+              if (response.status < 500 || response.status === 503) {
+                const fields = workerRefusalFields(rejection);
+                run.launchRejection = { status: response.status, code, fields };
+                run.result = refusedLaunchResult(run);
+                transition(run, 'failed', { reason: `worker_rejected_${response.status}`, code, ...(fields.length ? { fields } : {}) });
+                run.lastError = `worker launch rejected with HTTP ${response.status}`;
+                changed = true;
+                break;
+              }
+              throw new Error(`worker launch HTTP ${response.status}`);
             }
-            throw new Error(`worker launch HTTP ${response.status}`);
+            run.workerReceipt = await response.json() as Record<string, unknown>;
+            transition(run, 'running', { engine: run.engine });
+            break;
           }
-          run.workerReceipt = await response.json() as Record<string, unknown>;
-          transition(run, 'running');
         } else {
-          const statusResponse = await this.worker(`/v1/runs/${run.runId}/status`);
+          const statusResponse = await this.worker(run.engine, `/v1/runs/${run.runId}/status`);
           const workerStatus = statusResponse.ok ? await statusResponse.json() as { status?: string } : null;
           if (workerStatus?.status === 'unknown' || workerStatus?.status === 'unknown_run') {
             // The worker already issued an admission receipt. Its later lack of
@@ -531,7 +555,7 @@ export class RunnerRunCoordinator {
           } else if (workerStatus?.status === 'running' || workerStatus?.status === 'accepted') {
             if (run.state !== 'running') transition(run, 'running');
           } else if (['succeeded', 'failed', 'cancelled'].includes(workerStatus?.status ?? '')) {
-            const resultResponse = await this.worker(`/v1/runs/${run.runId}/result`);
+            const resultResponse = await this.worker(run.engine, `/v1/runs/${run.runId}/result`);
             if (resultResponse.ok) {
               const launchResult = await resultResponse.json() as Record<string, any>;
               run.answer = typeof launchResult.answer === 'string' ? launchResult.answer : null;
@@ -547,7 +571,7 @@ export class RunnerRunCoordinator {
                   : launchResult.exitCode != null || launchResult.exitSignal != null,
                 startedAt: run.startedAt ?? run.createdAt, finishedAt: now(),
                 ...(run.answer !== null ? { text: run.answer } : {}), ...(launchResult.failure ? { failure: launchResult.failure } : {}), usage: { status: 'unknown' },
-                outputRefs: run.artifacts.map((artifact) => String(artifact['url'])), persistence: run.artifacts.length ? 'persisted' : 'not_required', persistenceReason: run.artifacts.length ? `artifacts are committed to ${String(repo?.['fullName'] ?? 'the repository')}` : 'the worker reported no artifacts', cleanup: 'completed', cleanupReason: 'execution workspace is owned by the France VM worker', logPath: run.logUrl ?? `vm-run:${run.runId}` };
+                outputRefs: run.artifacts.map((artifact) => String(artifact['url'])), persistence: run.artifacts.length ? 'persisted' : 'not_required', persistenceReason: run.artifacts.length ? `artifacts are committed to ${String(repo?.['fullName'] ?? 'the repository')}` : 'the worker reported no artifacts', cleanup: 'completed', cleanupReason: 'execution workspace is owned by the selected worker', logPath: run.logUrl ?? `worker-run:${run.runId}` };
               transition(run, outcome, { exitReason: launchResult.exitReason });
             }
           }
@@ -556,7 +580,7 @@ export class RunnerRunCoordinator {
         const message = cause instanceof Error ? cause.message : String(cause);
         if (!run.workerReceipt) {
           try {
-            const statusResponse = await this.worker(`/v1/runs/${run.runId}/status`);
+            const statusResponse = await this.worker(run.engine, `/v1/runs/${run.runId}/status`);
             const observed = statusResponse.ok ? await statusResponse.json() as { status?: string } : null;
             if (observed?.status && !['unknown', 'unknown_run'].includes(observed.status)) {
               run.workerReceipt = { runId: run.runId, status: 'accepted', operationId: 'reconciled' };
@@ -574,11 +598,27 @@ export class RunnerRunCoordinator {
     if (Object.values(stored.runs).some((run) => ACTIVE.has(run.state))) await this.state.storage.setAlarm(Date.now() + 5_000);
   }
 
-  private async worker(path: string, method = 'GET', body?: unknown, timeoutMs = 8_000): Promise<Response> {
-    const base = this.env.VM_WORKER_URL.replace(/\/+$/, '');
-    if (!/^https:\/\//.test(base)) throw new Error('VM_WORKER_URL must be an https origin');
+  private hasGhaWorker(): boolean {
+    const token = this.env.GHA_WORKER_TOKEN?.trim() ?? '';
+    try {
+      const url = new URL(this.env.GHA_WORKER_URL?.trim() ?? '');
+      return url.protocol === 'https:' && !url.username && !url.password && !url.hash && token.length >= 24;
+    } catch { return false; }
+  }
+
+  private async worker(engine: string, path: string, method = 'GET', body?: unknown, timeoutMs = 8_000): Promise<Response> {
+    const route = engine === FRANCE_ENGINE
+      ? { base: this.env.VM_WORKER_URL, token: this.env.VM_WORKER_TOKEN }
+      : engine === GHA_ENGINE
+        ? { base: this.env.GHA_WORKER_URL, token: this.env.GHA_WORKER_TOKEN }
+        : null;
+    if (!route) throw new Error(`worker route is not supported for ${engine}`);
+    const { base: baseValue, token } = route;
+    if (!baseValue || !token) throw new Error(`worker route is not configured for ${engine}`);
+    const base = baseValue.replace(/\/+$/, '');
+    if (!/^https:\/\//.test(base)) throw new Error(`worker URL must be an https origin for ${engine}`);
     const send = this.env.FETCH ?? fetch;
-    return send(`${base}${path}`, { method, headers: { authorization: `Bearer ${this.env.VM_WORKER_TOKEN}`, ...(body === undefined ? {} : { 'content-type': 'application/json' }) }, ...(body === undefined ? {} : { body: JSON.stringify(body) }), signal: AbortSignal.timeout(timeoutMs) });
+    return send(`${base}${path}`, { method, headers: { authorization: `Bearer ${token}`, ...(body === undefined ? {} : { 'content-type': 'application/json' }) }, ...(body === undefined ? {} : { body: JSON.stringify(body) }), signal: AbortSignal.timeout(timeoutMs) });
   }
 
   private async read(): Promise<Stored> { return await this.state.storage.get<Stored>(stateKey) ?? structuredClone(INIT); }
