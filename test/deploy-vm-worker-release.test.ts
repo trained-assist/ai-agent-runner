@@ -3,10 +3,12 @@ import { describe, expect, it } from 'vitest';
 
 const updaterPath = new URL('../scripts/deploy-vm-worker-release.sh', import.meta.url);
 const operationsPath = new URL('../docs/VM-WORKER-OPERATIONS.md', import.meta.url);
+const releaseWorkflowPath = new URL('../.github/workflows/vm-worker-release.yml', import.meta.url);
 
 describe('VM worker release updater safety contract', () => {
   it('validates the endpoint before switching releases and requires readyz', async () => {
     const updater = await readFile(updaterPath, 'utf8');
+    const workflow = await readFile(releaseWorkflowPath, 'utf8');
     const validateEndpoint = updater.indexOf('VM_WORKER_PUBLIC_URL must be an http(s) origin');
     const switchRelease = updater.indexOf('mv -Tf "${root}/.current.$$" "${root}/current"');
     expect(validateEndpoint).toBeGreaterThanOrEqual(0);
@@ -14,6 +16,8 @@ describe('VM worker release updater safety contract', () => {
     expect(updater).toContain('"${public_url%/}/healthz" -o /dev/null');
     expect(updater).toContain('"${public_url%/}/version" -o "${tmp}/version.json"');
     expect(updater).toContain('"${public_url%/}/readyz" -o /dev/null');
+    expect(updater).toContain('assert-vm-worker-update-ready.mjs');
+    expect(workflow).toContain('scripts/assert-vm-worker-update-ready.mjs');
   });
 
   it('verifies the bundled OpenCode version and binary hash before switching, then reports both identities', async () => {
