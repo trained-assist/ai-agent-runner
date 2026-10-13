@@ -7,7 +7,11 @@
       "name": "trained-assist-llm-ladder",
       "options": {
         "baseURL": "https://llm-ladder.trainedassist.store/v1",
-        "apiKey": "{env:LLM_LADDER_TOKEN}"
+        "apiKey": "{env:LLM_LADDER_TOKEN}",
+        "headers": {
+          "x-ladder-trace": "{env:RUNNER_LADDER_TRACE_ID}",
+          "x-ladder-run": "{env:RUNNER_LADDER_RUN_ID}"
+        }
       },
       "models": {
         "free": { "name": "ladder free" }
