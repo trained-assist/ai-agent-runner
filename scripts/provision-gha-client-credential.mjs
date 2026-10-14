@@ -127,7 +127,10 @@ function deleteWranglerSecret(cwd, config, env, secretName) {
 async function verifyGatewayToken(token) {
   const probeId = `provisioning-auth-${clientId}`;
   const response = await fetch(`${gatewayUrl.origin}/v1/runs/${probeId}/status`, {
-    headers: { authorization: `Bearer ${token}` },
+    headers: {
+      authorization: `Bearer ${token}`,
+      'user-agent': 'trained-assist-runner-provisioner/1.0',
+    },
     signal: AbortSignal.timeout(10_000),
   });
   if (response.status !== 200) return false;
