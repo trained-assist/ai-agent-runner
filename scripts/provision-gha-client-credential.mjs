@@ -37,8 +37,8 @@ const keychainAccount = args.get('--keychain-account');
 const keychainLabel = args.get('--keychain-label');
 let cloudflareToken = process.env.CLOUDFLARE_API_TOKEN?.trim();
 if (!cloudflareToken && (keychainService || keychainAccount || keychainLabel)) {
-  if (process.platform !== 'darwin' || !keychainService || !keychainAccount || !keychainLabel) {
-    throw new Error('macOS Keychain token lookup requires --keychain-service, --keychain-account and --keychain-label');
+  if (!keychainService || !keychainAccount || !keychainLabel) {
+    throw new Error('Keychain token lookup requires --keychain-service, --keychain-account and --keychain-label');
   }
   try {
     cloudflareToken = execFileSync('security', [
