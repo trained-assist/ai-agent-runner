@@ -32,6 +32,25 @@ if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(githubRepo)) throw new Error('inv
 
 const runnerConfigPath = resolve(root, runnerConfig);
 const configText = readFileSync(runnerConfigPath, 'utf8');
+const keychainService = args.get('--keychain-service');
+const keychainAccount = args.get('--keychain-account');
+const keychainLabel = args.get('--keychain-label');
+let cloudflareToken = process.env.CLOUDFLARE_API_TOKEN?.trim();
+if (!cloudflareToken && (keychainService || keychainAccount || keychainLabel)) {
+  if (process.platform !== 'darwin' || !keychainService || !keychainAccount || !keychainLabel) {
+    throw new Error('macOS Keychain token lookup requires --keychain-service, --keychain-account and --keychain-label');
+  }
+  try {
+    cloudflareToken = execFileSync('security', [
+      'find-generic-password', '-s', keychainService, '-a', keychainAccount, '-l', keychainLabel, '-w',
+    ], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+  } catch {
+    throw new Error(`Cloudflare token was not readable from Keychain item ${keychainService}/${keychainAccount}/${keychainLabel}`);
+  }
+  if (!cloudflareToken) throw new Error('Cloudflare Keychain token is empty');
+}
+const cloudflareEnvironment = { ...process.env };
+if (cloudflareToken) cloudflareEnvironment['CLOUDFLARE_API_TOKEN'] = cloudflareToken;
 const urlMatch = configText.match(/(?:["']?GHA_WORKER_URL["']?)\s*[:=]\s*["']([^"']+)["']/);
 const gatewayUrlValue = args.get('--gateway-url') ?? urlMatch?.[1];
 if (!gatewayUrlValue) throw new Error(`GHA_WORKER_URL is missing from ${runnerConfig}`);
@@ -44,9 +63,9 @@ if (gatewayUrl.protocol !== 'https:' || gatewayUrl.username || gatewayUrl.passwo
   throw new Error('gateway URL and environment must match the approved production or sandbox GHA gateway');
 }
 
-function run(command, commandArgs, { cwd, input } = {}) {
+function run(command, commandArgs, { cwd, input, environment } = {}) {
   try {
-    return execFileSync(command, commandArgs, { cwd, input, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
+    return execFileSync(command, commandArgs, { cwd, input, env: environment, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
   } catch (error) {
     const stderr = String(error?.stderr ?? '');
     if (stderr.includes('CLOUDFLARE_API_TOKEN')) throw new Error('Cloudflare CLI is not authenticated; set CLOUDFLARE_API_TOKEN and retry');
@@ -58,13 +77,13 @@ function run(command, commandArgs, { cwd, input } = {}) {
 function wrangler(cwd, config, env, action, secretName, input) {
   const commandArgs = ['--no-install', 'wrangler', 'secret', action, secretName, '--config', config];
   if (env && env !== 'production') commandArgs.push('--env', env);
-  return run('npx', commandArgs, { cwd, input });
+  return run('npx', commandArgs, { cwd, input, environment: cloudflareEnvironment });
 }
 
 function wranglerSecretNames(cwd, config, env) {
   const commandArgs = ['--no-install', 'wrangler', 'secret', 'list', '--config', config];
   if (env && env !== 'production') commandArgs.push('--env', env);
-  const parsed = JSON.parse(run('npx', commandArgs, { cwd }));
+  const parsed = JSON.parse(run('npx', commandArgs, { cwd, environment: cloudflareEnvironment }));
   if (!Array.isArray(parsed)) throw new Error('Wrangler returned an unexpected secret inventory');
   return new Set(parsed.map((item) => item?.name).filter((name) => typeof name === 'string'));
 }
@@ -77,7 +96,7 @@ function githubSecretNames() {
 function deleteWranglerSecret(cwd, config, env, secretName) {
   const commandArgs = ['--no-install', 'wrangler', 'secret', 'delete', secretName, '--config', config];
   if (env && env !== 'production') commandArgs.push('--env', env);
-  try { execFileSync('npx', commandArgs, { cwd, input: 'y\n', encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }); return true; }
+  try { execFileSync('npx', commandArgs, { cwd, input: 'y\n', env: cloudflareEnvironment, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }); return true; }
   catch { return false; }
 }
 

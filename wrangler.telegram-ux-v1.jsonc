@@ -1,6 +1,7 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "trained-assist-runner-api-telegram-ux-v1-sandbox",
+  "account_id": "d740a05e9442c1d0feacae2dfc673e93",
   "main": "src/cloudflare/index.ts",
   "compatibility_date": "2026-10-09",
   "workers_dev": true,

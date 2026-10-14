@@ -33,6 +33,26 @@ GHA_GATEWAY_REPO_DIR=/path/to/opencode-gha-runner \
   --gateway-env production --runner-config wrangler.production.jsonc --github-env production --dry-run
 ```
 
+On Vova's Mac, the sandbox Cloudflare API token is stored in Keychain as service
+`cloudflare.com`, account `trained-assist-sandbox`, label
+`Trained Assist Cloudflare Sandbox API Token`. Agents can ask the provisioner to read that
+specific entry without printing it or putting it in a shell profile:
+
+```sh
+GHA_GATEWAY_REPO_DIR=/path/to/opencode-gha-runner \
+  node scripts/provision-gha-client-credential.mjs --client-id sandbox3_agent_api \
+  --gateway-env sandbox --runner-config wrangler.sandbox3.jsonc --github-env sandbox \
+  --keychain-service cloudflare.com --keychain-account trained-assist-sandbox \
+  --keychain-label 'Trained Assist Cloudflare Sandbox API Token' --dry-run
+```
+
+The same flags work for the Telegram sandbox by changing `--client-id` and `--runner-config`.
+The script passes the retrieved token only to Wrangler child processes; it does not pass it to
+GitHub CLI or print it. The Runner and gateway Wrangler configs pin the non-secret Cloudflare
+account ID, so scoped tokens do not need account-membership enumeration access.
+
+For other machines or production, use the matching scoped token in `CLOUDFLARE_API_TOKEN` or
+an explicitly selected local Keychain item. The sandbox token is not a production credential.
 The operator needs Cloudflare credentials for the selected gateway and Runner Workers, plus
 GitHub Actions environment-secret write access. If a later write or verification fails, the
 command removes the copies created in that invocation and reports any cleanup requiring
