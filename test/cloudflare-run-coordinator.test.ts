@@ -34,7 +34,15 @@ function setup() {
         launched.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
         return Response.json({ runId: launched.at(-1)?.['runId'], operationId: 'op-test', status: 'accepted', statusUrl: 'https://france.example/status', resultUrl: 'https://france.example/result' }, { status: 202 });
       }
-      if (url.pathname.endsWith('/status')) return Response.json({ status: ++poll === 1 ? 'running' : 'succeeded' });
+      if (url.pathname.endsWith('/status')) {
+        const status = ++poll === 1 ? 'running' : 'succeeded';
+        return Response.json({ status, state: status });
+      }
+      if (url.pathname.endsWith('/logs')) {
+        const after = Number(url.searchParams.get('after') ?? 0);
+        const logs = [{ sequence: 1, stream: 'stdout', message: 'step 1: inspect' }, { sequence: 2, stream: 'stderr', message: 'progress warning' }].filter((entry) => entry.sequence > after);
+        return Response.json({ runId: url.pathname.split('/').at(-2), cursor: logs.at(-1)?.sequence ?? after, hasMore: false, state: 'running', logs });
+      }
       if (url.pathname.endsWith('/result')) return Response.json({ exitReason: 'completed', exitCode: 0, exitSignal: null, answer: 'done', artifacts: [], logUrl: '', repo: null });
       return Response.json({ status: 'cancelled' });
     },
@@ -184,12 +192,45 @@ describe('Cloudflare Runner run coordinator', () => {
     await coordinator.alarm();
     expect(launched).toHaveLength(1);
     expect(launched[0]).toMatchObject({ engine: { name: 'eu-vm-agent-run' }, input: { inlinePrompt: 'say done' }, resultUrl: `https://runner-api.example/v1/runs/${receipt.runId}/result` });
+    expect(await (await coordinator.fetch(call(`/v1/runs/${receipt.runId}/status`))).json()).toMatchObject({ state: 'starting', statusFreshness: 'unobserved' });
     await coordinator.alarm();
+    const live = await coordinator.fetch(call(`/v1/runs/${receipt.runId}/events?cursor=0`));
+    expect(await live.json()).toMatchObject({ snapshot: { state: 'running', statusFreshness: 'fresh', output: {
+      stdout: 'step 1: inspect', stderr: 'progress warning', updatedAt: expect.any(String),
+    } } });
     await coordinator.alarm();
     const status = await coordinator.fetch(call(`/v1/runs/${receipt.runId}/status`));
     expect(await status.json()).toMatchObject({ state: 'succeeded', answer: 'done' });
     const result = await coordinator.fetch(call(`/v1/runs/${receipt.runId}/result`));
     expect(await result.json()).toMatchObject({ outcome: 'succeeded', text: 'done' });
+  });
+
+  it('marks a receipt-backed run unknown after stale worker status and resumes polling without relaunching', async () => {
+    const { coordinator, storage, launched, env } = setup();
+    const response = await coordinator.fetch(call('/v1/runs', body, { 'idempotency-key': 'stale-status-recovery' }));
+    const receipt = await response.json() as { runId: string };
+    await coordinator.alarm();
+    const stored = storage.values.get('runner-v1') as { runs: Record<string, { lastHeartbeatAt?: string }> };
+    stored.runs[receipt.runId]!.lastHeartbeatAt = new Date(Date.now() - 60_000).toISOString();
+    env.FETCH = async (input) => {
+      const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+      if (url.pathname.endsWith('/status')) throw new Error('worker unavailable');
+      throw new Error('unexpected request');
+    };
+    await coordinator.alarm();
+    expect(await (await coordinator.fetch(call(`/v1/runs/${receipt.runId}/status`))).json()).toMatchObject({ state: 'unknown', connectionLost: true, statusFreshness: 'stale' });
+    expect(launched).toHaveLength(1);
+    expect(storage.alarmAt).not.toBeNull();
+
+    env.FETCH = async (input) => {
+      const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+      if (url.pathname.endsWith('/status')) return Response.json({ status: 'running', state: 'running' });
+      if (url.pathname.endsWith('/logs')) return Response.json({ cursor: 0, logs: [] });
+      throw new Error('unexpected request');
+    };
+    await coordinator.alarm();
+    expect(await (await coordinator.fetch(call(`/v1/runs/${receipt.runId}/status`))).json()).toMatchObject({ state: 'running', connectionLost: false, statusFreshness: 'fresh' });
+    expect(launched).toHaveLength(1);
   });
 
   it('proxies only a completed run output path to the VM worker', async () => {
