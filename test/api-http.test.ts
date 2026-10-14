@@ -6,6 +6,7 @@ import {
   SseCollector,
   alphaKey,
   authHeader,
+  betaKey,
   getArtifacts,
   getResult,
   getStatus,
@@ -26,6 +27,40 @@ import { createHarness, waitFor } from './helpers.js';
 import { createHash, createHmac } from 'node:crypto';
 
 describe('http auth, scopes and structured refusals', () => {
+  it('lists active runs with bounded pagination and principal isolation, without exposing prompt or answer', async () => {
+    const h = await startHttpHarness({ worker: { autoDeliver: false } });
+    const first = await postSubmit(h.base, alphaKey, 'active-list-1', submitBody({ userTaskId: 'private-task-one' }));
+    const second = await postSubmit(h.base, alphaKey, 'active-list-2', submitBody({ userTaskId: 'private-task-two' }));
+    expect(first.status).toBe(202);
+    expect(second.status).toBe(202);
+    const firstReceipt = await first.json() as { runId: string };
+
+    const page1Response = await fetch(`${h.base}/v1/runs?state=active&limit=1`, { headers: authHeader(alphaKey) });
+    expect(page1Response.status).toBe(200);
+    const page1 = await page1Response.json() as { runs: Array<Record<string, unknown>>; nextCursor: string | null };
+    expect(page1.runs).toHaveLength(1);
+    expect(page1.runs[0]).toMatchObject({ state: 'running', userTaskId: 'private-task-one', runId: firstReceipt.runId,
+      links: { status: `/v1/runs/${firstReceipt.runId}/status`, events: `/v1/runs/${firstReceipt.runId}/events`, result: `/v1/runs/${firstReceipt.runId}/result` } });
+    expect(page1.nextCursor).toEqual(expect.any(String));
+    expect(JSON.stringify(page1)).not.toContain('hello agent');
+    expect(JSON.stringify(page1)).not.toContain('Готово, отчёт');
+
+    const page2Response = await fetch(`${h.base}/v1/runs?state=active&limit=1&cursor=${encodeURIComponent(page1.nextCursor!)}`, { headers: authHeader(alphaKey) });
+    const page2 = await page2Response.json() as { runs: Array<Record<string, unknown>>; nextCursor: string | null };
+    expect(page2.runs).toHaveLength(1);
+    expect(page2.runs[0]?.['userTaskId']).toBe('private-task-two');
+    expect(page2.nextCursor).toBeNull();
+
+    const foreign = await fetch(`${h.base}/v1/runs?state=active`, { headers: authHeader(betaKey) });
+    expect((await foreign.json() as { runs: unknown[] }).runs).toEqual([]);
+    const noReadScope = await fetch(`${h.base}/v1/runs?state=active`, { headers: authHeader(noScopeKey) });
+    expect(noReadScope.status).toBe(403);
+    const badLimit = await fetch(`${h.base}/v1/runs?limit=101`, { headers: authHeader(alphaKey) });
+    expect(badLimit.status).toBe(400);
+    const badState = await fetch(`${h.base}/v1/runs?state=all`, { headers: authHeader(alphaKey) });
+    expect(badState.status).toBe(400);
+  });
+
   it('accepts only short-lived CP-signed tenant/profile workspace capabilities', async () => {
     const key = 'ak_delegated_profile_test_key_012345678901234567890123456789';
     const secret = 'delegation-secret-that-is-only-shared-with-control-plane';
