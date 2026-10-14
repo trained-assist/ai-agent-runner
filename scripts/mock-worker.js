@@ -18,7 +18,7 @@ function ensureOpencodeBrowserConfig() {
   let base = {};
   try { base = JSON.parse(readFileSync('/Users/vova/.config/opencode/opencode.json', 'utf8')); } catch {}
   base.mcp = { ...(base.mcp || {}),
-    playwright: { type: 'local', command: ['npx', '-y', '@playwright/mcp@latest', '--browser', 'chromium', '--headless', '--isolated'], enabled: true }
+    playwright: { type: 'local', command: ['npx', '-y', '@playwright/mcp@latest', '--browser', 'chrome', '--headless', '--user-data-dir', '/tmp/pw-profile', '--ignore-https-errors'], enabled: true }
   };
   writeFileSync(OPENCODE_CONFIG_PATH, JSON.stringify(base, null, 2));
 }
