@@ -58,14 +58,18 @@ verified. See architecture [#208](https://github.com/trained-assist/trained-agen
 
 `eu-vm-agent-run` remains the default and primary execution route. The sandbox3 Worker knows
 the GHA/Azure gateway URL as a secondary route, but capacity cutover is enabled only when the
-Runner-owned `GHA_WORKER_TOKEN` secret is provisioned. It occurs only after France returns the
-typed pre-admission refusal `503 { accepted: false, code: "WORKER_CAPACITY" }`; the same run
-and operation identity is then persisted against `azure-cloud` before dispatch. Other refusals
-do not trigger this cutover. An accepted or ambiguous France launch is reconciled on France and
-never started again on GHA. The GHA token must be the gateway's worker credential, stored only
-in the Runner API environment. Production remains France-only until a separately reviewed
-promotion provisions that credential. The sandbox-only `mock-test` engine returns fixed `pong`
-without calling a worker or model.
+Runner-owned `GHA_WORKER_TOKEN` secret is provisioned for the sandbox3 fallback. The gateway
+uses a separate named credential `WORKER_CLIENT_TOKEN_SANDBOX3_AGENT_API`, so this sandbox can
+be rotated or revoked without touching the gateway's existing primary key or other clients.
+The shared sandbox provisioning command installs the same generated value in the gateway,
+Runner API and GitHub Actions secret stores, then checks authenticated gateway access without
+creating a run. The cutover occurs only after France returns the typed pre-admission refusal
+`503 { accepted: false, code: "WORKER_CAPACITY" }`; the same run and operation identity is then
+persisted against `azure-cloud` before dispatch. Other refusals do not trigger this cutover. An
+accepted or ambiguous France launch is reconciled on France and never started again on GHA.
+Production remains France-only until a separately reviewed promotion provisions a production
+credential. The sandbox-only `mock-test` engine returns fixed `pong` without calling a worker
+or model.
 
 ## Configuration
 
@@ -139,9 +143,9 @@ Worker secrets:
 - `VM_WORKER_TOKEN`: the France worker's current Bearer credential.
 - `GHA_WORKER_URL`: non-secret HTTPS address of the GHA/Azure gateway; configured as a Worker var
   only in sandbox3 for this rollout.
-- `GHA_WORKER_TOKEN`: the gateway's Bearer credential, stored as a Runner Worker secret. The
-  sandbox Actions environment may provision it from a secret of the same name; if absent, the
-  API remains France-only. Never send this credential to CP, France, or task input.
+- `GHA_WORKER_TOKEN`: the sandbox's GHA gateway client Bearer credential, stored as a Runner
+  Worker secret. It is distinct from the gateway primary credential and never goes to CP,
+  France, or task input. If absent, the API remains France-only.
 - `RUN_LAUNCH_ENCRYPTION_KEY`: stable random value of at least 32 characters. The Durable
   Object stores encrypted launch bodies; keep this key stable while any run is active.
 - `MCP_TEST_AUTH_TOKEN`: test-only Bearer shared with `trained-assist-mcp-host-test-160`.
