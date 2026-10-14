@@ -1,4 +1,4 @@
-name: Inspect one production active Runner run
+name: Inspect one production Runner task
 
 on:
   workflow_dispatch:
@@ -30,31 +30,26 @@ jobs:
           if (apiKey.length < 32) throw new Error('production_runner_api_key_missing');
 
           const base = 'https://trained-assist-runner-api-production.skillset-apply.workers.dev';
-          let cursor;
           const matches = [];
-          do {
-            const url = new URL('/v1/runs', base);
-            url.searchParams.set('state', 'active');
-            url.searchParams.set('limit', '100');
-            if (cursor) url.searchParams.set('cursor', cursor);
-            const response = await fetch(url, {
-              headers: { authorization: `Bearer ${apiKey}` },
-              signal: AbortSignal.timeout(15_000),
-            });
-            if (!response.ok) throw new Error(`active_run_list_http_${response.status}`);
-            const page = await response.json();
-            for (const run of page.runs ?? []) {
-              if (run.userTaskId === taskId) {
-                matches.push({ runId: run.runId, state: run.state, createdAt: run.createdAt, startedAt: run.startedAt });
-              }
+          const url = new URL('/v1/runs', base);
+          url.searchParams.set('state', 'all');
+          url.searchParams.set('userTaskId', taskId);
+          const response = await fetch(url, {
+            headers: { authorization: `Bearer ${apiKey}` },
+            signal: AbortSignal.timeout(15_000),
+          });
+          if (!response.ok) throw new Error(`active_run_list_http_${response.status}`);
+          const page = await response.json();
+          for (const run of page.runs ?? []) {
+            if (run.userTaskId === taskId) {
+              matches.push({ runId: run.runId, state: run.state, createdAt: run.createdAt, startedAt: run.startedAt });
             }
-            cursor = page.nextCursor ?? undefined;
-          } while (cursor);
+          }
 
           console.log(JSON.stringify({
             userTaskId: taskId,
-            activeMatchCount: matches.length,
-            activeRuns: matches,
-            interpretation: matches.length ? 'active_run_found' : 'no_active_run; task may be queued elsewhere, never launched, or already terminal',
+            runRecordCount: matches.length,
+            runs: matches,
+            interpretation: matches.length ? 'run_record_found; state and startedAt distinguish accepted from started and terminal' : 'no_run_record_for_user_task_id',
           }));
           NODE

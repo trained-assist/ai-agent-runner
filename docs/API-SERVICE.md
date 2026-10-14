@@ -168,7 +168,7 @@ snapshot → изменение/удаление → API publication → сле�
 | `GET /v1/capabilities` | декларация возможностей (см. §5) |
 | `POST /v1/profiles/workspace` | идемпотентно создаёт/проверяет приватный workspace по signed tenant/profile; scope `profiles:provision`, тело `{}`, Agent Run не запускается |
 | `POST /v1/runs` | приём: `Idempotency-Key` обязателен; `202` — новый receipt, `200` — дедуп |
-| `GET /v1/runs?state=active&limit=50&cursor=...` | список своих запусков, без prompt/answer/events; максимум 100 строк на страницу, scope `runs:read` |
+| `GET /v1/runs?state=active&limit=50&cursor=...` | список своих запусков в stateless API, без prompt/answer/events; максимум 100 строк на страницу, scope `runs:read`. Cloudflare Worker требует точный `userTaskId`; `state=active` показывает незавершённые runs, `state=all` — записи задачи во всех состояниях. Это ограничение нужно, поскольку Durable Objects хранят задачи отдельно и не имеют глобального перечисления. |
 | `GET /v1/runs/{id}/status` | состояние рана, курсор событий, `answer` агента |
 | `GET /v1/runs/{id}/result` | `RunResult` после терминального состояния, иначе `409 RESULT_NOT_READY` |
 | `GET /v1/runs/{id}/events` | страница событий (`?cursor=&limit=`) либо SSE на `Accept: text/event-stream` |
