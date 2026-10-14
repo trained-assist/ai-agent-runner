@@ -32,9 +32,10 @@ if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(githubRepo)) throw new Error('inv
 
 const runnerConfigPath = resolve(root, runnerConfig);
 const configText = readFileSync(runnerConfigPath, 'utf8');
-const urlMatch = configText.match(/"GHA_WORKER_URL"\s*:\s*"([^"]+)"/);
-if (!urlMatch) throw new Error(`GHA_WORKER_URL is missing from ${runnerConfig}`);
-const gatewayUrl = new URL(urlMatch[1]);
+const urlMatch = configText.match(/(?:["']?GHA_WORKER_URL["']?)\s*[:=]\s*["']([^"']+)["']/);
+const gatewayUrlValue = args.get('--gateway-url') ?? urlMatch?.[1];
+if (!gatewayUrlValue) throw new Error(`GHA_WORKER_URL is missing from ${runnerConfig}`);
+const gatewayUrl = new URL(gatewayUrlValue);
 if (gatewayUrl.protocol !== 'https:' || !gatewayUrl.hostname.includes('gateway-sandbox')) {
   throw new Error('provisioning only supports an HTTPS sandbox gateway URL');
 }
