@@ -17,6 +17,7 @@ Commands:
   submit   [--file <path|->] [--json <json>] [--engine <name>] [--adapter-version <v>]
            [--prompt <text>] [--instructions <text>] [--timeout-ms <n>]
            [--user-task-id <id>] [--conversation-id <id>] [--idempotency-key <key>]
+  list     [--state active] [--limit <1..100>] [--cursor <cursor>]
   status   <runId>
   events   <runId> [--cursor <n>] [--limit <n>]
   follow   <runId> [--cursor <n>] [--timeout-ms <n>]   SSE until the run reaches a terminal state
@@ -197,6 +198,15 @@ async function commandStatus(conn, runId) {
   print(await request(conn, 'GET', `/v1/runs/${encodeURIComponent(runId)}/status`));
 }
 
+async function commandList(conn, flags) {
+  const params = new URLSearchParams();
+  params.set('state', flags['state'] ?? 'active');
+  if (flags['limit'] !== undefined) params.set('limit', String(intFlag(flags, 'limit', 50)));
+  if (flags['cursor'] !== undefined) params.set('cursor', flags['cursor']);
+  const query = params.size ? `?${params}` : '';
+  print(await request(conn, 'GET', `/v1/runs${query}`));
+}
+
 async function commandEvents(conn, flags, runId) {
   const params = new URLSearchParams();
   if (flags['cursor'] !== undefined) params.set('cursor', String(intFlag(flags, 'cursor', 0)));
@@ -321,6 +331,9 @@ async function main() {
   switch (command) {
     case 'submit':
       await commandSubmit(conn, flags);
+      break;
+    case 'list':
+      await commandList(conn, flags);
       break;
     case 'status':
       if (!runId) fail('status: <runId> is required', EXIT_USAGE);
