@@ -148,14 +148,20 @@ export default {
     }
     const path = url.pathname.split('/').filter(Boolean);
     if (path[0] !== 'v1' || path[1] !== 'runs') return error('ROUTE_NOT_FOUND', `no route for ${url.pathname}`, 404);
-    if ((path.length === 2 && request.method !== 'POST') || (path.length > 2 && !['GET', 'POST'].includes(request.method))) return error('METHOD_NOT_ALLOWED', 'method not allowed', 405);
-    if (!requireScope(principal, path.length === 2 || path[3] === 'cancel' ? 'runs:write' : 'runs:read')) return error('FORBIDDEN', 'API key does not have the required scope', 403);
+    if ((path.length === 2 && !['GET', 'POST'].includes(request.method)) || (path.length > 2 && !['GET', 'POST'].includes(request.method))) return error('METHOD_NOT_ALLOWED', 'method not allowed', 405);
+    if (!requireScope(principal, path.length === 2 && request.method === 'POST' || path[3] === 'cancel' ? 'runs:write' : 'runs:read')) return error('FORBIDDEN', 'API key does not have the required scope', 403);
     let objectName: string;
     if (path.length === 2 && request.method === 'POST') {
       let submitted: { userTaskId?: unknown };
       try { submitted = await request.clone().json() as { userTaskId?: unknown }; } catch { return error('INVALID_REQUEST', 'request body must be JSON', 400); }
       if (typeof submitted.userTaskId !== 'string' || !SAFE_ID.test(submitted.userTaskId)) return error('INVALID_REQUEST', 'userTaskId is required and must be a safe id', 400);
       objectName = `task-${await sha256(`${principal.principalId}\0${principal.profileId}\0${submitted.userTaskId}`)}`;
+    } else if (path.length === 2 && request.method === 'GET') {
+      const taskId = url.searchParams.get('userTaskId');
+      if (!taskId || !SAFE_ID.test(taskId)) return error('INVALID_REQUEST', 'userTaskId query parameter is required and must be a safe id', 400);
+      const state = url.searchParams.get('state');
+      if (state !== null && state !== 'active') return error('INVALID_REQUEST', 'state supports only active', 400);
+      objectName = `task-${await sha256(`${principal.principalId}\0${principal.profileId}\0${taskId}`)}`;
     } else {
       const match = /^run_([0-9a-f]{64})_[0-9a-f]{24}$/.exec(path[2] ?? '');
       if (!match?.[1]) return error('INVALID_REQUEST', 'invalid run id', 400);

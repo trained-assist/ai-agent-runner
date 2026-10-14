@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { RunnerRunCoordinator } from '../src/cloudflare/run-coordinator.js';
+import runnerWorker from '../src/cloudflare/runner-api.js';
 import type { ApiPrincipal, DurableObjectStateLike, DurableStorage, RunnerWorkerEnv } from '../src/cloudflare/types.js';
 import { createHash, generateKeyPairSync, verify } from 'node:crypto';
 
@@ -52,6 +53,31 @@ const body = { userTaskId: 'task-a', input: { inlinePrompt: 'say done' }, envAll
 const testMcp = { servers: [{ serverId: 'trained-assist-registry-test', transport: 'remote', url: 'https://trained-assist-mcp-host-test-160.skillset-apply.workers.dev/mcp', bindingRef: 'registry-mcp-test-160-read', allowedTools: ['registry.fixture_read'], policyVersion: 'registry-fixture-policy-v1', catalogueVersion: 'registry-fixture-catalogue-v1' }] };
 
 describe('Cloudflare Runner run coordinator', () => {
+  it('lists only active metadata for one task and enforces principal ownership', async () => {
+    const { coordinator, storage } = setup();
+    const submitted = await coordinator.fetch(call('/v1/runs', body, { 'idempotency-key': 'scoped-active-list' }));
+    expect(submitted.status).toBe(202);
+    const receipt = await submitted.json() as { runId: string };
+
+    const response = await coordinator.fetch(call('/v1/runs?userTaskId=task-a&state=active'));
+    expect(response.status).toBe(200);
+    const page = await response.json() as { runs: Array<Record<string, unknown>>; nextCursor: string | null };
+    expect(page.runs).toHaveLength(1);
+    expect(page.runs[0]).toMatchObject({ runId: receipt.runId, userTaskId: 'task-a' });
+    expect(page.runs[0]).not.toHaveProperty('answer');
+    expect(page.runs[0]).not.toHaveProperty('events');
+    expect(page.nextCursor).toBeNull();
+
+    const foreign = await coordinator.fetch(call('/v1/runs?userTaskId=task-a&state=active', undefined, {}, {
+      ...principal, principalId: 'principal-b', keyHash: 'b'.repeat(64),
+    }));
+    expect((await foreign.json() as { runs: unknown[] }).runs).toEqual([]);
+
+    const stored = storage.values.get('runner-v1') as { runs: Record<string, { state: string }> };
+    stored.runs[receipt.runId]!.state = 'succeeded';
+    expect((await (await coordinator.fetch(call('/v1/runs?userTaskId=task-a&state=active'))).json() as { runs: unknown[] }).runs).toEqual([]);
+  });
+
   it('cleans terminal task state and refuses active, unknown, or foreign runs', async () => {
     const { coordinator, storage } = setup();
     const submitted = await coordinator.fetch(call('/v1/runs', body, { 'idempotency-key': 'cleanup-terminal' }));
@@ -482,5 +508,40 @@ describe('Cloudflare Runner run coordinator', () => {
     const badEndpoint = await coordinator.fetch(bodyWith({ ...principal, principalId: 'integration-telegram-ux-v1', profileId: 'integration-telegram-ux-v1', mcpBindings: ['registry-mcp-test-160-read'] }, { servers: [{ ...testMcp.servers[0], url: 'https://attacker.example/mcp' }] }, 'wrong-endpoint'));
     expect(badEndpoint.status).toBe(422);
     expect(JSON.stringify(storage.values.get('runner-v1'))).not.toContain('test-host-bearer-token-123');
+  });
+});
+
+describe('Cloudflare Runner API scoped active-run lookup route', () => {
+  it('routes GET by exact task id and requires runs:read', async () => {
+    const secret = 'production-api-key-for-test-only';
+    const keyHash = createHash('sha256').update(secret).digest('hex');
+    const calls: Request[] = [];
+    const makeEnv = (scopes: string[]) => ({
+      DEPLOYMENT_ENV: 'production',
+      RUNNER_API_KEYS_PRODUCTION: JSON.stringify([{ keyHash, principalId: 'cp', tenantId: 'tenant', profileId: 'profile',
+        repository: 'trained-assist/ai-agent-runner', scopes, engines: ['eu-vm-agent-run'] }]),
+      RUNNER_API_KEYS: '[]', VM_WORKER_URL: 'https://france.example', VM_WORKER_TOKEN: 'test-worker-token',
+      RUNNER_API_PUBLIC_URL: 'https://runner.example', RUN_LAUNCH_ENCRYPTION_KEY: 'test-launch-key-at-least-32-characters',
+      ALLOWED_REPOSITORIES: 'trained-assist/ai-agent-runner', RUNNER_RUNS: {
+        idFromName: (name: string) => name,
+        get: (_id: unknown) => ({ fetch: async (request: Request) => {
+          calls.push(request);
+          return Response.json({ runs: [], nextCursor: null });
+        } }),
+      },
+    }) as unknown as RunnerWorkerEnv;
+
+    const headers = { authorization: `Bearer ${secret}` };
+    const response = await runnerWorker.fetch(new Request('https://runner.example/v1/runs?state=active&userTaskId=task-1', { headers }), makeEnv(['runs:read']));
+    expect(response.status).toBe(200);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.url).toContain('userTaskId=task-1');
+    expect(calls[0]?.headers.get('x-runner-principal')).toContain('"principalId":"cp"');
+
+    const malformed = await runnerWorker.fetch(new Request('https://runner.example/v1/runs?state=active&userTaskId=bad%20id', { headers }), makeEnv(['runs:read']));
+    expect(malformed.status).toBe(400);
+    const forbidden = await runnerWorker.fetch(new Request('https://runner.example/v1/runs?state=active&userTaskId=task-1', { headers }), makeEnv(['runs:write']));
+    expect(forbidden.status).toBe(403);
+    expect(calls).toHaveLength(1);
   });
 });

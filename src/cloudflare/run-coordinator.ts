@@ -125,6 +125,7 @@ export class RunnerRunCoordinator {
     const segments = url.pathname.split('/').filter(Boolean);
     if (url.pathname === '/v1/sandbox/cleanup-task') return request.method === 'POST' ? this.cleanupTask(request, principal) : error('METHOD_NOT_ALLOWED', 'method not allowed', 405);
     if (url.pathname === '/v1/runs/cancel-by-idempotency-key') return request.method === 'POST' ? this.cancelByIdempotencyKey(request, principal) : error('METHOD_NOT_ALLOWED', 'method not allowed', 405);
+    if (segments.length === 2 && request.method === 'GET') return this.listTaskRuns(url, principal);
     if (segments.length === 2 && request.method === 'POST') return this.submit(request, principal);
     if (segments.length !== 4) return error('ROUTE_NOT_FOUND', `no route for ${url.pathname}`, 404);
     let runId: string;
@@ -175,6 +176,21 @@ export class RunnerRunCoordinator {
       case 'cancel': return request.method === 'POST' ? this.cancel(request, runId, principal) : error('METHOD_NOT_ALLOWED', 'cancel supports POST only', 405);
       default: return error('ROUTE_NOT_FOUND', `no route for ${url.pathname}`, 404);
     }
+  }
+
+  private async listTaskRuns(url: URL, principal: ApiPrincipal): Promise<Response> {
+    const taskId = url.searchParams.get('userTaskId');
+    if (!taskId || !SAFE_ID.test(taskId)) return error('INVALID_REQUEST', 'userTaskId query parameter is required and must be a safe id', 400);
+    const stateFilter = url.searchParams.get('state');
+    if (stateFilter !== null && stateFilter !== 'active') return error('INVALID_REQUEST', 'state supports only active', 400);
+    const stored = await this.read();
+    const runs = Object.values(stored.runs)
+      .filter((run) => run.userTaskId === taskId && owns(run, principal) && !['succeeded', 'failed', 'cancelled'].includes(run.state))
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.runId.localeCompare(b.runId))
+      .map((run) => ({ runId: run.runId, userTaskId: run.userTaskId, state: run.state,
+        createdAt: run.createdAt, updatedAt: run.updatedAt, startedAt: run.startedAt,
+        links: { status: `/v1/runs/${encodeURIComponent(run.runId)}/status`, result: `/v1/runs/${encodeURIComponent(run.runId)}/result` } }));
+    return json({ runs, nextCursor: null });
   }
 
   private async cleanupTask(request: Request, principal: ApiPrincipal): Promise<Response> {
