@@ -160,7 +160,7 @@ export default {
       const taskId = url.searchParams.get('userTaskId');
       if (!taskId || !SAFE_ID.test(taskId)) return error('INVALID_REQUEST', 'userTaskId query parameter is required and must be a safe id', 400);
       const state = url.searchParams.get('state');
-      if (state !== null && state !== 'active') return error('INVALID_REQUEST', 'state supports only active', 400);
+      if (state !== null && !['active', 'all'].includes(state)) return error('INVALID_REQUEST', 'state supports active or all', 400);
       objectName = `task-${await sha256(`${principal.principalId}\0${principal.profileId}\0${taskId}`)}`;
     } else {
       const match = /^run_([0-9a-f]{64})_[0-9a-f]{24}$/.exec(path[2] ?? '');

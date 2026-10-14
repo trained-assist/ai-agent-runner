@@ -182,10 +182,11 @@ export class RunnerRunCoordinator {
     const taskId = url.searchParams.get('userTaskId');
     if (!taskId || !SAFE_ID.test(taskId)) return error('INVALID_REQUEST', 'userTaskId query parameter is required and must be a safe id', 400);
     const stateFilter = url.searchParams.get('state');
-    if (stateFilter !== null && stateFilter !== 'active') return error('INVALID_REQUEST', 'state supports only active', 400);
+    if (stateFilter !== null && !['active', 'all'].includes(stateFilter)) return error('INVALID_REQUEST', 'state supports active or all', 400);
     const stored = await this.read();
     const runs = Object.values(stored.runs)
-      .filter((run) => run.userTaskId === taskId && owns(run, principal) && !['succeeded', 'failed', 'cancelled'].includes(run.state))
+      .filter((run) => run.userTaskId === taskId && owns(run, principal)
+        && (stateFilter === 'all' || !['succeeded', 'failed', 'cancelled'].includes(run.state)))
       .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.runId.localeCompare(b.runId))
       .map((run) => ({ runId: run.runId, userTaskId: run.userTaskId, state: run.state,
         createdAt: run.createdAt, updatedAt: run.updatedAt, startedAt: run.startedAt,

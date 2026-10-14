@@ -76,6 +76,8 @@ describe('Cloudflare Runner run coordinator', () => {
     const stored = storage.values.get('runner-v1') as { runs: Record<string, { state: string }> };
     stored.runs[receipt.runId]!.state = 'succeeded';
     expect((await (await coordinator.fetch(call('/v1/runs?userTaskId=task-a&state=active'))).json() as { runs: unknown[] }).runs).toEqual([]);
+    const allStates = await coordinator.fetch(call('/v1/runs?userTaskId=task-a&state=all'));
+    expect((await allStates.json() as { runs: Array<Record<string, unknown>> }).runs).toMatchObject([{ runId: receipt.runId, state: 'succeeded' }]);
   });
 
   it('cleans terminal task state and refuses active, unknown, or foreign runs', async () => {

@@ -1,4 +1,4 @@
-name: Inspect one production active Runner run
+name: Inspect one production Runner task
 
 on:
   workflow_dispatch:
@@ -32,7 +32,7 @@ jobs:
           const base = 'https://trained-assist-runner-api-production.skillset-apply.workers.dev';
           const matches = [];
           const url = new URL('/v1/runs', base);
-          url.searchParams.set('state', 'active');
+          url.searchParams.set('state', 'all');
           url.searchParams.set('userTaskId', taskId);
           const response = await fetch(url, {
             headers: { authorization: `Bearer ${apiKey}` },
@@ -48,8 +48,8 @@ jobs:
 
           console.log(JSON.stringify({
             userTaskId: taskId,
-            activeMatchCount: matches.length,
-            activeRuns: matches,
-            interpretation: matches.length ? 'active_run_found' : 'no_active_run; task may be queued elsewhere, never launched, or already terminal',
+            runRecordCount: matches.length,
+            runs: matches,
+            interpretation: matches.length ? 'run_record_found; state and startedAt distinguish accepted from started and terminal' : 'no_run_record_for_user_task_id',
           }));
           NODE
