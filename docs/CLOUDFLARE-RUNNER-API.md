@@ -1,5 +1,23 @@
 # Cloudflare Runner API
 
+## Current rollout checkpoint (verified 2026-10-15)
+
+The isolated sandbox Worker at `trained-assist-runner-api-sandbox3.skillset-apply.workers.dev/version`
+still reports source `b7c9c7664cadafdad59cdfe40c3b2f9428aaf3be`. The sandbox France VM
+`eu-vm2-sandbox` reports worker `0.3.8`, source
+`de051f5f2ed63e00d3dcd2db8a54c2965c9f01b1`; its `/readyz` reports ready. Runner API PR
+[#321](https://github.com/trained-assist/ai-agent-runner/pull/321) adds process-confirmed
+status, heartbeat freshness, and bounded live output snapshots, and is merged on main at
+`25244b3`. Its compatible signed VM bundle is published as
+[`vm-worker-v0.3.12`](https://github.com/trained-assist/ai-agent-runner/releases/tag/vm-worker-v0.3.12)
+from source `cc2396c878c2069891901880033d865e639c32d7`; checksum and GitHub provenance
+attestation were verified. The VM bundle is not installed yet, so the sandbox Worker must
+remain on its current compatible version until an operator updates the VM to `0.3.12`.
+Then deploy the exact reviewed main SHA and run the real sandbox canary before changing
+production. Track this rollout and the remaining lifecycle inventory work in
+[#320](https://github.com/trained-assist/ai-agent-runner/issues/320). Production was not
+changed.
+
 Status (verified 2026-10-10): the isolated `trained-assist-runner-api-sandbox3` Cloudflare
 Worker is serverless and dispatches real jobs to the France VM2 execution worker. The VM runs
 signed release `vm-worker-v0.3.5` (`dcca4e4b225ad2489748946b5afec6106b337b9d`) at
