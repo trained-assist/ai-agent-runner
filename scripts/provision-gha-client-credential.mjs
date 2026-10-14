@@ -6,6 +6,28 @@ import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const usage = `Usage: node scripts/provision-gha-client-credential.mjs [options]
+
+By default, Cloudflare authentication comes from the macOS Keychain item
+"Trained Assist Cloudflare Account Admin Token" (service cloudflare.com,
+account trained-assist-cloudflare-admin). The value is passed only to Wrangler.
+
+Options:
+  --client-id ID             Stable client ID (default: sandbox3_agent_api)
+  --gateway-env ENV          sandbox or production (default: sandbox)
+  --runner-config FILE       Runner Wrangler config
+  --gateway-config FILE      Gateway Wrangler config
+  --github-env ENV           GitHub environment (default: sandbox)
+  --github-repo OWNER/REPO   GitHub repo (default: trained-assist/ai-agent-runner)
+  --dry-run                  Read secret names only; do not write credentials
+  --keychain-service NAME    Override Keychain service (requires account and label)
+  --keychain-account NAME    Override Keychain account
+  --keychain-label NAME      Override Keychain label
+  --help                     Show this help`;
+if (process.argv.slice(2).some((arg) => arg === '--help' || arg === '-h')) {
+  console.log(usage);
+  process.exit(0);
+}
 const args = new Map();
 for (let i = 2; i < process.argv.length; i += 1) {
   const key = process.argv[i];
@@ -32,25 +54,14 @@ if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(githubRepo)) throw new Error('inv
 
 const runnerConfigPath = resolve(root, runnerConfig);
 const configText = readFileSync(runnerConfigPath, 'utf8');
-const keychainService = args.get('--keychain-service');
-const keychainAccount = args.get('--keychain-account');
-const keychainLabel = args.get('--keychain-label');
-let cloudflareToken = process.env.CLOUDFLARE_API_TOKEN?.trim();
-if (!cloudflareToken && (keychainService || keychainAccount || keychainLabel)) {
-  if (!keychainService || !keychainAccount || !keychainLabel) {
-    throw new Error('Keychain token lookup requires --keychain-service, --keychain-account and --keychain-label');
-  }
-  try {
-    cloudflareToken = execFileSync('security', [
-      'find-generic-password', '-s', keychainService, '-a', keychainAccount, '-l', keychainLabel, '-w',
-    ], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
-  } catch {
-    throw new Error(`Cloudflare token was not readable from Keychain item ${keychainService}/${keychainAccount}/${keychainLabel}`);
-  }
-  if (!cloudflareToken) throw new Error('Cloudflare Keychain token is empty');
+const keychainFlags = ['--keychain-service', '--keychain-account', '--keychain-label'];
+const hasKeychainOverride = keychainFlags.some((key) => args.has(key));
+if (hasKeychainOverride && keychainFlags.some((key) => !args.has(key))) {
+  throw new Error('Keychain token lookup requires all of --keychain-service, --keychain-account and --keychain-label');
 }
-const cloudflareEnvironment = { ...process.env };
-if (cloudflareToken) cloudflareEnvironment['CLOUDFLARE_API_TOKEN'] = cloudflareToken;
+const keychainService = args.get('--keychain-service') ?? 'cloudflare.com';
+const keychainAccount = args.get('--keychain-account') ?? 'trained-assist-cloudflare-admin';
+const keychainLabel = args.get('--keychain-label') ?? 'Trained Assist Cloudflare Account Admin Token';
 const urlMatch = configText.match(/(?:["']?GHA_WORKER_URL["']?)\s*[:=]\s*["']([^"']+)["']/);
 const gatewayUrlValue = args.get('--gateway-url') ?? urlMatch?.[1];
 if (!gatewayUrlValue) throw new Error(`GHA_WORKER_URL is missing from ${runnerConfig}`);
@@ -62,6 +73,19 @@ if (gatewayUrl.protocol !== 'https:' || gatewayUrl.username || gatewayUrl.passwo
   || (gatewayIsSandbox && gatewayEnv !== 'sandbox') || (gatewayIsProduction && gatewayEnv !== 'production')) {
   throw new Error('gateway URL and environment must match the approved production or sandbox GHA gateway');
 }
+
+let cloudflareToken = process.env.CLOUDFLARE_API_TOKEN?.trim();
+if (!cloudflareToken) {
+  try {
+    cloudflareToken = execFileSync('security', [
+      'find-generic-password', '-s', keychainService, '-a', keychainAccount, '-l', keychainLabel, '-w',
+    ], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+  } catch {
+    throw new Error(`Cloudflare token was not readable from Keychain item ${keychainService}/${keychainAccount}/${keychainLabel}`);
+  }
+  if (!cloudflareToken) throw new Error('Cloudflare Keychain token is empty');
+}
+const cloudflareEnvironment = { ...process.env, CLOUDFLARE_API_TOKEN: cloudflareToken };
 
 function run(command, commandArgs, { cwd, input, environment } = {}) {
   try {

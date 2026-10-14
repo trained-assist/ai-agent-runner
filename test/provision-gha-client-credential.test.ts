@@ -35,7 +35,7 @@ function invoke(fixture: ReturnType<typeof setup>, { client = 'sandbox3_agent_ap
     '--github-env', githubEnv,
     '--dry-run',
   ];
-  if (keychain) args.push('--keychain-service', 'cloudflare.com', '--keychain-account', 'trained-assist-sandbox', '--keychain-label', 'Trained Assist Cloudflare Sandbox API Token');
+  if (keychain) args.push('--keychain-service', 'cloudflare.com', '--keychain-account', 'trained-assist-cloudflare-admin', '--keychain-label', 'Trained Assist Cloudflare Account Admin Token');
   return spawnSync(process.execPath, args, {
     encoding: 'utf8',
     env: {
@@ -117,10 +117,25 @@ describe('GHA client credential provisioning', () => {
       expect(result.stdout).not.toContain('mock-keychain-token');
       expect(result.stderr).not.toContain('mock-keychain-token');
       const calls = readFileSync(fixture.calls, 'utf8');
-      expect(calls).toContain('security find-generic-password -s cloudflare.com -a trained-assist-sandbox -l Trained Assist Cloudflare Sandbox API Token -w');
+      expect(calls).toContain('security find-generic-password -s cloudflare.com -a trained-assist-cloudflare-admin -l Trained Assist Cloudflare Account Admin Token -w');
       expect(calls.split('\n').filter((line) => line.startsWith('npx ')).every((line) => line.includes('token-present=yes'))).toBe(true);
       expect(calls.split('\n').filter((line) => line.startsWith('gh ')).every((line) => line.includes('token-present='))).toBe(true);
       expect(calls.split('\n').filter((line) => line.startsWith('gh ')).every((line) => !line.includes('token-present=yes'))).toBe(true);
+    } finally {
+      rmSync(fixture.directory, { recursive: true, force: true });
+    }
+  });
+
+  it('uses the named Cloudflare account admin Keychain item by default', () => {
+    const fixture = setup();
+    try {
+      const result = invoke(fixture);
+      expect(result.status).toBe(0);
+      const calls = readFileSync(fixture.calls, 'utf8');
+      expect(calls).toContain('security find-generic-password -s cloudflare.com -a trained-assist-cloudflare-admin -l Trained Assist Cloudflare Account Admin Token -w');
+      expect(calls.split('\n').filter((line) => line.startsWith('npx ')).every((line) => line.includes('token-present=yes'))).toBe(true);
+      expect(calls.split('\n').filter((line) => line.startsWith('gh ')).every((line) => !line.includes('token-present=yes'))).toBe(true);
+      expect(result.stdout).not.toContain('mock-keychain-token');
     } finally {
       rmSync(fixture.directory, { recursive: true, force: true });
     }
