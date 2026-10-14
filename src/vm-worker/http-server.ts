@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import type { LaunchArtifact, LaunchRequest, LaunchResult, WorkerRunStatus } from '../adapters/external-worker-adapter.js';
 import { isEnvName, isSafeId } from '../contracts/validate.js';
 import type { RunSpec } from '../contracts/run-spec.js';
+import type { LogEvent } from '../contracts/events.js';
 import { Runner } from '../runner/runner.js';
 import { isTerminalState } from '../runner/state-machine.js';
 import type { CapacityAdmission, CapacityEnvelope, CapacityReservationStore, HostUsageSampler } from './capacity-admission.js';
@@ -153,7 +154,7 @@ export function createVmWorkerServer(options: VmWorkerServerOptions): VmWorkerSe
     const snapshot = options.runner.getRun(runId);
     if (endpoint === 'status' && method === 'GET') {
       const status: WorkerRunStatus = snapshot ? stateToWorkerStatus(snapshot.state) : 'unknown';
-      sendJson(res, 200, { runId, status, ...(snapshot ? { updatedAt: snapshot.updatedAt } : {}) });
+      sendJson(res, 200, { runId, status, ...(snapshot ? { state: snapshot.state, updatedAt: snapshot.updatedAt } : {}) });
       return;
     }
     if (!snapshot) { sendJson(res, endpoint === 'result' ? 404 : 200, endpoint === 'result' ? { error: 'NOT_FOUND' } : { runId, status: 'unknown_run' }); return; }
@@ -201,7 +202,21 @@ export function createVmWorkerServer(options: VmWorkerServerOptions): VmWorkerSe
       return;
     }
     if (endpoint === 'logs' && method === 'GET') {
-      await streamLogs(req, res, options.runner, runId, Number(url.searchParams.get('after') ?? '0'));
+      const after = Number(url.searchParams.get('after') ?? '0');
+      if (url.searchParams.get('snapshot') === '1') {
+        if (!Number.isSafeInteger(after) || after < 0) { sendJson(res, 400, { error: 'INVALID_CURSOR' }); return; }
+        const events = options.runner.events(runId, after).filter((event): event is LogEvent => event.type === 'log'
+          && (event.payload.stream === 'stdout' || event.payload.stream === 'stderr')).slice(0, 100);
+        const cursor = events.at(-1)?.sequence ?? after;
+        sendJson(res, 200, { runId, cursor, hasMore: options.runner.events(runId, cursor).some((event) => event.type === 'log'
+          && (event.payload.stream === 'stdout' || event.payload.stream === 'stderr')),
+          state: options.runner.getRun(runId)?.state ?? 'unknown',
+          logs: events.map((event) => ({ sequence: event.sequence, stream: event.payload.stream,
+            message: event.payload.message.length > 16_000 ? event.payload.message.slice(-16_000) : event.payload.message,
+            truncated: event.payload.message.length > 16_000 })) });
+        return;
+      }
+      await streamLogs(req, res, options.runner, runId, after);
       return;
     }
     sendJson(res, 405, { error: 'METHOD_NOT_ALLOWED' });

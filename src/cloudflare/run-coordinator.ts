@@ -8,6 +8,7 @@ interface RunRecord {
   principalId: string; profileId: string; tenantId?: string; idempotencyKey: string; payloadHash: string;
   engine: string; state: State; sequence: number; createdAt: string; updatedAt: string; startedAt: string | null;
   finishedAt: string | null; answer: string | null; cancelRequested: boolean; launchCiphertext: string;
+  lastHeartbeatAt?: string | null; logCursor?: number; output?: { stdout: string; stderr: string; updatedAt: string | null; truncated: boolean };
   launchAttempts: number; result?: Record<string, unknown>; workerReceipt?: Record<string, unknown>;
   launchRejection?: { status: number; code: string; fields: string[] };
   lastError?: string;
@@ -20,6 +21,7 @@ interface Stored { runs: Record<string, RunRecord>; idempotency: Record<string, 
 const INIT: Stored = { runs: {}, idempotency: {}, latestOwnerGeneration: 0 };
 const ACTIVE = new Set<State>(['queued', 'starting', 'running']);
 const TERMINAL = new Set<State>(['succeeded', 'failed', 'cancelled']);
+const UNKNOWN_RECONCILE_MS = 30 * 60_000;
 const now = (): string => new Date().toISOString();
 const stateKey = 'runner-v1';
 const MCP_TEST = Object.freeze({
@@ -39,7 +41,10 @@ function principalOf(request: Request): ApiPrincipal | null {
 function view(run: RunRecord): Record<string, unknown> {
   return { requestId: run.requestId, userTaskId: run.userTaskId, conversationId: run.conversationId, runId: run.runId,
     ownerGeneration: run.ownerGeneration, state: run.state, engine: run.engine, cancelRequested: run.cancelRequested, connectionLost: run.state === 'unknown',
-    observedAt: run.updatedAt, sequence: run.sequence, fencing: { rejected: 0 }, answer: run.answer };
+    observedAt: run.updatedAt, lastHeartbeatAt: run.lastHeartbeatAt ?? null,
+    statusFreshness: run.lastHeartbeatAt && Date.now() - Date.parse(run.lastHeartbeatAt) > 30_000 ? 'stale' : run.lastHeartbeatAt ? 'fresh' : 'unobserved',
+    output: run.output ?? { stdout: '', stderr: '', updatedAt: null, truncated: false },
+    sequence: run.sequence, fencing: { rejected: 0 }, answer: run.answer };
 }
 
 function workerRefusalCode(body: unknown, status: number): string {
@@ -154,7 +159,10 @@ export class RunnerRunCoordinator {
         const limit = Math.min(500, Math.max(1, Number(url.searchParams.get('limit') ?? 500) || 500));
         const events = run.events.filter((event) => Number(event['sequence']) > cursor).slice(0, limit);
         return json({ runId, events, cursor: events.at(-1)?.['sequence'] ?? cursor, hasMore: false,
-          snapshot: { state: run.state, connectionLost: run.state === 'unknown', sequence: run.sequence, ownerGeneration: run.ownerGeneration }, droppedEvents: 0, logUrl: run.logUrl });
+          snapshot: { state: run.state, connectionLost: run.state === 'unknown', sequence: run.sequence, ownerGeneration: run.ownerGeneration,
+            observedAt: run.updatedAt, lastHeartbeatAt: run.lastHeartbeatAt ?? null,
+            statusFreshness: run.lastHeartbeatAt && Date.now() - Date.parse(run.lastHeartbeatAt) > 30_000 ? 'stale' : run.lastHeartbeatAt ? 'fresh' : 'unobserved',
+            output: run.output ?? { stdout: '', stderr: '', updatedAt: null, truncated: false } }, droppedEvents: 0, logUrl: run.logUrl });
       }
       case 'artifacts':
         if (request.method !== 'GET') return error('METHOD_NOT_ALLOWED', 'artifacts supports GET only', 405);
@@ -494,7 +502,8 @@ export class RunnerRunCoordinator {
     await this.ready;
     const stored = await this.read();
     let changed = false;
-    const pendingRuns = Object.values(stored.runs).filter((run) => ACTIVE.has(run.state));
+    const pendingRuns = Object.values(stored.runs).filter((run) => ACTIVE.has(run.state)
+      || run.state === 'unknown' && !!run.workerReceipt && Date.now() - Date.parse(run.updatedAt) < UNKNOWN_RECONCILE_MS);
     for (const run of pendingRuns) {
       try {
         if (run.engine === 'mock-test') {
@@ -535,18 +544,39 @@ export class RunnerRunCoordinator {
             throw new Error(`worker launch HTTP ${response.status}`);
           }
           run.workerReceipt = await response.json() as Record<string, unknown>;
-          transition(run, 'running');
+          // A 202 receipt proves durable admission only. The next worker status
+          // poll must report the process state before we say it has started.
         } else {
           const statusResponse = await this.worker(`/v1/runs/${run.runId}/status`);
-          const workerStatus = statusResponse.ok ? await statusResponse.json() as { status?: string } : null;
+          if (!statusResponse.ok) throw new Error(`worker status HTTP ${statusResponse.status}`);
+          const workerStatus = await statusResponse.json() as { status?: string; state?: string };
+          run.lastHeartbeatAt = now();
+          const logsResponse = await this.worker(`/v1/runs/${run.runId}/logs?after=${run.logCursor ?? 0}&snapshot=1`);
+          if (logsResponse.ok) {
+            const batch = await logsResponse.json() as { cursor?: number; logs?: Array<{ stream?: string; message?: string; truncated?: boolean }> };
+            const output = run.output ?? { stdout: '', stderr: '', updatedAt: null, truncated: false };
+            let received = false;
+            for (const entry of batch.logs ?? []) {
+              if ((entry.stream !== 'stdout' && entry.stream !== 'stderr') || typeof entry.message !== 'string') continue;
+              const previous = output[entry.stream];
+              output[entry.stream] = `${previous}${previous ? '\n' : ''}${entry.message}`.slice(-24_000);
+              output.truncated ||= entry.truncated === true || previous.length + entry.message.length > 24_000;
+              received = true;
+            }
+            if (Number.isSafeInteger(batch.cursor) && Number(batch.cursor) >= (run.logCursor ?? 0)) run.logCursor = Number(batch.cursor);
+            if (received) output.updatedAt = now();
+            run.output = output;
+          }
           if (workerStatus?.status === 'unknown' || workerStatus?.status === 'unknown_run') {
             // The worker already issued an admission receipt. Its later lack of
             // knowledge is not proof that execution did not start, so a fresh
             // launch could run the task twice. Reconciliation/fencing owns the
             // next decision; the coordinator must preserve this uncertainty.
             transition(run, 'unknown', { reason: 'worker_no_longer_knows_run' });
-          } else if (workerStatus?.status === 'running' || workerStatus?.status === 'accepted') {
-            if (run.state !== 'running') transition(run, 'running');
+          } else if (workerStatus.status === 'running' || workerStatus.status === 'accepted') {
+            const observedState: State = workerStatus.state === 'running' || workerStatus.state === 'finalizing' ? 'running' : 'starting';
+            if (run.state !== observedState) transition(run, observedState,
+              observedState === 'running' ? { evidence: 'worker_process_state' } : { evidence: 'worker_accepted' });
           } else if (['succeeded', 'failed', 'cancelled'].includes(workerStatus?.status ?? '')) {
             const resultResponse = await this.worker(`/v1/runs/${run.runId}/result`);
             if (resultResponse.ok) {
@@ -574,21 +604,30 @@ export class RunnerRunCoordinator {
         if (!run.workerReceipt) {
           try {
             const statusResponse = await this.worker(`/v1/runs/${run.runId}/status`);
-            const observed = statusResponse.ok ? await statusResponse.json() as { status?: string } : null;
+            const observed = statusResponse.ok ? await statusResponse.json() as { status?: string; state?: string } : null;
             if (observed?.status && !['unknown', 'unknown_run'].includes(observed.status)) {
               run.workerReceipt = { runId: run.runId, status: 'accepted', operationId: 'reconciled' };
-              transition(run, ['succeeded', 'failed', 'cancelled'].includes(observed.status) ? observed.status as State : 'running', { reconciled: true });
+              run.lastHeartbeatAt = now();
+              const observedState = ['succeeded', 'failed', 'cancelled'].includes(observed.status) ? observed.status as State
+                : observed.state === 'running' || observed.state === 'finalizing' ? 'running' : 'starting';
+              transition(run, observedState, { reconciled: true, evidence: observedState === 'running' ? 'worker_process_state' : 'worker_accepted' });
             } else transition(run, 'unknown', { reason: 'worker_acceptance_could_not_be_confirmed' });
           } catch {
             transition(run, 'unknown', { reason: 'worker_acceptance_could_not_be_confirmed' });
           }
-        } else { run.state = 'running'; run.updatedAt = now(); }
+        } else {
+          const lastHeartbeat = run.lastHeartbeatAt ? Date.parse(run.lastHeartbeatAt) : Date.parse(run.startedAt ?? run.updatedAt);
+          if (Number.isFinite(lastHeartbeat) && Date.now() - lastHeartbeat > 30_000) transition(run, 'unknown', { reason: 'worker_status_stale' });
+        }
         run['lastError'] = message.slice(0, 200);
       }
       changed = true;
     }
     if (changed) await Promise.all(pendingRuns.map((run) => this.writeRun(run)));
-    if (Object.values(stored.runs).some((run) => ACTIVE.has(run.state))) await this.state.storage.setAlarm(Date.now() + 5_000);
+    if (Object.values(stored.runs).some((run) => ACTIVE.has(run.state)
+      || run.state === 'unknown' && !!run.workerReceipt && Date.now() - Date.parse(run.updatedAt) < UNKNOWN_RECONCILE_MS)) {
+      await this.state.storage.setAlarm(Date.now() + 5_000);
+    }
   }
 
   private async worker(path: string, method = 'GET', body?: unknown, timeoutMs = 8_000): Promise<Response> {

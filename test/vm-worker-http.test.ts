@@ -57,6 +57,12 @@ describe('installable VM HTTP worker', () => {
     expect(stream).toContain('worker says hello');
     expect(stream).toContain('event: stderr');
 
+    const snapshot = await fetch(`${fixture.base}/v1/runs/${RUN_ID}/logs?after=0&snapshot=1`, { headers: authHeaders() });
+    expect(snapshot.status).toBe(200);
+    expect(await snapshot.json()).toMatchObject({ runId: RUN_ID, cursor: 11, hasMore: false, logs: [
+      { sequence: 10, stream: 'stdout', message: 'worker says hello' }, { sequence: 11, stream: 'stderr', message: 'diagnostic' },
+    ] });
+
     const status = await fetch(`${fixture.base}/v1/runs/${RUN_ID}/status`, { headers: authHeaders() });
     expect(await status.json()).toMatchObject({ runId: RUN_ID, status: 'succeeded' });
     const resultResponse = await fetch(`${fixture.base}/v1/runs/${RUN_ID}/result`, { headers: authHeaders() });

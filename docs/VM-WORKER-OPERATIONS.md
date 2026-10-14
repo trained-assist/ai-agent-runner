@@ -182,10 +182,16 @@ for rollback.
   admission threshold. HTTP 503 removes the worker from new-run routing. Its JSON
   identifies each check, current CPU/RAM, projected load, and active reservations.
 - `POST /v1/launch` uses `Authorization: Bearer <VM_WORKER_TOKEN>` and returns a
-  receipt only after durable admission and Runner start.
+  receipt after durable admission; the receipt alone does not prove process start.
 - `GET /v1/runs/{runId}/status` reports accepted/running/terminal state;
   `GET .../result` returns the terminal result; `GET .../logs?after={sequence}` provides
   replayable stdout/stderr SSE; `POST .../cancel` requests cancellation.
+
+Status JSON also includes the exact Runner state so the Cloudflare coordinator can
+distinguish accepted/starting from a process that has reached `running`. For bounded
+background reconciliation, `GET .../logs?after={sequence}&snapshot=1` returns up to
+100 replayable stdout/stderr records and the next sequence cursor. Each returned
+message is capped at 16,000 characters; the existing SSE route remains unchanged.
 
 The result includes `exitObserved` independently from `exitCode` and `exitSignal`. During
 cancellation, OS process-tree polling can confirm that the process ended even if the engine's
