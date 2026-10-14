@@ -1,0 +1,60 @@
+name: Inspect one production active Runner run
+
+on:
+  workflow_dispatch:
+    inputs:
+      user_task_id:
+        description: Exact CP userTaskId to match in the active-run list
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    environment: production
+    steps:
+      - name: Query the authenticated active-run list and filter locally
+        env:
+          RUNNER_API_KEY: ${{ secrets.RUNNER_API_KEY_AGENT_API }}
+          USER_TASK_ID: ${{ inputs.user_task_id }}
+        run: |
+          node --input-type=module <<'NODE'
+          const taskId = process.env.USER_TASK_ID?.trim() ?? '';
+          const apiKey = process.env.RUNNER_API_KEY?.trim() ?? '';
+          if (!/^[A-Za-z0-9_-]{1,128}$/.test(taskId)) throw new Error('invalid_user_task_id');
+          if (apiKey.length < 32) throw new Error('production_runner_api_key_missing');
+
+          const base = 'https://trained-assist-runner-api-production.skillset-apply.workers.dev';
+          let cursor;
+          const matches = [];
+          do {
+            const url = new URL('/v1/runs', base);
+            url.searchParams.set('state', 'active');
+            url.searchParams.set('limit', '100');
+            if (cursor) url.searchParams.set('cursor', cursor);
+            const response = await fetch(url, {
+              headers: { authorization: `Bearer ${apiKey}` },
+              signal: AbortSignal.timeout(15_000),
+            });
+            if (!response.ok) throw new Error(`active_run_list_http_${response.status}`);
+            const page = await response.json();
+            for (const run of page.runs ?? []) {
+              if (run.userTaskId === taskId) {
+                matches.push({ runId: run.runId, state: run.state, createdAt: run.createdAt, startedAt: run.startedAt });
+              }
+            }
+            cursor = page.nextCursor ?? undefined;
+          } while (cursor);
+
+          console.log(JSON.stringify({
+            userTaskId: taskId,
+            activeMatchCount: matches.length,
+            activeRuns: matches,
+            interpretation: matches.length ? 'active_run_found' : 'no_active_run; task may be queued elsewhere, never launched, or already terminal',
+          }));
+          NODE
