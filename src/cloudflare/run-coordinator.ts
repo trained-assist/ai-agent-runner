@@ -6,7 +6,7 @@ interface RunRecord {
   requestId: string; runId: string; userTaskId: string; conversationId: string; jobId: string;
   ownerGeneration: number;
   principalId: string; profileId: string; tenantId?: string; idempotencyKey: string; payloadHash: string;
-  engine: string; state: State; sequence: number; createdAt: string; updatedAt: string; startedAt: string | null;
+  engine: string; routeMode: 'auto' | 'france' | 'gha'; state: State; sequence: number; createdAt: string; updatedAt: string; startedAt: string | null;
   finishedAt: string | null; answer: string | null; cancelRequested: boolean; launchCiphertext: string;
   launchAttempts: number; result?: Record<string, unknown>; workerReceipt?: Record<string, unknown>;
   launchRejection?: { status: number; code: string; fields: string[] };
@@ -40,7 +40,7 @@ function principalOf(request: Request): ApiPrincipal | null {
 
 function view(run: RunRecord): Record<string, unknown> {
   return { requestId: run.requestId, userTaskId: run.userTaskId, conversationId: run.conversationId, runId: run.runId,
-    ownerGeneration: run.ownerGeneration, state: run.state, engine: run.engine, cancelRequested: run.cancelRequested, connectionLost: run.state === 'unknown',
+    ownerGeneration: run.ownerGeneration, state: run.state, engine: run.engine, routeMode: run.routeMode ?? 'auto', cancelRequested: run.cancelRequested, connectionLost: run.state === 'unknown',
     observedAt: run.updatedAt, sequence: run.sequence, fencing: { rejected: 0 }, answer: run.answer };
 }
 
@@ -224,7 +224,7 @@ export class RunnerRunCoordinator {
       body = JSON.parse(text) as Record<string, any>;
     } catch { return error('INVALID_REQUEST', 'request body must be JSON', 400); }
     if (!body || typeof body !== 'object' || Array.isArray(body)) return error('INVALID_REQUEST', 'request body must be an object', 400);
-    const allowedFields = new Set(['userTaskId', 'conversationId', 'engine', 'input', 'ingressManifest', 'envAllowlist', 'limits', 'deadline', 'regionConstraints', 'credentialBindings', 'mcp', 'budget', 'result', 'outputs', 'traceId', 'instructions', 'repository', 'isolation']);
+    const allowedFields = new Set(['userTaskId', 'conversationId', 'engine', 'routeMode', 'input', 'ingressManifest', 'envAllowlist', 'limits', 'deadline', 'regionConstraints', 'credentialBindings', 'mcp', 'budget', 'result', 'outputs', 'traceId', 'instructions', 'repository', 'isolation']);
     const unknownFields = Object.keys(body).filter((name) => !allowedFields.has(name));
     if (unknownFields.length) return error('INVALID_REQUEST', 'request contains unsupported fields', 400, { errors: unknownFields.map((name) => `request.${name}: unknown field`) });
     if (!Array.isArray(body.envAllowlist) || !body.limits || !Number.isSafeInteger(body.limits.timeoutMs) || body.limits.timeoutMs <= 0 || body.limits.timeoutMs > 86_400_000) return error('INVALID_REQUEST', 'envAllowlist and a valid limits.timeoutMs are required', 400);
@@ -267,10 +267,16 @@ export class RunnerRunCoordinator {
     }
     if (body.profileWorkspace || body.credentialBindings?.length) return error('FEATURE_UNSUPPORTED', 'profile workspace and credential bindings are not supported by this Worker API yet', 422);
     if (body.isolation !== undefined && body.isolation?.mode !== 'none') return error('ISOLATION_UNSUPPORTED', 'the France VM worker currently supports isolation.mode=none only', 422);
-    if (body.regionConstraints?.allowedRegions && !body.regionConstraints.allowedRegions.includes('eu')) return error('REGION_UNAVAILABLE', 'this Runner API only dispatches to the France EU worker', 422);
-    const engine = typeof body.engine?.name === 'string' ? body.engine.name : (this.env.RUNNER_ENGINE || DEFAULT_ENGINE);
-    const mockTest = engine === 'mock-test';
-    if ((engine !== (this.env.RUNNER_ENGINE || DEFAULT_ENGINE) && !(mockTest && this.env.MOCK_TEST_ENABLED === 'true')) || (principal.engines && !principal.engines.includes(engine))) return error('FORBIDDEN', 'requested engine is not allowed for this key', 403);
+    const routeMode = body.routeMode === undefined ? 'auto' : body.routeMode;
+    if (routeMode !== 'auto' && routeMode !== 'france' && routeMode !== 'gha') return error('INVALID_REQUEST', 'routeMode must be auto, france, or gha', 400);
+    if (routeMode === 'gha' && !this.hasGhaWorker()) return error('ROUTE_UNAVAILABLE', 'the GHA/Azure route is not configured for this Runner API', 503);
+    if (routeMode !== 'gha' && body.regionConstraints?.allowedRegions && !body.regionConstraints.allowedRegions.includes('eu')) return error('REGION_UNAVAILABLE', 'this Runner API only dispatches to the France EU worker', 422);
+    const mockTest = body.engine?.name === 'mock-test' && this.env.MOCK_TEST_ENABLED === 'true';
+    const engine = mockTest ? 'mock-test' : routeMode === 'gha' ? GHA_ENGINE : FRANCE_ENGINE;
+    if (routeMode !== 'gha' && engine === GHA_ENGINE) return error('INVALID_REQUEST', 'use routeMode=gha to select the GHA/Azure execution route', 400);
+    if (routeMode === 'gha' && body.engine?.name !== undefined && body.engine.name !== GHA_ENGINE) return error('INVALID_REQUEST', 'engine.name must be azure-cloud when routeMode=gha', 400);
+    if (!mockTest && body.engine?.name !== undefined && body.engine.name !== engine) return error('INVALID_REQUEST', `engine.name must be ${engine} for routeMode=${routeMode}`, 400);
+    if ((engine !== FRANCE_ENGINE && engine !== GHA_ENGINE && !(mockTest && this.env.MOCK_TEST_ENABLED === 'true')) || (principal.engines && !principal.engines.includes(engine))) return error('FORBIDDEN', 'requested engine is not allowed for this key', 403);
     const allowedRepositories = new Set(this.env.ALLOWED_REPOSITORIES.split(',').map((item) => item.trim()).filter(Boolean));
     const requestedRepository = body.repository?.fullName;
     if (principal.repository && requestedRepository && requestedRepository !== principal.repository) return error('REPOSITORY_BINDING_MISMATCH', 'request repository does not match the authenticated profile binding', 403);
@@ -341,7 +347,7 @@ export class RunnerRunCoordinator {
           resultUrl, isolation: body.isolation ?? { mode: 'none' }, outputs: Array.isArray(body.outputs) ? body.outputs : [],
           ...(mcp.length ? await this.testRegistryAttachment(mcp[0], { runId, taskId, profileId: principal.profileId, timeoutMs: clampInteger(limits.timeoutMs, 300_000, 1_000, 86_400_000) }) : {}) };
       record = { requestId, runId, userTaskId: taskId, conversationId, jobId, ownerGeneration, principalId: principal.principalId, profileId: principal.profileId,
-        ...(principal.tenantId ? { tenantId: principal.tenantId } : {}), idempotencyKey: idemKey, payloadHash, engine, state: 'queued', sequence: 0,
+        ...(principal.tenantId ? { tenantId: principal.tenantId } : {}), idempotencyKey: idemKey, payloadHash, engine, routeMode, state: 'queued', sequence: 0,
         createdAt: time, updatedAt: time, startedAt: null, finishedAt: null, answer: null, cancelRequested: false, launchAttempts: 0, events: [], artifacts: [], repo: null, logUrl: null, launchCiphertext: await encrypt(JSON.stringify(launch), this.env.RUN_LAUNCH_ENCRYPTION_KEY) };
       nextEvent(record, 'run_queued');
       stored.runs[runId] = record;
@@ -515,7 +521,7 @@ export class RunnerRunCoordinator {
             if (!response.ok) {
               const rejection = await response.clone().json().catch(() => null);
               const code = workerRefusalCode(rejection, response.status);
-              if (run.engine === FRANCE_ENGINE && isConfirmedCapacityRefusal(rejection, response.status) && this.hasGhaWorker()) {
+              if ((run.routeMode === 'auto' || !run.routeMode) && run.engine === FRANCE_ENGINE && isConfirmedCapacityRefusal(rejection, response.status) && this.hasGhaWorker()) {
                 const engine = launch['engine'] as Record<string, unknown> | undefined;
                 if (!engine || engine['name'] !== FRANCE_ENGINE) throw new Error('France launch engine does not match its persisted route');
                 launch['engine'] = { ...engine, name: GHA_ENGINE };

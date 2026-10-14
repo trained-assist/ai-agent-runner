@@ -127,7 +127,8 @@ export default {
     catch { return error('FORBIDDEN', 'invalid or expired host profile capability', 403); }
     if (url.pathname === '/v1/capabilities' && request.method === 'GET') {
       if (!requireScope(principal, 'runs:read')) return error('FORBIDDEN', 'API key does not have the required scope', 403);
-      return json({ schemaVersion: 1, contract: { name: 'ai-agent-runner/serverless-agent-api', version: 1 }, placement: 'cloudflare-worker', executionRegions: [env.RUNNER_ENGINE || DEFAULT_ENGINE], fallbackExecutionRegions: fallbackExecutionRegions(env) });
+      const ghaConfigured = fallbackExecutionRegions(env).includes('azure-cloud');
+      return json({ schemaVersion: 1, contract: { name: 'ai-agent-runner/serverless-agent-api', version: 1 }, placement: 'cloudflare-worker', executionRegions: [DEFAULT_ENGINE], fallbackExecutionRegions: ghaConfigured ? ['azure-cloud'] : [], routes: { auto: { primary: DEFAULT_ENGINE, fallback: ghaConfigured ? 'azure-cloud' : null }, france: { available: true, fallback: false }, gha: { available: ghaConfigured, engine: ghaConfigured ? 'azure-cloud' : null } } });
     }
     if (url.pathname === '/v1/sandbox/cleanup-task') {
       if (request.method !== 'POST') return error('METHOD_NOT_ALLOWED', 'method not allowed', 405);

@@ -63,9 +63,13 @@ provisioned. Each environment has a distinct named gateway credential, so sandbo
 be rotated or revoked without touching production or other clients. The provisioning command
 installs each generated value in that environment's gateway, Runner API and GitHub Actions
 environment, then checks authenticated gateway access without creating a run. Capabilities
-continues to list France in `executionRegions` (the caller-facing primary engine) and reports
-`azure-cloud` separately in `fallbackExecutionRegions` only when both URL and credential are
-present. The cutover occurs only after France returns the typed pre-admission refusal
+continues to list France in `executionRegions` and reports `azure-cloud` separately in
+`fallbackExecutionRegions` only when both URL and credential are present. `POST /v1/runs`
+accepts optional `routeMode`: `auto` (default; France, then GHA only after a confirmed
+pre-admission capacity refusal), `france` (France only), or `gha` (GHA/Azure only). For
+`routeMode: "gha"`, `engine.name` must be `azure-cloud`; the authenticated principal must also
+allow that engine. Capabilities includes per-route availability under `routes`. In auto mode,
+the cutover occurs only after France returns the typed pre-admission refusal
 `503 { accepted: false, code: "WORKER_CAPACITY" }`; the same run and operation identity is then
 persisted against `azure-cloud` before dispatch. Other refusals do not trigger this cutover. An
 accepted or ambiguous France launch is reconciled on France and never started again on GHA.

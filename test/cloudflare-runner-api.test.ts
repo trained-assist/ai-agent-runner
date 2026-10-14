@@ -27,10 +27,10 @@ describe('Cloudflare Runner API Worker', () => {
       GHA_WORKER_TOKEN: 'g'.repeat(32), RUNNER_RUNS: { idFromName: vi.fn(), get: vi.fn() },
     } as unknown as RunnerWorkerEnv;
     const response = await runnerApi.fetch(new Request('https://api.example/v1/capabilities', { headers: { authorization: `Bearer ${token}` } }), env);
-    expect(await response.json()).toMatchObject({ executionRegions: ['eu-vm-agent-run'], fallbackExecutionRegions: ['azure-cloud'] });
+    expect(await response.json()).toMatchObject({ executionRegions: ['eu-vm-agent-run'], fallbackExecutionRegions: ['azure-cloud'], routes: { auto: { primary: 'eu-vm-agent-run', fallback: 'azure-cloud' }, france: { available: true, fallback: false }, gha: { available: true, engine: 'azure-cloud' } } });
 
     const notProvisioned = await runnerApi.fetch(new Request('https://api.example/v1/capabilities', { headers: { authorization: `Bearer ${token}` } }), { ...env, GHA_WORKER_TOKEN: '' });
-    expect(await notProvisioned.json()).toMatchObject({ executionRegions: ['eu-vm-agent-run'], fallbackExecutionRegions: [] });
+    expect(await notProvisioned.json()).toMatchObject({ executionRegions: ['eu-vm-agent-run'], fallbackExecutionRegions: [], routes: { auto: { primary: 'eu-vm-agent-run', fallback: null }, gha: { available: false, engine: null } } });
   });
 
   it('reports the deployed Cloudflare Worker build identity', async () => {

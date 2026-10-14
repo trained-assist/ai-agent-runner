@@ -202,6 +202,42 @@ describe('Cloudflare Runner run coordinator', () => {
     expect(await result.json()).toMatchObject({ outcome: 'succeeded', text: 'done on GHA' });
   });
 
+  it('supports strict France and strict GHA API routes in addition to auto selection', async () => {
+    const france = setup();
+    france.env.GHA_WORKER_URL = 'https://gha.example';
+    france.env.GHA_WORKER_TOKEN = 'gha-worker-secret-for-test-only';
+    const franceHosts: string[] = [];
+    france.env.FETCH = async (input) => {
+      const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+      franceHosts.push(url.host);
+      return Response.json({ accepted: false, code: 'WORKER_CAPACITY' }, { status: 503 });
+    };
+    const franceAccepted = await france.coordinator.fetch(call('/v1/runs', { ...body, routeMode: 'france' }, { 'idempotency-key': 'strict-france' }));
+    expect(franceAccepted.status).toBe(202);
+    const franceReceipt = await franceAccepted.json() as { runId: string };
+    await france.coordinator.alarm();
+    expect(franceHosts).toEqual(['france.example']);
+    expect(await (await france.coordinator.fetch(call(`/v1/runs/${franceReceipt.runId}/result`))).json()).toMatchObject({ outcome: 'failed', failure: { code: 'WORKER_CAPACITY' } });
+
+    const gha = setup();
+    gha.env.GHA_WORKER_URL = 'https://gha.example';
+    gha.env.GHA_WORKER_TOKEN = 'gha-worker-secret-for-test-only';
+    const ghaHosts: string[] = [];
+    gha.env.FETCH = async (input, init) => {
+      const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+      ghaHosts.push(url.host);
+      const launch = JSON.parse(String(init?.body)) as { runId: string };
+      return Response.json({ runId: launch.runId, operationId: 'op-gha', status: 'accepted' }, { status: 202 });
+    };
+    const ghaAccepted = await gha.coordinator.fetch(call('/v1/runs', { ...body, routeMode: 'gha', engine: { name: 'azure-cloud', adapterVersion: '1' } }, { 'idempotency-key': 'strict-gha' }));
+    expect(ghaAccepted.status).toBe(202);
+    const ghaReceipt = await ghaAccepted.json() as { runId: string };
+    await gha.coordinator.alarm();
+    expect(ghaHosts).toEqual(['gha.example']);
+    expect(gha.storage.values.get('runner-v1')).toMatchObject({ runs: { [ghaReceipt.runId]: { engine: 'azure-cloud', routeMode: 'gha', state: 'running' } } });
+    expect(await (await gha.coordinator.fetch(call(`/v1/runs/${ghaReceipt.runId}/status`))).json()).toMatchObject({ engine: 'azure-cloud', routeMode: 'gha', state: 'running' });
+  });
+
   it('does not cut over to GHA for a non-capacity France refusal', async () => {
     const { coordinator, env } = setup();
     env.GHA_WORKER_URL = 'https://gha.example';
