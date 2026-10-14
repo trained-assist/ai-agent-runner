@@ -36,8 +36,12 @@ const urlMatch = configText.match(/(?:["']?GHA_WORKER_URL["']?)\s*[:=]\s*["']([^
 const gatewayUrlValue = args.get('--gateway-url') ?? urlMatch?.[1];
 if (!gatewayUrlValue) throw new Error(`GHA_WORKER_URL is missing from ${runnerConfig}`);
 const gatewayUrl = new URL(gatewayUrlValue);
-if (gatewayUrl.protocol !== 'https:' || !gatewayUrl.hostname.includes('gateway-sandbox')) {
-  throw new Error('provisioning only supports an HTTPS sandbox gateway URL');
+const gatewayIsSandbox = gatewayUrl.hostname === 'opencode-gha-runner-gateway-sandbox.skillset-apply.workers.dev';
+const gatewayIsProduction = gatewayUrl.hostname === 'opencode-gha-runner-gateway.skillset-apply.workers.dev';
+if (gatewayUrl.protocol !== 'https:' || gatewayUrl.username || gatewayUrl.password || gatewayUrl.pathname !== '/' || gatewayUrl.search || gatewayUrl.hash
+  || !(gatewayIsSandbox || gatewayIsProduction)
+  || (gatewayIsSandbox && gatewayEnv !== 'sandbox') || (gatewayIsProduction && gatewayEnv !== 'production')) {
+  throw new Error('gateway URL and environment must match the approved production or sandbox GHA gateway');
 }
 
 function run(command, commandArgs, { cwd, input } = {}) {
@@ -53,13 +57,13 @@ function run(command, commandArgs, { cwd, input } = {}) {
 
 function wrangler(cwd, config, env, action, secretName, input) {
   const commandArgs = ['--no-install', 'wrangler', 'secret', action, secretName, '--config', config];
-  if (env) commandArgs.push('--env', env);
+  if (env && env !== 'production') commandArgs.push('--env', env);
   return run('npx', commandArgs, { cwd, input });
 }
 
 function wranglerSecretNames(cwd, config, env) {
   const commandArgs = ['--no-install', 'wrangler', 'secret', 'list', '--config', config];
-  if (env) commandArgs.push('--env', env);
+  if (env && env !== 'production') commandArgs.push('--env', env);
   const parsed = JSON.parse(run('npx', commandArgs, { cwd }));
   if (!Array.isArray(parsed)) throw new Error('Wrangler returned an unexpected secret inventory');
   return new Set(parsed.map((item) => item?.name).filter((name) => typeof name === 'string'));
@@ -72,7 +76,7 @@ function githubSecretNames() {
 
 function deleteWranglerSecret(cwd, config, env, secretName) {
   const commandArgs = ['--no-install', 'wrangler', 'secret', 'delete', secretName, '--config', config];
-  if (env) commandArgs.push('--env', env);
+  if (env && env !== 'production') commandArgs.push('--env', env);
   try { execFileSync('npx', commandArgs, { cwd, input: 'y\n', encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }); return true; }
   catch { return false; }
 }

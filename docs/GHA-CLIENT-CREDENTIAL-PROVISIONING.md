@@ -1,28 +1,45 @@
-# Provisioning an isolated GHA gateway credential
+# Provisioning isolated GHA gateway credentials
 
-Each Runner API sandbox gets a distinct key for its GHA gateway client. The matching value
-is installed in three places: a named client secret on the GHA gateway, `GHA_WORKER_TOKEN`
-on that Runner API Worker, and a sandbox-specific GitHub Actions environment secret. For
-sandbox3, the names are `WORKER_CLIENT_TOKEN_SANDBOX3_AGENT_API`, `GHA_WORKER_TOKEN`, and
-`GHA_WORKER_TOKEN_SANDBOX3_AGENT_API` respectively.
+Each real Runner API Worker needs a unique GHA gateway client credential. A generated value
+is installed in three places: a named client secret on the correct GHA gateway, that Runner
+Worker's `GHA_WORKER_TOKEN`, and a GitHub Actions environment secret for the corresponding
+repository environment. The command never prints the value, refuses to overwrite any existing
+copy, and verifies gateway authentication without creating a run.
 
-After the gateway client-credential support and Runner capacity-cutover changes have been
-deployed to their sandbox environments, run from this repository:
+| Runner API Worker | Client ID | Runner config | Gateway URL/environment | GitHub environment |
+| --- | --- | --- | --- | --- |
+| sandbox3 | `sandbox3_agent_api` | `wrangler.sandbox3.jsonc` | sandbox gateway / `sandbox` | `sandbox` |
+| Telegram UX sandbox | `telegram_ux_v1_agent_api` | `wrangler.telegram-ux-v1.jsonc` | sandbox gateway / `sandbox` | `sandbox` |
+| production | `production_agent_api` | `wrangler.production.jsonc` | production gateway / `production` | `production` |
+
+The gateway URL and gateway environment are validated as a pair. The `production` gateway
+environment means the base production Worker (no Wrangler `--env` flag); `sandbox` uses the
+isolated sandbox Worker. The mock-only `cp-sandbox3` Worker is deliberately excluded.
+
+Run a read-only inventory first, then repeat without `--dry-run` only after the exact target
+environment and credential stores have been reviewed:
 
 ```sh
 GHA_GATEWAY_REPO_DIR=/path/to/opencode-gha-runner \
   node scripts/provision-gha-client-credential.mjs --client-id sandbox3_agent_api \
-  --gateway-env sandbox --runner-config wrangler.sandbox3.jsonc --github-env sandbox
+  --gateway-env sandbox --runner-config wrangler.sandbox3.jsonc --github-env sandbox --dry-run
+
+GHA_GATEWAY_REPO_DIR=/path/to/opencode-gha-runner \
+  node scripts/provision-gha-client-credential.mjs --client-id telegram_ux_v1_agent_api \
+  --gateway-env sandbox --runner-config wrangler.telegram-ux-v1.jsonc --github-env sandbox --dry-run
+
+GHA_GATEWAY_REPO_DIR=/path/to/opencode-gha-runner \
+  node scripts/provision-gha-client-credential.mjs --client-id production_agent_api \
+  --gateway-env production --runner-config wrangler.production.jsonc --github-env production --dry-run
 ```
 
-The operator needs Cloudflare credentials for both sandbox Workers and GitHub Actions
-environment-secret write access. The command refuses to overwrite any existing copy. It
-generates 32 random bytes, streams the value over stdin to each secret manager, verifies that
-the gateway accepts the new Bearer token without creating a run, and never prints the value.
-If a later step fails, it removes copies created in this invocation and reports any cleanup
-that needs attention. Use a new client ID for an additional sandbox; use a separately reviewed
-rotation procedure when a credential already exists.
+The operator needs Cloudflare credentials for the selected gateway and Runner Workers, plus
+GitHub Actions environment-secret write access. If a later write or verification fails, the
+command removes the copies created in that invocation and reports any cleanup requiring
+attention. Existing credentials must use a separately reviewed rotation procedure.
 
-The canary workflow reads `GHA_WORKER_TOKEN_SANDBOX3_AGENT_API`, while the Runner API reads its
-own `GHA_WORKER_TOKEN`. The sandbox3 Runner points to the isolated GHA gateway sandbox. The
-production GHA gateway URL and its existing primary token are untouched.
+Do not provision production or deploy the production Runner configuration until the reviewed
+source is merged and the production deployment workflow's exact-SHA sandbox gate passes. After
+provisioning, confirm `/v1/capabilities` reports `executionRegions: ["eu-vm-agent-run"]` and
+`fallbackExecutionRegions: ["azure-cloud"]`. That indicates both routes are configured; a
+live controlled capacity-refusal canary is still required to prove fallback execution.

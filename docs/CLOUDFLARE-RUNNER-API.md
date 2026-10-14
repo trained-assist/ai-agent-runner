@@ -56,20 +56,31 @@ the target ownership boundary. Do not extend that handoff; move provisioning to 
 production secrets and remove the CP copy only after Runner readiness and CP authentication are
 verified. See architecture [#208](https://github.com/trained-assist/trained-agent-architecture/issues/208).
 
-`eu-vm-agent-run` remains the default and primary execution route. The sandbox3 Worker knows
-the GHA/Azure gateway URL as a secondary route, but capacity cutover is enabled only when the
-Runner-owned `GHA_WORKER_TOKEN` secret is provisioned for the sandbox3 fallback. The gateway
-uses a separate named credential `WORKER_CLIENT_TOKEN_SANDBOX3_AGENT_API`, so this sandbox can
-be rotated or revoked without touching the gateway's existing primary key or other clients.
-The shared sandbox provisioning command installs the same generated value in the gateway,
-Runner API and GitHub Actions secret stores, then checks authenticated gateway access without
-creating a run. The cutover occurs only after France returns the typed pre-admission refusal
+`eu-vm-agent-run` remains the default and primary execution route. Production, sandbox3 and
+the Telegram UX sandbox each configure a GHA/Azure gateway as a secondary route. Capacity
+cutover is enabled independently per Worker only when its Runner-owned `GHA_WORKER_TOKEN` is
+provisioned. Each environment has a distinct named gateway credential, so sandbox tokens can
+be rotated or revoked without touching production or other clients. The provisioning command
+installs each generated value in that environment's gateway, Runner API and GitHub Actions
+environment, then checks authenticated gateway access without creating a run. Capabilities
+continues to list France in `executionRegions` (the caller-facing primary engine) and reports
+`azure-cloud` separately in `fallbackExecutionRegions` only when both URL and credential are
+present. The cutover occurs only after France returns the typed pre-admission refusal
 `503 { accepted: false, code: "WORKER_CAPACITY" }`; the same run and operation identity is then
 persisted against `azure-cloud` before dispatch. Other refusals do not trigger this cutover. An
 accepted or ambiguous France launch is reconciled on France and never started again on GHA.
-Production remains France-only until a separately reviewed promotion provisions a production
-credential. The sandbox-only `mock-test` engine returns fixed `pong` without calling a worker
-or model.
+The production fallback remains disabled until its separately reviewed secret provisioning and
+deployment are completed. The isolated `cp-sandbox3` mock-only Worker remains independent and
+never advertises or invokes either real worker. The sandbox-only `mock-test` engine returns
+fixed `pong` without calling a worker or model.
+
+The three real Worker targets are `sandbox3` (GHA sandbox gateway), `telegram-ux-v1` (GHA
+sandbox gateway), and `production` (GHA production gateway). Provision each with a distinct
+client ID: `sandbox3_agent_api` / `wrangler.sandbox3.jsonc` / GitHub environment `sandbox`,
+`telegram_ux_v1_agent_api` / `wrangler.telegram-ux-v1.jsonc` / `sandbox`, and
+`production_agent_api` / `wrangler.production.jsonc` / `production`. The gateway environment is
+`sandbox` for the first two and `production` for the base production gateway. `cp-sandbox3` is
+deliberately excluded because it is an isolated mock contract test.
 
 ## Configuration
 
@@ -142,8 +153,8 @@ Worker secrets:
 - `VM_WORKER_URL`: HTTPS address of the France execution worker route.
 - `VM_WORKER_TOKEN`: the France worker's current Bearer credential.
 - `GHA_WORKER_URL`: non-secret HTTPS address of the GHA/Azure gateway; configured as a Worker var
-  only in sandbox3 for this rollout.
-- `GHA_WORKER_TOKEN`: the sandbox's GHA gateway client Bearer credential, stored as a Runner
+  for production, sandbox3 and Telegram UX sandbox.
+- `GHA_WORKER_TOKEN`: this Runner environment's GHA gateway client Bearer credential, stored as a Runner
   Worker secret. It is distinct from the gateway primary credential and never goes to CP,
   France, or task input. If absent, the API remains France-only.
 - `RUN_LAUNCH_ENCRYPTION_KEY`: stable random value of at least 32 characters. The Durable

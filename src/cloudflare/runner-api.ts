@@ -3,6 +3,15 @@ import type { ApiPrincipal, RunnerWorkerEnv } from './types.js';
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const DEFAULT_ENGINE = 'eu-vm-agent-run';
 
+function fallbackExecutionRegions(env: RunnerWorkerEnv): string[] {
+  if ((env.GHA_WORKER_TOKEN?.trim().length ?? 0) < 24) return [];
+  try {
+    const url = new URL(env.GHA_WORKER_URL?.trim() ?? '');
+    if (url.protocol !== 'https:' || url.username || url.password || url.hash || url.pathname !== '/' || url.search) return [];
+    return ['azure-cloud'];
+  } catch { return []; }
+}
+
 interface KeyConfig extends ApiPrincipal { keyHash: string }
 
 function json(value: unknown, status = 200): Response {
@@ -118,7 +127,7 @@ export default {
     catch { return error('FORBIDDEN', 'invalid or expired host profile capability', 403); }
     if (url.pathname === '/v1/capabilities' && request.method === 'GET') {
       if (!requireScope(principal, 'runs:read')) return error('FORBIDDEN', 'API key does not have the required scope', 403);
-      return json({ schemaVersion: 1, contract: { name: 'ai-agent-runner/serverless-agent-api', version: 1 }, placement: 'cloudflare-worker', executionRegions: ['eu-vm-agent-run'] });
+      return json({ schemaVersion: 1, contract: { name: 'ai-agent-runner/serverless-agent-api', version: 1 }, placement: 'cloudflare-worker', executionRegions: [env.RUNNER_ENGINE || DEFAULT_ENGINE], fallbackExecutionRegions: fallbackExecutionRegions(env) });
     }
     if (url.pathname === '/v1/sandbox/cleanup-task') {
       if (request.method !== 'POST') return error('METHOD_NOT_ALLOWED', 'method not allowed', 405);

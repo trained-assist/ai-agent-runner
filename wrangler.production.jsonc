@@ -13,6 +13,7 @@
     "DEPLOYMENT_ENV": "production",
     "RUNNER_API_PUBLIC_URL": "https://trained-assist-runner-api-production.skillset-apply.workers.dev",
     "RUNNER_ENGINE": "eu-vm-agent-run",
+    "GHA_WORKER_URL": "https://opencode-gha-runner-gateway.skillset-apply.workers.dev",
     "MOCK_TEST_ENABLED": "false",
     "ALLOWED_REPOSITORIES": "trained-assist/ai-agent-runner",
     "ALLOWED_ENVIRONMENT_NAMES": "LLM_LADDER_TOKEN"
