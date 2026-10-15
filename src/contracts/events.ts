@@ -19,6 +19,8 @@ export const RUNNER_EVENT_TYPES = [
   'inputs_materialized',
   'started',
   'log',
+  'assistant_message',
+  'assistant_question',
   'exit',
   'finalizing',
   'artifact_exported',
@@ -95,6 +97,22 @@ export interface InputsMaterializedEvent extends EventEnvelope {
 export interface LogEvent extends EventEnvelope {
   type: 'log';
   payload: { stream: 'stdout' | 'stderr' | 'runner'; level: 'info' | 'warn' | 'error'; message: string };
+}
+
+/** A completed, user-visible OpenCode message that precedes a tool-call step. */
+export interface AssistantMessageEvent extends EventEnvelope {
+  type: 'assistant_message';
+  payload: { sessionId: string; messageId: string; text: string };
+}
+
+export interface AssistantQuestionEvent extends EventEnvelope {
+  type: 'assistant_question';
+  payload: {
+    sessionId: string;
+    requestId: string;
+    questions: Array<{ header: string; question: string; multiple: boolean; options: Array<{ label: string; description: string }> }>;
+    toolCallId: string | null;
+  };
 }
 
 export interface ExitEvent extends EventEnvelope {
@@ -219,6 +237,8 @@ export type RunnerEvent =
   | InputsMaterializedEvent
   | StartedEvent
   | LogEvent
+  | AssistantMessageEvent
+  | AssistantQuestionEvent
   | ExitEvent
   | FinalizingEvent
   | ArtifactExportedEvent
@@ -266,6 +286,8 @@ const PAYLOAD_KEYS: Record<RunnerEventType, readonly string[]> = {
   inputs_materialized: ['status', 'declared', 'requested', 'files', 'bytes', 'entries', 'reason'],
   started: ['pid'],
   log: ['stream', 'level', 'message'],
+  assistant_message: ['sessionId', 'messageId', 'text'],
+  assistant_question: ['sessionId', 'requestId', 'questions', 'toolCallId'],
   exit: ['code', 'signal'],
   finalizing: ['reason'],
   artifact_exported: ['artifactId', 'sourcePath', 'size', 'sha256', 'mime', 'version'],
@@ -353,6 +375,38 @@ function validatePayload(type: RunnerEventType, value: unknown, path: string, co
       }
       checkString(value['message'], `${path}.message`, collector, 10_000);
       break;
+    case 'assistant_message':
+      checkString(value['sessionId'], `${path}.sessionId`, collector, 100);
+      checkString(value['messageId'], `${path}.messageId`, collector, 200);
+      checkString(value['text'], `${path}.text`, collector, 64_000);
+      break;
+    case 'assistant_question': {
+      checkString(value['sessionId'], `${path}.sessionId`, collector, 100);
+      checkString(value['requestId'], `${path}.requestId`, collector, 200);
+      if (value['toolCallId'] !== null) checkString(value['toolCallId'], `${path}.toolCallId`, collector, 200);
+      const questions = value['questions'];
+      if (!checkArray(questions, `${path}.questions`, collector)) break;
+      if (questions.length < 1 || questions.length > 20) collector.push(`${path}.questions: expected 1..20 questions`);
+      questions.slice(0, 20).forEach((question, index) => {
+        const questionPath = `${path}.questions[${index}]`;
+        if (!checkObject(question, questionPath, collector)) return;
+        checkKeys(question, ['header', 'question', 'multiple', 'options'], ['header', 'question', 'multiple', 'options'], questionPath, collector);
+        checkString(question['header'], `${questionPath}.header`, collector, 200);
+        checkString(question['question'], `${questionPath}.question`, collector, 5000);
+        if (typeof question['multiple'] !== 'boolean') collector.push(`${questionPath}.multiple: expected boolean`);
+        const options = question['options'];
+        if (!checkArray(options, `${questionPath}.options`, collector)) return;
+        if (options.length > 20) collector.push(`${questionPath}.options: too many options`);
+        options.slice(0, 20).forEach((option, optionIndex) => {
+          const optionPath = `${questionPath}.options[${optionIndex}]`;
+          if (!checkObject(option, optionPath, collector)) return;
+          checkKeys(option, ['label', 'description'], ['label', 'description'], optionPath, collector);
+          checkString(option['label'], `${optionPath}.label`, collector, 200);
+          checkString(option['description'], `${optionPath}.description`, collector, 500);
+        });
+      });
+      break;
+    }
     case 'exit':
       if (value['code'] !== null && typeof value['code'] !== 'number') collector.push(`${path}.code: expected number or null`);
       if (value['signal'] !== null && typeof value['signal'] !== 'string') collector.push(`${path}.signal: expected string or null`);

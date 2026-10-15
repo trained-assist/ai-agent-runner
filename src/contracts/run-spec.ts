@@ -45,6 +45,8 @@ export interface InputRef {
 export interface InputSpec {
   refs?: InputRef[];
   inlinePrompt?: string;
+  /** Resume the OpenCode session archived in this task's profile workspace. */
+  resumeSessionFrom?: { sourceRunId: string; sessionId: string; path: string; sha256: string; size: number };
 }
 
 export interface IngressManifestRef {
@@ -313,8 +315,29 @@ function validateEnvAllowlist(value: unknown, path: string, collector: ErrorColl
 
 function validateInput(value: unknown, path: string, collector: ErrorCollector): InputSpec | undefined {
   if (!checkObject(value, path, collector)) return undefined;
-  checkKeys(value, ['refs', 'inlinePrompt'], [], path, collector);
+  checkKeys(value, ['refs', 'inlinePrompt', 'resumeSessionFrom'], [], path, collector);
   const input: InputSpec = {};
+  if (value['resumeSessionFrom'] !== undefined) {
+    const source = value['resumeSessionFrom'];
+    if (checkObject(source, `${path}.resumeSessionFrom`, collector)) {
+      checkKeys(source, ['sourceRunId', 'sessionId', 'path', 'sha256', 'size'], ['sourceRunId', 'sessionId', 'path', 'sha256', 'size'], `${path}.resumeSessionFrom`, collector);
+      if (!isSafeId(source['sourceRunId'])) collector.push(`${path}.resumeSessionFrom.sourceRunId: expected a safe run id`);
+      if (typeof source['sessionId'] !== 'string' || !/^ses_[0-7][0-9A-HJKMNP-TV-Z]{25}$/.test(source['sessionId'])) collector.push(`${path}.resumeSessionFrom.sessionId: expected an OpenCode session id`);
+      if (typeof source['path'] !== 'string' || source['path'] !== `.session-traces/${String(source['sessionId'])}.json`) collector.push(`${path}.resumeSessionFrom.path: expected the session archive path`);
+      if (typeof source['sha256'] !== 'string' || !/^[0-9a-f]{64}$/.test(source['sha256'])) collector.push(`${path}.resumeSessionFrom.sha256: expected sha256`);
+      if (typeof source['size'] !== 'number' || !Number.isSafeInteger(source['size']) || source['size'] < 0) collector.push(`${path}.resumeSessionFrom.size: expected non-negative integer`);
+      if (isSafeId(source['sourceRunId']) && typeof source['sessionId'] === 'string'
+        && /^ses_[0-7][0-9A-HJKMNP-TV-Z]{25}$/.test(source['sessionId'])
+        && source['path'] === `.session-traces/${source['sessionId']}.json`
+        && typeof source['sha256'] === 'string' && /^[0-9a-f]{64}$/.test(source['sha256'])
+        && typeof source['size'] === 'number' && Number.isSafeInteger(source['size']) && source['size'] >= 0) {
+        input.resumeSessionFrom = {
+          sourceRunId: source['sourceRunId'], sessionId: source['sessionId'], path: source['path'],
+          sha256: source['sha256'], size: source['size'],
+        };
+      }
+    }
+  }
   if (value['refs'] !== undefined) {
     const refs = value['refs'];
     if (checkArray(refs, `${path}.refs`, collector)) {

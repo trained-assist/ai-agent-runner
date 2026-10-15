@@ -20,7 +20,7 @@ import type { BlobCallOptions, BlobHead, BlobRef, BlobStore } from '../src/stora
 
 /** Движок, который пишет объявленный файл выхода и печатает ответ. */
 class WritingEngine implements EngineAdapter {
-  readonly name = 'fake';
+  readonly name: string = 'fake';
   startCalls = 0;
 
   constructor(private readonly files: Record<string, string> = { 'ran.txt': 'ok' }) {}
@@ -56,6 +56,14 @@ class WritingEngine implements EngineAdapter {
 class SilentEngine extends WritingEngine {
   protected override script(): string {
     return super.script().replace("console.log('agent: готово');", '');
+  }
+}
+
+class OpenCodeCheckpointEngine extends WritingEngine {
+  override readonly name = 'opencode';
+
+  constructor() {
+    super({ '.session-traces/ses_01J9A3J9Y7V8W2K4M6N0PQRSTZ.json': JSON.stringify({ info: { id: 'ses_01J9A3J9Y7V8W2K4M6N0PQRSTZ' }, messages: [{ role: 'assistant' }] }) });
   }
 }
 
@@ -98,6 +106,16 @@ function resultOnDisk(rootDir: string, runId: string): { persistence: string; cl
 }
 
 describe('lifecycle рана: persist → проверенная уборка (issue #52, шаги 3–5)', () => {
+  it('does not claim a session checkpoint when the existing profile archive path is absent', async () => {
+    const engine = new OpenCodeCheckpointEngine();
+    const h = createHarness({ adapters: { opencode: engine }, artifactExport: true });
+    const { receipt } = h.start({ engine: { name: 'opencode', adapterVersion: '1' } });
+    const result = await h.runner.waitFor(receipt.runId);
+
+    expect(result.outputRefs).toHaveLength(0);
+    expect(result.sessionCheckpoint).toBeUndefined();
+  });
+
   it('после terminal+persist каталог и сокет рана отсутствуют, а результат и лог читаются', async () => {
     const engine = new WritingEngine();
     const h = createHarness({ adapters: { fake: engine }, artifactExport: true });

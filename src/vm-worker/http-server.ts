@@ -433,6 +433,7 @@ function toLaunchResult(options: VmWorkerServerOptions, snapshot: NonNullable<Re
     stderr,
     answer: checkpoint?.answer.text ?? null,
     answerSource: checkpoint?.answer.source ?? null,
+    ...(result.sessionCheckpoint ? { sessionCheckpoint: result.sessionCheckpoint } : {}),
     durationMs: Number.isFinite(started) && Number.isFinite(finished) ? Math.max(0, finished - started) : 0,
     timedOut: result.exitReason === 'timeout',
     outputTruncated: stdout.length + stderr.length >= (spec?.limits.maxOutputBytes ?? 1_000_000),
@@ -470,6 +471,10 @@ async function streamLogs(req: IncomingMessage, res: ServerResponse, runner: Run
     const events = runner.events(runId, cursor);
     for (const event of events) {
       cursor = Math.max(cursor, event.sequence);
+      if (event.type === 'assistant_message') {
+        res.write(`id: ${event.sequence}\nevent: assistant_message\ndata: ${JSON.stringify(event.payload)}\n\n`);
+        continue;
+      }
       if (event.type !== 'log') continue;
       const stream = event.payload.stream;
       if (stream !== 'stdout' && stream !== 'stderr') continue;

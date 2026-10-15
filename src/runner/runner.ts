@@ -1,4 +1,5 @@
 import { chmodSync, chownSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { EngineAdapter, EngineHandle } from '../adapters/engine/engine-adapter.js';
@@ -10,7 +11,7 @@ import {
   type RunnerEvent,
   type RunnerEventType,
 } from '../contracts/events.js';
-import type { RunResult } from '../contracts/result.js';
+import type { RunResult, SessionCheckpointRef } from '../contracts/result.js';
 import type { RunSpec } from '../contracts/run-spec.js';
 import { stripRepositoryToken, validateRunSpec } from '../contracts/run-spec.js';
 import { ConflictError, PreflightError, SpecValidationError } from '../contracts/validate.js';
@@ -28,7 +29,7 @@ import { InputMaterializer, type MaterializeReceipt } from '../storage/input-mat
 import { materializeIngressManifest, type IngressArtifactResolver } from '../storage/ingress-artifact.js';
 import { artifactNameFor, mimeForName } from '../storage/export-manifest.js';
 import type { RunExportManifest } from '../storage/export-manifest.js';
-import { isRegularFile, resolveExistingInsideRoot } from '../storage/local-paths.js';
+import { isRegularFile, resolveExistingInsideRoot, resolveInsideRoot } from '../storage/local-paths.js';
 import { profileKey } from '../storage/keys.js';
 import { redactSecrets, specHash, truncateLine, writeFileAtomic } from './util.js';
 import {
@@ -283,6 +284,7 @@ interface InternalRun {
   workspaceToken: string | null;
   repositoryCommit: string | null;
   workspacePublishFailed: boolean;
+  sessionCheckpoint: SessionCheckpointRef | null;
 }
 
 /**
@@ -458,6 +460,7 @@ export class Runner {
         workspaceToken: null,
         repositoryCommit: state.profileWorkspaceCommit ?? state.result?.repositoryCommit ?? null,
         workspacePublishFailed: false,
+        sessionCheckpoint: state.result?.sessionCheckpoint ?? null,
       });
     }
   }
@@ -655,6 +658,7 @@ export class Runner {
         : spec.profileWorkspace ? spec.repository?.token ?? null : null,
       repositoryCommit: null,
       workspacePublishFailed: false,
+      sessionCheckpoint: null,
     });
     this.emit(state, 'claimed', { operationId });
     void this.execute(spec.runId).catch(() => undefined);
@@ -1143,6 +1147,8 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
             }
           : {}),
         onLog: (stream, line) => this.onEngineLog(runId, stream, line),
+        onAssistantMessage: (message) => this.onEngineAssistantMessage(runId, message),
+        onAssistantQuestion: (question) => this.onEngineAssistantQuestion(runId, question),
         onExit: (code, signal) => {
           void this.onEngineExit(runId, code, signal);
         },
@@ -1273,6 +1279,36 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
    */
   private async materializeInputs(st: PersistedRunState): Promise<void> {
     const refs = st.spec.input?.refs ?? [];
+    const resume = st.spec.input?.resumeSessionFrom;
+    if (resume) {
+      if (st.spec.engine.name !== 'opencode') {
+        throw new PreflightError('MATERIALIZE_REF_INVALID', 'OpenCode session checkpoints can only resume an OpenCode run');
+      }
+      if (!st.spec.profileWorkspace?.snapshotUrl || !st.spec.profileWorkspace.savebackUrl) {
+        throw new PreflightError('MATERIALIZE_REF_INVALID', 'OpenCode session resume requires the existing profile archive/restore path');
+      }
+      if (resume.path !== `.session-traces/${resume.sessionId}.json`) {
+        throw new PreflightError('MATERIALIZE_REF_INVALID', 'OpenCode session checkpoint path is outside the session archive namespace');
+      }
+      let bytes: Buffer;
+      try {
+        bytes = readFileSync(resolveInsideRoot(st.spec.cwd, resume.path, 'OpenCode session checkpoint'));
+      } catch (error) {
+        throw new PreflightError('MATERIALIZE_REF_UNAVAILABLE', `OpenCode session checkpoint was not restored from the profile archive: ${String((error as Error).message)}`, { retryable: true });
+      }
+      let sessionId: unknown;
+      try {
+        const parsed = JSON.parse(bytes.toString('utf8')) as { info?: { id?: unknown } };
+        sessionId = parsed.info?.id;
+      } catch {
+        throw new PreflightError('MATERIALIZE_REF_INVALID', 'OpenCode session checkpoint is not valid exported session JSON');
+      }
+      if (bytes.length !== resume.size || createHash('sha256').update(bytes).digest('hex') !== resume.sha256
+        || typeof sessionId !== 'string' || sessionId !== resume.sessionId || !/^ses_[0-7][0-9A-HJKMNP-TV-Z]{25}$/.test(sessionId)) {
+        throw new PreflightError('MATERIALIZE_REF_INVALID', 'OpenCode session checkpoint failed profile archive integrity validation');
+      }
+      this.emit(st, 'log', { stream: 'runner', level: 'info', message: `opencode.session_checkpoint_restored sessionId=${sessionId} bytes=${bytes.length} sourceRunId=${resume.sourceRunId}` });
+    }
     const materializer = this.opts.inputs;
     const ingress = st.spec.ingressManifest;
     if (ingress) {
@@ -1803,6 +1839,41 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
     this.emit(st, 'log', { stream, level: 'info', message: sanitized });
   }
 
+  private onEngineAssistantMessage(runId: string, message: { sessionId: string; messageId: string; text: string }): void {
+    const run = this.runs.get(runId);
+    if (!run || this.disposed || isTerminalState(run.state.state)) return;
+    if (!/^ses_[0-7][0-9A-HJKMNP-TV-Z]{25}$/.test(message.sessionId) || !message.messageId.trim()) return;
+    // These are user-visible message bodies, so preserve normal paragraph/newline
+    // formatting while redacting credentials and non-printable controls.
+    const safeText = redactRunSecrets(redactSecrets(message.text), run.runtimeSecrets)
+      .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, ' ')
+      .slice(0, 64_000);
+    if (!safeText.trim()) return;
+    this.emit(run.state, 'assistant_message', { sessionId: message.sessionId, messageId: message.messageId, text: safeText });
+  }
+
+  private onEngineAssistantQuestion(runId: string, question: {
+    sessionId: string;
+    requestId: string;
+    questions: Array<{ header: string; question: string; multiple: boolean; options: Array<{ label: string; description: string }> }>;
+    toolCallId: string | null;
+  }): void {
+    const run = this.runs.get(runId);
+    if (!run || this.disposed || isTerminalState(run.state.state)) return;
+    if (!/^ses_[0-7][0-9A-HJKMNP-TV-Z]{25}$/.test(question.sessionId) || !question.requestId.trim()) return;
+    const safe = (value: string, limit: number): string => redactRunSecrets(redactSecrets(value), run.runtimeSecrets)
+      .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, ' ').slice(0, limit);
+    this.emit(run.state, 'assistant_question', {
+      sessionId: question.sessionId,
+      requestId: question.requestId.slice(0, 200),
+      toolCallId: question.toolCallId?.slice(0, 200) ?? null,
+      questions: question.questions.slice(0, 20).map(item => ({
+        header: safe(item.header, 200), question: safe(item.question, 5000), multiple: item.multiple === true,
+        options: item.options.slice(0, 20).map(option => ({ label: safe(option.label, 200), description: safe(option.description, 500) })),
+      })),
+    });
+  }
+
   /**
    * Хвост stdout движка — запасной источник текста ответа (issue #52, шаг 2). Накопитель
    * ограничен и живёт только в памяти воркера: после выхода движка хвост либо становится
@@ -1968,6 +2039,7 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
       }
     }
     const exit = run ? this.resolveExit(run, st) : null;
+    await this.saveOpenCodeSessionCheckpoint(st, run ?? null);
     // Fast result boundary: persist the engine outcome and answer before any declared
     // output upload. The checkpoint + result are durable on the Runner host; the clean
     // room remains leased until recover() verifies remote custody and completes cleanup.
@@ -2358,6 +2430,48 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
   }
 
   /**
+   * Привязывает OpenCode transcript к существующему profile saveback/archive. Полные
+   * bytes идут по действующей политике heavy objects в GCS, а GitHub profile держит
+   * только архивный ref; отдельный ArtifactStore для сессий не создаётся.
+   */
+  private async saveOpenCodeSessionCheckpoint(st: PersistedRunState, run: InternalRun | null): Promise<void> {
+    if (st.spec.engine.name !== 'opencode' || !run || !st.spec.profileWorkspace?.savebackUrl) return;
+    const sessionDir = join(st.spec.cwd, '.session-traces');
+    if (!existsSync(sessionDir)) return;
+    try {
+      const changed = st.result?.profileChanges?.files ?? [];
+      const names = changed.map((file) => file.path.match(/^\.session-traces\/(ses_[0-7][0-9A-HJKMNP-TV-Z]{25})\.json$/)?.[1]).filter((id): id is string => !!id);
+      const resumed = st.spec.input?.resumeSessionFrom;
+      const candidateIds = [...new Set([...names, ...(resumed ? [resumed.sessionId] : [])])];
+      let selected: { sessionId: string; path: string; bytes: Buffer } | undefined;
+      for (const sessionId of candidateIds) {
+        const relativePath = `.session-traces/${sessionId}.json`;
+        let bytes: Buffer;
+        try { bytes = readFileSync(resolveInsideRoot(st.spec.cwd, relativePath, 'OpenCode session checkpoint')); }
+        catch { continue; }
+        const expected = changed.find((file) => file.path === relativePath);
+        const archivedResume = resumed?.path === relativePath && resumed.sha256 === createHash('sha256').update(bytes).digest('hex') && resumed.size === bytes.length;
+        if ((expected && expected.sha256 === createHash('sha256').update(bytes).digest('hex') && expected.size === bytes.length) || archivedResume) {
+          selected = { sessionId, path: relativePath, bytes };
+          break;
+        }
+      }
+      if (!selected) return;
+      const { sessionId, path: relativePath, bytes } = selected;
+      const parsed = JSON.parse(bytes.toString('utf8')) as { info?: { id?: unknown } };
+      if (parsed.info?.id !== sessionId || !/^ses_[0-7][0-9A-HJKMNP-TV-Z]{25}$/.test(sessionId)) {
+        throw new Error('exported session has an invalid id');
+      }
+      const sha256 = createHash('sha256').update(bytes).digest('hex');
+      run.sessionCheckpoint = { sourceRunId: names.includes(sessionId) ? st.runId : resumed?.sourceRunId ?? st.runId, sessionId, path: relativePath, sha256, size: bytes.length };
+      this.emit(st, 'log', { stream: 'runner', level: 'info', message: `opencode.session_checkpoint_archived sessionId=${sessionId} bytes=${bytes.length} sha256=${sha256}` });
+    } catch (error) {
+      const detail = truncateLine(redactSecrets(error instanceof Error ? error.message : String(error)), 300);
+      this.emit(st, 'log', { stream: 'runner', level: 'warn', message: `opencode.session_checkpoint_unavailable reason=${detail}` });
+    }
+  }
+
+  /**
    * Текст ответа агента — отдельный долговечный артефакт `answer.txt` (issue #52, шаг 2).
    *
    * Он не входит в план экспорта: план — это контракт клиента (объявленные выходы) плюс
@@ -2577,6 +2691,7 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
       ? { status: 'failed' as const, reason: 'profile saveback upload failed; the VM retained the run workspace' }
       : this.persistenceStatus(exportManifest);
     const cleanupStatus = this.cleanupStatus(this.soleCopiesOnDisk(st, exportManifest), cleanup);
+    const sessionCheckpoint = this.runs.get(st.runId)?.sessionCheckpoint ?? st.result?.sessionCheckpoint;
 
     const result: RunResult = {
       schemaVersion: 1,
@@ -2594,6 +2709,7 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
       finishedAt: this.nowIso(),
       usage: { status: 'unknown' },
       outputRefs,
+      ...(sessionCheckpoint ? { sessionCheckpoint } : {}),
       persistence: persistence.status,
       persistenceReason: persistence.reason,
       cleanup: cleanupStatus.status,

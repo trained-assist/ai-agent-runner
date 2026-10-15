@@ -1276,7 +1276,8 @@ export class AgentApi {
       while (!state.controller.signal.aborted && !state.stopping && !this.disposed) {
         try {
           const result = await worker.streamLogs!(record.runId, cursor, state.controller.signal,
-            (stream, message, workerSequence) => this.appendWorkerLog(record, state, stream, message, workerSequence));
+            (stream, message, workerSequence) => this.appendWorkerLog(record, state, stream, message, workerSequence),
+            (message, workerSequence) => this.appendWorkerAssistantMessage(record, message, workerSequence));
           cursor = Math.max(cursor, result.cursor);
           if (result.completed) state.completed = true;
           if (!result.supported || result.completed) return;
@@ -1332,6 +1333,37 @@ export class AgentApi {
     this.store.recordWorkerLogCursor(record.runId, sourceSequence, apiSequence);
   }
 
+  private appendWorkerAssistantMessage(
+    record: AdmissionRecord,
+    message: { sessionId: string; messageId: string; text: string },
+    sourceSequence: number,
+  ): void {
+    const cursor = this.store.workerLogCursor(record.runId);
+    if (sourceSequence <= cursor.sourceSequence) return;
+    const progress = this.store.progressOf(record.runId);
+    const safeText = message.text.slice(0, 64_000);
+    let apiSequence = progress?.sequence ?? cursor.apiSequence;
+    if (progress && !isTerminalApiState(progress.state) && safeText.trim()) {
+      const event: RunnerEvent = {
+        schemaVersion: RUNNER_EVENT_SCHEMA_VERSION,
+        eventId: newApiId('evt'),
+        runId: record.runId,
+        jobId: record.jobId,
+        userTaskId: record.userTaskId,
+        profileId: record.profileId,
+        ownerGeneration: record.ownerGeneration,
+        sequence: progress.sequence + 1,
+        timestamp: this.nowIso(),
+        traceId: record.spec.traceId ?? null,
+        type: 'assistant_message',
+        payload: { sessionId: message.sessionId, messageId: message.messageId, text: safeText },
+      };
+      this.store.append(record.runId, [event]);
+      apiSequence = event.sequence;
+    }
+    this.store.recordWorkerLogCursor(record.runId, sourceSequence, apiSequence);
+  }
+
   /** The terminal status can beat the worker's 250ms log poll; replay once at the terminal cursor before finalizing. */
   private async drainWorkerLogStream(record: AdmissionRecord, worker: ExternalWorker): Promise<void> {
     const state = this.liveLogStreams.get(record.runId);
@@ -1344,7 +1376,8 @@ export class AgentApi {
     try {
       const cursor = this.store.workerLogCursor(record.runId).sourceSequence;
       const result = await worker.streamLogs(record.runId, cursor, controller.signal,
-        (stream, message, sourceSequence) => this.appendWorkerLog(record, state, stream, message, sourceSequence));
+        (stream, message, sourceSequence) => this.appendWorkerLog(record, state, stream, message, sourceSequence),
+        (message, sourceSequence) => this.appendWorkerAssistantMessage(record, message, sourceSequence));
       state.completed = result.supported && result.completed;
     } catch (err) {
       this.log({ event: 'worker_log_drain_incomplete', runId: record.runId, message: err instanceof Error ? err.message : String(err) });
