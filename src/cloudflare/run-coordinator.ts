@@ -22,6 +22,8 @@ interface RunRecord {
   artifacts: Array<Record<string, unknown>>; repo: Record<string, unknown> | null; logUrl: string | null;
   events: Array<Record<string, unknown>>;
   webhook?: WebhookDelivery;
+  developerGuest?: boolean;
+  artifactExpiresAt?: string;
 }
 interface CancellationFence { userTaskId: string; ownerGeneration: number; principalId: string; profileId: string; tenantId?: string; createdAt: string }
 interface Stored { runs: Record<string, RunRecord>; idempotency: Record<string, string>; cancellationFences?: Record<string, CancellationFence>; latestOwnerGeneration: number; requestId?: string; jobId?: string }
@@ -32,6 +34,7 @@ const ACTIVE = new Set<State>(['queued', 'starting', 'running']);
 const TERMINAL = new Set<State>(['succeeded', 'failed', 'cancelled']);
 const UNKNOWN_RECONCILE_MS = 30 * 60_000;
 const MAX_WEBHOOK_ATTEMPTS = 8;
+const GUEST_ARTIFACT_TTL_MS = 24 * 60 * 60_000;
 const now = (): string => new Date().toISOString();
 const stateKey = 'runner-v1';
 const MCP_TEST = Object.freeze({
@@ -48,10 +51,26 @@ function principalOf(request: Request): ApiPrincipal | null {
   try { return JSON.parse(request.headers.get('x-runner-principal') ?? 'null') as ApiPrincipal | null; } catch { return null; }
 }
 
+async function guestSignature(secret: string, runId: string, path: string, expiresAt: string): Promise<string> {
+  if (secret.length < 32) throw new Error('RUNNER_GUEST_DOWNLOAD_SECRET must contain at least 32 characters');
+  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const bytes = new Uint8Array(await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(`${runId}\n${path}\n${expiresAt}`)));
+  return [...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+async function guestDownloadUrl(env: RunnerWorkerEnv, run: RunRecord, path: string): Promise<string> {
+  const expiresAt = run.artifactExpiresAt!;
+  const signature = await guestSignature(env.RUNNER_GUEST_DOWNLOAD_SECRET ?? '', run.runId, path, expiresAt);
+  const url = new URL(`/v1/developer/downloads/${run.runId}`, env.RUNNER_API_PUBLIC_URL);
+  url.search = new URLSearchParams({ path, expires: expiresAt, signature }).toString();
+  return url.href;
+}
+
 function view(run: RunRecord): Record<string, unknown> {
   const progressAgeMs = run.workerReportedUpdatedAt ? Date.now() - Date.parse(run.workerReportedUpdatedAt) : null;
   return { requestId: run.requestId, userTaskId: run.userTaskId, conversationId: run.conversationId, runId: run.runId,
     ownerGeneration: run.ownerGeneration, state: run.state, engine: run.engine, cancelRequested: run.cancelRequested, connectionLost: run.state === 'unknown',
+    createdAt: run.createdAt, startedAt: run.startedAt, finishedAt: run.finishedAt,
     observedAt: run.updatedAt, lastHeartbeatAt: run.lastHeartbeatAt ?? null,
     statusFreshness: run.lastHeartbeatAt && Date.now() - Date.parse(run.lastHeartbeatAt) > 30_000 ? 'stale' : run.lastHeartbeatAt ? 'fresh' : 'unobserved',
     workerReportedUpdatedAt: run.workerReportedUpdatedAt ?? null,
@@ -141,10 +160,13 @@ export class RunnerRunCoordinator {
 
   async fetch(request: Request): Promise<Response> {
     await this.ready;
-    const principal = principalOf(request);
-    if (!principal) return error('UNAUTHENTICATED', 'authenticated principal missing', 401);
     const url = new URL(request.url);
     const segments = url.pathname.split('/').filter(Boolean);
+    if (segments.length === 4 && segments[0] === 'v1' && segments[1] === 'runs' && segments[3] === 'download') {
+      return this.guestDownload(request, segments[2]!);
+    }
+    const principal = principalOf(request);
+    if (!principal) return error('UNAUTHENTICATED', 'authenticated principal missing', 401);
     if (url.pathname === '/v1/sandbox/cleanup-task') return request.method === 'POST' ? this.cleanupTask(request, principal) : error('METHOD_NOT_ALLOWED', 'method not allowed', 405);
     if (url.pathname === '/v1/runs/cancel-by-idempotency-key') return request.method === 'POST' ? this.cancelByIdempotencyKey(request, principal) : error('METHOD_NOT_ALLOWED', 'method not allowed', 405);
     if (segments.length === 2 && request.method === 'GET') return this.listTaskRuns(url, principal);
@@ -183,21 +205,13 @@ export class RunnerRunCoordinator {
       }
       case 'artifacts':
         if (request.method !== 'GET') return error('METHOD_NOT_ALLOWED', 'artifacts supports GET only', 405);
+        if (run.developerGuest && run.artifactExpiresAt && Date.now() >= Date.parse(run.artifactExpiresAt)) return error('ARTIFACT_EXPIRED', 'guest artifacts are no longer available', 410);
         if (url.searchParams.has('path')) {
-          if (!TERMINAL.has(run.state)) return error('RESULT_NOT_READY', 'run outputs are not available before completion', 409);
-          const sourcePath = url.searchParams.get('path') ?? '';
-          if (!sourcePath || sourcePath.length > 512 || /[\x00-\x1f\x7f]/.test(sourcePath)) return error('INVALID_REQUEST', 'a valid artifact path is required', 400);
-          if (!run.artifacts.some((artifact) => artifact['path'] === sourcePath)) return error('NOT_FOUND', 'artifact path is not part of this run', 404);
-          const query = new URLSearchParams({ path: sourcePath });
-          const response = await this.worker(`/v1/runs/${encodeURIComponent(run.runId)}/artifacts?${query.toString()}`, 'GET', undefined, 30_000);
-          const headers = new Headers({ 'cache-control': 'private, no-store', 'x-content-type-options': 'nosniff' });
-          for (const name of ['content-type', 'content-length', 'content-disposition', 'x-content-sha256']) {
-            const value = response.headers.get(name);
-            if (value) headers.set(name, value);
-          }
-          return new Response(response.body, { status: response.status, headers });
+          return this.artifactBytes(run, url.searchParams.get('path') ?? '');
         }
-        return json({ runId, conversationId: run.conversationId, userTaskId: run.userTaskId, repo: run.repo, branchUrl: null, mergeUrl: null, count: run.artifacts.length, artifacts: run.artifacts, logUrl: run.logUrl, note: run.artifacts.length ? 'artifacts are committed by the VM worker to the run branch' : 'the VM worker reported no artifacts' });
+        return json({ runId, conversationId: run.conversationId, userTaskId: run.userTaskId, repo: run.developerGuest ? null : run.repo, branchUrl: null, mergeUrl: null, count: run.artifacts.length, artifacts: run.artifacts, logUrl: run.logUrl,
+          ...(run.developerGuest ? { expiresAt: run.artifactExpiresAt ?? null } : {}),
+          note: run.artifacts.length ? run.developerGuest ? 'guest downloads expire 24 hours after result collection' : 'artifacts are committed by the VM worker to the run branch' : 'the VM worker reported no artifacts' });
       case 'webhook':
         if (request.method !== 'GET') return error('METHOD_NOT_ALLOWED', 'webhook supports GET only', 405);
         if (!run.webhook) return error('WEBHOOK_NOT_CONFIGURED', 'run has no webhook', 404);
@@ -208,6 +222,41 @@ export class RunnerRunCoordinator {
       case 'cancel': return request.method === 'POST' ? this.cancel(request, runId, principal) : error('METHOD_NOT_ALLOWED', 'cancel supports POST only', 405);
       default: return error('ROUTE_NOT_FOUND', `no route for ${url.pathname}`, 404);
     }
+  }
+
+  private async guestDownload(request: Request, runId: string): Promise<Response> {
+    if (request.method !== 'GET') return error('METHOD_NOT_ALLOWED', 'downloads support GET only', 405);
+    if (!SAFE_ID.test(runId)) return error('INVALID_REQUEST', 'invalid run id', 400);
+    const run = (await this.read()).runs[runId];
+    if (!run?.developerGuest || !run.artifactExpiresAt) return error('NOT_FOUND', 'download not found', 404);
+    const url = new URL(request.url);
+    const path = url.searchParams.get('path') ?? '';
+    const expires = url.searchParams.get('expires') ?? '';
+    const signature = url.searchParams.get('signature') ?? '';
+    if (!path || expires !== run.artifactExpiresAt || !/^[0-9a-f]{64}$/.test(signature)) return error('NOT_FOUND', 'download not found', 404);
+    if (Date.now() >= Date.parse(expires)) return error('ARTIFACT_EXPIRED', 'guest artifact link has expired', 410);
+    if (!run.artifacts.some((artifact) => artifact['path'] === path)) return error('NOT_FOUND', 'download not found', 404);
+    const receivedBytes = Uint8Array.from(signature.match(/../g)!, (byte) => Number.parseInt(byte, 16));
+    const secret = this.env.RUNNER_GUEST_DOWNLOAD_SECRET ?? '';
+    if (secret.length < 32) return error('SERVER_MISCONFIGURED', 'guest download signing is unavailable', 503);
+    const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['verify']);
+    const valid = await crypto.subtle.verify('HMAC', key, receivedBytes, new TextEncoder().encode(`${runId}\n${path}\n${expires}`));
+    if (!valid) return error('NOT_FOUND', 'download not found', 404);
+    return this.artifactBytes(run, path);
+  }
+
+  private async artifactBytes(run: RunRecord, sourcePath: string): Promise<Response> {
+    if (!TERMINAL.has(run.state)) return error('RESULT_NOT_READY', 'run outputs are not available before completion', 409);
+    if (!sourcePath || sourcePath.length > 512 || /[\x00-\x1f\x7f]/.test(sourcePath)) return error('INVALID_REQUEST', 'a valid artifact path is required', 400);
+    if (!run.artifacts.some((artifact) => artifact['path'] === sourcePath)) return error('NOT_FOUND', 'artifact path is not part of this run', 404);
+    const query = new URLSearchParams({ path: sourcePath });
+    const response = await this.worker(`/v1/runs/${encodeURIComponent(run.runId)}/artifacts?${query.toString()}`, 'GET', undefined, 30_000);
+    const headers = new Headers({ 'cache-control': 'private, no-store', 'x-content-type-options': 'nosniff' });
+    for (const name of ['content-type', 'content-length', 'content-disposition', 'x-content-sha256']) {
+      const value = response.headers.get(name);
+      if (value) headers.set(name, value);
+    }
+    return new Response(response.body, { status: response.status, headers });
   }
 
   private async listTaskRuns(url: URL, principal: ApiPrincipal): Promise<Response> {
@@ -258,6 +307,9 @@ export class RunnerRunCoordinator {
   }
 
   private async submit(request: Request, principal: ApiPrincipal): Promise<Response> {
+    if (principal.developerGuest && (this.env.RUNNER_GUEST_DOWNLOAD_SECRET?.length ?? 0) < 32) {
+      return error('SERVER_MISCONFIGURED', 'guest download signing is unavailable', 503);
+    }
     const key = request.headers.get('idempotency-key')?.trim() ?? '';
     if (!key || key.length > 200) return error('MISSING_IDEMPOTENCY_KEY', 'Idempotency-Key header is required and must be at most 200 characters', 400);
     let body: Record<string, any>;
@@ -431,6 +483,7 @@ export class RunnerRunCoordinator {
           resultUrl, isolation: body.isolation ?? { mode: 'none' }, outputs: Array.isArray(body.outputs) ? body.outputs : [],
           ...(mcp.length ? await this.testRegistryAttachment(mcp[0], { runId, taskId, profileId: principal.profileId, timeoutMs: clampInteger(limits.timeoutMs, 300_000, 1_000, 86_400_000) }) : {}) };
       record = { requestId, runId, userTaskId: taskId, conversationId, jobId, ownerGeneration, principalId: principal.principalId, profileId: principal.profileId,
+        ...(principal.developerGuest ? { developerGuest: true } : {}),
         ...(principal.tenantId ? { tenantId: principal.tenantId } : {}), idempotencyKey: idemKey, payloadHash, engine, state: 'queued', sequence: 0,
         createdAt: time, updatedAt: time, startedAt: null, finishedAt: null, answer: null, cancelRequested: false, launchAttempts: 0, events: [], artifacts: [], repo: null, logUrl: null,
         ...(webhook ? { webhook } : {}), launchCiphertext: await encrypt(JSON.stringify(launch), this.env.RUN_LAUNCH_ENCRYPTION_KEY) };
@@ -668,6 +721,13 @@ export class RunnerRunCoordinator {
               const repo = run.repo;
               run.artifacts = Array.isArray(launchResult.artifacts) ? launchResult.artifacts.map((artifact: Record<string, any>) => ({ ...artifact,
                 url: repo && typeof repo['fullName'] === 'string' ? `https://github.com/${repo['fullName']}/${typeof repo['commit'] === 'string' && repo['commit'] ? `blob/${repo['commit']}` : `tree/${String(repo['branch'] ?? '')}`}/${String(artifact.path ?? '').split('/').map(encodeURIComponent).join('/')}` : String(artifact.path ?? '') })) : [];
+              if (run.developerGuest) {
+                run.artifactExpiresAt = new Date(Date.now() + GUEST_ARTIFACT_TTL_MS).toISOString();
+                run.artifacts = await Promise.all(run.artifacts.map(async (artifact) => {
+                  const downloadUrl = await guestDownloadUrl(this.env, run, String(artifact['path']));
+                  return { ...artifact, url: downloadUrl, downloadUrl, expiresAt: run.artifactExpiresAt };
+                }));
+              }
               const outcome = launchResult.exitReason === 'completed' ? 'succeeded' : launchResult.exitReason === 'cancelled' ? 'cancelled' : 'failed';
               run.result = { schemaVersion: 1, runId: run.runId, jobId: run.jobId, userTaskId: run.userTaskId, profileId: run.profileId, ownerGeneration: run.ownerGeneration,
                 outcome, exitReason: launchResult.exitReason ?? 'worker_crash', exitCode: launchResult.exitCode ?? null, exitSignal: launchResult.exitSignal ?? null,
@@ -676,7 +736,9 @@ export class RunnerRunCoordinator {
                   : launchResult.exitCode != null || launchResult.exitSignal != null,
                 startedAt: run.startedAt ?? run.createdAt, finishedAt: now(),
                 ...(run.answer !== null ? { text: run.answer } : {}), ...(launchResult.failure ? { failure: launchResult.failure } : {}), usage: { status: 'unknown' },
-                outputRefs: run.artifacts.map((artifact) => String(artifact['url'])), persistence: run.artifacts.length ? 'persisted' : 'not_required', persistenceReason: run.artifacts.length ? `artifacts are committed to ${String(repo?.['fullName'] ?? 'the repository')}` : 'the worker reported no artifacts', cleanup: 'completed', cleanupReason: 'execution workspace is owned by the France VM worker', logPath: run.logUrl ?? `vm-run:${run.runId}` };
+                outputRefs: run.artifacts.map((artifact) => String(run.developerGuest ? artifact['downloadUrl'] : artifact['url'])),
+                ...(run.developerGuest ? { artifacts: run.artifacts, artifactExpiresAt: run.artifactExpiresAt } : {}),
+                persistence: run.artifacts.length ? 'persisted' : 'not_required', persistenceReason: run.artifacts.length ? run.developerGuest ? 'artifacts were exported by the execution worker' : `artifacts are committed to ${String(repo?.['fullName'] ?? 'the repository')}` : 'the worker reported no artifacts', cleanup: 'completed', cleanupReason: 'execution workspace is owned by the France VM worker', logPath: run.logUrl ?? `vm-run:${run.runId}` };
               transition(run, outcome, { exitReason: launchResult.exitReason });
             }
           }
