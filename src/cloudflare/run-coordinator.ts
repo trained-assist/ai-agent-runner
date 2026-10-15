@@ -2,6 +2,8 @@ import type { ApiPrincipal, DurableObjectStateLike, RunnerWorkerEnv } from './ty
 import { DEFAULT_ENGINE, SAFE_ID, error, json } from './runner-api.js';
 import { deliverTerminalWebhook, resolveWebhook, type WebhookConnection, type WebhookDelivery } from './webhooks.js';
 
+const AGENT_HISTORY_PATH = '__runner/agent-history.json';
+
 type State = 'queued' | 'starting' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'unknown';
 interface RunRecord {
   requestId: string; runId: string; userTaskId: string; conversationId: string; jobId: string;
@@ -23,6 +25,7 @@ interface RunRecord {
   events: Array<Record<string, unknown>>;
   webhook?: WebhookDelivery;
   developerGuest?: boolean;
+  developerApi?: boolean;
   artifactExpiresAt?: string;
 }
 interface CancellationFence { userTaskId: string; ownerGeneration: number; principalId: string; profileId: string; tenantId?: string; createdAt: string }
@@ -250,7 +253,9 @@ export class RunnerRunCoordinator {
     if (!sourcePath || sourcePath.length > 512 || /[\x00-\x1f\x7f]/.test(sourcePath)) return error('INVALID_REQUEST', 'a valid artifact path is required', 400);
     if (!run.artifacts.some((artifact) => artifact['path'] === sourcePath)) return error('NOT_FOUND', 'artifact path is not part of this run', 404);
     const query = new URLSearchParams({ path: sourcePath });
-    const response = await this.worker(`/v1/runs/${encodeURIComponent(run.runId)}/artifacts?${query.toString()}`, 'GET', undefined, 30_000);
+    const response = await this.worker(sourcePath === AGENT_HISTORY_PATH && run.developerApi
+      ? `/v1/runs/${encodeURIComponent(run.runId)}/history`
+      : `/v1/runs/${encodeURIComponent(run.runId)}/artifacts?${query.toString()}`, 'GET', undefined, 30_000);
     const headers = new Headers({ 'cache-control': 'private, no-store', 'x-content-type-options': 'nosniff' });
     for (const name of ['content-type', 'content-length', 'content-disposition', 'x-content-sha256']) {
       const value = response.headers.get(name);
@@ -483,6 +488,7 @@ export class RunnerRunCoordinator {
           resultUrl, isolation: body.isolation ?? { mode: 'none' }, outputs: Array.isArray(body.outputs) ? body.outputs : [],
           ...(mcp.length ? await this.testRegistryAttachment(mcp[0], { runId, taskId, profileId: principal.profileId, timeoutMs: clampInteger(limits.timeoutMs, 300_000, 1_000, 86_400_000) }) : {}) };
       record = { requestId, runId, userTaskId: taskId, conversationId, jobId, ownerGeneration, principalId: principal.principalId, profileId: principal.profileId,
+        ...(principal.developerApi ? { developerApi: true } : {}),
         ...(principal.developerGuest ? { developerGuest: true } : {}),
         ...(principal.tenantId ? { tenantId: principal.tenantId } : {}), idempotencyKey: idemKey, payloadHash, engine, state: 'queued', sequence: 0,
         createdAt: time, updatedAt: time, startedAt: null, finishedAt: null, answer: null, cancelRequested: false, launchAttempts: 0, events: [], artifacts: [], repo: null, logUrl: null,
@@ -719,8 +725,22 @@ export class RunnerRunCoordinator {
               run.repo = launchResult.repo && typeof launchResult.repo === 'object' ? launchResult.repo as Record<string, unknown> : null;
               run.logUrl = typeof launchResult.logUrl === 'string' && launchResult.logUrl ? launchResult.logUrl : null;
               const repo = run.repo;
-              run.artifacts = Array.isArray(launchResult.artifacts) ? launchResult.artifacts.map((artifact: Record<string, any>) => ({ ...artifact,
+              run.artifacts = Array.isArray(launchResult.artifacts) ? launchResult.artifacts.filter((artifact: Record<string, any>) => !run.developerApi || artifact.path !== AGENT_HISTORY_PATH).map((artifact: Record<string, any>) => ({ ...artifact,
                 url: repo && typeof repo['fullName'] === 'string' ? `https://github.com/${repo['fullName']}/${typeof repo['commit'] === 'string' && repo['commit'] ? `blob/${repo['commit']}` : `tree/${String(repo['branch'] ?? '')}`}/${String(artifact.path ?? '').split('/').map(encodeURIComponent).join('/')}` : String(artifact.path ?? '') })) : [];
+              if (run.developerApi) {
+                const history = await this.worker(`/v1/runs/${run.runId}/history?manifest=1`);
+                if (history.ok) {
+                  const manifest = await history.json() as Record<string, unknown>;
+                  if (manifest['path'] === AGENT_HISTORY_PATH && manifest['name'] === 'agent-history.json'
+                    && manifest['mime'] === 'application/json' && typeof manifest['size'] === 'number'
+                    && Number.isSafeInteger(manifest['size']) && manifest['size'] >= 0 && manifest['size'] <= 20 * 1024 * 1024
+                    && typeof manifest['sha256'] === 'string' && /^[0-9a-f]{64}$/.test(manifest['sha256'])) {
+                    const historyUrl = new URL(`/v1/developer/runs/${run.runId}/artifacts`, this.env.RUNNER_API_PUBLIC_URL);
+                    historyUrl.search = new URLSearchParams({ path: AGENT_HISTORY_PATH }).toString();
+                    run.artifacts.push({ ...manifest, url: historyUrl.href, downloadUrl: historyUrl.href });
+                  }
+                }
+              }
               if (run.developerGuest) {
                 run.artifactExpiresAt = new Date(Date.now() + GUEST_ARTIFACT_TTL_MS).toISOString();
                 run.artifacts = await Promise.all(run.artifacts.map(async (artifact) => {
@@ -737,7 +757,8 @@ export class RunnerRunCoordinator {
                 startedAt: run.startedAt ?? run.createdAt, finishedAt: now(),
                 ...(run.answer !== null ? { text: run.answer } : {}), ...(launchResult.failure ? { failure: launchResult.failure } : {}), usage: { status: 'unknown' },
                 outputRefs: run.artifacts.map((artifact) => String(run.developerGuest ? artifact['downloadUrl'] : artifact['url'])),
-                ...(run.developerGuest ? { artifacts: run.artifacts, artifactExpiresAt: run.artifactExpiresAt } : {}),
+                ...(run.developerApi ? { artifacts: run.artifacts } : {}),
+                ...(run.developerGuest ? { artifactExpiresAt: run.artifactExpiresAt } : {}),
                 persistence: run.artifacts.length ? 'persisted' : 'not_required', persistenceReason: run.artifacts.length ? run.developerGuest ? 'artifacts were exported by the execution worker' : `artifacts are committed to ${String(repo?.['fullName'] ?? 'the repository')}` : 'the worker reported no artifacts', cleanup: 'completed', cleanupReason: 'execution workspace is owned by the France VM worker', logPath: run.logUrl ?? `vm-run:${run.runId}` };
               transition(run, outcome, { exitReason: launchResult.exitReason });
             }

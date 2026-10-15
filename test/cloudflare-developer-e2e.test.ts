@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import { createHash } from 'node:crypto';
 import runnerApi, { sha256 } from '../src/cloudflare/runner-api.js';
 import { RunnerRunCoordinator } from '../src/cloudflare/run-coordinator.js';
 import type { DurableObjectStateLike, DurableStorage, RunnerWorkerEnv } from '../src/cloudflare/types.js';
@@ -20,6 +21,8 @@ describe('developer API through the live coordinator contract', () => {
     const token = 'developer-end-to-end-key';
     const guestToken = 'guest-end-to-end-key';
     const launched: unknown[] = [];
+    const historyBytes = JSON.stringify({ schemaVersion: 1, entries: [{ type: 'assistant_message', text: 'Checking the repository.' }] });
+    const historySha = createHash('sha256').update(historyBytes).digest('hex');
     const storage = new MemoryStorage();
     const state: DurableObjectStateLike = { storage, blockConcurrencyWhile: async (fn) => fn() };
     let coordinator: RunnerRunCoordinator;
@@ -49,6 +52,11 @@ describe('developer API through the live coordinator contract', () => {
           answer: 'SDK generated', artifacts: [{ path: 'output/readme.txt', name: 'readme.txt', mime: 'text/plain', size: 3,
             sha256: 'a'.repeat(64) }], logUrl: '', repo: null });
         if (path.endsWith('/logs')) return Response.json({ logs: [], cursor: 0, hasMore: false, state: 'succeeded' });
+        if (path.endsWith('/history')) {
+          if (url.searchParams.get('manifest') === '1') return Response.json({ path: '__runner/agent-history.json',
+            name: 'agent-history.json', mime: 'application/json', size: Buffer.byteLength(historyBytes), sha256: historySha });
+          return new Response(historyBytes, { headers: { 'content-type': 'application/json', 'x-content-sha256': historySha } });
+        }
         if (path.endsWith('/artifacts') && url.searchParams.get('path') === 'output/readme.txt') {
           return new Response('SDK', { headers: { 'content-type': 'text/plain', 'x-content-sha256': 'a'.repeat(64) } });
         }
@@ -71,7 +79,13 @@ describe('developer API through the live coordinator contract', () => {
     const status = await runnerApi.fetch(new Request(`https://api.example/v1/developer/runs/${receipt.runId}`, { headers }), env);
     expect(await status.json()).toMatchObject({ state: 'succeeded', createdAt: expect.any(String), finishedAt: expect.any(String) });
     const result = await runnerApi.fetch(new Request(`https://api.example/v1/developer/runs/${receipt.runId}/result`, { headers }), env);
-    expect((await result.json() as { text: string }).text).toBe('SDK generated');
+    const registeredResult = await result.json() as { text: string; outputRefs: string[] };
+    expect(registeredResult.text).toBe('SDK generated');
+    const registeredHistoryUrl = `https://api.example/v1/developer/runs/${receipt.runId}/artifacts?path=__runner%2Fagent-history.json`;
+    expect(registeredResult.outputRefs).toContain(registeredHistoryUrl);
+    const registeredHistory = await runnerApi.fetch(new Request(registeredHistoryUrl, { headers }), env);
+    expect(await registeredHistory.json()).toMatchObject({ entries: [{ type: 'assistant_message' }] });
+    expect((await runnerApi.fetch(new Request(registeredHistoryUrl, { headers: { authorization: `Bearer ${guestToken}` } }), env)).status).toBe(404);
     const cancel = await runnerApi.fetch(new Request(`https://api.example/v1/developer/runs/${receipt.runId}/cancel`, {
       method: 'POST', headers,
     }), env);
@@ -86,10 +100,13 @@ describe('developer API through the live coordinator contract', () => {
     const guestRunId = (await guestSubmit.json() as { runId: string }).runId;
     for (let attempt = 0; attempt < 4; attempt++) await coordinator.alarm();
     const guestResultResponse = await runnerApi.fetch(new Request(`https://api.example/v1/developer/runs/${guestRunId}/result`, { headers: guestHeaders }), env);
-    const guestResult = await guestResultResponse.json() as { outputRefs: string[]; artifacts: Array<{ downloadUrl: string; expiresAt: string }> };
-    expect(guestResult.artifacts).toHaveLength(1);
-    expect(guestResult.outputRefs).toEqual([guestResult.artifacts[0]!.downloadUrl]);
-    expect(Date.parse(guestResult.artifacts[0]!.expiresAt) - Date.now()).toBeGreaterThan(23 * 60 * 60_000);
+    const guestResult = await guestResultResponse.json() as { outputRefs: string[]; artifacts: Array<{ path: string; downloadUrl: string; expiresAt: string }> };
+    expect(guestResult.artifacts).toHaveLength(2);
+    expect(guestResult.outputRefs).toEqual(guestResult.artifacts.map((artifact) => artifact.downloadUrl));
+    const history = guestResult.artifacts.find((artifact) => artifact.path === '__runner/agent-history.json')!;
+    expect(Date.parse(history.expiresAt) - Date.now()).toBeGreaterThan(23 * 60 * 60_000);
+    const historyDownload = await runnerApi.fetch(new Request(history.downloadUrl), env);
+    expect(await historyDownload.json()).toMatchObject({ entries: [{ type: 'assistant_message', text: 'Checking the repository.' }] });
     const link = guestResult.artifacts[0]!.downloadUrl;
     const downloaded = await runnerApi.fetch(new Request(link), env);
     expect(downloaded.status).toBe(200);
@@ -106,6 +123,7 @@ describe('developer API through the live coordinator contract', () => {
     const dateNow = vi.spyOn(Date, 'now').mockReturnValue(Date.parse(guestResult.artifacts[0]!.expiresAt) + 1);
     try {
       expect((await runnerApi.fetch(new Request(link), env)).status).toBe(410);
+      expect((await runnerApi.fetch(new Request(history.downloadUrl), env)).status).toBe(410);
       expect((await runnerApi.fetch(new Request(`https://api.example/v1/developer/runs/${guestRunId}/artifacts`, { headers: guestHeaders }), env)).status).toBe(410);
     } finally { dateNow.mockRestore(); }
   });
