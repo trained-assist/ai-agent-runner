@@ -76,6 +76,8 @@ The run uses the existing `Idempotency-Key` rule. On a terminal `succeeded`, `fa
 
 The receiver verifies `X-ServerlessAgence-Signature: v1=<hex>` as HMAC-SHA256 over `<X-ServerlessAgence-Timestamp>.<raw JSON body>` using its configured signing secret. It should reject stale timestamps and deduplicate by `X-ServerlessAgence-Delivery` or `eventId`. Any 2xx acknowledges delivery. Other statuses, redirects and timeouts retry with exponential backoff, up to eight attempts. Network ambiguity can produce a duplicate after the receiver accepted the first request. `GET /v1/developer/runs/{runId}/webhook` reports `pending`, `delivered` or `failed`, attempts and last HTTP status. Pending delivery blocks sandbox cleanup; completed or exhausted delivery can be cleaned normally.
 
+For credential-using browser, model, GitHub and cloud actions, see the [trusted executor registry and audit contract](TRUSTED-CREDENTIAL-EXECUTORS.md). All new customer executors are disabled until their runtime adapters and isolation checks exist.
+
 ## Product and infrastructure work before public beta
 
 - [x] Add a simplified, opt-in run route and capabilities probe without changing the Control Plane route.
