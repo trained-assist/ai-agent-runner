@@ -45,19 +45,33 @@ a run carrying an ingress manifest fails closed before OpenCode starts; a partia
 configuration prevents worker startup. Ingress input materialization and profile
 workspace publication are separate capabilities.
 
+Production profile `trained-assist-production` uses a separate, read-only Control Plane
+principal. The signed France VM release accepts the narrowly scoped
+`configure-production-ingress` forced command through the protected workflow. It
+installs `RUNNER_CONTROL_PLANE_PRODUCTION_URL`,
+`RUNNER_CONTROL_PLANE_PRODUCTION_PRINCIPAL`, and
+`RUNNER_CONTROL_PLANE_PRODUCTION_PRINCIPAL_SECRET` in a root-owned systemd
+environment file. Production pins fail closed if this group is absent; sandbox pins
+continue to use the original `RUNNER_CONTROL_PLANE_*` group. Rotate the production
+credential as a paired Control Plane and VM operation.
+
 ## Install on a Linux VM
 
-Release delivery and service lifecycle are separate processes. GitHub Actions builds
-and signs an immutable release; `ai-agent-vm-worker-update <tag>` verifies and installs
-that release, switches the versioned symlink, restarts systemd, and rolls back if the
-new process is not ready. The signed bundle also carries the pinned OpenCode Linux x64
+GitHub Actions builds and signs an immutable release; the France sandbox deployment job
+then verifies and installs it after active work drains. The updater switches the versioned
+symlink, restarts systemd, and rolls back if the new process is not ready. The signed
+bundle also carries the pinned OpenCode Linux x64
 binary; the updater verifies its version and SHA-256 and points `/usr/local/bin/opencode`
 through the same `current` symlink, so rollback restores the matching binary. `/version`
 reports the Runner source commit and the OpenCode version, source commit, and binary SHA.
 `ai-agent-vm-worker.service` owns the long-running worker.
 `install-vm-worker.sh` is only a one-time bootstrap for the service account, unit,
-configuration templates, and updater. There is currently no automatic VM rollout or
-VM self-deployment: the operator invokes the updater after reviewing a release.
+configuration templates, and updater. Each worker release pins a specific OpenCode
+preview tag and its source/archive/binary hashes. Before packaging, CI compares that pin
+with the newest published `mem-preview` tag and fails if the pin is stale. A new OpenCode
+preview therefore requires an explicit pin change and worker release; builds never float
+to an unreviewed binary. The France auto-deploy is release-triggered in GitHub Actions;
+there is no workstation scheduler or VM self-update timer.
 France bootstrap also installs the host shared libraries required by headless
 Playwright Chromium. It does not install a browser or restart the worker service;
 the agent may install a pinned Playwright package and browser inside its run workspace.
@@ -175,17 +189,28 @@ for rollback.
 ## Health and run tracking
 
 - `GET /healthz` is unauthenticated liveness only. HTTP 200 means the process answers.
-- `GET /version` reports the deployed version/source commit and the value-free binding
-  inventory for periodic deployment drift checks.
+- `GET /version` reports the deployed worker release/source commit, bundled OpenCode
+  version/source commit/binary SHA-256, and value-free binding inventory. The scheduled
+  GitHub drift workflow verifies the latest stable signed worker release and compares all
+  reported identities with the deployed VM; mismatch or missing identity is emitted as a
+  warning annotation with expected and actual release metadata. It observes drift but does
+  not install releases; updates still use the signed operator updater until a restricted
+  automatic deployment identity is implemented.
 - `GET /readyz` is unauthenticated readiness. HTTP 200 means Runner, OpenCode, the
   capacity store, and a fresh whole-host sample are available with room under the 60%
   admission threshold. HTTP 503 removes the worker from new-run routing. Its JSON
   identifies each check, current CPU/RAM, projected load, and active reservations.
 - `POST /v1/launch` uses `Authorization: Bearer <VM_WORKER_TOKEN>` and returns a
-  receipt only after durable admission and Runner start.
+  receipt after durable admission; the receipt alone does not prove process start.
 - `GET /v1/runs/{runId}/status` reports accepted/running/terminal state;
   `GET .../result` returns the terminal result; `GET .../logs?after={sequence}` provides
   replayable stdout/stderr SSE; `POST .../cancel` requests cancellation.
+
+Status JSON also includes the exact Runner state so the Cloudflare coordinator can
+distinguish accepted/starting from a process that has reached `running`. For bounded
+background reconciliation, `GET .../logs?after={sequence}&snapshot=1` returns up to
+100 replayable stdout/stderr records and the next sequence cursor. Each returned
+message is capped at 16,000 characters; the existing SSE route remains unchanged.
 
 The result includes `exitObserved` independently from `exitCode` and `exitSignal`. During
 cancellation, OS process-tree polling can confirm that the process ended even if the engine's
@@ -211,6 +236,16 @@ recovery, and capacity reservations stay active until terminal state is observed
 The Cloudflare Runner API selects the France VM worker for these sandbox lanes. A VM only
 answers its own health/capacity and runs accepted work; it never routes to another VM or GHA.
 These lanes do not fall back to GitHub Actions when France is unavailable.
+
+The signed release workflow can deploy that same verified bundle to the France sandbox.
+It uses a dedicated forced-command SSH key restricted to `update vm-worker-vX.Y.Z`; a
+short-lived GitHub release-read token is supplied on stdin and is not persisted on the VM.
+Before changing versions, the updater waits for `/readyz` to report zero active runs and
+reservations. The cloud workflow retries only this busy state, then checks `/healthz`,
+`/version` and `/readyz` after restart and rolls back on failure. Re-running a release
+already installed with matching worker and OpenCode hashes is a no-op. This automation
+targets only the France sandbox, not Russia or production, and does not require a
+workstation scheduler.
 
 This drift check is deliberately narrower than product migration acceptance. See
 [VM-WORKER-LEGACY-COMPATIBILITY.md](VM-WORKER-LEGACY-COMPATIBILITY.md) and

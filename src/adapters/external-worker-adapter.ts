@@ -3,6 +3,7 @@ import { RUNNER_EVENT_SCHEMA_VERSION, type RunnerEvent } from '../contracts/even
 import { RUN_RESULT_SCHEMA_VERSION, type ExitReason, type FailureClass, type RunFailure, type RunOutcome, type RunResult } from '../contracts/result.js';
 import { validateRunResult } from '../contracts/result.js';
 import type { IngressManifestRef, OutputSpec, RunSpec } from '../contracts/run-spec.js';
+import type { SessionCheckpointRef } from '../contracts/result.js';
 import {
   ErrorCollector,
   PreflightError,
@@ -130,7 +131,7 @@ export interface LaunchRequest {
   operationId: string;
   ownerGeneration: number;
   engine: { name: string; adapterVersion: string; modelSettings?: { model?: string } };
-  input: { inlinePrompt: string };
+  input: { inlinePrompt: string; resumeSessionFrom?: { sourceRunId: string; sessionId: string; path: string; sha256: string; size: number } };
   cwd: string;
   envAllowlist: string[];
   env: Record<string, string>;
@@ -211,6 +212,8 @@ export interface LaunchResult {
   exitSignal: string | null;
   /** Whether the worker observed process termination, even when no code/signal was available. */
   exitObserved?: boolean;
+  /** Explicit evidence at the OpenCode process boundary. */
+  engineStart?: RunResult['engineStart'];
   exitReason: ExitReason;
   stdout: string;
   stderr: string;
@@ -229,6 +232,7 @@ export interface LaunchResult {
   /** Null when the accepted execution intentionally has no repository side effects (e.g. mock-test). */
   repo: LaunchRepo | null;
   profileChanges?: { files: Array<{ path: string; sha256: string; size: number }>; deletes: string[] };
+  sessionCheckpoint?: SessionCheckpointRef;
   failure?: LaunchFailure;
 }
 
@@ -248,7 +252,8 @@ export interface ExternalWorker {
   restoreMcp?(spec: RunSpec, admittedAt: string): Promise<void>;
   status(runId: string): Promise<WorkerStatusView>;
   /** Follow replayable live stdout/stderr logs when a worker exposes its SSE endpoint. */
-  streamLogs?(runId: string, after: number, signal: AbortSignal, onLog: (stream: 'stdout' | 'stderr', message: string, sequence: number) => void): Promise<{ cursor: number; completed: boolean; supported: boolean }>;
+  streamLogs?(runId: string, after: number, signal: AbortSignal, onLog: (stream: 'stdout' | 'stderr', message: string, sequence: number) => void,
+    onAssistantMessage?: (message: { sessionId: string; messageId: string; text: string }, sequence: number) => void): Promise<{ cursor: number; completed: boolean; supported: boolean }>;
   result(runId: string): Promise<LaunchResult>;
   cancel(runId: string): Promise<WorkerCancelResult>;
 }
@@ -314,6 +319,7 @@ const LAUNCH_RESULT_KEYS = [
   'exitCode',
   'exitSignal',
   'exitObserved',
+  'engineStart',
   'exitReason',
   'stdout',
   'stderr',
@@ -326,6 +332,7 @@ const LAUNCH_RESULT_KEYS = [
   'logUrl',
   'repo',
   'profileChanges',
+  'sessionCheckpoint',
   'failure',
 ] as const;
 
@@ -455,7 +462,10 @@ export function launchRequestFromSpec(
       adapterVersion: spec.engine.adapterVersion,
       ...(spec.engine.modelSettings?.model !== undefined ? { modelSettings: { model: spec.engine.modelSettings.model } } : {}),
     },
-    input: { inlinePrompt: prompt },
+    input: {
+      inlinePrompt: prompt,
+      ...(spec.input?.resumeSessionFrom ? { resumeSessionFrom: spec.input.resumeSessionFrom } : {}),
+    },
     cwd: spec.cwd,
     envAllowlist: [...spec.envAllowlist],
     env,
@@ -535,7 +545,7 @@ export function validateLaunchResult(input: unknown, expectedRunId: string): Val
   // настоящий opencode-шлюз его не присылает вовсе. Отсутствие этих полей — не повод
   // выбросить результат целого рана: живая проба #100 показала, что реальный ответ
   // отвергался как WORKER_PROTOCOL_INVALID, и рана с артефактами у клиента не было.
-  const OPTIONAL_RESULT_KEYS = ['failure', 'pid', 'answer', 'profileChanges', 'exitObserved'] as const;
+  const OPTIONAL_RESULT_KEYS = ['failure', 'pid', 'answer', 'profileChanges', 'exitObserved', 'engineStart', 'sessionCheckpoint'] as const;
   checkKeys(
     input,
     LAUNCH_RESULT_KEYS,
@@ -557,6 +567,7 @@ export function validateLaunchResult(input: unknown, expectedRunId: string): Val
   if (input['exitCode'] !== null && typeof input['exitCode'] !== 'number') collector.push('launch.exitCode: expected number or null');
   if (input['exitSignal'] !== null && typeof input['exitSignal'] !== 'string') collector.push('launch.exitSignal: expected string or null');
   if (input['exitObserved'] !== undefined && typeof input['exitObserved'] !== 'boolean') collector.push('launch.exitObserved: expected boolean when present');
+  if (input['engineStart'] !== undefined && !['not_started', 'started', 'unknown'].includes(String(input['engineStart']))) collector.push('launch.engineStart: expected not_started | started | unknown');
   if (input['exitObserved'] === false && (input['exitCode'] !== null || input['exitSignal'] !== null)) collector.push('launch.exitObserved: false conflicts with an exit code or signal');
   if (typeof input['exitReason'] !== 'string' || !(EXIT_REASONS as readonly string[]).includes(input['exitReason'])) {
     collector.push(`launch.exitReason: expected one of ${EXIT_REASONS.join(', ')}`);
@@ -581,7 +592,8 @@ export function validateLaunchResult(input: unknown, expectedRunId: string): Val
     input['artifacts'].forEach((artifact, index) => {
       const path = `launch.artifacts[${index}]`;
       if (!checkObject(artifact, path, collector)) return;
-      checkKeys(artifact, ['path', 'name', 'mime', 'sha256', 'size', 'objectKey'], ['path', 'name', 'mime', 'sha256', 'size'], path, collector);
+      checkKeys(artifact, ['artifactId', 'path', 'name', 'mime', 'sha256', 'size', 'objectKey'], ['path', 'name', 'mime', 'sha256', 'size'], path, collector);
+      if (artifact['artifactId'] !== undefined && !isSafeId(artifact['artifactId'])) collector.push(`${path}.artifactId: expected an artifact id`);
       checkString(artifact['path'], `${path}.path`, collector, 512);
       checkString(artifact['name'], `${path}.name`, collector, 200);
       checkString(artifact['mime'], `${path}.mime`, collector, 100);
@@ -641,6 +653,18 @@ export function validateLaunchResult(input: unknown, expectedRunId: string): Val
       } else value['deletes'].forEach((path, index) => {
         if (!isSafeRelativePath(path)) collector.push(`launch.profileChanges.deletes[${index}]: expected safe relative path`);
       });
+    }
+  }
+
+  if (input['sessionCheckpoint'] !== undefined) {
+    const checkpoint = input['sessionCheckpoint'];
+    if (checkObject(checkpoint, 'launch.sessionCheckpoint', collector)) {
+      checkKeys(checkpoint, ['sourceRunId', 'sessionId', 'path', 'sha256', 'size'], ['sourceRunId', 'sessionId', 'path', 'sha256', 'size'], 'launch.sessionCheckpoint', collector);
+      if (!isSafeId(checkpoint['sourceRunId'])) collector.push('launch.sessionCheckpoint.sourceRunId: expected a safe run id');
+      if (typeof checkpoint['sessionId'] !== 'string' || !/^ses_[0-7][0-9A-HJKMNP-TV-Z]{25}$/.test(checkpoint['sessionId'])) collector.push('launch.sessionCheckpoint.sessionId: expected an OpenCode session id');
+      if (typeof checkpoint['path'] !== 'string' || checkpoint['path'] !== `.session-traces/${String(checkpoint['sessionId'])}.json`) collector.push('launch.sessionCheckpoint.path: expected the session archive path');
+      if (typeof checkpoint['sha256'] !== 'string' || !/^[0-9a-f]{64}$/.test(checkpoint['sha256'])) collector.push('launch.sessionCheckpoint.sha256: expected sha256');
+      if (typeof checkpoint['size'] !== 'number' || !Number.isSafeInteger(checkpoint['size']) || checkpoint['size'] < 0) collector.push('launch.sessionCheckpoint.size: expected non-negative integer');
     }
   }
 
@@ -764,12 +788,14 @@ export function mapLaunchResult(
     exitCode: launch.exitCode,
     exitSignal: launch.exitSignal,
     exitObserved: launch.exitObserved ?? (launch.exitCode !== null || launch.exitSignal !== null),
+    ...(launch.engineStart ? { engineStart: launch.engineStart } : {}),
     startedAt: times.startedAt,
     finishedAt: times.finishedAt,
     ...(typeof launch.answer === 'string' ? { text: launch.answer } : {}),
     ...(failure ? { failure } : {}),
     usage: { status: 'unknown' },
     outputRefs,
+    ...(launch.sessionCheckpoint ? { sessionCheckpoint: launch.sessionCheckpoint } : {}),
     persistence,
     persistenceReason:
       persistence === 'persisted'
@@ -1197,6 +1223,7 @@ export class ExternalWorkerAdapter implements ExternalWorker {
     after: number,
     signal: AbortSignal,
     onLog: (stream: 'stdout' | 'stderr', message: string, sequence: number) => void,
+    onAssistantMessage?: (message: { sessionId: string; messageId: string; text: string }, sequence: number) => void,
   ): Promise<{ cursor: number; completed: boolean; supported: boolean }> {
     const base = this.baseUrl;
     if (!base) return { cursor: after, completed: false, supported: false };
@@ -1243,6 +1270,19 @@ export class ExternalWorkerAdapter implements ExternalWorker {
               if (typeof message === 'string') {
                 cursor = sequence;
                 onLog(event, message, sequence);
+              }
+            }
+          }
+          if (event === 'assistant_message' && data.length > 0) {
+            const sequence = Number(id);
+            if (Number.isSafeInteger(sequence) && sequence > cursor) {
+              let message: unknown;
+              try { message = JSON.parse(data.join('\n')); } catch { message = null; }
+              const value = message as { sessionId?: unknown; messageId?: unknown; text?: unknown } | null;
+              if (value && typeof value.sessionId === 'string' && typeof value.messageId === 'string'
+                && typeof value.text === 'string' && value.text.length <= 64_000) {
+                cursor = sequence;
+                onAssistantMessage?.({ sessionId: value.sessionId, messageId: value.messageId, text: value.text }, sequence);
               }
             }
           }

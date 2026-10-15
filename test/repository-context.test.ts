@@ -223,6 +223,7 @@ describe('repository context: stateless API (#74)', () => {
       options: {},
       logCursors: [],
       pushLog: () => undefined,
+      pushAssistantMessage: () => undefined,
       finishLogs: () => undefined,
       lastAuthorization: () => undefined,
       close: async () => undefined,

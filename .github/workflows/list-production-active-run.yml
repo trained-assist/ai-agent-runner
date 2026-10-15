@@ -1,0 +1,47 @@
+name: Inspect one production Runner run
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Exact runId returned by the production Control Plane
+        required: true
+        type: string
+      save_redacted_vm_log:
+        description: Save the redacted VM stdout/stderr as a short-lived private Actions artifact
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Inspect exact run and its saved event log without printing user content
+        env:
+          RUNNER_API_KEY: ${{ secrets.RUNNER_API_KEY_AGENT_API }}
+          RUNNER_VM_URL: ${{ secrets.EU_VM_WORKER_URL }}
+          RUNNER_VM_TOKEN: ${{ secrets.EU_VM_WORKER_TOKEN }}
+          RUN_ID: ${{ inputs.run_id }}
+          VM_LOG_OUTPUT_PATH: ${{ inputs.save_redacted_vm_log && 'vm-run-log.txt' || '' }}
+        run: node scripts/inspect-production-run.mjs
+      - name: Upload redacted VM log for diagnosis
+        if: inputs.save_redacted_vm_log
+        uses: actions/upload-artifact@v4
+        with:
+          name: redacted-vm-run-log
+          path: vm-run-log.txt
+          if-no-files-found: error
+          retention-days: 1

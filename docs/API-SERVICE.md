@@ -168,12 +168,15 @@ snapshot → изменение/удаление → API publication → сле�
 | `GET /v1/capabilities` | декларация возможностей (см. §5) |
 | `POST /v1/profiles/workspace` | идемпотентно создаёт/проверяет приватный workspace по signed tenant/profile; scope `profiles:provision`, тело `{}`, Agent Run не запускается |
 | `POST /v1/runs` | приём: `Idempotency-Key` обязателен; `202` — новый receipt, `200` — дедуп |
+| `GET /v1/runs?state=active&limit=50&cursor=...` | список своих запусков в stateless API, без prompt/answer/events; максимум 100 строк на страницу, scope `runs:read`. Cloudflare Worker требует точный `userTaskId`; `state=active` показывает незавершённые runs, `state=all` — записи задачи во всех состояниях. Это ограничение нужно, поскольку Durable Objects хранят задачи отдельно и не имеют глобального перечисления. |
 | `GET /v1/runs/{id}/status` | состояние рана, курсор событий, `answer` агента |
 | `GET /v1/runs/{id}/result` | `RunResult` после терминального состояния, иначе `409 RESULT_NOT_READY` |
 | `GET /v1/runs/{id}/events` | страница событий (`?cursor=&limit=`) либо SSE на `Accept: text/event-stream` |
 | `GET /v1/runs/{id}/artifacts` | ветка рана, ссылка на merge, ссылки на файлы по коммиту и `logUrl` |
 | `GET /v1/runs/{id}/log` | `302` на ссылку лога в Google Storage |
 | `POST /v1/runs/{id}/cancel` | пробрасывает отмену воркеру; `202` — принята, `200` — уже терминальный |
+
+В Cloudflare Runner API статус обновляется фоновым Durable Object alarm-ом; запросы клиента не ждут синхронного callback от worker. `202 accepted` подтверждает только durable admission и оставляет run в `starting`. Состояние `running` выставляется после ответа worker с точным `state: "running"` или `"finalizing"`. Ответы `/status` и `/events` содержат `lastHeartbeatAt`, `statusFreshness` (`unobserved` / `fresh` / `stale`) и ограниченный хвост `output.stdout` / `output.stderr` (до 24 тыс. символов на поток). Coordinator забирает stdout/stderr у VM пакетами по sequence cursor во время фоновой сверки. При потере связи heartbeat не продлевается; после 30 секунд без подтверждения receipt-backed run становится `unknown` и продолжает сверяться по тому же receipt, не отправляя задачу повторно. Повторная сверка `unknown` длится не более 30 минут после перехода в это состояние, чтобы не держать вечные фоновые alarm-ы; после этого остаётся доступен последний подтверждённый статус и его возраст. Клиент может опрашивать Runner API, показывать последний вывод и возраст статуса, а `stale`/`unknown` не считать подтверждением активного процесса.
 
 `POST /v1/profiles/workspace` требует API key со scope `profiles:provision`, пустое тело
 `{}` и все четыре короткоживущих заголовка `x-agent-profile-*`. `tenantId` берётся из API key;

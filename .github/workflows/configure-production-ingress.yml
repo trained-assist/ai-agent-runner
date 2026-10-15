@@ -1,0 +1,63 @@
+name: Configure France VM production ingress
+
+on:
+  workflow_dispatch:
+    inputs:
+      configure:
+        description: Install the scoped production ingress credential after a signed VM release
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  configure:
+    if: github.ref == 'refs/heads/main' && inputs.configure == true
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: france-sandbox
+    steps:
+      - uses: actions/checkout@v4
+      - name: Require scoped credentials and updated VM release
+        env:
+          INGRESS_SECRET: ${{ secrets.PRODUCTION_RUNNER_INGRESS_SECRET }}
+          VM_DEPLOY_KEY: ${{ secrets.FRANCE_VM_RELEASE_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$VM_DEPLOY_KEY"
+          [[ "$INGRESS_SECRET" =~ ^[A-Za-z0-9_-]{43,128}$ ]]
+          curl --silent --show-error --fail --max-time 10 https://eu-vm-worker.169-58-15-230.sslip.io/version |
+            node -e 'let s=""; process.stdin.on("data", x => s+=x); process.stdin.on("end", () => { const v=JSON.parse(s).build?.version; if(!v || Number(v.split(".")[2]) < 22) process.exit(1); });'
+      - name: Install production ingress on France VM after active runs drain
+        env:
+          INGRESS_SECRET: ${{ secrets.PRODUCTION_RUNNER_INGRESS_SECRET }}
+          VM_DEPLOY_KEY: ${{ secrets.FRANCE_VM_RELEASE_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          install -m 0700 -d "$RUNNER_TEMP/ssh"
+          install -m 0600 /dev/null "$RUNNER_TEMP/ssh/id_ed25519"
+          printf '%s\n' "$VM_DEPLOY_KEY" > "$RUNNER_TEMP/ssh/id_ed25519"
+          install -m 0600 deploy/vm-worker/france-deploy-known-hosts "$RUNNER_TEMP/ssh/known_hosts"
+          for attempt in $(seq 1 30); do
+            set +e
+            printf '%s\n' "$INGRESS_SECRET" | ssh -i "$RUNNER_TEMP/ssh/id_ed25519" \
+              -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+              -o UserKnownHostsFile="$RUNNER_TEMP/ssh/known_hosts" \
+              -o ConnectTimeout=15 root@169.58.15.230 configure-production-ingress
+            status=$?
+            set -e
+            if [[ "$status" -eq 0 ]]; then exit 0; fi
+            if [[ "$status" -ne 75 ]]; then exit "$status"; fi
+            echo "France VM has active runs; retry $attempt/30 in 30 seconds" >&2
+            sleep 30
+          done
+          exit 75
+      - name: Confirm production ingress bindings and readiness
+        run: |
+          set -euo pipefail
+          curl --silent --show-error --fail --max-time 10 https://eu-vm-worker.169-58-15-230.sslip.io/version |
+            node -e 'let s=""; process.stdin.on("data", x => s+=x); process.stdin.on("end", () => { const x=JSON.parse(s); const b=x.bindings?.inventory ?? []; const required=["RUNNER_CONTROL_PLANE_PRODUCTION_URL","RUNNER_CONTROL_PLANE_PRODUCTION_PRINCIPAL","RUNNER_CONTROL_PLANE_PRODUCTION_PRINCIPAL_SECRET"]; if(required.some(n => !b.find(v => v.name===n)?.configured)) process.exit(1); console.log("Production ingress bindings present"); });'
+          curl --silent --show-error --fail --max-time 10 https://eu-vm-worker.169-58-15-230.sslip.io/readyz |
+            node -e 'let s=""; process.stdin.on("data", x => s+=x); process.stdin.on("end", () => { if(JSON.parse(s).ready!==true) process.exit(1); console.log("VM worker ready"); });'

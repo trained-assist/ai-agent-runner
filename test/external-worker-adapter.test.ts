@@ -156,6 +156,14 @@ describe('валидация LaunchResult', () => {
     expect(validated.ok).toBe(true);
   });
 
+  it('preserves explicit engine-start evidence from the worker for safe retry decisions', () => {
+    const validated = validateLaunchResult(launchResult({ engineStart: 'not_started' }), 'run-1');
+    expect(validated.ok).toBe(true);
+    if (!validated.ok) return;
+    const mapping = mapLaunchResult(makeRunSpec({ runId: 'run-1' }), validated.value, TIMES);
+    expect(mapping.result.engineStart).toBe('not_started');
+  });
+
   it('ответ без answer принимается: настоящий opencode-шлюз его не присылает', () => {
     // Живая проба #100: реальный результат воркера отвергался как WORKER_PROTOCOL_INVALID
     // только из-за отсутствующего answer — рана с артефактами у клиента не было.
@@ -221,6 +229,28 @@ describe('валидация LaunchResult', () => {
     for (const bad of [null, undefined, 42]) {
       expect(validateLaunchResult(launchResult({ logUrl: bad as unknown as string }), 'run-1').ok).toBe(false);
     }
+  });
+});
+
+describe('replayable worker message stream', () => {
+  it('parses structured assistant messages on the existing worker event stream and advances its cursor', async () => {
+    const message = { sessionId: 'ses_01J9A3J9Y7V8W2K4M6N0PQRSTZ', messageId: 'msg_01J9A3J9Y7V8W2K4M6N0PQRSTZ', text: 'Проверяю перед изменениями.' };
+    const frames = [
+      `id: 4\nevent: stdout\ndata: ${JSON.stringify('visible output')}\n\n`,
+      `id: 5\nevent: assistant_message\ndata: ${JSON.stringify(message)}\n\n`,
+      'id: 6\nevent: end\ndata: {}\n\n',
+    ].join('');
+    const adapter = new ExternalWorkerAdapter({ baseUrl: 'https://worker.example.test', fetchImpl: async () => new Response(frames, {
+      status: 200, headers: { 'content-type': 'text/event-stream' },
+    }) });
+    const logs: Array<{ stream: string; message: string; sequence: number }> = [];
+    const messages: Array<{ message: typeof message; sequence: number }> = [];
+    const outcome = await adapter.streamLogs('run-1', 3, new AbortController().signal,
+      (stream, text, sequence) => logs.push({ stream, message: text, sequence }),
+      (value, sequence) => messages.push({ message: value, sequence }));
+    expect(outcome).toEqual({ cursor: 5, completed: true, supported: true });
+    expect(logs).toEqual([{ stream: 'stdout', message: 'visible output', sequence: 4 }]);
+    expect(messages).toEqual([{ message, sequence: 5 }]);
   });
 });
 

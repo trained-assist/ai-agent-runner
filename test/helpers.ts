@@ -23,6 +23,7 @@ import type { CleanRoomProvider } from '../src/isolation/contract.js';
 import type { EngineConfigTemplate } from '../src/isolation/engine-config.js';
 import type { IngressArtifactResolver } from '../src/storage/ingress-artifact.js';
 import type { ErrorPublisher } from '../src/contracts/error-publisher.js';
+import type { RunBranchWorker } from '../src/workspace/run-branch-worker.js';
 
 let counter = 0;
 
@@ -107,6 +108,7 @@ export interface HarnessOptions {
   ingressResolver?: IngressArtifactResolver;
   /** Издатель error-событий C12 в Error Watcher (I3). */
   errorPublisher?: ErrorPublisher;
+  profileWorkspace?: RunBranchWorker;
 }
 
 export interface Harness {
@@ -153,6 +155,7 @@ export function createHarness(options: HarnessOptions = {}): Harness {
   if (options.engineConfigTemplates) base.engineConfigTemplates = options.engineConfigTemplates;
   if (options.ingressResolver) base.ingressResolver = options.ingressResolver;
   if (options.errorPublisher) base.errorPublisher = options.errorPublisher;
+  if (options.profileWorkspace) base.profileWorkspace = options.profileWorkspace;
   let exports: RunExportStore | null = null;
   let artifacts: ArtifactStore | null = null;
   let blob: BlobStore | null = options.blob ?? null;

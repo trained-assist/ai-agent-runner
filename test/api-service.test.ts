@@ -542,6 +542,27 @@ describe('stateless AgentApi: capabilities отчитываются честно
     expect(worker.logCursors).toContain(1);
   }, 30000);
 
+  it('зеркалит завершённое сообщение OpenCode из VM event stream в события Runner API, пока run активен', async () => {
+    const worker = await startMockWorker({ liveLogs: true, terminalStatus: 'running', answer: null });
+    worker.autoDeliver = false;
+    onTestFinished(() => worker.close());
+    const vmPrincipal: Principal = { ...alpha, engines: ['eu-vm-agent-run'] };
+    const service = new AgentApi({ workers: [adapterFor(worker, { engineName: 'eu-vm-agent-run' })] });
+    onTestFinished(() => service.dispose());
+    const submitted = service.submit(vmPrincipal, 'idem-live-assistant-message',
+      body({ engine: { name: 'eu-vm-agent-run', adapterVersion: '1' } }));
+    await waitForState(service, vmPrincipal, submitted.runId, 'running');
+    worker.pushAssistantMessage(submitted.runId, {
+      sessionId: 'ses_01J9A3J9Y7V8W2K4M6N0PQRSTZ',
+      messageId: 'msg_01J9A3J9Y7V8W2K4M6N0PQRSTZ',
+      text: 'Сейчас проверю репозиторий, затем запущу тесты.',
+    });
+    await waitForCondition(() => service.events(vmPrincipal, submitted.runId).events.some(event =>
+      event.type === 'assistant_message' && event.payload.text === 'Сейчас проверю репозиторий, затем запущу тесты.'),
+    5000, 'structured assistant message to reach API clients');
+    expect(service.status(vmPrincipal, submitted.runId).state).toBe('running');
+  }, 30000);
+
   it('operationId стабилен в пределах попытки — на этом держится дедупликация воркера', () => {
     // Контракт внешнего worker, п. 2: воркер помнит принятые operationId. Свежий id на
     // каждый submit делал дедупликацию бессмысленной — после рестарта API повтор с новым

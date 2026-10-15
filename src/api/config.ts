@@ -14,7 +14,7 @@ import {
   ExternalWorkerAdapter,
 } from '../adapters/external-worker-adapter.js';
 import { KeyRegistry } from './auth.js';
-import { bindingFileResolver, configuredDocumentsBindingResolver, configuredTestRegistryBindingResolver, parseRemoteMcpServerPolicies, type RemoteMcpHostOptions, type RemoteMcpBindingResolver } from '../adapters/remote-mcp.js';
+import { bindingFileResolver, configuredDocumentsBindingResolver, configuredTestRegistryBindingResolver, configuredUserMcpBindingResolver, parseRemoteMcpServerPolicies, type RemoteMcpHostOptions, type RemoteMcpBindingResolver } from '../adapters/remote-mcp.js';
 
 export const DEFAULT_API_PORT = 8787;
 export const DEFAULT_API_HOST = '0.0.0.0';
@@ -280,10 +280,60 @@ export function loadAgentApiConfig(env: Record<string, string | undefined> = pro
   const testValues = [token, privateKeyPem ?? privateKeyPkcs8DerBase64, catalogueVersion, registryDigest];
   if (testValues.some(value => value !== undefined) && testValues.some(value => value === undefined)) throw new Error('test registry MCP configuration requires bearer, Ed25519 key, catalogue version and pinned registry digest');
   const testRegistryResolver = configuredTestRegistryBindingResolver(testValues.every(value => value === undefined) ? undefined : { token: token!, ...(privateKeyPem ? { privateKeyPem } : { privateKeyPkcs8DerBase64: privateKeyPkcs8DerBase64! }), catalogueVersion: catalogueVersion!, registryDigest: registryDigest! });
+  const userMcpPolicy = remoteMcpServers?.['mem-gpt'];
+  const userMcpToken = envValue(env, 'RUNNER_MCP_USER_TOKEN');
+  const userMcpPrivateKeyPem = envValue(env, 'RUNNER_MCP_USER_SIGNING_KEY');
+  const userMcpPrivateKeyB64 = envValue(env, 'RUNNER_MCP_USER_SIGNING_KEY_B64');
+  if (userMcpPrivateKeyPem && userMcpPrivateKeyB64) throw new Error('user MCP delegation must use exactly one signing key format');
+  const userMcpProfileUsersRaw = envValue(env, 'AGENT_API_USER_MCP_PROFILE_USERS');
+  const userMcpValues = [userMcpToken, userMcpPrivateKeyPem ?? userMcpPrivateKeyB64, userMcpProfileUsersRaw];
+  if (userMcpValues.some(value => value !== undefined) && userMcpValues.some(value => value === undefined)) {
+    throw new Error('user MCP delegation requires a token, Ed25519 key and explicit profile-to-user map');
+  }
+  if (userMcpPolicy && (userMcpPolicy.url !== 'https://trained-assist-mcp-user-sandbox.skillset-apply.workers.dev/mcp' ||
+      userMcpPolicy.runnerProof !== true || !userMcpPolicy.proofEnvName || !userMcpPolicy.registryDigest || !userMcpPolicy.catalogueVersion ||
+      userMcpPolicy.policyVersion !== 'mem-gpt-user-run-v1' ||
+      userMcpPolicy.bindingScopes['mem-gpt-user-sandbox'] !== 'mcp:user-agent-run')) {
+    throw new Error('user MCP policy must pin the sandbox catalog and run-scoped binding');
+  }
+  if (userMcpValues.some(value => value !== undefined) && !userMcpPolicy) {
+    throw new Error('user MCP delegation secrets require the pinned mem-gpt sandbox policy');
+  }
+  let userMcpProfileUsers: Record<string, string> | undefined;
+  if (userMcpProfileUsersRaw) {
+    try {
+      const parsed: unknown = JSON.parse(userMcpProfileUsersRaw);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error();
+      userMcpProfileUsers = parsed as Record<string, string>;
+    } catch { throw new Error('AGENT_API_USER_MCP_PROFILE_USERS must be a JSON object'); }
+  }
+  if (userMcpPolicy && !userMcpValues.some(value => value === undefined)) {
+    const serverAllowedTools = userMcpPolicy.allowedTools;
+    if (serverAllowedTools.some(tool => !['identity.whoami', 'google_docs.connect', 'google_docs.get_document'].includes(tool))) {
+      throw new Error('user MCP policy contains an unknown catalog tool');
+    }
+  }
+  const userMcpResolver = userMcpPolicy && userMcpToken && userMcpProfileUsers
+    ? configuredUserMcpBindingResolver({
+      token: userMcpToken,
+      ...(userMcpPrivateKeyPem ? { privateKeyPem: userMcpPrivateKeyPem } : { privateKeyPkcs8DerBase64: userMcpPrivateKeyB64! }),
+      profileUsers: userMcpProfileUsers,
+      serverUrl: userMcpPolicy.url,
+      serverId: 'mem-gpt',
+      bindingRef: 'mem-gpt-user-sandbox',
+      scope: 'mcp:user-agent-run',
+      policyVersion: userMcpPolicy.policyVersion!,
+      catalogueVersion: userMcpPolicy.catalogueVersion!,
+      catalogueDigest: userMcpPolicy.registryDigest!,
+      allowedTools: userMcpPolicy.allowedTools,
+    })
+    : undefined;
   const existingResolver = configuredDocumentsBindingResolver(envValue(env, 'AGENT_API_DOCUMENTS_MCP_MODULE'), envValue(env, 'AGENT_API_DOCUMENTS_MCP_REGISTRATIONS')) ?? bindingFileResolver(envValue(env, 'AGENT_API_REMOTE_MCP_BINDINGS_FILE'));
-  const resolveBinding: RemoteMcpBindingResolver = async (bindingRef, context) => context.profileId === 'integration-telegram-ux-v1' || bindingRef === 'registry-mcp-test-160-read'
-    ? context.profileId === 'integration-telegram-ux-v1' ? testRegistryResolver?.(bindingRef, context) ?? null : null
-    : existingResolver?.(bindingRef, context) ?? null;
+  const resolveBinding: RemoteMcpBindingResolver = async (bindingRef, context) =>
+    bindingRef === 'registry-mcp-test-160-read'
+      ? context.profileId === 'integration-telegram-ux-v1' ? testRegistryResolver?.(bindingRef, context) ?? null : null
+      : bindingRef === 'mem-gpt-user-sandbox' ? userMcpResolver?.(bindingRef, context) ?? null
+        : existingResolver?.(bindingRef, context) ?? null;
 
   return {
     host: env['AGENT_API_HOST']?.trim() || DEFAULT_API_HOST,

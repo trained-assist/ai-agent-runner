@@ -4,6 +4,8 @@ import { isSafeRelativePath } from '../storage/local-paths.js';
 export const RUN_RESULT_SCHEMA_VERSION = 1 as const;
 
 export type RunOutcome = 'succeeded' | 'failed' | 'cancelled';
+/** Evidence at the engine boundary; only `not_started` permits an automatic fresh attempt. */
+export type EngineStartEvidence = 'not_started' | 'started' | 'unknown';
 
 export type ExitReason =
   | 'completed'
@@ -26,6 +28,15 @@ export interface RunFailure {
 
 export type UsageReport = { status: 'unknown' } | { status: 'known'; usd: number };
 
+/** Pointer into the existing profile archive; transcript bytes are held by its GCS heavy-object path. */
+export interface SessionCheckpointRef {
+  sourceRunId: string;
+  sessionId: string;
+  path: string;
+  sha256: string;
+  size: number;
+}
+
 export interface RunResult {
   schemaVersion: typeof RUN_RESULT_SCHEMA_VERSION;
   runId: string;
@@ -38,6 +49,7 @@ export interface RunResult {
   exitCode: number | null;
   exitSignal: string | null;
   exitObserved: boolean;
+  engineStart?: EngineStartEvidence;
   startedAt: string;
   finishedAt: string;
   /** Captured engine answer; independent of the asynchronous artifact export phase. */
@@ -45,6 +57,7 @@ export interface RunResult {
   failure?: RunFailure;
   usage: UsageReport;
   outputRefs: string[];
+  sessionCheckpoint?: SessionCheckpointRef;
   /**
    * Сохранение выходов — отдельный от движка статус (issue #52, шаг 3/5).
    * `persisted` означает «каждый байт подтверждён чтением из долговечного хранилища»,
@@ -93,12 +106,14 @@ const RESULT_KEYS = [
   'exitCode',
   'exitSignal',
   'exitObserved',
+  'engineStart',
   'startedAt',
   'finishedAt',
   'text',
   'failure',
   'usage',
   'outputRefs',
+  'sessionCheckpoint',
   'persistence',
   'persistenceReason',
   'repositoryCommit',
@@ -117,7 +132,7 @@ const OUTCOME_EXIT_REASONS: Record<RunOutcome, readonly ExitReason[]> = {
 export function validateRunResult(input: unknown): ValidationResult<RunResult> {
   const collector = new ErrorCollector();
   if (!checkObject(input, 'result', collector)) return collector.finish(undefined as never);
-  const optional = new Set(['failure', 'persistenceReason', 'repositoryCommit', 'profileChanges', 'cleanupReason', 'text']);
+  const optional = new Set(['failure', 'persistenceReason', 'repositoryCommit', 'profileChanges', 'cleanupReason', 'text', 'sessionCheckpoint', 'engineStart']);
   const required = RESULT_KEYS.filter((key) => !optional.has(key));
   checkKeys(input, RESULT_KEYS, required, 'result', collector);
 
@@ -167,6 +182,7 @@ export function validateRunResult(input: unknown): ValidationResult<RunResult> {
     }
   }
   if (typeof input['exitObserved'] !== 'boolean') collector.push('result.exitObserved: expected boolean');
+  if (input['engineStart'] !== undefined && !['not_started', 'started', 'unknown'].includes(String(input['engineStart']))) collector.push('result.engineStart: expected not_started | started | unknown');
   if (!isUtcTimestamp(input['startedAt'])) collector.push('result.startedAt: expected UTC ISO timestamp');
   if (!isUtcTimestamp(input['finishedAt'])) collector.push('result.finishedAt: expected UTC ISO timestamp');
   // Engine output may contain line breaks and tabs; it is data, not an identifier.
@@ -203,6 +219,18 @@ export function validateRunResult(input: unknown): ValidationResult<RunResult> {
 
   if (!Array.isArray(input['outputRefs'])) collector.push('result.outputRefs: expected array');
   else input['outputRefs'].forEach((ref, i) => checkString(ref, `result.outputRefs[${i}]`, collector, 500));
+
+  if (input['sessionCheckpoint'] !== undefined) {
+    const checkpoint = input['sessionCheckpoint'];
+    if (checkObject(checkpoint, 'result.sessionCheckpoint', collector)) {
+      checkKeys(checkpoint, ['sourceRunId', 'sessionId', 'path', 'sha256', 'size'], ['sourceRunId', 'sessionId', 'path', 'sha256', 'size'], 'result.sessionCheckpoint', collector);
+      if (!isSafeId(checkpoint['sourceRunId'])) collector.push('result.sessionCheckpoint.sourceRunId: expected a safe run id');
+      if (typeof checkpoint['sessionId'] !== 'string' || !/^ses_[0-7][0-9A-HJKMNP-TV-Z]{25}$/.test(checkpoint['sessionId'])) collector.push('result.sessionCheckpoint.sessionId: expected an OpenCode session id');
+      if (typeof checkpoint['path'] !== 'string' || checkpoint['path'] !== `.session-traces/${String(checkpoint['sessionId'])}.json`) collector.push('result.sessionCheckpoint.path: expected the session archive path');
+      if (typeof checkpoint['sha256'] !== 'string' || !/^[0-9a-f]{64}$/.test(checkpoint['sha256'])) collector.push('result.sessionCheckpoint.sha256: expected sha256');
+      if (typeof checkpoint['size'] !== 'number' || !Number.isSafeInteger(checkpoint['size']) || checkpoint['size'] < 0) collector.push('result.sessionCheckpoint.size: expected non-negative integer');
+    }
+  }
 
   if (
     input['persistence'] !== 'pending' &&

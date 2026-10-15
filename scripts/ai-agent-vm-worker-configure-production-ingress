@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+  echo 'Production ingress configuration requires root' >&2
+  exit 1
+fi
+ingress_secret=''
+if ! IFS= read -r -t 15 ingress_secret || [[ ! "$ingress_secret" =~ ^[A-Za-z0-9_-]{43,128}$ ]]; then
+  echo 'Production ingress credential was not received in the expected format' >&2
+  exit 2
+fi
+
+config_dir=/etc/ai-agent-runner
+config_file="$config_dir/production-ingress.env"
+dropin_dir=/etc/systemd/system/ai-agent-vm-worker.service.d
+dropin_file="$dropin_dir/production-ingress.conf"
+base_config="$config_dir/worker.env"
+public_url="$(sed -n 's/^VM_WORKER_PUBLIC_URL=//p' "$base_config" | tail -n 1 | sed 's/^"//;s/"$//')"
+if [[ ! "$public_url" =~ ^https?://[^/]+/?$ ]]; then
+  echo 'VM worker public URL is invalid' >&2
+  exit 1
+fi
+
+ready_file="$(mktemp)"
+config_stage="$(mktemp "$config_dir/.production-ingress.XXXXXX")"
+dropin_stage=''
+cleanup() { rm -f "$ready_file" "$config_stage" "${dropin_stage:-}"; }
+trap cleanup EXIT
+
+curl --silent --show-error --fail --max-time 5 "${public_url%/}/readyz" -o "$ready_file"
+VM_WORKER_UPDATE_READINESS_FILE="$ready_file" node /usr/local/sbin/assert-vm-worker-update-ready.mjs
+
+printf 'RUNNER_CONTROL_PLANE_PRODUCTION_URL=https://trained-assist-cp-production.skillset-apply.workers.dev\nRUNNER_CONTROL_PLANE_PRODUCTION_PRINCIPAL=production-runner-ingress-v1\nRUNNER_CONTROL_PLANE_PRODUCTION_PRINCIPAL_SECRET=%s\n' "$ingress_secret" > "$config_stage"
+unset ingress_secret
+chown root:root "$config_stage"
+chmod 0600 "$config_stage"
+install -d -o root -g root -m 0755 "$dropin_dir"
+dropin_stage="$(mktemp "$dropin_dir/.production-ingress.XXXXXX")"
+printf '[Service]\nEnvironmentFile=%s\n' "$config_file" > "$dropin_stage"
+chown root:root "$dropin_stage"
+chmod 0644 "$dropin_stage"
+
+if [[ -e "$config_file" || -e "$dropin_file" ]]; then
+  if [[ -f "$config_file" && -f "$dropin_file" ]] \
+    && cmp -s "$config_stage" "$config_file" && cmp -s "$dropin_stage" "$dropin_file"; then
+    echo 'Production ingress credential already installed and matched'
+    exit 0
+  fi
+  echo 'Production ingress is already configured; rotate it through a separate reviewed operation' >&2
+  exit 1
+fi
+mv "$config_stage" "$config_file"
+mv "$dropin_stage" "$dropin_file"
+systemctl daemon-reload
+if ! systemctl restart ai-agent-vm-worker; then
+  rm -f "$dropin_file" "$config_file"
+  systemctl daemon-reload
+  systemctl restart ai-agent-vm-worker || true
+  echo 'Production ingress restart failed and configuration was rolled back' >&2
+  exit 1
+fi
+healthy=false
+for attempt in 1 2 3 4 5; do
+  if curl --silent --show-error --fail --max-time 5 "${public_url%/}/readyz" -o "$ready_file" \
+    && node -e 'const fs=require("fs"); if(JSON.parse(fs.readFileSync(process.argv[1],"utf8")).ready!==true) process.exit(1)' "$ready_file"; then
+    healthy=true
+    break
+  fi
+  sleep 2
+done
+if [[ "$healthy" != true ]]; then
+  rm -f "$dropin_file" "$config_file"
+  systemctl daemon-reload
+  systemctl restart ai-agent-vm-worker || true
+  echo 'Production ingress readiness failed and configuration was rolled back' >&2
+  exit 1
+fi
+echo 'Production Control Plane ingress credential installed; VM worker ready'

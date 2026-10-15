@@ -9,6 +9,15 @@ export interface EngineStartContext {
   cwd: string;
   env: Record<string, string>;
   onLog: (stream: EngineLogStream, line: string) => void;
+  /** Completed user-facing OpenCode message emitted before a tool-call step. */
+  onAssistantMessage?: (message: { sessionId: string; messageId: string; text: string }) => void;
+  /** A native OpenCode question that pauses headless execution for a user answer. */
+  onAssistantQuestion?: (question: {
+    sessionId: string;
+    requestId: string;
+    questions: Array<{ header: string; question: string; multiple: boolean; options: Array<{ label: string; description: string }> }>;
+    toolCallId: string | null;
+  }) => void;
   onExit: (code: number | null, signal: string | null) => void;
   /**
    * Идентичичность рана (issue #51). Присутствует только когда хост поднял границу:

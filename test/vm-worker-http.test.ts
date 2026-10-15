@@ -56,14 +56,34 @@ describe('installable VM HTTP worker', () => {
     expect(stream).toContain('event: stdout');
     expect(stream).toContain('worker says hello');
     expect(stream).toContain('event: stderr');
+    expect(stream).toContain('event: assistant_message');
+    expect(stream).toContain('Checking the repository first.');
+
+    const snapshot = await fetch(`${fixture.base}/v1/runs/${RUN_ID}/logs?after=0&snapshot=1`, { headers: authHeaders() });
+    expect(snapshot.status).toBe(200);
+    expect(await snapshot.json()).toMatchObject({ runId: RUN_ID, cursor: 11, hasMore: false, logs: [
+      { sequence: 10, stream: 'stdout', message: 'worker says hello' }, { sequence: 11, stream: 'stderr', message: 'diagnostic' },
+    ] });
 
     const status = await fetch(`${fixture.base}/v1/runs/${RUN_ID}/status`, { headers: authHeaders() });
-    expect(await status.json()).toMatchObject({ runId: RUN_ID, status: 'succeeded' });
+    expect(await status.json()).toMatchObject({ runId: RUN_ID, status: 'succeeded', state: 'succeeded', startPhase: 'started', startAttempts: 1 });
     const resultResponse = await fetch(`${fixture.base}/v1/runs/${RUN_ID}/result`, { headers: authHeaders() });
     const result = await resultResponse.json();
     expect(resultResponse.status).toBe(200);
     expect(result).toMatchObject({ runId: RUN_ID, status: 'started', exitObserved: true,
       stdout: 'worker says hello', repo: { branch: `agent-run/${RUN_ID}`, commit: null } });
+    const historyManifestResponse = await fetch(`${fixture.base}/v1/runs/${RUN_ID}/history?manifest=1`, { headers: authHeaders() });
+    expect(historyManifestResponse.status).toBe(200);
+    const historyManifest = await historyManifestResponse.json() as { path: string; sha256: string; size: number };
+    expect(historyManifest.path).toBe('__runner/agent-history.json');
+    const historyResponse = await fetch(`${fixture.base}/v1/runs/${RUN_ID}/history`, { headers: authHeaders() });
+    const historyBytes = Buffer.from(await historyResponse.arrayBuffer());
+    expect(historyResponse.status).toBe(200);
+    expect(historyBytes.length).toBe(historyManifest.size);
+    expect(createHash('sha256').update(historyBytes).digest('hex')).toBe(historyManifest.sha256);
+    expect(JSON.parse(historyBytes.toString('utf8'))).toMatchObject({ runId: RUN_ID, outcome: 'succeeded',
+      entries: [{ type: 'log', text: 'worker says hello' }, { type: 'log', text: 'diagnostic' },
+        { type: 'assistant_message', text: 'Checking the repository first.' }], answer: 'worker says hello' });
   });
 
   it('refuses a saturated host before Runner.start with the exact capacity code', async () => {
@@ -111,11 +131,59 @@ describe('installable VM HTTP worker', () => {
     expect(spec.envAllowlist).toContain('OPENCODE_CONFIG_CONTENT');
     expect(runtimeEnv.RUNNER_MCP_REGISTRY_TEST).toBe('test-registry-bearer-token-123');
     expect(runtimeEnv.RUNNER_MCP_REGISTRY_TEST_PROOF).toBe('signed-run-bound-proof-123456');
-    const config = JSON.parse(runtimeEnv.OPENCODE_CONFIG_CONTENT!) as { mcp: Record<string, { url: string; headers: Record<string, string> }> };
+    const config = JSON.parse(runtimeEnv.OPENCODE_CONFIG_CONTENT!) as { mcp: Record<string, { url: string; oauth: boolean; headers: Record<string, string> }> };
     expect(config.mcp['trained-assist-registry-test']!.url).toBe('https://trained-assist-mcp-host-test-160.skillset-apply.workers.dev/mcp');
+    expect(config.mcp['trained-assist-registry-test']!.oauth).toBe(false);
     expect(config.mcp['trained-assist-registry-test']!.headers.Authorization).toBe('Bearer {env:RUNNER_MCP_REGISTRY_TEST}');
     expect(JSON.stringify(spec)).not.toContain('test-registry-bearer-token-123');
     expect(JSON.stringify(spec)).not.toContain('signed-run-bound-proof-123456');
+  });
+
+  it('passes the pinned sandbox user catalog to OpenCode without persisting its token or proof', async () => {
+    const fixture = await startFixture({ allowedEnvironmentNames: ['LLM_LADDER_TOKEN'] });
+    cleanups.push(fixture.close);
+    const request = launchRequest({ profileId: 'integration-telegram-ux-v1', mcp: { servers: { 'mem-gpt': {
+      type: 'remote', url: 'https://trained-assist-mcp-user-sandbox.skillset-apply.workers.dev/mcp', enabled: true,
+      headers: {
+        Authorization: 'Bearer {env:RUNNER_MCP_USER_TOKEN}',
+        'X-MCP-Operation': 'invocation', 'X-MCP-Scope': 'mcp:user-agent-run',
+        'X-MCP-User-Task-Id': 'task-vm-worker-test', 'X-MCP-Profile': 'integration-telegram-ux-v1',
+        'X-MCP-Run-Id': RUN_ID, 'X-MCP-Run-Binding': '{env:RUNNER_MCP_USER_PROOF}',
+      },
+    } } }, mcpSecrets: { RUNNER_MCP_USER_TOKEN: 'user-catalog-bearer-token-123456',
+      RUNNER_MCP_USER_PROOF: 'signed-user-run-proof-123456' } });
+    const accepted = await launch(fixture.base, request);
+    expect(accepted.status, await accepted.clone().text()).toBe(202);
+    const { spec, runtimeEnv } = fixture.runner.startCalls[0]!;
+    expect(runtimeEnv.RUNNER_MCP_USER_TOKEN).toBe('user-catalog-bearer-token-123456');
+    expect(runtimeEnv.RUNNER_MCP_USER_PROOF).toBe('signed-user-run-proof-123456');
+    expect(runtimeEnv.OPENCODE_CONFIG_CONTENT).toContain('trained-assist-mcp-user-sandbox');
+    expect(JSON.parse(runtimeEnv.OPENCODE_CONFIG_CONTENT!).mcp['mem-gpt'].oauth).toBe(false);
+    const openCodeConfig = JSON.parse(runtimeEnv.OPENCODE_CONFIG_CONTENT!) as { permission?: Record<string, string> };
+    expect(openCodeConfig.permission).toEqual({
+      'mem-gpt_identity_whoami': 'allow',
+      'mem-gpt_google_docs_connect': 'allow',
+      'mem-gpt_google_docs_get_document': 'allow',
+    });
+    expect(JSON.stringify(spec)).not.toContain('user-catalog-bearer-token-123456');
+    expect(JSON.stringify(spec)).not.toContain('signed-user-run-proof-123456');
+  });
+
+  it('rejects a multi-server MCP payload even when each entry is individually pinned', async () => {
+    const fixture = await startFixture();
+    cleanups.push(fixture.close);
+    const headers = { Authorization: 'Bearer {env:RUNNER_MCP_USER_TOKEN}', 'X-MCP-Operation': 'invocation',
+      'X-MCP-Scope': 'mcp:user-agent-run', 'X-MCP-User-Task-Id': 'task-vm-worker-test',
+      'X-MCP-Profile': 'integration-telegram-ux-v1', 'X-MCP-Run-Id': RUN_ID,
+      'X-MCP-Run-Binding': '{env:RUNNER_MCP_USER_PROOF}' };
+    const response = await launch(fixture.base, launchRequest({ profileId: 'integration-telegram-ux-v1', mcp: { servers: {
+      'mem-gpt': { type: 'remote', url: 'https://trained-assist-mcp-user-sandbox.skillset-apply.workers.dev/mcp', enabled: true, headers },
+      'trained-assist-registry-test': { type: 'remote', url: 'https://trained-assist-mcp-host-test-160.skillset-apply.workers.dev/mcp', enabled: true, headers },
+    } }, mcpSecrets: { RUNNER_MCP_USER_TOKEN: 'user-catalog-bearer-token-123456',
+      RUNNER_MCP_USER_PROOF: 'signed-user-run-proof-123456',
+      RUNNER_MCP_REGISTRY_TEST: 'test-registry-bearer-token-123', RUNNER_MCP_REGISTRY_TEST_PROOF: 'signed-run-bound-proof-123456' } }));
+    expect(response.status).toBe(400);
+    expect(fixture.runner.startCalls).toHaveLength(0);
   });
 
   it('rejects caller-selected MCP endpoints before Runner admission', async () => {
@@ -363,7 +431,10 @@ class FakeRunner {
     const at = new Date().toISOString();
     this.eventList.push({ type: 'log', sequence: 10, payload: { stream: 'stdout', message: 'worker says hello' } });
     this.eventList.push({ type: 'log', sequence: 11, payload: { stream: 'stderr', message: 'diagnostic' } });
-    this.snapshot = { runId: spec.runId, state: 'running', updatedAt: at, ownerGeneration: spec.ownerGeneration, pid: 1234, result: null, checkpoint: null };
+    this.eventList.push({ type: 'assistant_message', sequence: 12, payload: {
+      sessionId: 'ses_01J9A3J9Y7V8W2K4M6N0PQRSTZ', messageId: 'msg_01J9A3J9Y7V8W2K4M6N0PQRSTZ', text: 'Checking the repository first.',
+    } });
+    this.snapshot = { runId: spec.runId, state: 'running', startPhase: 'started', startAttempts: 1, startedAt: at, updatedAt: at, ownerGeneration: spec.ownerGeneration, pid: 1234, result: null, checkpoint: null };
     setTimeout(() => {
       this.state = 'succeeded';
       this.snapshot!.state = 'succeeded';

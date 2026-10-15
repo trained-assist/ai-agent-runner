@@ -1,5 +1,8 @@
 import type { ApiPrincipal, DurableObjectStateLike, RunnerWorkerEnv } from './types.js';
 import { DEFAULT_ENGINE, SAFE_ID, error, json } from './runner-api.js';
+import { deliverTerminalWebhook, resolveWebhook, type WebhookConnection, type WebhookDelivery } from './webhooks.js';
+
+const AGENT_HISTORY_PATH = '__runner/agent-history.json';
 
 type State = 'queued' | 'starting' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'unknown';
 interface RunRecord {
@@ -8,18 +11,33 @@ interface RunRecord {
   principalId: string; profileId: string; tenantId?: string; idempotencyKey: string; payloadHash: string;
   engine: string; routeMode: 'auto' | 'france' | 'gha'; state: State; sequence: number; createdAt: string; updatedAt: string; startedAt: string | null;
   finishedAt: string | null; answer: string | null; cancelRequested: boolean; launchCiphertext: string;
+  lastHeartbeatAt?: string | null; logCursor?: number; output?: { stdout: string; stderr: string; updatedAt: string | null; truncated: boolean };
+  /** Worker contact and worker-reported run progress are separate signals. */
+  workerReportedUpdatedAt?: string | null;
+  workerProgressObservedAt?: string | null;
+  workerStartPhase?: string | null;
+  workerStartAttempts?: number | null;
+  workerStartedAt?: string | null;
   launchAttempts: number; result?: Record<string, unknown>; workerReceipt?: Record<string, unknown>;
   launchRejection?: { status: number; code: string; fields: string[] };
   lastError?: string;
   artifacts: Array<Record<string, unknown>>; repo: Record<string, unknown> | null; logUrl: string | null;
   events: Array<Record<string, unknown>>;
+  webhook?: WebhookDelivery;
+  developerGuest?: boolean;
+  developerApi?: boolean;
+  artifactExpiresAt?: string;
 }
 interface CancellationFence { userTaskId: string; ownerGeneration: number; principalId: string; profileId: string; tenantId?: string; createdAt: string }
 interface Stored { runs: Record<string, RunRecord>; idempotency: Record<string, string>; cancellationFences?: Record<string, CancellationFence>; latestOwnerGeneration: number; requestId?: string; jobId?: string }
+interface ModelConnection { connectionId: string; principalId: string; profileId: string; tenantId?: string; provider: 'openai'; model: string; secretBinding: string }
 
 const INIT: Stored = { runs: {}, idempotency: {}, latestOwnerGeneration: 0 };
 const ACTIVE = new Set<State>(['queued', 'starting', 'running']);
 const TERMINAL = new Set<State>(['succeeded', 'failed', 'cancelled']);
+const UNKNOWN_RECONCILE_MS = 30 * 60_000;
+const MAX_WEBHOOK_ATTEMPTS = 8;
+const GUEST_ARTIFACT_TTL_MS = 24 * 60 * 60_000;
 const now = (): string => new Date().toISOString();
 const stateKey = 'runner-v1';
 const FRANCE_ENGINE = 'eu-vm-agent-run';
@@ -33,15 +51,50 @@ const MCP_TEST = Object.freeze({
   digest: '129ab5033964c3ed5be47414711026cc2469b3d9af90ce83ee071cba7f005ea9',
   tokenEnv: 'RUNNER_MCP_REGISTRY_TEST',
 });
+const MCP_USER = Object.freeze({
+  profile: 'integration-telegram-ux-v1', principal: 'integration-telegram-ux-v1',
+  server: 'mem-gpt', binding: 'mem-gpt-user-sandbox', scope: 'mcp:user-agent-run',
+  policy: 'mem-gpt-user-run-v1', audience: 'trained-assist:mcp:user', issuer: 'trained-assist-agent-runner',
+  url: 'https://trained-assist-mcp-user-sandbox.skillset-apply.workers.dev/mcp',
+  digest: '8c17e64a0d71123698b139bd5957a10fff71a2b15f12601a95adcde150350e71',
+  catalogue: 'mem-gpt-user-catalogue-v1', tokenEnv: 'RUNNER_MCP_USER_TOKEN', proofEnv: 'RUNNER_MCP_USER_PROOF',
+  tools: ['identity.whoami', 'google_docs.connect', 'google_docs.get_document'],
+});
 
 function principalOf(request: Request): ApiPrincipal | null {
   try { return JSON.parse(request.headers.get('x-runner-principal') ?? 'null') as ApiPrincipal | null; } catch { return null; }
 }
 
+async function guestSignature(secret: string, runId: string, path: string, expiresAt: string): Promise<string> {
+  if (secret.length < 32) throw new Error('RUNNER_GUEST_DOWNLOAD_SECRET must contain at least 32 characters');
+  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const bytes = new Uint8Array(await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(`${runId}\n${path}\n${expiresAt}`)));
+  return [...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+async function guestDownloadUrl(env: RunnerWorkerEnv, run: RunRecord, path: string): Promise<string> {
+  const expiresAt = run.artifactExpiresAt!;
+  const signature = await guestSignature(env.RUNNER_GUEST_DOWNLOAD_SECRET ?? '', run.runId, path, expiresAt);
+  const url = new URL(`/v1/developer/downloads/${run.runId}`, env.RUNNER_API_PUBLIC_URL);
+  url.search = new URLSearchParams({ path, expires: expiresAt, signature }).toString();
+  return url.href;
+}
+
 function view(run: RunRecord): Record<string, unknown> {
+  const progressAgeMs = run.workerReportedUpdatedAt ? Date.now() - Date.parse(run.workerReportedUpdatedAt) : null;
   return { requestId: run.requestId, userTaskId: run.userTaskId, conversationId: run.conversationId, runId: run.runId,
     ownerGeneration: run.ownerGeneration, state: run.state, engine: run.engine, routeMode: run.routeMode ?? 'auto', cancelRequested: run.cancelRequested, connectionLost: run.state === 'unknown',
-    observedAt: run.updatedAt, sequence: run.sequence, fencing: { rejected: 0 }, answer: run.answer };
+    createdAt: run.createdAt, startedAt: run.startedAt, finishedAt: run.finishedAt,
+    observedAt: run.updatedAt, lastHeartbeatAt: run.lastHeartbeatAt ?? null,
+    statusFreshness: run.lastHeartbeatAt && Date.now() - Date.parse(run.lastHeartbeatAt) > 30_000 ? 'stale' : run.lastHeartbeatAt ? 'fresh' : 'unobserved',
+    workerReportedUpdatedAt: run.workerReportedUpdatedAt ?? null,
+    workerProgressObservedAt: run.workerProgressObservedAt ?? null,
+    workerStartPhase: run.workerStartPhase ?? null,
+    workerStartAttempts: run.workerStartAttempts ?? null,
+    workerStartedAt: run.workerStartedAt ?? null,
+    workerProgressFreshness: progressAgeMs === null || !Number.isFinite(progressAgeMs) ? 'unobserved' : progressAgeMs > 30_000 ? 'stale' : 'fresh',
+    output: run.output ?? { stdout: '', stderr: '', updatedAt: null, truncated: false },
+    sequence: run.sequence, fencing: { rejected: 0 }, answer: run.answer };
 }
 
 function workerRefusalCode(body: unknown, status: number): string {
@@ -82,7 +135,7 @@ function refusedLaunchResult(run: RunRecord): Record<string, unknown> {
   return {
     schemaVersion: 1, runId: run.runId, jobId: run.jobId, userTaskId: run.userTaskId,
     profileId: run.profileId, ownerGeneration: run.ownerGeneration, outcome: 'failed',
-    exitReason: 'preflight_refused', exitCode: null, exitSignal: null, exitObserved: false,
+    exitReason: 'preflight_refused', exitCode: null, exitSignal: null, exitObserved: false, engineStart: 'not_started',
     startedAt: run.startedAt ?? run.createdAt, finishedAt: run.finishedAt ?? now(),
     failure: { code: code.startsWith('WORKER_') ? code : `WORKER_${code}`, failureClass: 'preflight',
       safeSummary: `The ${run.engine} execution worker refused the run before accepting it (HTTP ${status}, ${code}${fieldSummary}).`, retryable: false },
@@ -127,12 +180,16 @@ export class RunnerRunCoordinator {
 
   async fetch(request: Request): Promise<Response> {
     await this.ready;
-    const principal = principalOf(request);
-    if (!principal) return error('UNAUTHENTICATED', 'authenticated principal missing', 401);
     const url = new URL(request.url);
     const segments = url.pathname.split('/').filter(Boolean);
+    if (segments.length === 4 && segments[0] === 'v1' && segments[1] === 'runs' && segments[3] === 'download') {
+      return this.guestDownload(request, segments[2]!);
+    }
+    const principal = principalOf(request);
+    if (!principal) return error('UNAUTHENTICATED', 'authenticated principal missing', 401);
     if (url.pathname === '/v1/sandbox/cleanup-task') return request.method === 'POST' ? this.cleanupTask(request, principal) : error('METHOD_NOT_ALLOWED', 'method not allowed', 405);
     if (url.pathname === '/v1/runs/cancel-by-idempotency-key') return request.method === 'POST' ? this.cancelByIdempotencyKey(request, principal) : error('METHOD_NOT_ALLOWED', 'method not allowed', 405);
+    if (segments.length === 2 && request.method === 'GET') return this.listTaskRuns(url, principal);
     if (segments.length === 2 && request.method === 'POST') return this.submit(request, principal);
     if (segments.length !== 4) return error('ROUTE_NOT_FOUND', `no route for ${url.pathname}`, 404);
     let runId: string;
@@ -161,28 +218,86 @@ export class RunnerRunCoordinator {
         const limit = Math.min(500, Math.max(1, Number(url.searchParams.get('limit') ?? 500) || 500));
         const events = run.events.filter((event) => Number(event['sequence']) > cursor).slice(0, limit);
         return json({ runId, events, cursor: events.at(-1)?.['sequence'] ?? cursor, hasMore: false,
-          snapshot: { state: run.state, connectionLost: run.state === 'unknown', sequence: run.sequence, ownerGeneration: run.ownerGeneration }, droppedEvents: 0, logUrl: run.logUrl });
+          snapshot: { state: run.state, connectionLost: run.state === 'unknown', sequence: run.sequence, ownerGeneration: run.ownerGeneration,
+            observedAt: run.updatedAt, lastHeartbeatAt: run.lastHeartbeatAt ?? null,
+            statusFreshness: run.lastHeartbeatAt && Date.now() - Date.parse(run.lastHeartbeatAt) > 30_000 ? 'stale' : run.lastHeartbeatAt ? 'fresh' : 'unobserved',
+            output: run.output ?? { stdout: '', stderr: '', updatedAt: null, truncated: false } }, droppedEvents: 0, logUrl: run.logUrl });
       }
       case 'artifacts':
         if (request.method !== 'GET') return error('METHOD_NOT_ALLOWED', 'artifacts supports GET only', 405);
+        if (run.developerGuest && run.artifactExpiresAt && Date.now() >= Date.parse(run.artifactExpiresAt)) return error('ARTIFACT_EXPIRED', 'guest artifacts are no longer available', 410);
         if (url.searchParams.has('path')) {
-          if (!TERMINAL.has(run.state)) return error('RESULT_NOT_READY', 'run outputs are not available before completion', 409);
-          const sourcePath = url.searchParams.get('path') ?? '';
-          if (!sourcePath || sourcePath.length > 512 || /[\x00-\x1f\x7f]/.test(sourcePath)) return error('INVALID_REQUEST', 'a valid artifact path is required', 400);
-          if (!run.artifacts.some((artifact) => artifact['path'] === sourcePath)) return error('NOT_FOUND', 'artifact path is not part of this run', 404);
-          const query = new URLSearchParams({ path: sourcePath });
-          const response = await this.worker(run.engine, `/v1/runs/${encodeURIComponent(run.runId)}/artifacts?${query.toString()}`, 'GET', undefined, 30_000);
-          const headers = new Headers({ 'cache-control': 'private, no-store', 'x-content-type-options': 'nosniff' });
-          for (const name of ['content-type', 'content-length', 'content-disposition', 'x-content-sha256']) {
-            const value = response.headers.get(name);
-            if (value) headers.set(name, value);
-          }
-          return new Response(response.body, { status: response.status, headers });
+          return this.artifactBytes(run, url.searchParams.get('path') ?? '');
         }
-        return json({ runId, conversationId: run.conversationId, userTaskId: run.userTaskId, repo: run.repo, branchUrl: null, mergeUrl: null, count: run.artifacts.length, artifacts: run.artifacts, logUrl: run.logUrl, note: run.artifacts.length ? 'artifacts are committed by the VM worker to the run branch' : 'the VM worker reported no artifacts' });
+        return json({ runId, conversationId: run.conversationId, userTaskId: run.userTaskId, repo: run.developerGuest ? null : run.repo, branchUrl: null, mergeUrl: null, count: run.artifacts.length, artifacts: run.artifacts, logUrl: run.logUrl,
+          ...(run.developerGuest ? { expiresAt: run.artifactExpiresAt ?? null } : {}),
+          note: run.artifacts.length ? run.developerGuest ? 'guest downloads expire 24 hours after result collection' : 'artifacts are committed by the VM worker to the run branch' : 'the VM worker reported no artifacts' });
+      case 'webhook':
+        if (request.method !== 'GET') return error('METHOD_NOT_ALLOWED', 'webhook supports GET only', 405);
+        if (!run.webhook) return error('WEBHOOK_NOT_CONFIGURED', 'run has no webhook', 404);
+        return json({ runId, webhookId: run.webhook.webhookId, status: run.webhook.deliveredAt ? 'delivered' : run.webhook.exhaustedAt ? 'failed' : 'pending',
+          attempts: run.webhook.attempts, nextAttemptAt: run.webhook.deliveredAt || run.webhook.exhaustedAt ? null : run.webhook.nextAttemptAt,
+          deliveredAt: run.webhook.deliveredAt ?? null, lastStatus: run.webhook.lastStatus ?? null,
+          lastError: run.webhook.lastError ?? null });
       case 'cancel': return request.method === 'POST' ? this.cancel(request, runId, principal) : error('METHOD_NOT_ALLOWED', 'cancel supports POST only', 405);
       default: return error('ROUTE_NOT_FOUND', `no route for ${url.pathname}`, 404);
     }
+  }
+
+  private async guestDownload(request: Request, runId: string): Promise<Response> {
+    if (request.method !== 'GET') return error('METHOD_NOT_ALLOWED', 'downloads support GET only', 405);
+    if (!SAFE_ID.test(runId)) return error('INVALID_REQUEST', 'invalid run id', 400);
+    const run = (await this.read()).runs[runId];
+    if (!run?.developerGuest || !run.artifactExpiresAt) return error('NOT_FOUND', 'download not found', 404);
+    const url = new URL(request.url);
+    const path = url.searchParams.get('path') ?? '';
+    const expires = url.searchParams.get('expires') ?? '';
+    const signature = url.searchParams.get('signature') ?? '';
+    if (!path || expires !== run.artifactExpiresAt || !/^[0-9a-f]{64}$/.test(signature)) return error('NOT_FOUND', 'download not found', 404);
+    if (Date.now() >= Date.parse(expires)) return error('ARTIFACT_EXPIRED', 'guest artifact link has expired', 410);
+    if (!run.artifacts.some((artifact) => artifact['path'] === path)) return error('NOT_FOUND', 'download not found', 404);
+    const receivedBytes = Uint8Array.from(signature.match(/../g)!, (byte) => Number.parseInt(byte, 16));
+    const secret = this.env.RUNNER_GUEST_DOWNLOAD_SECRET ?? '';
+    if (secret.length < 32) return error('SERVER_MISCONFIGURED', 'guest download signing is unavailable', 503);
+    const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['verify']);
+    const valid = await crypto.subtle.verify('HMAC', key, receivedBytes, new TextEncoder().encode(`${runId}\n${path}\n${expires}`));
+    if (!valid) return error('NOT_FOUND', 'download not found', 404);
+    return this.artifactBytes(run, path);
+  }
+
+  private async artifactBytes(run: RunRecord, sourcePath: string): Promise<Response> {
+    if (!TERMINAL.has(run.state)) return error('RESULT_NOT_READY', 'run outputs are not available before completion', 409);
+    if (!sourcePath || sourcePath.length > 512 || /[\x00-\x1f\x7f]/.test(sourcePath)) return error('INVALID_REQUEST', 'a valid artifact path is required', 400);
+    if (!run.artifacts.some((artifact) => artifact['path'] === sourcePath)) return error('NOT_FOUND', 'artifact path is not part of this run', 404);
+    const query = new URLSearchParams({ path: sourcePath });
+    const response = await this.worker(run.engine, sourcePath === AGENT_HISTORY_PATH && run.developerApi
+      ? `/v1/runs/${encodeURIComponent(run.runId)}/history`
+      : `/v1/runs/${encodeURIComponent(run.runId)}/artifacts?${query.toString()}`, 'GET', undefined, 30_000);
+    const headers = new Headers({ 'cache-control': 'private, no-store', 'x-content-type-options': 'nosniff' });
+    for (const name of ['content-type', 'content-length', 'content-disposition', 'x-content-sha256']) {
+      const value = response.headers.get(name);
+      if (value) headers.set(name, value);
+    }
+    return new Response(response.body, { status: response.status, headers });
+  }
+
+  private async listTaskRuns(url: URL, principal: ApiPrincipal): Promise<Response> {
+    const taskId = url.searchParams.get('userTaskId');
+    if (!taskId || !SAFE_ID.test(taskId)) return error('INVALID_REQUEST', 'userTaskId query parameter is required and must be a safe id', 400);
+    const stateFilter = url.searchParams.get('state');
+    if (stateFilter !== null && !['active', 'all'].includes(stateFilter)) return error('INVALID_REQUEST', 'state supports active or all', 400);
+    const stored = await this.read();
+    const runs = Object.values(stored.runs)
+      .filter((run) => run.userTaskId === taskId && owns(run, principal)
+        && (stateFilter === 'all' || !['succeeded', 'failed', 'cancelled'].includes(run.state)))
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.runId.localeCompare(b.runId))
+      .map((run) => ({ runId: run.runId, userTaskId: run.userTaskId, state: run.state,
+        createdAt: run.createdAt, updatedAt: run.updatedAt, startedAt: run.startedAt,
+        workerStartPhase: run.workerStartPhase ?? null, workerStartAttempts: run.workerStartAttempts ?? null,
+        workerProgressFreshness: run.workerReportedUpdatedAt
+          ? Date.now() - Date.parse(run.workerReportedUpdatedAt) > 30_000 ? 'stale' : 'fresh' : 'unobserved',
+        links: { status: `/v1/runs/${encodeURIComponent(run.runId)}/status`, result: `/v1/runs/${encodeURIComponent(run.runId)}/result` } }));
+    return json({ runs, nextCursor: null });
   }
 
   private async cleanupTask(request: Request, principal: ApiPrincipal): Promise<Response> {
@@ -202,6 +317,7 @@ export class RunnerRunCoordinator {
       }
       if (entries.some((run) => !owns(run, principal))) return error('FORBIDDEN', 'task state is not owned by this principal', 403);
       if (entries.some((run) => ACTIVE.has(run.state) || run.state === 'unknown' || !TERMINAL.has(run.state))) return error('RUN_NOT_TERMINAL', 'active or unknown runs cannot be cleaned up', 409);
+      if (entries.some((run) => run.webhook && !run.webhook.deliveredAt && !run.webhook.exhaustedAt)) return error('WEBHOOK_DELIVERY_PENDING', 'pending webhook delivery cannot be cleaned up', 409);
       // This Durable Object is keyed to one task ID. Remove the whole record so
       // idempotency keys, owner generations, events, and results are reset too.
       const fences = Object.fromEntries(Object.entries(stored.cancellationFences ?? {}).filter(([, fence]) => fence.userTaskId === body.userTaskId));
@@ -213,6 +329,9 @@ export class RunnerRunCoordinator {
   }
 
   private async submit(request: Request, principal: ApiPrincipal): Promise<Response> {
+    if (principal.developerGuest && (this.env.RUNNER_GUEST_DOWNLOAD_SECRET?.length ?? 0) < 32) {
+      return error('SERVER_MISCONFIGURED', 'guest download signing is unavailable', 503);
+    }
     const key = request.headers.get('idempotency-key')?.trim() ?? '';
     if (!key || key.length > 200) return error('MISSING_IDEMPOTENCY_KEY', 'Idempotency-Key header is required and must be at most 200 characters', 400);
     let body: Record<string, any>;
@@ -224,7 +343,7 @@ export class RunnerRunCoordinator {
       body = JSON.parse(text) as Record<string, any>;
     } catch { return error('INVALID_REQUEST', 'request body must be JSON', 400); }
     if (!body || typeof body !== 'object' || Array.isArray(body)) return error('INVALID_REQUEST', 'request body must be an object', 400);
-    const allowedFields = new Set(['userTaskId', 'conversationId', 'engine', 'routeMode', 'input', 'ingressManifest', 'envAllowlist', 'limits', 'deadline', 'regionConstraints', 'credentialBindings', 'mcp', 'budget', 'result', 'outputs', 'traceId', 'instructions', 'repository', 'isolation']);
+    const allowedFields = new Set(['userTaskId', 'conversationId', 'engine', 'routeMode', 'input', 'ingressManifest', 'envAllowlist', 'limits', 'deadline', 'regionConstraints', 'credentialBindings', 'mcp', 'budget', 'result', 'outputs', 'traceId', 'instructions', 'repository', 'isolation', 'webhookId']);
     const unknownFields = Object.keys(body).filter((name) => !allowedFields.has(name));
     if (unknownFields.length) return error('INVALID_REQUEST', 'request contains unsupported fields', 400, { errors: unknownFields.map((name) => `request.${name}: unknown field`) });
     if (!Array.isArray(body.envAllowlist) || !body.limits || !Number.isSafeInteger(body.limits.timeoutMs) || body.limits.timeoutMs <= 0 || body.limits.timeoutMs > 86_400_000) return error('INVALID_REQUEST', 'envAllowlist and a valid limits.timeoutMs are required', 400);
@@ -246,26 +365,50 @@ export class RunnerRunCoordinator {
     }
     if (Array.isArray(body.input?.refs) && body.input.refs.length) return error('INPUT_REFS_UNSUPPORTED', 'input refs need a durable workspace and are not supported by this Worker API yet', 422);
     const mcp = body.mcp?.servers?.length ? body.mcp.servers : [];
-    if (!Array.isArray(mcp) || mcp.length > 1) return error('MCP_HOST_POLICY_MISSING', 'only the pinned test Registry MCP server is supported by this Worker API', 422);
+    if (!Array.isArray(mcp) || mcp.length > 1) return error('MCP_HOST_POLICY_MISSING', 'only one host-pinned MCP server is supported by this Worker API', 422);
+    let userMcp = false;
     if (mcp.length === 1) {
       const server = mcp[0];
       const fields = ['serverId', 'transport', 'url', 'bindingRef', 'allowedTools', 'policyVersion', 'catalogueVersion'];
-      if (!server || typeof server !== 'object' || Object.keys(server).some((field) => !fields.includes(field)) ||
-          principal.profileId !== MCP_TEST.profile || principal.principalId !== MCP_TEST.principal ||
-          !principal.mcpBindings?.includes(MCP_TEST.binding) || server.serverId !== MCP_TEST.server ||
-          server.transport !== 'remote' || server.url !== MCP_TEST.url || server.bindingRef !== MCP_TEST.binding ||
-          !Array.isArray(server.allowedTools) || server.allowedTools.length !== 1 || server.allowedTools[0] !== MCP_TEST.tool ||
-          server.policyVersion !== MCP_TEST.policy || typeof server.catalogueVersion !== 'string' ||
-          !/^[A-Za-z0-9._~-]{1,200}$/.test(server.catalogueVersion) ||
-          (this.env.MCP_TEST_CATALOGUE_VERSION && server.catalogueVersion !== this.env.MCP_TEST_CATALOGUE_VERSION)) {
-        return error('MCP_HOST_POLICY_MISSING', 'MCP descriptor is outside this principal’s pinned test Registry policy', 422);
-      }
-      if (!this.env.MCP_TEST_AUTH_TOKEN || !this.env.MCP_TEST_RUNNER_PRIVATE_JWK || !this.env.MCP_TEST_CATALOGUE_VERSION || !this.env.MCP_TEST_EXPIRES_AT ||
-          !Number.isFinite(Date.parse(this.env.MCP_TEST_EXPIRES_AT)) || Date.parse(this.env.MCP_TEST_EXPIRES_AT) <= Date.now()) {
-        return error('MCP_BINDING_UNAVAILABLE', 'pinned test Registry MCP secrets or lease are not configured', 503);
-      }
+      if (!server || typeof server !== 'object' || Object.keys(server).some((field) => !fields.includes(field))) return error('MCP_HOST_POLICY_MISSING', 'MCP descriptor contains unsupported fields', 422);
+      if (server.serverId === MCP_TEST.server) {
+        if (principal.profileId !== MCP_TEST.profile || principal.principalId !== MCP_TEST.principal ||
+            !principal.mcpBindings?.includes(MCP_TEST.binding) || server.transport !== 'remote' || server.url !== MCP_TEST.url || server.bindingRef !== MCP_TEST.binding ||
+            !Array.isArray(server.allowedTools) || server.allowedTools.length !== 1 || server.allowedTools[0] !== MCP_TEST.tool ||
+            server.policyVersion !== MCP_TEST.policy || typeof server.catalogueVersion !== 'string' ||
+            !/^[A-Za-z0-9._~-]{1,200}$/.test(server.catalogueVersion) ||
+            (this.env.MCP_TEST_CATALOGUE_VERSION && server.catalogueVersion !== this.env.MCP_TEST_CATALOGUE_VERSION)) {
+          return error('MCP_HOST_POLICY_MISSING', 'MCP descriptor is outside this principal’s pinned test Registry policy', 422);
+        }
+        if (!this.env.MCP_TEST_AUTH_TOKEN || !this.env.MCP_TEST_RUNNER_PRIVATE_JWK || !this.env.MCP_TEST_CATALOGUE_VERSION || !this.env.MCP_TEST_EXPIRES_AT ||
+            !Number.isFinite(Date.parse(this.env.MCP_TEST_EXPIRES_AT)) || Date.parse(this.env.MCP_TEST_EXPIRES_AT) <= Date.now()) {
+          return error('MCP_BINDING_UNAVAILABLE', 'pinned test Registry MCP secrets or lease are not configured', 503);
+        }
+      } else if (server.serverId === MCP_USER.server) {
+        if (principal.profileId !== MCP_USER.profile || principal.principalId !== MCP_USER.principal ||
+            server.transport !== 'remote' || server.url !== MCP_USER.url || server.bindingRef !== MCP_USER.binding ||
+            !Array.isArray(server.allowedTools) || server.allowedTools.length !== MCP_USER.tools.length ||
+            MCP_USER.tools.some((tool, index) => server.allowedTools[index] !== tool) ||
+            server.policyVersion !== MCP_USER.policy || server.catalogueVersion !== MCP_USER.catalogue) {
+          return error('MCP_HOST_POLICY_MISSING', 'MCP descriptor is outside this profile’s pinned user catalog policy', 422);
+        }
+        if (!this.env.MCP_USER_AUTH_TOKEN || this.env.MCP_USER_AUTH_TOKEN.length < 32 || !this.env.MCP_USER_RUNNER_PRIVATE_JWK ||
+            this.env.MCP_USER_CATALOGUE_VERSION !== MCP_USER.catalogue || this.env.MCP_USER_CATALOGUE_DIGEST !== MCP_USER.digest) {
+          return error('MCP_BINDING_UNAVAILABLE', 'pinned sandbox user catalog credentials or digest are not configured', 503);
+        }
+        let profileUsers: Record<string, string>;
+        try {
+          const parsed: unknown = JSON.parse(this.env.MCP_USER_PROFILE_USER_IDS ?? 'null');
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || Object.keys(parsed).some(profile => profile !== MCP_USER.profile) ||
+              Object.values(parsed).some(value => typeof value !== 'string' || !/^[A-Za-z0-9._:@-]{1,200}$/.test(value))) throw new Error();
+          profileUsers = parsed as Record<string, string>;
+        } catch { return error('MCP_BINDING_UNAVAILABLE', 'sandbox user catalog profile mapping is invalid', 503); }
+        if (!profileUsers[principal.profileId]) return error('MCP_BINDING_UNAVAILABLE', 'sandbox user catalog has no user mapping for this profile', 503);
+        userMcp = true;
+      } else return error('MCP_HOST_POLICY_MISSING', 'MCP server is not host approved', 422);
     }
-    if (body.profileWorkspace || body.credentialBindings?.length) return error('FEATURE_UNSUPPORTED', 'profile workspace and credential bindings are not supported by this Worker API yet', 422);
+    if (userMcp && body.limits.timeoutMs > 7_140_000) return error('MCP_GRANT_MAX_LIFETIME', 'sandbox user catalog runs are limited to a grant lifetime of two hours', 422);
+    if (body.profileWorkspace) return error('FEATURE_UNSUPPORTED', 'profile workspace is not supported by this Worker API yet', 422);
     if (body.isolation !== undefined && body.isolation?.mode !== 'none') return error('ISOLATION_UNSUPPORTED', 'the France VM worker currently supports isolation.mode=none only', 422);
     const routeMode = body.routeMode === undefined ? 'auto' : body.routeMode;
     if (routeMode !== 'auto' && routeMode !== 'france' && routeMode !== 'gha') return error('INVALID_REQUEST', 'routeMode must be auto, france, or gha', 400);
@@ -291,6 +434,50 @@ export class RunnerRunCoordinator {
     const envAllowlist = requestedEnv as string[];
     const launchEnv = runtimeEnv(this.env, envAllowlist);
     if (envAllowlist.some((name) => !launchEnv[name])) return error('SERVER_MISCONFIGURED', 'an approved runtime environment secret is missing', 503);
+    let boundModel: string | undefined;
+    if (body.credentialBindings !== undefined && !(Array.isArray(body.credentialBindings) && body.credentialBindings.length === 0)) {
+      if (this.env.DEPLOYMENT_ENV === 'production' || this.env.RUNNER_BYOK_ENABLED !== 'true') {
+        return error('FEATURE_UNSUPPORTED', 'hosted model connections are disabled on this lane', 422);
+      }
+      const bindings = body.credentialBindings;
+      if (!Array.isArray(bindings) || bindings.length !== 1 || !bindings[0] ||
+          Object.keys(bindings[0]).sort().join(',') !== 'connectionId,type' || bindings[0].type !== 'openai' ||
+          typeof bindings[0].connectionId !== 'string' || !SAFE_ID.test(bindings[0].connectionId)) {
+        return error('INVALID_CREDENTIAL_BINDING', 'exactly one OpenAI connectionId binding is supported', 400);
+      }
+      if (envAllowlist.length || body.engine?.modelSettings?.model !== undefined) {
+        return error('INVALID_CREDENTIAL_BINDING', 'a model connection cannot be combined with runtime secrets or a caller-selected model', 400);
+      }
+      const allowedOnWorker = new Set((this.env.ALLOWED_ENVIRONMENT_NAMES ?? '').split(',').map((name) => name.trim()));
+      if (!allowedOnWorker.has('OPENAI_API_KEY')) return error('SERVER_MISCONFIGURED', 'OpenAI BYOK is not enabled on this lane', 503);
+      let connections: ModelConnection[];
+      try {
+        const parsed: unknown = JSON.parse(this.env.RUNNER_MODEL_CONNECTIONS ?? 'null');
+        if (!Array.isArray(parsed) || parsed.some((entry) => !validModelConnection(entry))) throw new Error('invalid connections');
+        connections = parsed as ModelConnection[];
+      } catch { return error('SERVER_MISCONFIGURED', 'model connection registry is invalid', 503); }
+      const selected = connections.find((entry) => entry.connectionId === bindings[0].connectionId &&
+        entry.principalId === principal.principalId && entry.profileId === principal.profileId && entry.tenantId === principal.tenantId);
+      if (!selected) return error('MODEL_CONNECTION_NOT_FOUND', 'model connection is not available to this principal', 404);
+      const secret = this.env[selected.secretBinding];
+      if (typeof secret !== 'string' || !secret || secret.length > 100_000) return error('SERVER_MISCONFIGURED', 'model connection secret is unavailable', 503);
+      envAllowlist.push('OPENAI_API_KEY');
+      launchEnv.OPENAI_API_KEY = secret;
+      boundModel = selected.model;
+    }
+    let webhook: WebhookDelivery | undefined;
+    if (body.webhookId !== undefined) {
+      if (this.env.DEPLOYMENT_ENV === 'production' || this.env.RUNNER_WEBHOOKS_ENABLED !== 'true') return error('FEATURE_UNSUPPORTED', 'webhook delivery is disabled on this lane', 422);
+      if (typeof body.webhookId !== 'string' || !SAFE_ID.test(body.webhookId)) return error('INVALID_REQUEST', 'webhookId must be a safe ID', 400);
+      let connection: WebhookConnection | null;
+      try { connection = resolveWebhook(this.env, principal, body.webhookId); }
+      catch { return error('SERVER_MISCONFIGURED', 'webhook registry is invalid', 503); }
+      if (!connection) return error('WEBHOOK_NOT_FOUND', 'webhook is not available to this principal', 404);
+      const secret = this.env[connection.secretBinding];
+      if (typeof secret !== 'string' || secret.length < 24) return error('SERVER_MISCONFIGURED', 'webhook signing secret is unavailable', 503);
+      webhook = { webhookId: connection.webhookId, url: connection.url, secretBinding: connection.secretBinding,
+        attempts: 0, nextAttemptAt: now() };
+    }
     const idemKey = `${principal.principalId}\0${key}`;
     const hashInput = structuredClone(body);
     if (hashInput.repository && typeof hashInput.repository === 'object') delete hashInput.repository.token;
@@ -303,7 +490,8 @@ export class RunnerRunCoordinator {
       const stored = await tx.get<Stored>(stateKey) ?? structuredClone(INIT);
       const expiration = Date.now() - 24 * 60 * 60 * 1000;
       for (const [oldRunId, oldRun] of Object.entries(stored.runs)) {
-        if (TERMINAL.has(oldRun.state) && oldRun.finishedAt && Date.parse(oldRun.finishedAt) < expiration) {
+        if (TERMINAL.has(oldRun.state) && oldRun.finishedAt && Date.parse(oldRun.finishedAt) < expiration
+          && (!oldRun.webhook || oldRun.webhook.deliveredAt || oldRun.webhook.exhaustedAt)) {
           delete stored.runs[oldRunId];
           for (const [oldKey, mappedRun] of Object.entries(stored.idempotency)) if (mappedRun === oldRunId) delete stored.idempotency[oldKey];
         }
@@ -339,16 +527,21 @@ export class RunnerRunCoordinator {
       const resultUrl = `${this.env.RUNNER_API_PUBLIC_URL.replace(/\/+$/, '')}/v1/runs/${runId}/result`;
       const limits = body.limits;
       const launch = { runId, jobId, userTaskId: taskId, profileId: principal.profileId, conversationId, operationId: `op_${await digest(`${taskId}:${ownerGeneration}`).then((h) => h.slice(0, 24))}`,
-          ownerGeneration, engine: { name: engine, adapterVersion: body.engine?.adapterVersion ?? '1', ...(body.engine?.modelSettings?.model ? { modelSettings: { model: body.engine.modelSettings.model } } : {}) },
+          ownerGeneration, engine: { name: engine, adapterVersion: body.engine?.adapterVersion ?? '1', ...(boundModel || body.engine?.modelSettings?.model ? { modelSettings: { model: boundModel ?? body.engine.modelSettings.model } } : {}) },
           input: { inlinePrompt: `${typeof inputPrompt === 'string' ? inputPrompt : ''}${instructions ? `${inputPrompt ? '\n\nAdditional instructions: ' : ''}${instructions}` : ''}` }, cwd: `/tmp/runner/${runId}`, envAllowlist, env: launchEnv, limits: { timeoutMs: clampInteger(limits.timeoutMs, 300_000, 1_000, 86_400_000), maxOutputBytes: clampInteger(limits.maxOutputBytes, 5_000_000, 1, 100_000_000), maxLogBytes: clampInteger(limits.maxLogBytes, 5_000_000, 1, 100_000_000) },
           ...(ingressManifest ? { ingressManifest: { ...ingressManifest, userTaskId: taskId, profileId: principal.profileId, runId, ownerGeneration } } : {}),
           repository: { fullName: repository ?? '', branch: `agent-run/${runId}`, ...(body.repository?.revision ? { revision: body.repository.revision } : {}) },
           ...(repositoryToken ? { publicationToken: repositoryToken } : {}),
           resultUrl, isolation: body.isolation ?? { mode: 'none' }, outputs: Array.isArray(body.outputs) ? body.outputs : [],
-          ...(mcp.length ? await this.testRegistryAttachment(mcp[0], { runId, taskId, profileId: principal.profileId, timeoutMs: clampInteger(limits.timeoutMs, 300_000, 1_000, 86_400_000) }) : {}) };
+          ...(mcp.length ? userMcp
+            ? await this.userCatalogAttachment({ runId, taskId, profileId: principal.profileId, ownerGeneration, timeoutMs: clampInteger(limits.timeoutMs, 300_000, 1_000, 86_400_000) })
+            : await this.testRegistryAttachment(mcp[0], { runId, taskId, profileId: principal.profileId, timeoutMs: clampInteger(limits.timeoutMs, 300_000, 1_000, 86_400_000) }) : {}) };
       record = { requestId, runId, userTaskId: taskId, conversationId, jobId, ownerGeneration, principalId: principal.principalId, profileId: principal.profileId,
+        ...(principal.developerApi ? { developerApi: true } : {}),
+        ...(principal.developerGuest ? { developerGuest: true } : {}),
         ...(principal.tenantId ? { tenantId: principal.tenantId } : {}), idempotencyKey: idemKey, payloadHash, engine, routeMode, state: 'queued', sequence: 0,
-        createdAt: time, updatedAt: time, startedAt: null, finishedAt: null, answer: null, cancelRequested: false, launchAttempts: 0, events: [], artifacts: [], repo: null, logUrl: null, launchCiphertext: await encrypt(JSON.stringify(launch), this.env.RUN_LAUNCH_ENCRYPTION_KEY) };
+        createdAt: time, updatedAt: time, startedAt: null, finishedAt: null, answer: null, cancelRequested: false, launchAttempts: 0, events: [], artifacts: [], repo: null, logUrl: null,
+        ...(webhook ? { webhook } : {}), launchCiphertext: await encrypt(JSON.stringify(launch), this.env.RUN_LAUNCH_ENCRYPTION_KEY) }
       nextEvent(record, 'run_queued');
       stored.runs[runId] = record;
       stored.idempotency[idemKey] = runId;
@@ -487,11 +680,51 @@ export class RunnerRunCoordinator {
     };
   }
 
+  private async userCatalogAttachment(context: { runId: string; taskId: string; profileId: string; ownerGeneration: number; timeoutMs: number }): Promise<Record<string, unknown>> {
+    let profileUsers: Record<string, string>;
+    let jwk: JsonWebKey;
+    try {
+      profileUsers = JSON.parse(this.env.MCP_USER_PROFILE_USER_IDS ?? 'null') as Record<string, string>;
+      jwk = JSON.parse(this.env.MCP_USER_RUNNER_PRIVATE_JWK ?? 'null') as JsonWebKey;
+    } catch { throw new Error('sandbox user catalog signing configuration is invalid'); }
+    const userId = profileUsers?.[context.profileId];
+    if (typeof userId !== 'string' || !/^[A-Za-z0-9._:@-]{1,200}$/.test(userId) ||
+        jwk?.kty !== 'OKP' || jwk?.crv !== 'Ed25519' || typeof jwk.d !== 'string' || typeof jwk.x !== 'string') {
+      throw new Error('sandbox user catalog subject or Ed25519 key is unavailable');
+    }
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    const exp = nowSeconds + Math.ceil(context.timeoutMs / 1000) + 60;
+    if (exp - nowSeconds > 7200) throw new Error('sandbox user catalog grant would exceed its maximum lifetime');
+    const key = await crypto.subtle.importKey('jwk', jwk, { name: 'Ed25519' }, false, ['sign']);
+    const claims = {
+      iss: MCP_USER.issuer, aud: MCP_USER.audience, sub: context.runId,
+      userId, runId: context.runId, userTaskId: context.taskId, profileId: context.profileId,
+      ownerGeneration: context.ownerGeneration, serverId: MCP_USER.server,
+      bindingRef: MCP_USER.binding, scope: MCP_USER.scope, policyVersion: MCP_USER.policy,
+      catalogueVersion: MCP_USER.catalogue, catalogueDigest: MCP_USER.digest,
+      allowedTools: MCP_USER.tools, iat: nowSeconds, exp,
+    };
+    const encode = (value: unknown): string => base64Url(new TextEncoder().encode(JSON.stringify(value)));
+    const signingInput = `${encode({ alg: 'EdDSA', typ: 'JWT' })}.${encode(claims)}`;
+    const signature = await crypto.subtle.sign({ name: 'Ed25519' }, key, new TextEncoder().encode(signingInput));
+    const proof = `${signingInput}.${base64Url(new Uint8Array(signature))}`;
+    return {
+      mcp: { servers: { [MCP_USER.server]: { type: 'remote', url: MCP_USER.url, enabled: true, headers: {
+        Authorization: `Bearer {env:${MCP_USER.tokenEnv}}`,
+        'X-MCP-Operation': 'invocation', 'X-MCP-Scope': MCP_USER.scope,
+        'X-MCP-User-Task-Id': context.taskId, 'X-MCP-Profile': context.profileId,
+        'X-MCP-Run-Id': context.runId, 'X-MCP-Run-Binding': `{env:${MCP_USER.proofEnv}}`,
+      } } } },
+      mcpSecrets: { [MCP_USER.tokenEnv]: this.env.MCP_USER_AUTH_TOKEN, [MCP_USER.proofEnv]: proof },
+    };
+  }
+
   async alarm(): Promise<void> {
     await this.ready;
     const stored = await this.read();
     let changed = false;
-    const pendingRuns = Object.values(stored.runs).filter((run) => ACTIVE.has(run.state));
+    const pendingRuns = Object.values(stored.runs).filter((run) => ACTIVE.has(run.state)
+      || run.state === 'unknown' && !!run.workerReceipt && Date.now() - Date.parse(run.updatedAt) < UNKNOWN_RECONCILE_MS);
     for (const run of pendingRuns) {
       try {
         if (run.engine === 'mock-test') {
@@ -499,7 +732,7 @@ export class RunnerRunCoordinator {
           run.startedAt = run.createdAt;
           run.answer = 'pong';
           run.result = { schemaVersion: 1, runId: run.runId, jobId: run.jobId, userTaskId: run.userTaskId, profileId: run.profileId,
-            ownerGeneration: run.ownerGeneration, outcome: 'succeeded', exitReason: 'completed', exitCode: 0, exitSignal: null, exitObserved: true,
+            ownerGeneration: run.ownerGeneration, outcome: 'succeeded', exitReason: 'completed', exitCode: 0, exitSignal: null, exitObserved: true, engineStart: 'started',
             startedAt: run.startedAt, finishedAt, text: 'pong', usage: { status: 'unknown' }, outputRefs: [], persistence: 'not_required',
             persistenceReason: 'mock-test creates no repository or artifacts', cleanup: 'completed', cleanupReason: 'mock-test creates no workspace', logPath: `mock-test://${run.runId}` };
           transition(run, 'succeeded', { engine: 'mock-test' });
@@ -546,38 +779,101 @@ export class RunnerRunCoordinator {
               throw new Error(`worker launch HTTP ${response.status}`);
             }
             run.workerReceipt = await response.json() as Record<string, unknown>;
-            transition(run, 'running', { engine: run.engine });
+            // A 202 receipt proves durable admission only. The next worker status
+            // poll must report process state before the run is marked running.
             break;
           }
         } else {
           const statusResponse = await this.worker(run.engine, `/v1/runs/${run.runId}/status`);
-          const workerStatus = statusResponse.ok ? await statusResponse.json() as { status?: string } : null;
+          if (!statusResponse.ok) throw new Error(`worker status HTTP ${statusResponse.status}`);
+          const workerStatus = await statusResponse.json() as { status?: string; state?: string; startPhase?: string; startAttempts?: number; startedAt?: string; updatedAt?: string };
+          run.lastHeartbeatAt = now();
+          if (typeof workerStatus.startPhase === 'string') run.workerStartPhase = workerStatus.startPhase;
+          if (Number.isSafeInteger(workerStatus.startAttempts)) run.workerStartAttempts = workerStatus.startAttempts;
+          if (typeof workerStatus.startedAt === 'string') run.workerStartedAt = workerStatus.startedAt;
+          if (typeof workerStatus.updatedAt === 'string' && Number.isFinite(Date.parse(workerStatus.updatedAt))) {
+            if (workerStatus.updatedAt !== run.workerReportedUpdatedAt) run.workerProgressObservedAt = now();
+            run.workerReportedUpdatedAt = workerStatus.updatedAt;
+          }
+          const logsResponse = await this.worker(run.engine, `/v1/runs/${run.runId}/logs?after=${run.logCursor ?? 0}&snapshot=1`);
+          if (logsResponse.ok) {
+            const batch = await logsResponse.json() as { cursor?: number; logs?: Array<{ stream?: string; message?: string; truncated?: boolean }> };
+            const output = run.output ?? { stdout: '', stderr: '', updatedAt: null, truncated: false };
+            let received = false;
+            for (const entry of batch.logs ?? []) {
+              if ((entry.stream !== 'stdout' && entry.stream !== 'stderr') || typeof entry.message !== 'string') continue;
+              const previous = output[entry.stream];
+              output[entry.stream] = `${previous}${previous ? '\n' : ''}${entry.message}`.slice(-24_000);
+              output.truncated ||= entry.truncated === true || previous.length + entry.message.length > 24_000;
+              received = true;
+            }
+            if (Number.isSafeInteger(batch.cursor) && Number(batch.cursor) >= (run.logCursor ?? 0)) run.logCursor = Number(batch.cursor);
+            if (received) output.updatedAt = now();
+            run.output = output;
+          }
           if (workerStatus?.status === 'unknown' || workerStatus?.status === 'unknown_run') {
             // The worker already issued an admission receipt. Its later lack of
             // knowledge is not proof that execution did not start, so a fresh
             // launch could run the task twice. Reconciliation/fencing owns the
             // next decision; the coordinator must preserve this uncertainty.
             transition(run, 'unknown', { reason: 'worker_no_longer_knows_run' });
-          } else if (workerStatus?.status === 'running' || workerStatus?.status === 'accepted') {
-            if (run.state !== 'running') transition(run, 'running');
+          } else if (workerStatus.status === 'running' || workerStatus.status === 'accepted') {
+            const observedState: State = workerStatus.state === 'running' || workerStatus.state === 'finalizing' ? 'running' : 'starting';
+            if (run.state !== observedState) transition(run, observedState,
+              observedState === 'running' ? { evidence: 'worker_process_state' } : { evidence: 'worker_accepted' });
           } else if (['succeeded', 'failed', 'cancelled'].includes(workerStatus?.status ?? '')) {
             const resultResponse = await this.worker(run.engine, `/v1/runs/${run.runId}/result`);
             if (resultResponse.ok) {
               const launchResult = await resultResponse.json() as Record<string, any>;
-              run.answer = typeof launchResult.answer === 'string' ? launchResult.answer : null;
+              const explicitAnswer = typeof launchResult.answer === 'string' && launchResult.answer.trim().length > 0
+                ? launchResult.answer : null;
+              // Older VM worker releases can return a completed OpenCode stdout
+              // without the normalized `answer` checkpoint field. Preserve that
+              // captured output as a bounded fallback so the public result does
+              // not silently discard a response. Do not treat a truncated stdout
+              // buffer as a complete user answer.
+              const stdoutAnswer = !launchResult.outputTruncated && typeof launchResult.stdout === 'string'
+                && launchResult.stdout.trim().length > 0
+                ? launchResult.stdout.trim().slice(0, 100_000) : null;
+              run.answer = explicitAnswer ?? stdoutAnswer;
               run.repo = launchResult.repo && typeof launchResult.repo === 'object' ? launchResult.repo as Record<string, unknown> : null;
               run.logUrl = typeof launchResult.logUrl === 'string' && launchResult.logUrl ? launchResult.logUrl : null;
               const repo = run.repo;
-              run.artifacts = Array.isArray(launchResult.artifacts) ? launchResult.artifacts.map((artifact: Record<string, any>) => ({ ...artifact,
+              run.artifacts = Array.isArray(launchResult.artifacts) ? launchResult.artifacts.filter((artifact: Record<string, any>) => !run.developerApi || artifact.path !== AGENT_HISTORY_PATH).map((artifact: Record<string, any>) => ({ ...artifact,
                 url: repo && typeof repo['fullName'] === 'string' ? `https://github.com/${repo['fullName']}/${typeof repo['commit'] === 'string' && repo['commit'] ? `blob/${repo['commit']}` : `tree/${String(repo['branch'] ?? '')}`}/${String(artifact.path ?? '').split('/').map(encodeURIComponent).join('/')}` : String(artifact.path ?? '') })) : [];
+              if (run.developerApi) {
+                const history = await this.worker(run.engine, `/v1/runs/${run.runId}/history?manifest=1`);
+                if (history.ok) {
+                  const manifest = await history.json() as Record<string, unknown>;
+                  if (manifest['path'] === AGENT_HISTORY_PATH && manifest['name'] === 'agent-history.json'
+                    && manifest['mime'] === 'application/json' && typeof manifest['size'] === 'number'
+                    && Number.isSafeInteger(manifest['size']) && manifest['size'] >= 0 && manifest['size'] <= 20 * 1024 * 1024
+                    && typeof manifest['sha256'] === 'string' && /^[0-9a-f]{64}$/.test(manifest['sha256'])) {
+                    const historyUrl = new URL(`/v1/developer/runs/${run.runId}/artifacts`, this.env.RUNNER_API_PUBLIC_URL);
+                    historyUrl.search = new URLSearchParams({ path: AGENT_HISTORY_PATH }).toString();
+                    run.artifacts.push({ ...manifest, url: historyUrl.href, downloadUrl: historyUrl.href });
+                  }
+                }
+              }
+              if (run.developerGuest) {
+                run.artifactExpiresAt = new Date(Date.now() + GUEST_ARTIFACT_TTL_MS).toISOString();
+                run.artifacts = await Promise.all(run.artifacts.map(async (artifact) => {
+                  const downloadUrl = await guestDownloadUrl(this.env, run, String(artifact['path']));
+                  return { ...artifact, url: downloadUrl, downloadUrl, expiresAt: run.artifactExpiresAt };
+                }));
+              }
               const outcome = launchResult.exitReason === 'completed' ? 'succeeded' : launchResult.exitReason === 'cancelled' ? 'cancelled' : 'failed';
               run.result = { schemaVersion: 1, runId: run.runId, jobId: run.jobId, userTaskId: run.userTaskId, profileId: run.profileId, ownerGeneration: run.ownerGeneration,
                 outcome, exitReason: launchResult.exitReason ?? 'worker_crash', exitCode: launchResult.exitCode ?? null, exitSignal: launchResult.exitSignal ?? null,
+                engineStart: launchResult.engineStart === 'not_started' || launchResult.engineStart === 'started' ? launchResult.engineStart : 'unknown',
                 exitObserved: typeof launchResult.exitObserved === 'boolean' ? launchResult.exitObserved
                   : launchResult.exitCode != null || launchResult.exitSignal != null,
                 startedAt: run.startedAt ?? run.createdAt, finishedAt: now(),
                 ...(run.answer !== null ? { text: run.answer } : {}), ...(launchResult.failure ? { failure: launchResult.failure } : {}), usage: { status: 'unknown' },
-                outputRefs: run.artifacts.map((artifact) => String(artifact['url'])), persistence: run.artifacts.length ? 'persisted' : 'not_required', persistenceReason: run.artifacts.length ? `artifacts are committed to ${String(repo?.['fullName'] ?? 'the repository')}` : 'the worker reported no artifacts', cleanup: 'completed', cleanupReason: 'execution workspace is owned by the selected worker', logPath: run.logUrl ?? `worker-run:${run.runId}` };
+                outputRefs: run.artifacts.map((artifact) => String(run.developerGuest ? artifact['downloadUrl'] : artifact['url'])),
+                ...(run.developerApi ? { artifacts: run.artifacts } : {}),
+                ...(run.developerGuest ? { artifactExpiresAt: run.artifactExpiresAt } : {}),
+                persistence: run.artifacts.length ? 'persisted' : 'not_required', persistenceReason: run.artifacts.length ? run.developerGuest ? 'artifacts were exported by the execution worker' : `artifacts are committed to ${String(repo?.['fullName'] ?? 'the repository')}` : 'the worker reported no artifacts', cleanup: 'completed', cleanupReason: 'execution workspace is owned by the selected worker', logPath: run.logUrl ?? `worker-run:${run.runId}` };
               transition(run, outcome, { exitReason: launchResult.exitReason });
             }
           }
@@ -587,21 +883,67 @@ export class RunnerRunCoordinator {
         if (!run.workerReceipt) {
           try {
             const statusResponse = await this.worker(run.engine, `/v1/runs/${run.runId}/status`);
-            const observed = statusResponse.ok ? await statusResponse.json() as { status?: string } : null;
+            const observed = statusResponse.ok ? await statusResponse.json() as { status?: string; state?: string; startPhase?: string; startAttempts?: number; startedAt?: string; updatedAt?: string } : null;
             if (observed?.status && !['unknown', 'unknown_run'].includes(observed.status)) {
               run.workerReceipt = { runId: run.runId, status: 'accepted', operationId: 'reconciled' };
-              transition(run, ['succeeded', 'failed', 'cancelled'].includes(observed.status) ? observed.status as State : 'running', { reconciled: true });
+              run.lastHeartbeatAt = now();
+              if (typeof observed.startPhase === 'string') run.workerStartPhase = observed.startPhase;
+              if (Number.isSafeInteger(observed.startAttempts)) run.workerStartAttempts = observed.startAttempts;
+              if (typeof observed.startedAt === 'string') run.workerStartedAt = observed.startedAt;
+              if (typeof observed.updatedAt === 'string' && Number.isFinite(Date.parse(observed.updatedAt))) {
+                if (observed.updatedAt !== run.workerReportedUpdatedAt) run.workerProgressObservedAt = now();
+                run.workerReportedUpdatedAt = observed.updatedAt;
+              }
+              const observedState = ['succeeded', 'failed', 'cancelled'].includes(observed.status) ? observed.status as State
+                : observed.state === 'running' || observed.state === 'finalizing' ? 'running' : 'starting';
+              transition(run, observedState, { reconciled: true, evidence: observedState === 'running' ? 'worker_process_state' : 'worker_accepted' });
             } else transition(run, 'unknown', { reason: 'worker_acceptance_could_not_be_confirmed' });
           } catch {
             transition(run, 'unknown', { reason: 'worker_acceptance_could_not_be_confirmed' });
           }
-        } else { run.state = 'running'; run.updatedAt = now(); }
+        } else {
+          const lastHeartbeat = run.lastHeartbeatAt ? Date.parse(run.lastHeartbeatAt) : Date.parse(run.startedAt ?? run.updatedAt);
+          if (Number.isFinite(lastHeartbeat) && Date.now() - lastHeartbeat > 30_000) transition(run, 'unknown', { reason: 'worker_status_stale' });
+        }
         run['lastError'] = message.slice(0, 200);
       }
       changed = true;
     }
     if (changed) await Promise.all(pendingRuns.map((run) => this.writeRun(run)));
-    if (Object.values(stored.runs).some((run) => ACTIVE.has(run.state))) await this.state.storage.setAlarm(Date.now() + 5_000);
+    const afterPolling = await this.read();
+    for (const run of Object.values(afterPolling.runs)) {
+      const delivery = run.webhook;
+      if (!TERMINAL.has(run.state) || !delivery || delivery.deliveredAt || delivery.exhaustedAt
+        || Date.parse(delivery.nextAttemptAt) > Date.now()) continue;
+      // Persist an attempt and a future retry before network I/O. A crash after
+      // receiver acceptance can cause a duplicate; eventId lets receivers dedupe.
+      delivery.attempts += 1;
+      delivery.nextAttemptAt = new Date(Date.now() + Math.min(300_000, 5_000 * 2 ** (delivery.attempts - 1))).toISOString();
+      await this.writeRun(run);
+      try {
+        const status = await deliverTerminalWebhook(this.env, delivery, run);
+        delivery.lastStatus = status;
+        if (status >= 200 && status < 300) {
+          delivery.deliveredAt = now();
+          delivery.lastError = undefined;
+        } else delivery.lastError = `HTTP_${status}`;
+      } catch { delivery.lastError = 'delivery_failed'; }
+      if (!delivery.deliveredAt && delivery.attempts >= MAX_WEBHOOK_ATTEMPTS) delivery.exhaustedAt = now();
+      await this.writeRun(run);
+    }
+    const latest = await this.read();
+    const activeNext = Object.values(latest.runs).some((run) => ACTIVE.has(run.state)
+      || run.state === 'unknown' && !!run.workerReceipt && Date.now() - Date.parse(run.updatedAt) < UNKNOWN_RECONCILE_MS)
+      ? Date.now() + 5_000 : Infinity;
+    let webhookNext = Infinity;
+    for (const run of Object.values(latest.runs)) {
+      if (TERMINAL.has(run.state) && run.webhook && !run.webhook.deliveredAt && !run.webhook.exhaustedAt) {
+        const dueAt = Date.parse(run.webhook.nextAttemptAt);
+        webhookNext = Math.min(webhookNext, Number.isFinite(dueAt) ? dueAt : Date.now() + 5_000);
+      }
+    }
+    const nextAlarm = Math.min(activeNext, webhookNext);
+    if (Number.isFinite(nextAlarm)) await this.state.storage.setAlarm(Math.max(Date.now() + 100, nextAlarm));
   }
 
   private hasGhaWorker(): boolean {
@@ -658,6 +1000,19 @@ function runtimeEnv(env: RunnerWorkerEnv, names: string[]): Record<string, strin
     if (typeof value === 'string') result[name] = value;
   }
   return result;
+}
+
+function validModelConnection(value: unknown): value is ModelConnection {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const entry = value as Record<string, unknown>;
+  return Object.keys(entry).every((key) => ['connectionId', 'principalId', 'profileId', 'tenantId', 'provider', 'model', 'secretBinding'].includes(key))
+    && typeof entry['connectionId'] === 'string' && SAFE_ID.test(entry['connectionId'])
+    && typeof entry['principalId'] === 'string' && entry['principalId'].length > 0
+    && typeof entry['profileId'] === 'string' && entry['profileId'].length > 0
+    && (entry['tenantId'] === undefined || typeof entry['tenantId'] === 'string' && entry['tenantId'].length > 0)
+    && entry['provider'] === 'openai'
+    && typeof entry['model'] === 'string' && /^openai\/[A-Za-z0-9._:-]{1,100}$/.test(entry['model'])
+    && typeof entry['secretBinding'] === 'string' && /^RUNNER_MODEL_SECRET_[A-Z0-9_]{1,80}$/.test(entry['secretBinding']);
 }
 
 async function encryptionKey(raw: string): Promise<CryptoKey> {

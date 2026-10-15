@@ -3,6 +3,12 @@ name: Signed VM worker release
 on:
   push:
     tags: ['vm-worker-v*']
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing signed release to deploy to the France sandbox
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -11,6 +17,7 @@ permissions:
 
 jobs:
   build-and-attest:
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -26,13 +33,17 @@ jobs:
           git merge-base --is-ancestor "$GITHUB_SHA" origin/main
       - name: Download and verify pinned OpenCode fork
         env:
-          OPENCODE_RELEASE_TAG: mem-v20261013-native-trace-af4e69c4be1e
-          OPENCODE_VERSION: 0.0.0-native-trace-af4e69c4be1e-20261013
-          OPENCODE_SOURCE_SHA: af4e69c4be1e4e36bc510cc6b1083571db4a4868
-          OPENCODE_ARCHIVE_SHA256: 7b7b57a1c8762f6735f2d794c1a455dbdd4d83b5af9cd0532eba49337570d5b3
-          OPENCODE_BINARY_SHA256: 1bed8883499b6e370208cf948b84c90a74369c934c566dab1deb501ef1cbea3d
+          GH_TOKEN: ${{ github.token }}
+          OPENCODE_RELEASE_TAG: mem-preview-20261015-turn-recovery-91570c76816f
+          OPENCODE_VERSION: 0.0.0-turn-recovery-91570c76816f-202610151149
+          OPENCODE_SOURCE_SHA: 91570c76816fa82244935521c7af4adf9ed81ec7
+          OPENCODE_ARCHIVE_SHA256: ecd22b2414fc626e86b723e4adc780a350bc8fb52d1e102c718c5825c38c5a90
+          OPENCODE_BINARY_SHA256: f0f143113a4c53a334f53a91482503fc362851fadc873ec1fd94ae14fdf92e36
         run: |
           set -euo pipefail
+          gh api --paginate --slurp 'repos/gpt-mem/opencode-mem/releases?per_page=100' > "$RUNNER_TEMP/opencode-releases.json"
+          node scripts/assert-opencode-release-freshness.mjs "$RUNNER_TEMP/opencode-releases.json" \
+            "$OPENCODE_RELEASE_TAG" "$OPENCODE_SOURCE_SHA" "$OPENCODE_ARCHIVE_SHA256"
           asset="opencode-linux-x64.tar.gz"
           curl --fail --location --silent --show-error \
             "https://github.com/gpt-mem/opencode-mem/releases/download/${OPENCODE_RELEASE_TAG}/${asset}" \
@@ -59,7 +70,9 @@ jobs:
           cp -R dist "$STAGE/dist"
           install -m 0755 "$RUNNER_TEMP/opencode-fork/opencode" "$STAGE/opencode"
           mkdir -p "$STAGE/scripts"
-          cp scripts/deploy-vm-worker-release.sh scripts/assert-vm-worker-update-ready.mjs "$STAGE/scripts/"
+          cp scripts/deploy-vm-worker-release.sh scripts/assert-vm-worker-update-ready.mjs scripts/ai-agent-vm-worker-gha-update scripts/ai-agent-vm-worker-configure-production-ingress "$STAGE/scripts/"
+          mkdir -p "$STAGE/deploy/vm-worker/inventory"
+          cp deploy/vm-worker/inventory/france.json "$STAGE/deploy/vm-worker/inventory/"
           (cd "$STAGE" && npm ci --omit=dev)
           tar -czf ai-agent-vm-worker-linux-x64.tar.gz -C "$STAGE" .
           sha256sum ai-agent-vm-worker-linux-x64.tar.gz > ai-agent-vm-worker-linux-x64.tar.gz.sha256
@@ -76,3 +89,61 @@ jobs:
             ai-agent-vm-worker-linux-x64.tar.gz.sha256 \
             --title "VM worker ${{ steps.bundle.outputs.version }}" \
             --generate-notes
+
+  deploy-france-sandbox:
+    name: Deploy signed release to France sandbox
+    needs: build-and-attest
+    if: ${{ always() && (needs.build-and-attest.result == 'success' || github.event_name == 'workflow_dispatch') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: france-sandbox
+    permissions:
+      contents: read
+      attestations: read
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+      GH_TOKEN: ${{ secrets.FRANCE_VM_RELEASE_READ_TOKEN || github.token }}
+      VM_DEPLOY_KEY: ${{ secrets.FRANCE_VM_RELEASE_DEPLOY_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate target release and deployment credential
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^vm-worker-v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          test -n "$VM_DEPLOY_KEY"
+          if [[ "$GH_TOKEN" =~ ^[A-Za-z0-9_]{20,300}$ ]]; then
+            echo 'GitHub release-read token matches the installed VM wrapper format.'
+          elif [[ "$GH_TOKEN" =~ ^[[:graph:]]{20,4096}$ ]]; then
+            echo 'GitHub release-read token requires the updated VM wrapper format.'
+          else
+            echo 'GitHub release-read token has an invalid format.' >&2
+            exit 2
+          fi
+      - name: Update France sandbox after active runs drain
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^vm-worker-v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          install -m 0700 -d "$RUNNER_TEMP/ssh"
+          install -m 0600 /dev/null "$RUNNER_TEMP/ssh/id_ed25519"
+          printf '%s\n' "$VM_DEPLOY_KEY" > "$RUNNER_TEMP/ssh/id_ed25519"
+          install -m 0600 deploy/vm-worker/france-deploy-known-hosts "$RUNNER_TEMP/ssh/known_hosts"
+          status=1
+          for attempt in $(seq 1 30); do
+            set +e
+            printf '%s\n' "$GH_TOKEN" | ssh -i "$RUNNER_TEMP/ssh/id_ed25519" \
+              -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+              -o UserKnownHostsFile="$RUNNER_TEMP/ssh/known_hosts" \
+              -o ConnectTimeout=15 root@169.58.15.230 "update $RELEASE_TAG"
+            status=$?
+            set -e
+            if [[ "$status" -eq 0 ]]; then
+              exit 0
+            fi
+            if [[ "$status" -ne 75 ]]; then
+              exit "$status"
+            fi
+            echo "France sandbox still has active runs; retry $attempt/30 in 30 seconds" >&2
+            sleep 30
+          done
+          echo "France sandbox did not drain within 15 minutes; rerun this workflow with the same signed release tag" >&2
+          exit 75

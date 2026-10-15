@@ -117,7 +117,16 @@ export function createAgentApiServer(service: AgentApi, options: AgentApiServerO
     }
 
     if (segments.length === 2) {
-      if (req.method !== 'POST') throw new ApiError('METHOD_NOT_ALLOWED', 'the run collection supports POST only');
+      if (req.method === 'GET') {
+        requireScope(principal, 'runs:read');
+        const state = url.searchParams.get('state');
+        if (state !== null && state !== 'active') throw new ApiError('INVALID_REQUEST', 'state supports only active');
+        const limit = intParam(url.searchParams.get('limit'), 'limit', 50);
+        const cursor = url.searchParams.get('cursor') ?? undefined;
+        sendJson(res, 200, service.listRuns(principal, { ...(state === 'active' ? { state } : {}), limit, ...(cursor ? { cursor } : {}) }));
+        return 200;
+      }
+      if (req.method !== 'POST') throw new ApiError('METHOD_NOT_ALLOWED', 'the run collection supports GET and POST only');
       requireScope(principal, 'runs:write');
       const body = await readJsonBody(req, maxBodyBytes);
       const response = service.submit(principal, req.headers['idempotency-key'], body);

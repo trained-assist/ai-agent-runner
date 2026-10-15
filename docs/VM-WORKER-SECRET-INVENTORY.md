@@ -18,6 +18,7 @@ readiness warnings; a missing required binding makes readiness fail.
 |---|---|---|
 | `VM_WORKER_TOKEN` | Authenticates Cloudflare Runner API → VM worker | Worker-local secret binding in `/etc/ai-agent-runner/worker.env`, mode 0600; the paired Runner API holds the matching write-only Cloudflare secret. Confirm the rotation owner. |
 | `RUNNER_GIT_TOKEN` | Optional private repository clone credential | Same host secret path; least-privilege read access only. It is not passed to OpenCode. |
+| `RUNNER_CONTROL_PLANE_PRODUCTION_*` | Read production task-scoped manifests and artifact bytes | Dedicated `production-runner-ingress-v1` principal with only `tasks:read` on `trained-assist-production`; secret in the protected France GitHub environment and root-owned `/etc/ai-agent-runner/production-ingress.env`. Install through the signed VM forced command. |
 | `GCP_PROJECT` | Optional project selection | Non-secret configuration; GCS access should use attached VM workload identity rather than a downloaded service-account key. |
 | GCS workload identity | Writes run/artifact data to `GCS_BUCKET` | Cloud IAM principal attached to the VM, not a process env secret. Record the actual cloud principal/roles with the host inventory. |
 | `GH_TOKEN` used by updater | Downloads and verifies the public GitHub release/attestation | Operator-only, transient update environment; it is not loaded by the worker service. Use the minimum read permissions and do not persist it in `worker.env`. |

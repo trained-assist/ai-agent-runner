@@ -5,7 +5,7 @@ import {
   compileCleanListRules,
   compilePolicy,
   DEFAULT_EXPORT_POLICY,
-  MIGRATION_COMPRESSION_EXCLUDES,
+  MIGRATION_COMPRESSION_RULES,
   buildMigrationPolicy,
   assertWorkspaceDir,
   classifyPath,
@@ -246,20 +246,20 @@ describe('legacy clean list compatibility', () => {
   });
 });
 
-describe('migration compression excludes engine state, not user text', () => {
-  it('drops agent home, session traces and generated indices', () => {
+describe('migration compression routes engine state without losing durable sessions', () => {
+  it('archives session traces as heavy objects and excludes regenerated runtime data', () => {
     const policy = compilePolicy({
       policyId: 'migration',
       version: 1,
       textMaxBytes: 1024,
       maxFiles: 100,
       maxTotalBytes: 1024 * 1024,
-      rules: [...DEFAULT_EXPORT_POLICY.rules, ...MIGRATION_COMPRESSION_EXCLUDES],
+      rules: [...DEFAULT_EXPORT_POLICY.rules, ...MIGRATION_COMPRESSION_RULES],
     });
+    expect(matchRule(policy, '.session-traces/ses_01J5Y5H0AH4Q4NXJ6P4C3P5V2K.json').action).toBe('heavy');
     for (const path of [
       '.agent-home/agent-data/engineering-workspaces/repo-maps/x/search/chunks.json',
       '.agent-tokens/alice/token',
-      '.session-traces/session.jsonl',
       '.mcp-runs/run-1/log',
       '.run-inputs/snap-1/file.md',
       'projects/app/repo-maps/abc/search/embed-abc.json',

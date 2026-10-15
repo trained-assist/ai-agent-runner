@@ -57,6 +57,12 @@ jobs:
         run: node scripts/sandbox3-profile-principal.mjs
       - name: Verify the signed sandbox3 profile using read-only capabilities
         run: node scripts/sandbox3-profile-auth-probe.mjs
+      - name: Provision dedicated developer API key and verify read-only capabilities
+        env:
+          SANDBOX3_DEVELOPER_API_KEY: ${{ secrets.SANDBOX3_DEVELOPER_API_KEY }}
+        run: |
+          test -n "$SANDBOX3_DEVELOPER_API_KEY"
+          node scripts/setup-developer-sandbox.mjs provision "$GITHUB_SHA"
       - name: Upload sanitized profile-auth evidence
         if: always() && hashFiles('sandbox3-profile-auth-evidence.json') != ''
         uses: actions/upload-artifact@v4

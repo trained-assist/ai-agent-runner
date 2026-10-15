@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
   echo "Run with sudo: ai-agent-vm-worker-update vm-worker-vX.Y.Z" >&2
   exit 1
@@ -63,6 +65,21 @@ if [[ ! -d "${release_dir}" ]]; then
   chmod -R go-w "${release_dir}"
 fi
 install -o root -g root -m 0755 "${release_dir}/scripts/deploy-vm-worker-release.sh" "${updater_path}"
+install -o root -g root -m 0644 "${release_dir}/scripts/assert-vm-worker-update-ready.mjs" "$(dirname -- "${updater_path}")/assert-vm-worker-update-ready.mjs"
+install -o root -g root -m 0755 "${release_dir}/scripts/ai-agent-vm-worker-gha-update" "$(dirname -- "${updater_path}")/ai-agent-vm-worker-gha-update"
+install -o root -g root -m 0755 "${release_dir}/scripts/ai-agent-vm-worker-configure-production-ingress" "$(dirname -- "${updater_path}")/ai-agent-vm-worker-configure-production-ingress"
+inventory_source="${release_dir}/deploy/vm-worker/inventory/france.json"
+inventory_target="$(sed -n 's/^VM_WORKER_BINDINGS_INVENTORY=//p' "$config_file" | tail -n 1 | sed 's/^"//;s/"$//')"
+if [[ ! -f "$inventory_source" ]]; then
+  echo 'Signed France VM release is missing its binding inventory' >&2
+  exit 1
+fi
+if [[ ! "$inventory_target" =~ ^/[A-Za-z0-9._/-]+$ || "$inventory_target" == *'..'* || ! -f "$inventory_target" ]]; then
+  echo 'VM worker binding inventory path is missing or invalid in the service configuration' >&2
+  exit 1
+fi
+install -o root -g root -m 0644 "$inventory_source" "$inventory_target"
+echo "Installed signed VM worker binding inventory at $inventory_target"
 old_target="$(readlink -f "${root}/current" 2>/dev/null || true)"
 old_opencode_target="$(readlink -f "${opencode_path}" 2>/dev/null || true)"
 public_url="$(sed -n 's/^VM_WORKER_PUBLIC_URL=//p' "${config_file}" | tail -n 1 | sed 's/^"//;s/"$//')"
@@ -70,9 +87,28 @@ if [[ ! "${public_url}" =~ ^https?://[^/]+/?$ ]]; then
   echo "VM_WORKER_PUBLIC_URL must be an http(s) origin in /etc/ai-agent-runner/worker.env" >&2
   exit 1
 fi
-if ! curl --silent --show-error --fail --max-time 5 "${public_url%/}/readyz" -o "${tmp}/preflight-ready.json" \
-  || ! VM_WORKER_UPDATE_READINESS_FILE="${tmp}/preflight-ready.json" node "${script_dir}/assert-vm-worker-update-ready.mjs"; then
+if [[ "${old_target}" == "${release_dir}" && "${old_opencode_target}" == "${release_dir}/opencode" ]] \
+  && systemctl is-active --quiet ai-agent-vm-worker \
+  && curl --silent --show-error --fail --max-time 5 "${public_url%/}/version" -o "${tmp}/current-version.json" \
+  && node -e 'const v=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")); const b=v.build; if(b?.sourceCommit!==process.argv[2] || b?.opencode?.version!==process.argv[3] || b?.opencode?.sourceCommit!==process.argv[4] || b?.opencode?.binarySha256!==process.argv[5]) process.exit(1)' "${tmp}/current-version.json" "${source_commit}" "${opencode_version}" "${opencode_source}" "${opencode_sha}" \
+  && curl --silent --show-error --fail --max-time 5 "${public_url%/}/readyz" -o "${tmp}/current-ready.json" \
+  && node -e 'if(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).ready!==true) process.exit(1)' "${tmp}/current-ready.json"; then
+  printf 'VM worker already at version=%s sourceCommit=%s opencodeVersion=%s opencodeSource=%s opencodeSha256=%s; no restart needed\n' "${version}" "${source_commit}" "${opencode_version}" "${opencode_source}" "${opencode_sha}"
+  exit 0
+fi
+if ! curl --silent --show-error --fail --max-time 5 "${public_url%/}/readyz" -o "${tmp}/preflight-ready.json"; then
   echo "Refusing VM worker update while readiness is unknown or runs/reservations are active" >&2
+  exit 1
+fi
+set +e
+VM_WORKER_UPDATE_READINESS_FILE="${tmp}/preflight-ready.json" node "${script_dir}/assert-vm-worker-update-ready.mjs"
+readiness_status=$?
+set -e
+if [[ "${readiness_status}" -eq 75 ]]; then
+  echo "VM worker is ready but still has active runs/reservations; retry later" >&2
+  exit 75
+elif [[ "${readiness_status}" -ne 0 ]]; then
+  echo "Refusing VM worker update because readiness is unknown or unhealthy" >&2
   exit 1
 fi
 
@@ -114,7 +150,8 @@ for _ in $(seq 1 30); do
     && curl --silent --show-error --fail --max-time 3 "${public_url%/}/healthz" -o /dev/null \
     && curl --silent --show-error --fail --max-time 3 "${public_url%/}/version" -o "${tmp}/version.json" \
     && node -e 'const v=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")); const b=v.build; if(b?.sourceCommit!==process.argv[2] || b?.opencode?.version!==process.argv[3] || b?.opencode?.sourceCommit!==process.argv[4] || b?.opencode?.binarySha256!==process.argv[5]) process.exit(1)' "${tmp}/version.json" "${source_commit}" "${opencode_version}" "${opencode_source}" "${opencode_sha}" \
-    && curl --silent --show-error --fail --max-time 3 "${public_url%/}/readyz" -o /dev/null; then
+    && curl --silent --show-error --fail --max-time 3 "${public_url%/}/readyz" -o "${tmp}/ready.json" \
+    && node -e 'if(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).ready!==true) process.exit(1)' "${tmp}/ready.json"; then
     healthy=true
     break
   fi

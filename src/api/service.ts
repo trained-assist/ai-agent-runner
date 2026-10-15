@@ -56,6 +56,21 @@ import { MOCK_TEST_ENGINE, MockTestWorker } from './mock-test-worker.js';
 
 export type ApiLogger = (entry: Record<string, unknown>) => void;
 
+function encodeRunListCursor(value: { createdAt: string; runId: string }): string {
+  return Buffer.from(JSON.stringify(value)).toString('base64url');
+}
+
+function decodeRunListCursor(value: string): { createdAt: string; runId: string } {
+  try {
+    const parsed = JSON.parse(Buffer.from(value, 'base64url').toString('utf8')) as Record<string, unknown>;
+    if (typeof parsed.createdAt !== 'string' || !Number.isFinite(Date.parse(parsed.createdAt)) ||
+        typeof parsed.runId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(parsed.runId)) throw new Error('invalid');
+    return { createdAt: parsed.createdAt, runId: parsed.runId };
+  } catch {
+    throw new ApiError('INVALID_REQUEST', 'cursor is invalid');
+  }
+}
+
 function isRegionalVmEngine(name: string): boolean {
   return name === 'eu-vm-agent-run' || name === 'rf-vm-agent-run';
 }
@@ -127,6 +142,24 @@ export interface RunArtifactsView {
   logUrl: string | null;
   note: string;
   publication?: import('./stateless-store.js').RunProgress['publication'];
+}
+
+export interface RunListEntry {
+  runId: string;
+  requestId: string;
+  userTaskId: string;
+  ownerGeneration: number;
+  state: RunStatusView['state'];
+  engine: string;
+  createdAt: string;
+  updatedAt: string;
+  startedAt: string | null;
+  links: { status: string; events: string; result: string };
+}
+
+export interface RunListPage {
+  runs: RunListEntry[];
+  nextCursor: string | null;
 }
 
 export interface AgentApiOptions {
@@ -419,6 +452,46 @@ export class AgentApi {
       fencing: { rejected: run.fencing.rejected },
       answer: run.answer,
       ...(this.opts.profileWorkspace ? { publication: run.publication } : {}),
+    };
+  }
+
+  listRuns(principal: Principal, options: { state?: 'active'; limit?: number; cursor?: string } = {}): RunListPage {
+    const limit = options.limit ?? 50;
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+      throw new ApiError('INVALID_REQUEST', 'limit must be an integer from 1 to 100');
+    }
+    const cursor = options.cursor ? decodeRunListCursor(options.cursor) : null;
+    const records = this.store.listAll()
+      .filter(record => record.principalId === principal.principalId && record.profileId === principal.profileId &&
+        (record.tenantId ?? null) === (principal.tenantId ?? null))
+      .map(record => ({ record, progress: this.store.progressOf(record.runId) }))
+      .filter(({ progress }) => !isTerminalApiState(progress?.state ?? 'queued'))
+      .sort((a, b) => a.record.createdAt.localeCompare(b.record.createdAt) || a.record.runId.localeCompare(b.record.runId))
+      .filter(({ record }) => !cursor || record.createdAt > cursor.createdAt ||
+        (record.createdAt === cursor.createdAt && record.runId > cursor.runId));
+    const page = records.slice(0, limit + 1);
+    const hasMore = page.length > limit;
+    const selected = page.slice(0, limit);
+    const runs = selected.map(({ record, progress }) => ({
+      runId: record.runId,
+      requestId: record.requestId,
+      userTaskId: record.userTaskId,
+      ownerGeneration: record.ownerGeneration,
+      state: progress?.state ?? 'queued',
+      engine: progress?.engine ?? record.spec.engine.name,
+      createdAt: record.createdAt,
+      updatedAt: progress?.updatedAt ?? record.createdAt,
+      startedAt: progress?.startedAt ?? null,
+      links: {
+        status: `/v1/runs/${encodeURIComponent(record.runId)}/status`,
+        events: `/v1/runs/${encodeURIComponent(record.runId)}/events`,
+        result: `/v1/runs/${encodeURIComponent(record.runId)}/result`,
+      },
+    }));
+    const last = selected.at(-1)?.record;
+    return {
+      runs,
+      nextCursor: hasMore && last ? encodeRunListCursor({ createdAt: last.createdAt, runId: last.runId }) : null,
     };
   }
 
@@ -1203,7 +1276,8 @@ export class AgentApi {
       while (!state.controller.signal.aborted && !state.stopping && !this.disposed) {
         try {
           const result = await worker.streamLogs!(record.runId, cursor, state.controller.signal,
-            (stream, message, workerSequence) => this.appendWorkerLog(record, state, stream, message, workerSequence));
+            (stream, message, workerSequence) => this.appendWorkerLog(record, state, stream, message, workerSequence),
+            (message, workerSequence) => this.appendWorkerAssistantMessage(record, message, workerSequence));
           cursor = Math.max(cursor, result.cursor);
           if (result.completed) state.completed = true;
           if (!result.supported || result.completed) return;
@@ -1259,6 +1333,37 @@ export class AgentApi {
     this.store.recordWorkerLogCursor(record.runId, sourceSequence, apiSequence);
   }
 
+  private appendWorkerAssistantMessage(
+    record: AdmissionRecord,
+    message: { sessionId: string; messageId: string; text: string },
+    sourceSequence: number,
+  ): void {
+    const cursor = this.store.workerLogCursor(record.runId);
+    if (sourceSequence <= cursor.sourceSequence) return;
+    const progress = this.store.progressOf(record.runId);
+    const safeText = message.text.slice(0, 64_000);
+    let apiSequence = progress?.sequence ?? cursor.apiSequence;
+    if (progress && !isTerminalApiState(progress.state) && safeText.trim()) {
+      const event: RunnerEvent = {
+        schemaVersion: RUNNER_EVENT_SCHEMA_VERSION,
+        eventId: newApiId('evt'),
+        runId: record.runId,
+        jobId: record.jobId,
+        userTaskId: record.userTaskId,
+        profileId: record.profileId,
+        ownerGeneration: record.ownerGeneration,
+        sequence: progress.sequence + 1,
+        timestamp: this.nowIso(),
+        traceId: record.spec.traceId ?? null,
+        type: 'assistant_message',
+        payload: { sessionId: message.sessionId, messageId: message.messageId, text: safeText },
+      };
+      this.store.append(record.runId, [event]);
+      apiSequence = event.sequence;
+    }
+    this.store.recordWorkerLogCursor(record.runId, sourceSequence, apiSequence);
+  }
+
   /** The terminal status can beat the worker's 250ms log poll; replay once at the terminal cursor before finalizing. */
   private async drainWorkerLogStream(record: AdmissionRecord, worker: ExternalWorker): Promise<void> {
     const state = this.liveLogStreams.get(record.runId);
@@ -1271,7 +1376,8 @@ export class AgentApi {
     try {
       const cursor = this.store.workerLogCursor(record.runId).sourceSequence;
       const result = await worker.streamLogs(record.runId, cursor, controller.signal,
-        (stream, message, sourceSequence) => this.appendWorkerLog(record, state, stream, message, sourceSequence));
+        (stream, message, sourceSequence) => this.appendWorkerLog(record, state, stream, message, sourceSequence),
+        (message, sourceSequence) => this.appendWorkerAssistantMessage(record, message, sourceSequence));
       state.completed = result.supported && result.completed;
     } catch (err) {
       this.log({ event: 'worker_log_drain_incomplete', runId: record.runId, message: err instanceof Error ? err.message : String(err) });

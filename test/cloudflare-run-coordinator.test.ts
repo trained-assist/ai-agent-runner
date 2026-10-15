@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { RunnerRunCoordinator } from '../src/cloudflare/run-coordinator.js';
+import runnerWorker from '../src/cloudflare/runner-api.js';
 import type { ApiPrincipal, DurableObjectStateLike, DurableStorage, RunnerWorkerEnv } from '../src/cloudflare/types.js';
-import { createHash, generateKeyPairSync, verify } from 'node:crypto';
+import { createHash, createHmac, generateKeyPairSync, verify } from 'node:crypto';
 
 class MemoryStorage implements DurableStorage {
   values = new Map<string, unknown>();
@@ -33,7 +34,15 @@ function setup() {
         launched.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
         return Response.json({ runId: launched.at(-1)?.['runId'], operationId: 'op-test', status: 'accepted', statusUrl: 'https://france.example/status', resultUrl: 'https://france.example/result' }, { status: 202 });
       }
-      if (url.pathname.endsWith('/status')) return Response.json({ status: ++poll === 1 ? 'running' : 'succeeded' });
+      if (url.pathname.endsWith('/status')) {
+        const status = ++poll === 1 ? 'running' : 'succeeded';
+        return Response.json({ status, state: status });
+      }
+      if (url.pathname.endsWith('/logs')) {
+        const after = Number(url.searchParams.get('after') ?? 0);
+        const logs = [{ sequence: 1, stream: 'stdout', message: 'step 1: inspect' }, { sequence: 2, stream: 'stderr', message: 'progress warning' }].filter((entry) => entry.sequence > after);
+        return Response.json({ runId: url.pathname.split('/').at(-2), cursor: logs.at(-1)?.sequence ?? after, hasMore: false, state: 'running', logs });
+      }
       if (url.pathname.endsWith('/result')) return Response.json({ exitReason: 'completed', exitCode: 0, exitSignal: null, answer: 'done', artifacts: [], logUrl: '', repo: null });
       return Response.json({ status: 'cancelled' });
     },
@@ -50,8 +59,36 @@ function call(path: string, body?: unknown, headers: Record<string, string> = {}
 
 const body = { userTaskId: 'task-a', input: { inlinePrompt: 'say done' }, envAllowlist: [], limits: { timeoutMs: 300_000 } };
 const testMcp = { servers: [{ serverId: 'trained-assist-registry-test', transport: 'remote', url: 'https://trained-assist-mcp-host-test-160.skillset-apply.workers.dev/mcp', bindingRef: 'registry-mcp-test-160-read', allowedTools: ['registry.fixture_read'], policyVersion: 'registry-fixture-policy-v1', catalogueVersion: 'registry-fixture-catalogue-v1' }] };
+const userMcp = { servers: [{ serverId: 'mem-gpt', transport: 'remote', url: 'https://trained-assist-mcp-user-sandbox.skillset-apply.workers.dev/mcp', bindingRef: 'mem-gpt-user-sandbox', allowedTools: ['identity.whoami', 'google_docs.connect', 'google_docs.get_document'], policyVersion: 'mem-gpt-user-run-v1', catalogueVersion: 'mem-gpt-user-catalogue-v1' }] };
 
 describe('Cloudflare Runner run coordinator', () => {
+  it('lists only active metadata for one task and enforces principal ownership', async () => {
+    const { coordinator, storage } = setup();
+    const submitted = await coordinator.fetch(call('/v1/runs', body, { 'idempotency-key': 'scoped-active-list' }));
+    expect(submitted.status).toBe(202);
+    const receipt = await submitted.json() as { runId: string };
+
+    const response = await coordinator.fetch(call('/v1/runs?userTaskId=task-a&state=active'));
+    expect(response.status).toBe(200);
+    const page = await response.json() as { runs: Array<Record<string, unknown>>; nextCursor: string | null };
+    expect(page.runs).toHaveLength(1);
+    expect(page.runs[0]).toMatchObject({ runId: receipt.runId, userTaskId: 'task-a' });
+    expect(page.runs[0]).not.toHaveProperty('answer');
+    expect(page.runs[0]).not.toHaveProperty('events');
+    expect(page.nextCursor).toBeNull();
+
+    const foreign = await coordinator.fetch(call('/v1/runs?userTaskId=task-a&state=active', undefined, {}, {
+      ...principal, principalId: 'principal-b', keyHash: 'b'.repeat(64),
+    }));
+    expect((await foreign.json() as { runs: unknown[] }).runs).toEqual([]);
+
+    const stored = storage.values.get('runner-v1') as { runs: Record<string, { state: string }> };
+    stored.runs[receipt.runId]!.state = 'succeeded';
+    expect((await (await coordinator.fetch(call('/v1/runs?userTaskId=task-a&state=active'))).json() as { runs: unknown[] }).runs).toEqual([]);
+    const allStates = await coordinator.fetch(call('/v1/runs?userTaskId=task-a&state=all'));
+    expect((await allStates.json() as { runs: Array<Record<string, unknown>> }).runs).toMatchObject([{ runId: receipt.runId, state: 'succeeded' }]);
+  });
+
   it('cleans terminal task state and refuses active, unknown, or foreign runs', async () => {
     const { coordinator, storage } = setup();
     const submitted = await coordinator.fetch(call('/v1/runs', body, { 'idempotency-key': 'cleanup-terminal' }));
@@ -156,7 +193,12 @@ describe('Cloudflare Runner run coordinator', () => {
     await coordinator.alarm();
     expect(launched).toHaveLength(1);
     expect(launched[0]).toMatchObject({ engine: { name: 'eu-vm-agent-run' }, input: { inlinePrompt: 'say done' }, resultUrl: `https://runner-api.example/v1/runs/${receipt.runId}/result` });
+    expect(await (await coordinator.fetch(call(`/v1/runs/${receipt.runId}/status`))).json()).toMatchObject({ state: 'starting', statusFreshness: 'unobserved' });
     await coordinator.alarm();
+    const live = await coordinator.fetch(call(`/v1/runs/${receipt.runId}/events?cursor=0`));
+    expect(await live.json()).toMatchObject({ snapshot: { state: 'running', statusFreshness: 'fresh', output: {
+      stdout: 'step 1: inspect', stderr: 'progress warning', updatedAt: expect.any(String),
+    } } });
     await coordinator.alarm();
     const status = await coordinator.fetch(call(`/v1/runs/${receipt.runId}/status`));
     expect(await status.json()).toMatchObject({ state: 'succeeded', answer: 'done' });
@@ -191,7 +233,7 @@ describe('Cloudflare Runner run coordinator', () => {
     expect(launchCalls[0]?.authorization).toBe('Bearer worker-secret');
     expect(launchCalls[1]?.authorization).toBe('Bearer gha-worker-secret-for-test-only');
     expect(launchCalls[1]?.body).toMatchObject({ runId: receipt.runId, operationId: launchCalls[0]?.body?.['operationId'], engine: { name: 'azure-cloud' } });
-    expect(storage.values.get('runner-v1')).toMatchObject({ runs: { [receipt.runId]: { engine: 'azure-cloud', state: 'running' } } });
+    expect(storage.values.get('runner-v1')).toMatchObject({ runs: { [receipt.runId]: { engine: 'azure-cloud', state: 'starting' } } });
 
     const recovered = new RunnerRunCoordinator({ storage, blockConcurrencyWhile: async (fn) => fn() }, env);
     await recovered.alarm();
@@ -234,8 +276,8 @@ describe('Cloudflare Runner run coordinator', () => {
     const ghaReceipt = await ghaAccepted.json() as { runId: string };
     await gha.coordinator.alarm();
     expect(ghaHosts).toEqual(['gha.example']);
-    expect(gha.storage.values.get('runner-v1')).toMatchObject({ runs: { [ghaReceipt.runId]: { engine: 'azure-cloud', routeMode: 'gha', state: 'running' } } });
-    expect(await (await gha.coordinator.fetch(call(`/v1/runs/${ghaReceipt.runId}/status`))).json()).toMatchObject({ engine: 'azure-cloud', routeMode: 'gha', state: 'running' });
+    expect(gha.storage.values.get('runner-v1')).toMatchObject({ runs: { [ghaReceipt.runId]: { engine: 'azure-cloud', routeMode: 'gha', state: 'starting' } } });
+    expect(await (await gha.coordinator.fetch(call(`/v1/runs/${ghaReceipt.runId}/status`))).json()).toMatchObject({ engine: 'azure-cloud', routeMode: 'gha', state: 'starting' });
   });
 
   it('does not cut over to GHA for a non-capacity France refusal', async () => {
@@ -271,6 +313,114 @@ describe('Cloudflare Runner run coordinator', () => {
     expect(hosts).toEqual(['france.example']);
     const result = await coordinator.fetch(call(`/v1/runs/${receipt.runId}/result`));
     expect(await result.json()).toMatchObject({ outcome: 'failed', failure: { code: 'WORKER_CAPACITY' } });
+  });
+
+  // Regressions from current main: preserve answers, stale-status recovery and process-start visibility.
+  it('preserves a non-truncated OpenCode stdout answer when an older worker omits answer', async () => {
+    const { coordinator, env } = setup();
+    const previousFetch = env.FETCH!;
+    env.FETCH = async (input, init) => {
+      const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+      if (url.pathname.endsWith('/result')) {
+        return Response.json({ exitReason: 'completed', exitCode: 0, exitSignal: null, answer: null,
+          stdout: 'GitHub auth is connected.', stderr: '', outputTruncated: false, artifacts: [], logUrl: '', repo: null });
+      }
+      return previousFetch(input, init);
+    };
+    const response = await coordinator.fetch(call('/v1/runs', body, { 'idempotency-key': 'stdout-answer-fallback' }));
+    const receipt = await response.json() as { runId: string };
+    await coordinator.alarm();
+    await coordinator.alarm();
+    await coordinator.alarm();
+
+    const status = await coordinator.fetch(call(`/v1/runs/${receipt.runId}/status`));
+    expect(await status.json()).toMatchObject({ state: 'succeeded', answer: 'GitHub auth is connected.' });
+    const result = await coordinator.fetch(call(`/v1/runs/${receipt.runId}/result`));
+    expect(await result.json()).toMatchObject({ outcome: 'succeeded', text: 'GitHub auth is connected.' });
+  });
+
+  it('does not promote a truncated stdout buffer to the answer', async () => {
+    const { coordinator, env } = setup();
+    const previousFetch = env.FETCH!;
+    env.FETCH = async (input, init) => {
+      const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+      if (url.pathname.endsWith('/result')) {
+        return Response.json({ exitReason: 'completed', exitCode: 0, exitSignal: null, answer: null,
+          stdout: 'partial response', stderr: '', outputTruncated: true, artifacts: [], logUrl: '', repo: null });
+      }
+      return previousFetch(input, init);
+    };
+    const response = await coordinator.fetch(call('/v1/runs', body, { 'idempotency-key': 'truncated-stdout-answer' }));
+    const receipt = await response.json() as { runId: string };
+    await coordinator.alarm();
+    await coordinator.alarm();
+    await coordinator.alarm();
+
+    const status = await coordinator.fetch(call(`/v1/runs/${receipt.runId}/status`));
+    expect(await status.json()).toMatchObject({ state: 'succeeded', answer: null });
+    const result = await coordinator.fetch(call(`/v1/runs/${receipt.runId}/result`));
+    expect(await result.json()).not.toHaveProperty('text');
+  });
+
+  it('marks a receipt-backed run unknown after stale worker status and resumes polling without relaunching', async () => {
+    const { coordinator, storage, launched, env } = setup();
+    const response = await coordinator.fetch(call('/v1/runs', body, { 'idempotency-key': 'stale-status-recovery' }));
+    const receipt = await response.json() as { runId: string };
+    await coordinator.alarm();
+    const stored = storage.values.get('runner-v1') as { runs: Record<string, { lastHeartbeatAt?: string }> };
+    stored.runs[receipt.runId]!.lastHeartbeatAt = new Date(Date.now() - 60_000).toISOString();
+    env.FETCH = async (input) => {
+      const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+      if (url.pathname.endsWith('/status')) throw new Error('worker unavailable');
+      throw new Error('unexpected request');
+    };
+    await coordinator.alarm();
+    expect(await (await coordinator.fetch(call(`/v1/runs/${receipt.runId}/status`))).json()).toMatchObject({ state: 'unknown', connectionLost: true, statusFreshness: 'stale' });
+    expect(launched).toHaveLength(1);
+    expect(storage.alarmAt).not.toBeNull();
+
+    env.FETCH = async (input) => {
+      const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+      if (url.pathname.endsWith('/status')) return Response.json({ status: 'running', state: 'running' });
+      if (url.pathname.endsWith('/logs')) return Response.json({ cursor: 0, logs: [] });
+      throw new Error('unexpected request');
+    };
+    await coordinator.alarm();
+    expect(await (await coordinator.fetch(call(`/v1/runs/${receipt.runId}/status`))).json()).toMatchObject({ state: 'running', connectionLost: false, statusFreshness: 'fresh' });
+    expect(launched).toHaveLength(1);
+  });
+
+  it('does not confuse a fresh poll with worker progress while a run is stuck before process start', async () => {
+    const { coordinator, env, launched } = setup();
+    const stuckSince = new Date(Date.now() - 10 * 60_000).toISOString();
+    env.FETCH = async (input, init) => {
+      const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+      if (url.pathname === '/v1/launch') {
+        const launch = JSON.parse(String(init?.body)) as { runId: string };
+        launched.push(launch);
+        return Response.json({ runId: launch.runId, operationId: 'op-stuck-start', status: 'accepted' }, { status: 202 });
+      }
+      if (url.pathname.endsWith('/status')) return Response.json({ status: 'running', state: 'starting', startPhase: 'materialize', startAttempts: 1, startedAt: null, updatedAt: stuckSince });
+      if (url.pathname.endsWith('/logs')) return Response.json({ cursor: 0, logs: [] });
+      if (url.pathname.endsWith('/cancel')) return Response.json({ status: 'stop_pending' });
+      throw new Error(`unexpected worker request ${url.pathname}`);
+    };
+    const response = await coordinator.fetch(call('/v1/runs', body, { 'idempotency-key': 'stuck-before-engine-start' }));
+    const receipt = await response.json() as { runId: string };
+
+    await coordinator.alarm(); // accepted by France worker
+    await coordinator.alarm(); // first status poll observes starting
+    await coordinator.alarm(); // identical worker updatedAt, but successful contact
+
+    const status = await coordinator.fetch(call(`/v1/runs/${receipt.runId}/status`));
+    expect(await status.json()).toMatchObject({ state: 'starting', statusFreshness: 'fresh',
+      workerReportedUpdatedAt: stuckSince, workerProgressFreshness: 'stale', workerStartPhase: 'materialize', workerStartAttempts: 1, workerStartedAt: null });
+    expect(launched).toHaveLength(1);
+
+    // A stuck accepted run stays fenced: it must not be resent merely because
+    // progress stopped. Restart policy may act only after pre-start is proven.
+    await coordinator.alarm();
+    expect(launched).toHaveLength(1);
   });
 
   it('proxies only a completed run output path to the VM worker', async () => {
@@ -579,6 +729,60 @@ describe('Cloudflare Runner run coordinator', () => {
     expect(JSON.stringify((await coordinator['read']()).runs[receipt.runId])).not.toContain('test-host-bearer-token-123');
   });
 
+  it('attaches a short-lived per-run proof to the pinned product user catalog without persisting secrets', async () => {
+    const pair = generateKeyPairSync('ed25519');
+    const privateJwk = pair.privateKey.export({ format: 'jwk' });
+    const { coordinator, launched, env } = setup();
+    env.MCP_USER_AUTH_TOKEN = 'product-user-mcp-transport-token-123';
+    env.MCP_USER_RUNNER_PRIVATE_JWK = JSON.stringify(privateJwk);
+    env.MCP_USER_PROFILE_USER_IDS = JSON.stringify({ 'integration-telegram-ux-v1': 'sandbox-user-1' });
+    env.MCP_USER_CATALOGUE_VERSION = 'mem-gpt-user-catalogue-v1';
+    env.MCP_USER_CATALOGUE_DIGEST = '8c17e64a0d71123698b139bd5957a10fff71a2b15f12601a95adcde150350e71';
+    const mcpPrincipal: ApiPrincipal = { ...principal, principalId: 'integration-telegram-ux-v1', profileId: 'integration-telegram-ux-v1' };
+    const response = await coordinator.fetch(call('/v1/runs', { ...body, mcp: userMcp }, { 'idempotency-key': 'product-user-mcp-run' }, mcpPrincipal));
+    expect(response.status, await response.clone().text()).toBe(202);
+    const receipt = await response.json() as { runId: string };
+    await coordinator.alarm();
+    const launch = launched[0]!;
+    const attachment = { mcp: launch.mcp as { servers: Record<string, { headers: Record<string, string> }> },
+      mcpSecrets: launch.mcpSecrets as Record<string, string> };
+    expect(Object.keys(attachment.mcp.servers)).toEqual(['mem-gpt']);
+    const server = attachment.mcp.servers['mem-gpt']!;
+    expect(server.headers).toMatchObject({
+      Authorization: 'Bearer {env:RUNNER_MCP_USER_TOKEN}',
+      'X-MCP-Operation': 'invocation', 'X-MCP-Scope': 'mcp:user-agent-run',
+      'X-MCP-Run-Id': receipt.runId, 'X-MCP-User-Task-Id': 'task-a',
+      'X-MCP-Run-Binding': '{env:RUNNER_MCP_USER_PROOF}',
+    });
+    const proof = attachment.mcpSecrets['RUNNER_MCP_USER_PROOF']!;
+    const [header, payload, signature] = proof.split('.');
+    const claims = JSON.parse(Buffer.from(payload!, 'base64url').toString('utf8')) as Record<string, unknown>;
+    expect(claims).toMatchObject({ userId: 'sandbox-user-1', runId: receipt.runId, userTaskId: 'task-a',
+      profileId: 'integration-telegram-ux-v1', ownerGeneration: 1, serverId: 'mem-gpt',
+      bindingRef: 'mem-gpt-user-sandbox', scope: 'mcp:user-agent-run',
+      catalogueVersion: 'mem-gpt-user-catalogue-v1',
+      catalogueDigest: '8c17e64a0d71123698b139bd5957a10fff71a2b15f12601a95adcde150350e71' });
+    expect(verify(null, Buffer.from(`${header}.${payload}`), pair.publicKey, Buffer.from(signature!, 'base64url'))).toBe(true);
+    expect(attachment.mcpSecrets['RUNNER_MCP_USER_TOKEN']).toBe('product-user-mcp-transport-token-123');
+    expect(JSON.stringify((await coordinator['read']()).runs[receipt.runId])).not.toContain('product-user-mcp-transport-token-123');
+    expect(JSON.stringify((await coordinator['read']()).runs[receipt.runId])).not.toContain(proof);
+  });
+
+  it('refuses a user-catalog descriptor outside the trusted profile or grant lifetime before admission', async () => {
+    const { coordinator, storage, env } = setup();
+    env.MCP_USER_AUTH_TOKEN = 'product-user-mcp-transport-token-123';
+    env.MCP_USER_RUNNER_PRIVATE_JWK = JSON.stringify(generateKeyPairSync('ed25519').privateKey.export({ format: 'jwk' }));
+    env.MCP_USER_PROFILE_USER_IDS = JSON.stringify({ 'integration-telegram-ux-v1': 'sandbox-user-1' });
+    env.MCP_USER_CATALOGUE_VERSION = 'mem-gpt-user-catalogue-v1';
+    env.MCP_USER_CATALOGUE_DIGEST = '8c17e64a0d71123698b139bd5957a10fff71a2b15f12601a95adcde150350e71';
+    const owner: ApiPrincipal = { ...principal, principalId: 'integration-telegram-ux-v1', profileId: 'integration-telegram-ux-v1' };
+    const wrongProfile = await coordinator.fetch(call('/v1/runs', { ...body, mcp: userMcp }, { 'idempotency-key': 'user-mcp-wrong-profile' }, principal));
+    expect(wrongProfile.status).toBe(422);
+    const longRun = await coordinator.fetch(call('/v1/runs', { ...body, mcp: userMcp, limits: { timeoutMs: 7_200_000 } }, { 'idempotency-key': 'user-mcp-too-long' }, owner));
+    expect(longRun.status).toBe(422);
+    expect(JSON.stringify(storage.values.get('runner-v1') ?? {})).not.toContain('sandbox-user-1');
+  });
+
   it('rejects unbound or altered MCP descriptors before storing a run', async () => {
     const { coordinator, storage, env } = setup();
     env.MCP_TEST_AUTH_TOKEN = 'test-host-bearer-token-123';
@@ -591,5 +795,196 @@ describe('Cloudflare Runner run coordinator', () => {
     const badEndpoint = await coordinator.fetch(bodyWith({ ...principal, principalId: 'integration-telegram-ux-v1', profileId: 'integration-telegram-ux-v1', mcpBindings: ['registry-mcp-test-160-read'] }, { servers: [{ ...testMcp.servers[0], url: 'https://attacker.example/mcp' }] }, 'wrong-endpoint'));
     expect(badEndpoint.status).toBe(422);
     expect(JSON.stringify(storage.values.get('runner-v1'))).not.toContain('test-host-bearer-token-123');
+  });
+});
+
+describe('tenant-bound model connections', () => {
+  const byokBody = { ...body, envAllowlist: [], credentialBindings: [{ type: 'openai', connectionId: 'conn-openai-a' }] };
+  function provision(env: RunnerWorkerEnv) {
+    env.RUNNER_BYOK_ENABLED = 'true';
+    env.ALLOWED_ENVIRONMENT_NAMES = 'OPENAI_API_KEY';
+    env.RUNNER_MODEL_CONNECTIONS = JSON.stringify([{ connectionId: 'conn-openai-a', principalId: principal.principalId,
+      profileId: principal.profileId, provider: 'openai', model: 'openai/gpt-5', secretBinding: 'RUNNER_MODEL_SECRET_A' }]);
+    env['RUNNER_MODEL_SECRET_A'] = 'test-only-provider-secret';
+  }
+
+  it('uses the principal-owned connection and encrypts the provider secret before storage', async () => {
+    const { coordinator, env, storage, launched } = setup();
+    provision(env);
+    const response = await coordinator.fetch(call('/v1/runs', byokBody, { 'idempotency-key': 'byok-1' }));
+    expect(response.status).toBe(202);
+    const stored = JSON.stringify(storage.values.get('runner-v1'));
+    expect(stored).not.toContain('test-only-provider-secret');
+    await coordinator.alarm();
+    expect(launched).toHaveLength(1);
+    expect(launched[0]).toMatchObject({ envAllowlist: ['OPENAI_API_KEY'], env: { OPENAI_API_KEY: 'test-only-provider-secret' },
+      engine: { modelSettings: { model: 'openai/gpt-5' } } });
+    const status = await coordinator.fetch(call(`/v1/runs/${(await response.json() as { runId: string }).runId}/status`));
+    expect(JSON.stringify(await status.json())).not.toContain('test-only-provider-secret');
+  });
+
+  it('cannot use another tenant connection or mix BYOK with managed secrets', async () => {
+    const { coordinator, env, storage } = setup();
+    provision(env);
+    const foreign = await coordinator.fetch(call('/v1/runs', byokBody, { 'idempotency-key': 'foreign' },
+      { ...principal, principalId: 'different-principal' }));
+    expect(foreign.status).toBe(404);
+    const mixed = await coordinator.fetch(call('/v1/runs', { ...byokBody, envAllowlist: ['LLM_LADDER_TOKEN'] }, { 'idempotency-key': 'mixed' }));
+    expect(mixed.status).toBe(403);
+    const missing = await coordinator.fetch(call('/v1/runs', { ...byokBody, credentialBindings: [{ type: 'openai', connectionId: 'missing' }] }, { 'idempotency-key': 'missing' }));
+    expect(missing.status).toBe(404);
+    expect((storage.values.get('runner-v1') as { runs: Record<string, unknown> }).runs).toEqual({});
+  });
+
+  it('keeps legacy requests with an empty credentialBindings array compatible', async () => {
+    const { coordinator } = setup();
+    const response = await coordinator.fetch(call('/v1/runs', { ...body, credentialBindings: [] }, { 'idempotency-key': 'legacy-empty' }));
+    expect(response.status).toBe(202);
+  });
+
+  it('does not admit BYOK on production or without the lane switch', async () => {
+    const { coordinator, env } = setup();
+    provision(env);
+    env.DEPLOYMENT_ENV = 'production';
+    expect((await coordinator.fetch(call('/v1/runs', byokBody, { 'idempotency-key': 'prod-byok' }))).status).toBe(422);
+    env.DEPLOYMENT_ENV = undefined;
+    env.RUNNER_BYOK_ENABLED = undefined;
+    expect((await coordinator.fetch(call('/v1/runs', byokBody, { 'idempotency-key': 'disabled-byok' }))).status).toBe(422);
+  });
+});
+
+describe('principal-bound terminal webhooks', () => {
+  const webhookSecret = 'sandbox-webhook-signing-secret-at-least-24';
+  function provision(env: RunnerWorkerEnv) {
+    env.RUNNER_WEBHOOKS_ENABLED = 'true';
+    env.RUNNER_WEBHOOKS = JSON.stringify([{ webhookId: 'wh-a', principalId: principal.principalId,
+      profileId: principal.profileId, url: 'https://hooks.customer.com/runner', secretBinding: 'RUNNER_WEBHOOK_SECRET_A' }]);
+    env['RUNNER_WEBHOOK_SECRET_A'] = webhookSecret;
+  }
+
+  it('delivers a signed terminal event, retries a 5xx, and reports the final delivery state', async () => {
+    const { coordinator, env, storage } = setup();
+    provision(env);
+    const sent: Array<{ headers: Headers; body: string }> = [];
+    const workerFetch = env.FETCH!;
+    env.FETCH = async (input, init) => {
+      const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+      if (url.hostname !== 'hooks.customer.com') return workerFetch(input, init);
+      sent.push({ headers: new Headers(init?.headers), body: String(init?.body) });
+      expect(init?.redirect).toBe('manual');
+      return new Response(null, { status: sent.length === 1 ? 503 : 204 });
+    };
+    const submitted = await coordinator.fetch(call('/v1/runs', { ...body, webhookId: 'wh-a' }, { 'idempotency-key': 'webhook-attempt' }));
+    expect(submitted.status).toBe(202);
+    const { runId } = await submitted.json() as { runId: string };
+    await coordinator.alarm();
+    await coordinator.alarm();
+    await coordinator.alarm();
+    expect(sent).toHaveLength(1);
+    const first = sent[0]!;
+    const payload = JSON.parse(first.body) as Record<string, unknown>;
+    expect(payload).toMatchObject({ eventId: `terminal:${runId}`, type: 'run.terminal', runId, state: 'succeeded',
+      resultUrl: `https://runner-api.example/v1/developer/runs/${runId}/result`, result: { text: 'done' } });
+    expect(first.headers.get('x-serverlessagence-signature')).toBe(`v1=${createHmac('sha256', webhookSecret)
+      .update(`${first.headers.get('x-serverlessagence-timestamp')}.${first.body}`).digest('hex')}`);
+    const pending = await coordinator.fetch(call(`/v1/runs/${runId}/webhook`));
+    expect(await pending.json()).toMatchObject({ status: 'pending', attempts: 1, lastStatus: 503 });
+    const persisted = storage.values.get('runner-v1') as { runs: Record<string, { webhook: { nextAttemptAt: string } }> };
+    expect(JSON.stringify(persisted)).not.toContain(webhookSecret);
+    persisted.runs[runId]!.webhook.nextAttemptAt = new Date(0).toISOString();
+    await coordinator.alarm();
+    expect(sent).toHaveLength(2);
+    expect(JSON.parse(sent[1]!.body)).toMatchObject({ eventId: `terminal:${runId}` });
+    const delivered = await coordinator.fetch(call(`/v1/runs/${runId}/webhook`));
+    expect(await delivered.json()).toMatchObject({ status: 'delivered', attempts: 2, lastStatus: 204 });
+    await coordinator.alarm();
+    expect(sent).toHaveLength(2);
+  });
+
+  it('rejects a foreign or unregistered webhook without creating a run', async () => {
+    const { coordinator, env, storage } = setup();
+    provision(env);
+    const foreign = await coordinator.fetch(call('/v1/runs', { ...body, webhookId: 'wh-a' }, { 'idempotency-key': 'foreign-webhook' },
+      { ...principal, principalId: 'other-principal' }));
+    expect(foreign.status).toBe(404);
+    const unknown = await coordinator.fetch(call('/v1/runs', { ...body, webhookId: 'not-registered' }, { 'idempotency-key': 'unknown-webhook' }));
+    expect(unknown.status).toBe(404);
+    expect((storage.values.get('runner-v1') as { runs: Record<string, unknown> }).runs).toEqual({});
+  });
+
+  it('refuses insecure endpoint configuration and keeps production webhook admission closed', async () => {
+    const { coordinator, env } = setup();
+    provision(env);
+    env.RUNNER_WEBHOOKS = JSON.stringify([{ webhookId: 'wh-a', principalId: principal.principalId, profileId: principal.profileId,
+      url: 'http://127.0.0.1/collect', secretBinding: 'RUNNER_WEBHOOK_SECRET_A' }]);
+    expect((await coordinator.fetch(call('/v1/runs', { ...body, webhookId: 'wh-a' }, { 'idempotency-key': 'bad-url' }))).status).toBe(503);
+    provision(env);
+    env.DEPLOYMENT_ENV = 'production';
+    expect((await coordinator.fetch(call('/v1/runs', { ...body, webhookId: 'wh-a' }, { 'idempotency-key': 'prod-webhook' }))).status).toBe(422);
+  });
+
+  it('stops after eight failed deliveries and protects a pending webhook from cleanup', async () => {
+    const { coordinator, env, storage } = setup();
+    provision(env);
+    let sent = 0;
+    const workerFetch = env.FETCH!;
+    env.FETCH = async (input, init) => {
+      const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+      if (url.hostname !== 'hooks.customer.com') return workerFetch(input, init);
+      sent += 1;
+      return new Response(null, { status: 503 });
+    };
+    const submitted = await coordinator.fetch(call('/v1/runs', { ...body, webhookId: 'wh-a' }, { 'idempotency-key': 'webhook-exhaustion' }));
+    const { runId } = await submitted.json() as { runId: string };
+    await coordinator.alarm();
+    await coordinator.alarm();
+    await coordinator.alarm();
+    expect(sent).toBe(1);
+    expect((await coordinator.fetch(call('/v1/sandbox/cleanup-task', { userTaskId: body.userTaskId }))).status).toBe(409);
+    for (let attempt = 2; attempt <= 8; attempt++) {
+      const persisted = storage.values.get('runner-v1') as { runs: Record<string, { webhook: { nextAttemptAt: string } }> };
+      persisted.runs[runId]!.webhook.nextAttemptAt = new Date(0).toISOString();
+      await coordinator.alarm();
+    }
+    expect(sent).toBe(8);
+    const status = await coordinator.fetch(call(`/v1/runs/${runId}/webhook`));
+    expect(await status.json()).toMatchObject({ status: 'failed', attempts: 8, lastStatus: 503 });
+    await coordinator.alarm();
+    expect(sent).toBe(8);
+  });
+});
+
+describe('Cloudflare Runner API scoped active-run lookup route', () => {
+  it('routes GET by exact task id and requires runs:read', async () => {
+    const secret = 'production-api-key-for-test-only';
+    const keyHash = createHash('sha256').update(secret).digest('hex');
+    const calls: Request[] = [];
+    const makeEnv = (scopes: string[]) => ({
+      DEPLOYMENT_ENV: 'production',
+      RUNNER_API_KEYS_PRODUCTION: JSON.stringify([{ keyHash, principalId: 'cp', tenantId: 'tenant', profileId: 'profile',
+        repository: 'trained-assist/ai-agent-runner', scopes, engines: ['eu-vm-agent-run'] }]),
+      RUNNER_API_KEYS: '[]', VM_WORKER_URL: 'https://france.example', VM_WORKER_TOKEN: 'test-worker-token',
+      RUNNER_API_PUBLIC_URL: 'https://runner.example', RUN_LAUNCH_ENCRYPTION_KEY: 'test-launch-key-at-least-32-characters',
+      ALLOWED_REPOSITORIES: 'trained-assist/ai-agent-runner', RUNNER_RUNS: {
+        idFromName: (name: string) => name,
+        get: (_id: unknown) => ({ fetch: async (request: Request) => {
+          calls.push(request);
+          return Response.json({ runs: [], nextCursor: null });
+        } }),
+      },
+    }) as unknown as RunnerWorkerEnv;
+
+    const headers = { authorization: `Bearer ${secret}` };
+    const response = await runnerWorker.fetch(new Request('https://runner.example/v1/runs?state=active&userTaskId=task-1', { headers }), makeEnv(['runs:read']));
+    expect(response.status).toBe(200);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.url).toContain('userTaskId=task-1');
+    expect(calls[0]?.headers.get('x-runner-principal')).toContain('"principalId":"cp"');
+
+    const malformed = await runnerWorker.fetch(new Request('https://runner.example/v1/runs?state=active&userTaskId=bad%20id', { headers }), makeEnv(['runs:read']));
+    expect(malformed.status).toBe(400);
+    const forbidden = await runnerWorker.fetch(new Request('https://runner.example/v1/runs?state=active&userTaskId=task-1', { headers }), makeEnv(['runs:write']));
+    expect(forbidden.status).toBe(403);
+    expect(calls).toHaveLength(1);
   });
 });

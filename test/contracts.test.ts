@@ -36,6 +36,9 @@ const EVENT_PAYLOADS: Record<RunnerEventType, unknown> = {
   },
   started: { pid: 4242 },
   log: { stream: 'stdout', level: 'info', message: 'hello' },
+  assistant_message: { sessionId: 'ses_01J9A3J9Y7V8W2K4M6N0PQRSTZ', messageId: 'msg-1', text: 'I will inspect this, then run a tool.' },
+  assistant_question: { sessionId: 'ses_01J9A3J9Y7V8W2K4M6N0PQRSTZ', requestId: 'question-1', toolCallId: 'call-1',
+    questions: [{ header: 'Target', question: 'Which target?', multiple: false, options: [{ label: 'Sandbox', description: 'Safe test' }] }] },
   exit: { code: 0, signal: null },
   finalizing: { reason: 'engine_exit' },
   artifact_exported: {
@@ -310,6 +313,12 @@ describe('validateRunnerEvent', () => {
 describe('validateRunResult', () => {
   it('accepts a valid succeeded result', () => {
     expect(validateRunResult(validResult()).ok).toBe(true);
+  });
+
+  it('accepts explicit engine-start evidence and rejects unknown evidence values', () => {
+    expect(validateRunResult(validResult({ engineStart: 'not_started' })).ok).toBe(true);
+    expect(validateRunResult(validResult({ engineStart: 'unknown' })).ok).toBe(true);
+    expect(validateRunResult(validResult({ engineStart: 'maybe' })).ok).toBe(false);
   });
 
   it('accepts a valid failed result with structured failure', () => {

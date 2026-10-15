@@ -1,4 +1,5 @@
 import { chmodSync, chownSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { EngineAdapter, EngineHandle } from '../adapters/engine/engine-adapter.js';
@@ -10,7 +11,7 @@ import {
   type RunnerEvent,
   type RunnerEventType,
 } from '../contracts/events.js';
-import type { RunResult } from '../contracts/result.js';
+import type { RunResult, SessionCheckpointRef } from '../contracts/result.js';
 import type { RunSpec } from '../contracts/run-spec.js';
 import { stripRepositoryToken, validateRunSpec } from '../contracts/run-spec.js';
 import { ConflictError, PreflightError, SpecValidationError } from '../contracts/validate.js';
@@ -28,7 +29,7 @@ import { InputMaterializer, type MaterializeReceipt } from '../storage/input-mat
 import { materializeIngressManifest, type IngressArtifactResolver } from '../storage/ingress-artifact.js';
 import { artifactNameFor, mimeForName } from '../storage/export-manifest.js';
 import type { RunExportManifest } from '../storage/export-manifest.js';
-import { isRegularFile, resolveExistingInsideRoot } from '../storage/local-paths.js';
+import { isRegularFile, resolveExistingInsideRoot, resolveInsideRoot } from '../storage/local-paths.js';
 import { profileKey } from '../storage/keys.js';
 import { redactSecrets, specHash, truncateLine, writeFileAtomic } from './util.js';
 import {
@@ -189,6 +190,9 @@ export interface RunSnapshot {
   jobId: string;
   operationId: string;
   state: RunState;
+  startPhase: PersistedRunState['startPhase'] | null;
+  startAttempts: number;
+  startedAt: string | null;
   ownerGeneration: number;
   sequence: number;
   connectionLost: boolean;
@@ -261,6 +265,7 @@ interface InternalRun {
   waiters: Array<(result: RunResult) => void>;
   handle: EngineHandle | null;
   timers: NodeJS.Timeout[];
+  startTimer: NodeJS.Timeout | null;
   exitReceived: boolean;
   finalizePromise: Promise<RunResult> | null;
   /** Per-run сессия MCP (P13): bridge + stdio-серверы; гасится вместе с раном. */
@@ -275,7 +280,9 @@ interface InternalRun {
    * считается то, что движок напечатало последним. Накопитель ограничен, в журнал рана
    * содержимое не попадает — только источник и размер.
    */
-  answerTail: string[];
+  stdoutAnswerParts: string[];
+  stdoutAnswerChars: number;
+  stdoutAnswerBytes: number;
   /** Launch-only credentials. Deliberately memory-only and never written to RunStore. */
   runtimeEnv: Record<string, string>;
   /** Allowlisted secret values used to scrub engine output before it reaches durable logs. */
@@ -283,6 +290,7 @@ interface InternalRun {
   workspaceToken: string | null;
   repositoryCommit: string | null;
   workspacePublishFailed: boolean;
+  sessionCheckpoint: SessionCheckpointRef | null;
 }
 
 /**
@@ -301,9 +309,7 @@ interface ExitResolution {
   answer: { present: boolean; source: 'agent_file' | 'engine_stdout' | null; chars: number; text: string };
 }
 
-/** Потолок накопителя ответа: хвост, а не архив вывода движка. */
-const ANSWER_TAIL_MAX_LINES = 200;
-const ANSWER_TAIL_MAX_LINE = 2000;
+const MAX_SAFE_START_RETRIES = 2;
 
 /** Receipt входа без материализации: ран объявляет ноль, а не молчит о ref'ах без снимка. */
 function emptyInputReceipt(st: PersistedRunState, declared: number) {
@@ -446,18 +452,22 @@ export class Runner {
         waiters: [],
         handle: null,
         timers: [],
+        startTimer: null,
         exitReceived: Boolean(state.exit?.observed),
         finalizePromise: null,
         mcp: null,
         mcpCleanup: null,
         mcpConfigPath: null,
         room: null,
-        answerTail: [],
+        stdoutAnswerParts: [],
+      stdoutAnswerChars: 0,
+      stdoutAnswerBytes: 0,
         runtimeEnv: {},
         runtimeSecrets: [],
         workspaceToken: null,
         repositoryCommit: state.profileWorkspaceCommit ?? state.result?.repositoryCommit ?? null,
         workspacePublishFailed: false,
+        sessionCheckpoint: state.result?.sessionCheckpoint ?? null,
       });
     }
   }
@@ -483,6 +493,9 @@ export class Runner {
       jobId: st.jobId,
       operationId: st.operationId,
       state: st.state,
+      startPhase: st.startPhase ?? null,
+      startAttempts: st.startAttempts ?? 0,
+      startedAt: st.startedAt,
       ownerGeneration: st.ownerGeneration,
       sequence: st.sequence,
       connectionLost: st.connectionLost,
@@ -615,6 +628,8 @@ export class Runner {
       profileId: spec.profileId,
       ownerGeneration: spec.ownerGeneration,
       state: 'queued',
+      startPhase: 'queued',
+      startAttempts: 1,
       sequence: 0,
       connectionLost: false,
       orphanedPid: null,
@@ -641,13 +656,16 @@ export class Runner {
       waiters: [],
       handle: null,
       timers: [],
+      startTimer: null,
       exitReceived: false,
       finalizePromise: null,
       mcp: null,
       mcpCleanup: null,
       mcpConfigPath: null,
       room: null,
-      answerTail: [],
+      stdoutAnswerParts: [],
+      stdoutAnswerChars: 0,
+      stdoutAnswerBytes: 0,
       runtimeEnv: { ...runtimeEnv },
       runtimeSecrets: spec.profileWorkspace?.savebackToken ? [spec.profileWorkspace.savebackToken] : [],
       workspaceToken: spec.profileWorkspace?.savebackUrl
@@ -655,6 +673,7 @@ export class Runner {
         : spec.profileWorkspace ? spec.repository?.token ?? null : null,
       repositoryCommit: null,
       workspacePublishFailed: false,
+      sessionCheckpoint: null,
     });
     this.emit(state, 'claimed', { operationId });
     void this.execute(spec.runId).catch(() => undefined);
@@ -687,6 +706,14 @@ export class Runner {
     }
 
     if (st.state === 'queued') {
+      this.completeWithoutEngine(st, 'cancelled', 'cancelled');
+      return { runId, status: 'stopped', state: st.state };
+    }
+
+    // A start-stage cancellation is terminal only while the adapter has not been
+    // invoked. execute() checks the terminal state after each awaited setup step,
+    // so late setup completion cannot cross the spawn boundary afterwards.
+    if (st.state === 'starting' && !st.startedAt && st.startPhase !== 'spawn') {
       this.completeWithoutEngine(st, 'cancelled', 'cancelled');
       return { runId, status: 'stopped', state: st.state };
     }
@@ -832,7 +859,20 @@ export class Runner {
       }
       switch (st.state) {
         case 'queued':
-          if (this.opts.resumeQueuedRuns === false) {
+          if (st.cancelRequested === 'cancel') {
+            this.completeWithoutEngine(st, 'cancelled', 'cancelled');
+            report.terminal += 1;
+          } else if (this.opts.resumeQueuedRuns !== false && (st.startAttempts ?? 1) <= MAX_SAFE_START_RETRIES + 1) {
+            // A timeout marker belongs to the previous pre-start attempt. If the
+            // worker died after it durably queued a safe retry but before cleanup
+            // launched it, recovery gives that retry a fresh start deadline.
+            st.cancelRequested = null;
+            this.store.saveState(st);
+            report.resumedQueued += 1;
+            this.emit(st, 'log', { stream: 'runner', level: 'warn',
+              message: `engine_start_recovery attempt=${st.startAttempts ?? 1}/${MAX_SAFE_START_RETRIES + 1} evidence=engine_not_started phase=queued` });
+            void this.execute(st.runId).catch(() => undefined);
+          } else if (this.opts.resumeQueuedRuns === false) {
             this.completeWithoutEngine(st, 'failed', 'worker_crash', {
               code: 'WORKER_RESTARTED_BEFORE_ENGINE_START',
               failureClass: 'runtime',
@@ -841,22 +881,52 @@ export class Runner {
             });
             report.lost += 1;
           } else {
-            report.resumedQueued += 1;
-            void this.execute(st.runId).catch(() => undefined);
+            this.completeWithoutEngine(st, 'failed', 'worker_crash', {
+              code: 'WORKER_START_RETRIES_EXHAUSTED', failureClass: 'runtime',
+              safeSummary: 'worker restarted after the automatic pre-start retry limit; no engine actions were replayed', retryable: false,
+            });
+            report.lost += 1;
           }
           break;
         case 'starting':
           report.orphanedMcp += await this.reapOrphanedMcp(run);
           if (st.pid && isProcessAlive(st.pid)) {
             await this.markOrphaned(run, report);
+          } else if (this.canRetryStartAfterRestart(st)) {
+            const lease = st.cleanRoom ? this.opts.isolation?.lease(st.runId) : null;
+            const hasLease = Boolean(lease && lease.status !== 'released');
+            if (!hasLease || await this.reconcileCleanRoom(run)) {
+              const nextAttempt = (st.startAttempts ?? 1) + 1;
+              st.startAttempts = nextAttempt;
+              st.pid = null;
+              st.pgid = null;
+              st.workerCrashed = false;
+              st.startPhase = 'queued';
+              if (this.transition(st, 'queued')) {
+                report.resumedQueued += 1;
+                this.emit(st, 'log', { stream: 'runner', level: 'warn',
+                  message: `engine_start_recovery attempt=${nextAttempt}/${MAX_SAFE_START_RETRIES + 1} evidence=engine_not_started` });
+                void this.execute(st.runId).catch(() => undefined);
+              }
+            } else {
+              st.workerCrashed = true;
+              this.store.saveState(st);
+              this.completeWithoutEngine(st, 'failed', 'worker_crash', {
+                code: 'WORKER_CRASH_BEFORE_ENGINE_START', failureClass: 'runtime',
+                safeSummary: 'worker restarted before engine spawn but clean-room recovery failed; retry was stopped safely', retryable: false,
+              });
+              report.lost += 1;
+            }
           } else {
             st.workerCrashed = true;
             this.store.saveState(st);
             this.completeWithoutEngine(st, 'failed', 'worker_crash', {
-              code: 'WORKER_CRASH',
+              code: st.startPhase === 'spawn' && !st.startedAt ? 'WORKER_CRASH_DURING_ENGINE_START' : 'WORKER_CRASH_BEFORE_ENGINE_START',
               failureClass: 'runtime',
-              safeSummary: 'worker restarted before the engine process was confirmed; no hidden rerun',
-              retryable: true,
+              safeSummary: st.startPhase === 'spawn' && !st.startedAt
+                ? 'worker restarted during an ambiguous engine spawn; no automatic rerun was made'
+                : 'worker restarted after the automatic pre-start retry limit; no hidden rerun',
+              retryable: false,
             });
             report.lost += 1;
           }
@@ -1021,6 +1091,30 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
     return true;
   }
 
+  private setStartPhase(st: PersistedRunState, phase: NonNullable<PersistedRunState['startPhase']>): void {
+    if (st.startPhase === phase) return;
+    st.startPhase = phase;
+    st.updatedAt = this.nowIso();
+    this.store.saveState(st);
+  }
+
+  private canRetryStartAfterRestart(st: PersistedRunState): boolean {
+    return st.state === 'starting' && st.startedAt === null && st.pid === null && st.pgid === null
+      && st.cancelRequested === null && (st.startAttempts ?? 0) <= MAX_SAFE_START_RETRIES
+      && ['queued', 'preflight', 'materialize', 'isolation', 'mcp'].includes(st.startPhase ?? '');
+  }
+
+  private settleStartCancellation(st: PersistedRunState): void {
+    if (st.cancelRequested === 'timeout') {
+      this.completeWithoutEngine(st, 'failed', 'startup_failure', {
+        code: 'ENGINE_START_TIMEOUT', failureClass: 'runtime',
+        safeSummary: `engine did not start during the ${st.spec.limits.timeoutMs}ms start deadline`, retryable: true,
+      });
+      return;
+    }
+    this.completeWithoutEngine(st, 'cancelled', 'cancelled');
+  }
+
   private emit(st: PersistedRunState, type: RunnerEventType, payload: unknown): RunnerEvent {
     const candidate = {
       schemaVersion: 1,
@@ -1074,20 +1168,49 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
     if (!run || this.disposed) return;
     const st = run.state;
     if (isTerminalState(st.state) || !this.transition(st, 'starting')) return;
+    const startAttempt = st.startAttempts ?? 1;
+    if (run.startTimer) clearTimeout(run.startTimer);
+    run.startTimer = null;
+    this.setStartPhase(st, 'preflight');
+    if (st.spec.limits.timeoutMs > 0) {
+      run.startTimer = setTimeout(() => {
+        run.startTimer = null;
+        if (!this.isCurrentStartAttempt(st, startAttempt) || isTerminalState(st.state) || st.startedAt) return;
+        st.cancelRequested = 'timeout';
+        this.store.saveState(st);
+        // Before `spawn`, no engine process could have received the task, so this
+        // is a safe terminal start-timeout. During spawn the outcome is ambiguous;
+        // keep it visible and fenced until adapter.start() resolves or recovery
+        // proves the process outcome.
+        if (st.startPhase === 'spawn') return;
+        if (!this.queuePreStartRetry(run, st, startAttempt, 'start_timeout')) {
+          this.completeWithoutEngine(st, 'failed', 'startup_failure', {
+            code: 'ENGINE_START_TIMEOUT', failureClass: 'runtime',
+            safeSummary: `engine did not start after ${startAttempt} attempts within the ${st.spec.limits.timeoutMs}ms start deadline`, retryable: false,
+          });
+        }
+      }, st.spec.limits.timeoutMs);
+      run.startTimer.unref?.();
+    }
 
     let handle: EngineHandle | null = null;
     let phase: 'preflight' | 'isolation' | 'mcp' | 'spawn' = 'preflight';
     try {
       await this.fireFault('preflight', runId);
       if (this.disposed) return;
+      if (!this.isCurrentStartAttempt(st, startAttempt)) return;
+      if (isTerminalState(st.state)) return;
       this.preflight(st);
       if (this.disposed) return;
       if (st.cancelRequested) {
         this.completeWithoutEngine(st, 'cancelled', 'cancelled');
         return;
       }
+      this.setStartPhase(st, 'materialize');
       await this.materialize(st);
       if (this.disposed) return;
+      if (!this.isCurrentStartAttempt(st, startAttempt)) return;
+      if (isTerminalState(st.state)) return;
       if (st.cancelRequested) {
         this.completeWithoutEngine(st, 'cancelled', 'cancelled');
         return;
@@ -1096,10 +1219,14 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
       // не «тихо» запускает движок под service UID.
       if (this.opts.isolation || st.spec.isolation?.mode === 'per_run_unix_identity') {
         phase = 'isolation';
+        this.setStartPhase(st, 'isolation');
         await this.fireFault('isolation', runId);
         if (this.disposed) return;
+        if (!this.isCurrentStartAttempt(st, startAttempt)) return;
         await this.prepareCleanRoom(run, st);
         if (this.disposed) return;
+        if (!this.isCurrentStartAttempt(st, startAttempt)) return;
+        if (isTerminalState(st.state)) return;
         if (st.cancelRequested) {
           await this.releaseCleanRoom(run, 'cancelled');
           this.completeWithoutEngine(st, 'cancelled', 'cancelled');
@@ -1112,11 +1239,18 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
       // должен иметь готовый локальный proxy. Отказ здесь валит старт, а не «тихий» ран.
       if ((st.spec.mcp?.servers.length ?? 0) > 0) {
         phase = 'mcp';
+        this.setStartPhase(st, 'mcp');
         await this.fireFault('mcp', runId);
         if (this.disposed) return;
+        if (!this.isCurrentStartAttempt(st, startAttempt)) return;
         await this.startMcpSession(run, st);
         if (this.disposed) {
           await this.stopMcpSession(run, 'worker_disposed');
+          return;
+        }
+        if (!this.isCurrentStartAttempt(st, startAttempt)) return;
+        if (isTerminalState(st.state)) {
+          await this.stopMcpSession(run, 'start_timeout');
           return;
         }
         if (st.cancelRequested) {
@@ -1128,10 +1262,13 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
       phase = 'spawn';
       await this.fireFault('spawn', runId);
       if (this.disposed) return;
+      if (!this.isCurrentStartAttempt(st, startAttempt)) return;
+      if (isTerminalState(st.state)) return;
       if (st.cancelRequested) {
-        this.completeWithoutEngine(st, 'cancelled', 'cancelled');
+        this.settleStartCancellation(st);
         return;
       }
+      this.setStartPhase(st, 'spawn');
       handle = await adapter.start({
         spec: st.spec,
         cwd: st.spec.cwd,
@@ -1143,6 +1280,8 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
             }
           : {}),
         onLog: (stream, line) => this.onEngineLog(runId, stream, line),
+        onAssistantMessage: (message) => this.onEngineAssistantMessage(runId, message),
+        onAssistantQuestion: (question) => this.onEngineAssistantQuestion(runId, question),
         onExit: (code, signal) => {
           void this.onEngineExit(runId, code, signal);
         },
@@ -1152,11 +1291,25 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
         handle.dispose();
         return;
       }
+      if (!this.isCurrentStartAttempt(st, startAttempt)) {
+        handle.killTree('SIGKILL');
+        handle.dispose();
+        return;
+      }
+      if (isTerminalState(st.state) || st.cancelRequested) {
+        handle.killTree('SIGKILL');
+        handle.dispose();
+        if (!isTerminalState(st.state)) this.settleStartCancellation(st);
+        return;
+      }
       if (!handle.pid) throw new Error('engine adapter did not return a live process id');
       if (run.room) await this.assertEngineIdentity(run, st, handle.pid);
       st.pid = handle.pid;
       st.pgid = handle.pgid ?? handle.pid;
       st.startedAt = this.nowIso();
+      this.setStartPhase(st, 'started');
+      if (run.startTimer) clearTimeout(run.startTimer);
+      run.startTimer = null;
       if (!this.transition(st, 'running')) {
         handle.killTree('SIGKILL');
         return;
@@ -1171,7 +1324,7 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
         handle.dispose();
       }
       // воркер останавливается: run остаётся в starting, recover() разберёт его
-      if (this.disposed) return;
+      if (this.disposed || !this.isCurrentStartAttempt(st, startAttempt)) return;
       if (isTerminalState(st.state) || st.finalized) return;
       this.failStartPath(st, err, phase);
     }
@@ -1273,6 +1426,36 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
    */
   private async materializeInputs(st: PersistedRunState): Promise<void> {
     const refs = st.spec.input?.refs ?? [];
+    const resume = st.spec.input?.resumeSessionFrom;
+    if (resume) {
+      if (st.spec.engine.name !== 'opencode') {
+        throw new PreflightError('MATERIALIZE_REF_INVALID', 'OpenCode session checkpoints can only resume an OpenCode run');
+      }
+      if (!st.spec.profileWorkspace?.snapshotUrl || !st.spec.profileWorkspace.savebackUrl) {
+        throw new PreflightError('MATERIALIZE_REF_INVALID', 'OpenCode session resume requires the existing profile archive/restore path');
+      }
+      if (resume.path !== `.session-traces/${resume.sessionId}.json`) {
+        throw new PreflightError('MATERIALIZE_REF_INVALID', 'OpenCode session checkpoint path is outside the session archive namespace');
+      }
+      let bytes: Buffer;
+      try {
+        bytes = readFileSync(resolveInsideRoot(st.spec.cwd, resume.path, 'OpenCode session checkpoint'));
+      } catch (error) {
+        throw new PreflightError('MATERIALIZE_REF_UNAVAILABLE', `OpenCode session checkpoint was not restored from the profile archive: ${String((error as Error).message)}`, { retryable: true });
+      }
+      let sessionId: unknown;
+      try {
+        const parsed = JSON.parse(bytes.toString('utf8')) as { info?: { id?: unknown } };
+        sessionId = parsed.info?.id;
+      } catch {
+        throw new PreflightError('MATERIALIZE_REF_INVALID', 'OpenCode session checkpoint is not valid exported session JSON');
+      }
+      if (bytes.length !== resume.size || createHash('sha256').update(bytes).digest('hex') !== resume.sha256
+        || typeof sessionId !== 'string' || sessionId !== resume.sessionId || !/^ses_[0-7][0-9A-HJKMNP-TV-Z]{25}$/.test(sessionId)) {
+        throw new PreflightError('MATERIALIZE_REF_INVALID', 'OpenCode session checkpoint failed profile archive integrity validation');
+      }
+      this.emit(st, 'log', { stream: 'runner', level: 'info', message: `opencode.session_checkpoint_restored sessionId=${sessionId} bytes=${bytes.length} sourceRunId=${resume.sourceRunId}` });
+    }
     const materializer = this.opts.inputs;
     const ingress = st.spec.ingressManifest;
     if (ingress) {
@@ -1749,6 +1932,48 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
   private clearTimers(run: InternalRun): void {
     for (const timer of run.timers) clearTimeout(timer);
     run.timers = [];
+    this.clearStartTimer(run);
+  }
+
+  private clearStartTimer(run: InternalRun): void {
+    if (run.startTimer) clearTimeout(run.startTimer);
+    run.startTimer = null;
+  }
+
+  private isCurrentStartAttempt(st: PersistedRunState, attempt: number): boolean {
+    return (st.startAttempts ?? 1) === attempt;
+  }
+
+  private queuePreStartRetry(run: InternalRun, st: PersistedRunState, expiredAttempt: number, reason: string): boolean {
+    if (expiredAttempt >= MAX_SAFE_START_RETRIES + 1 || isTerminalState(st.state)) return false;
+    st.startAttempts = expiredAttempt + 1;
+    st.startPhase = 'queued';
+    this.clearStartTimer(run);
+    if (!this.transition(st, 'queued')) return false;
+    this.emit(st, 'log', { stream: 'runner', level: 'warn',
+      message: `engine_start_recovery attempt=${st.startAttempts}/${MAX_SAFE_START_RETRIES + 1} evidence=engine_not_started reason=${reason}` });
+    void this.preparePreStartRetry(run, st, expiredAttempt).catch(() => undefined);
+    return true;
+  }
+
+  private async preparePreStartRetry(run: InternalRun, st: PersistedRunState, expiredAttempt: number): Promise<void> {
+    try {
+      await this.stopMcpSession(run, 'start_timeout_retry');
+      if (this.disposed || isTerminalState(st.state) || (st.startAttempts ?? 0) !== expiredAttempt + 1) return;
+      if (run.room) await this.releaseCleanRoom(run, 'start_timeout_retry');
+      if (this.disposed || isTerminalState(st.state) || (st.startAttempts ?? 0) !== expiredAttempt + 1) return;
+      st.cancelRequested = null;
+      this.store.saveState(st);
+      void this.execute(st.runId).catch(() => undefined);
+    } catch (error) {
+      if (this.disposed || isTerminalState(st.state) || (st.startAttempts ?? 0) !== expiredAttempt + 1) return;
+      st.cancelRequested = null;
+      const detail = truncateLine(redactSecrets(error instanceof Error ? error.message : String(error)), 300);
+      this.completeWithoutEngine(st, 'failed', 'startup_failure', {
+        code: 'STARTUP_RETRY_CLEANUP_FAILED', failureClass: 'runtime',
+        safeSummary: `safe startup retry could not clean up pre-engine resources: ${detail}`, retryable: false,
+      });
+    }
   }
 
   private onTimeout(runId: string): void {
@@ -1796,22 +2021,74 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
     if (!run || this.disposed) return;
     const st = run.state;
     if (isTerminalState(st.state)) return;
-    const limit = st.spec.limits.maxOutputBytes ?? st.spec.limits.maxLogBytes ?? DEFAULT_MAX_LOG_LINE;
-    const sanitized = redactRunSecrets(redactSecrets(truncateLine(rawLine, limit)), run.runtimeSecrets).replace(/[\x00-\x1f]/g, ' ');
+    const limit = st.spec.limits.maxLogBytes ?? st.spec.limits.maxOutputBytes ?? DEFAULT_MAX_LOG_LINE;
+    // The authoritative answer is independent of the bounded one-line log
+    // projection. OpenCode can emit a complete multi-paragraph text part here.
+    const redacted = redactRunSecrets(redactSecrets(rawLine), run.runtimeSecrets);
+    if (stream === 'stdout') this.rememberAnswerLine(run, redacted.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, ' '));
+    const sanitized = truncateLine(redacted, limit).replace(/[\x00-\x1f]/g, ' ');
     if (sanitized.length === 0) return;
-    if (stream === 'stdout') this.rememberAnswerLine(run, sanitized);
     this.emit(st, 'log', { stream, level: 'info', message: sanitized });
   }
 
-  /**
-   * Хвост stdout движка — запасной источник текста ответа (issue #52, шаг 2). Накопитель
-   * ограничен и живёт только в памяти воркера: после выхода движка хвост либо становится
-   * ответом, либо теряется вместе с процессом.
-   */
+  private onEngineAssistantMessage(runId: string, message: { sessionId: string; messageId: string; text: string }): void {
+    const run = this.runs.get(runId);
+    if (!run || this.disposed || isTerminalState(run.state.state)) return;
+    if (!/^ses_[0-7][0-9A-HJKMNP-TV-Z]{25}$/.test(message.sessionId) || !message.messageId.trim()) return;
+    // These are user-visible message bodies, so preserve normal paragraph/newline
+    // formatting while redacting credentials and non-printable controls.
+    const safeText = redactRunSecrets(redactSecrets(message.text), run.runtimeSecrets)
+      .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, ' ')
+      .slice(0, 64_000);
+    if (!safeText.trim()) return;
+    this.emit(run.state, 'assistant_message', { sessionId: message.sessionId, messageId: message.messageId, text: safeText });
+  }
+
+  private onEngineAssistantQuestion(runId: string, question: {
+    sessionId: string;
+    requestId: string;
+    questions: Array<{ header: string; question: string; multiple: boolean; options: Array<{ label: string; description: string }> }>;
+    toolCallId: string | null;
+  }): void {
+    const run = this.runs.get(runId);
+    if (!run || this.disposed || isTerminalState(run.state.state)) return;
+    if (!/^ses_[0-7][0-9A-HJKMNP-TV-Z]{25}$/.test(question.sessionId) || !question.requestId.trim()) return;
+    const safe = (value: string, limit: number): string => redactRunSecrets(redactSecrets(value), run.runtimeSecrets)
+      .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, ' ').slice(0, limit);
+    this.emit(run.state, 'assistant_question', {
+      sessionId: question.sessionId,
+      requestId: question.requestId.slice(0, 200),
+      toolCallId: question.toolCallId?.slice(0, 200) ?? null,
+      questions: question.questions.slice(0, 20).map(item => ({
+        header: safe(item.header, 200), question: safe(item.question, 5000), multiple: item.multiple === true,
+        options: item.options.slice(0, 20).map(option => ({ label: safe(option.label, 200), description: safe(option.description, 500) })),
+      })),
+    });
+  }
+
+  /** Bounded authoritative stdout, preserving paragraphs through checkpoint/saveback. */
   private rememberAnswerLine(run: InternalRun, line: string): void {
-    const tail = run.answerTail;
-    tail.push(line.length > ANSWER_TAIL_MAX_LINE ? line.slice(0, ANSWER_TAIL_MAX_LINE) : line);
-    while (tail.length > ANSWER_TAIL_MAX_LINES) tail.shift();
+    const separator = run.stdoutAnswerParts.length ? 1 : 0;
+    const available = ANSWER_MAX_CHARS - run.stdoutAnswerChars - separator;
+    const availableBytes = (run.state.spec.limits.maxOutputBytes ?? Number.POSITIVE_INFINITY) - run.stdoutAnswerBytes - separator;
+    if (available < 0 || availableBytes < 0) return;
+    let part = line.slice(0, available);
+    // Keep a valid Unicode boundary at the existing overall answer ceiling.
+    if (part.length < line.length && /[\uD800-\uDBFF]$/.test(part)) part = part.slice(0, -1);
+    let bytes = Buffer.from(part, 'utf8');
+    if (bytes.length > availableBytes) {
+      bytes = bytes.subarray(0, availableBytes);
+      const decoder = new TextDecoder('utf-8', { fatal: true });
+      // A byte ceiling can bisect a UTF-8 code point; at most three bytes
+      // need dropping before the prefix becomes valid text again.
+      for (;;) {
+        try { part = decoder.decode(bytes); break; }
+        catch { bytes = bytes.subarray(0, bytes.length - 1); }
+      }
+    }
+    run.stdoutAnswerParts.push(part);
+    run.stdoutAnswerChars += separator + part.length;
+    run.stdoutAnswerBytes += separator + bytes.length;
   }
 
   private async onEngineExit(runId: string, code: number | null, signal: string | null): Promise<void> {
@@ -1860,6 +2137,7 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
     failure?: RunResult['failure'],
   ): void {
     const internalRun = this.runs.get(st.runId);
+    if (internalRun) this.clearStartTimer(internalRun);
     if (internalRun) { internalRun.runtimeEnv = {}; internalRun.runtimeSecrets = []; }
     const result: RunResult = {
       schemaVersion: 1,
@@ -1873,6 +2151,7 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
       exitCode: null,
       exitSignal: null,
       exitObserved: false,
+      engineStart: st.startPhase === 'spawn' ? 'unknown' : 'not_started',
       startedAt: st.startedAt ?? st.createdAt,
       finishedAt: this.nowIso(),
       usage: { status: 'unknown' },
@@ -1968,6 +2247,7 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
       }
     }
     const exit = run ? this.resolveExit(run, st) : null;
+    await this.saveOpenCodeSessionCheckpoint(st, run ?? null);
     // Fast result boundary: persist the engine outcome and answer before any declared
     // output upload. The checkpoint + result are durable on the Runner host; the clean
     // room remains leased until recover() verifies remote custody and completes cleanup.
@@ -2332,8 +2612,8 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
     const answer = readAgentAnswer(st.spec.cwd, manifest);
     let answerText = answer.source === 'agent_file' ? answer.text : '';
     let answerSource: 'agent_file' | 'engine_stdout' | null = answer.source;
-    if (answerText.length === 0 && run.answerTail.length > 0) {
-      answerText = run.answerTail.join('\n');
+    if (answerText.length === 0 && run.stdoutAnswerParts.length > 0) {
+      answerText = run.stdoutAnswerParts.join('\n');
       answerSource = 'engine_stdout';
     }
     if (answerText.length > ANSWER_MAX_CHARS) {
@@ -2355,6 +2635,48 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
             : 'the agent declared no final manifest',
     });
     return { plan, answer: { present: answerText.length > 0, source: answerSource, chars: answerText.length, text: answerText } };
+  }
+
+  /**
+   * Привязывает OpenCode transcript к существующему profile saveback/archive. Полные
+   * bytes идут по действующей политике heavy objects в GCS, а GitHub profile держит
+   * только архивный ref; отдельный ArtifactStore для сессий не создаётся.
+   */
+  private async saveOpenCodeSessionCheckpoint(st: PersistedRunState, run: InternalRun | null): Promise<void> {
+    if (st.spec.engine.name !== 'opencode' || !run || !st.spec.profileWorkspace?.savebackUrl) return;
+    const sessionDir = join(st.spec.cwd, '.session-traces');
+    if (!existsSync(sessionDir)) return;
+    try {
+      const changed = st.result?.profileChanges?.files ?? [];
+      const names = changed.map((file) => file.path.match(/^\.session-traces\/(ses_[0-7][0-9A-HJKMNP-TV-Z]{25})\.json$/)?.[1]).filter((id): id is string => !!id);
+      const resumed = st.spec.input?.resumeSessionFrom;
+      const candidateIds = [...new Set([...names, ...(resumed ? [resumed.sessionId] : [])])];
+      let selected: { sessionId: string; path: string; bytes: Buffer } | undefined;
+      for (const sessionId of candidateIds) {
+        const relativePath = `.session-traces/${sessionId}.json`;
+        let bytes: Buffer;
+        try { bytes = readFileSync(resolveInsideRoot(st.spec.cwd, relativePath, 'OpenCode session checkpoint')); }
+        catch { continue; }
+        const expected = changed.find((file) => file.path === relativePath);
+        const archivedResume = resumed?.path === relativePath && resumed.sha256 === createHash('sha256').update(bytes).digest('hex') && resumed.size === bytes.length;
+        if ((expected && expected.sha256 === createHash('sha256').update(bytes).digest('hex') && expected.size === bytes.length) || archivedResume) {
+          selected = { sessionId, path: relativePath, bytes };
+          break;
+        }
+      }
+      if (!selected) return;
+      const { sessionId, path: relativePath, bytes } = selected;
+      const parsed = JSON.parse(bytes.toString('utf8')) as { info?: { id?: unknown } };
+      if (parsed.info?.id !== sessionId || !/^ses_[0-7][0-9A-HJKMNP-TV-Z]{25}$/.test(sessionId)) {
+        throw new Error('exported session has an invalid id');
+      }
+      const sha256 = createHash('sha256').update(bytes).digest('hex');
+      run.sessionCheckpoint = { sourceRunId: names.includes(sessionId) ? st.runId : resumed?.sourceRunId ?? st.runId, sessionId, path: relativePath, sha256, size: bytes.length };
+      this.emit(st, 'log', { stream: 'runner', level: 'info', message: `opencode.session_checkpoint_archived sessionId=${sessionId} bytes=${bytes.length} sha256=${sha256}` });
+    } catch (error) {
+      const detail = truncateLine(redactSecrets(error instanceof Error ? error.message : String(error)), 300);
+      this.emit(st, 'log', { stream: 'runner', level: 'warn', message: `opencode.session_checkpoint_unavailable reason=${detail}` });
+    }
   }
 
   /**
@@ -2577,6 +2899,7 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
       ? { status: 'failed' as const, reason: 'profile saveback upload failed; the VM retained the run workspace' }
       : this.persistenceStatus(exportManifest);
     const cleanupStatus = this.cleanupStatus(this.soleCopiesOnDisk(st, exportManifest), cleanup);
+    const sessionCheckpoint = this.runs.get(st.runId)?.sessionCheckpoint ?? st.result?.sessionCheckpoint;
 
     const result: RunResult = {
       schemaVersion: 1,
@@ -2590,10 +2913,12 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
       exitCode: st.exit?.code ?? null,
       exitSignal: st.exit?.signal ?? null,
       exitObserved: st.exit?.observed ?? false,
+      engineStart: st.startedAt ? 'started' : st.startPhase === 'spawn' ? 'unknown' : 'not_started',
       startedAt: st.startedAt ?? st.createdAt,
       finishedAt: this.nowIso(),
       usage: { status: 'unknown' },
       outputRefs,
+      ...(sessionCheckpoint ? { sessionCheckpoint } : {}),
       persistence: persistence.status,
       persistenceReason: persistence.reason,
       cleanup: cleanupStatus.status,

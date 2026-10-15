@@ -1,4 +1,5 @@
 import type { ApiPrincipal, RunnerWorkerEnv } from './types.js';
+import { developerCapabilities, developerRequest, developerWebhooks } from './developer-api.js';
 
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const DEFAULT_ENGINE = 'eu-vm-agent-run';
@@ -58,13 +59,22 @@ async function authenticate(request: Request, env: RunnerWorkerEnv): Promise<Api
         configured = [...configured, ...(raw as KeyConfig[])];
       } catch { throw new Error('RUNNER_API_KEYS_SANDBOX3 must be a valid JSON array of key hash records'); }
     }
+    if (env.RUNNER_API_KEYS_DEVELOPER !== undefined) {
+      try {
+        const raw: unknown = JSON.parse(env.RUNNER_API_KEYS_DEVELOPER);
+        if (!Array.isArray(raw) || raw.some((item) => !validKeyConfig(item) || !item.developerApi)) throw new Error('invalid developer key records');
+        configured = [...configured, ...(raw as KeyConfig[])];
+      } catch { throw new Error('RUNNER_API_KEYS_DEVELOPER must be a valid JSON array of developer key hash records'); }
+    }
   }
   const digest = await sha256(match[1]);
   const record = configured.find((entry) => entry.keyHash === digest);
   return record ? { principalId: record.principalId, profileId: record.profileId,
     ...(record.repository ? { repository: record.repository } : {}),
     ...(record.tenantId ? { tenantId: record.tenantId } : {}), scopes: record.scopes,
-    ...(record.engines ? { engines: record.engines } : {}), ...(record.mcpBindings ? { mcpBindings: record.mcpBindings } : {}), keyHash: record.keyHash } : null;
+    ...(record.engines ? { engines: record.engines } : {}), ...(record.mcpBindings ? { mcpBindings: record.mcpBindings } : {}),
+    ...(record.developerApi ? { developerApi: true } : {}),
+    ...(record.developerGuest ? { developerGuest: true } : {}), keyHash: record.keyHash } : null;
 }
 
 async function delegatedPrincipal(request: Request, principal: ApiPrincipal, env: RunnerWorkerEnv): Promise<ApiPrincipal> {
@@ -109,7 +119,9 @@ function validKeyConfig(value: unknown): value is KeyConfig {
     && Array.isArray(record['scopes']) && record['scopes'].length > 0 && record['scopes'].every((scope) => ['runs:read', 'runs:write'].includes(String(scope)))
     && (engines === undefined || Array.isArray(engines) && engines.every((engine) => typeof engine === 'string'))
     && (validRepository || mockOnly || pinnedMcpOnly)
-    && (record['mcpBindings'] === undefined || Array.isArray(record['mcpBindings']) && record['mcpBindings'].every((binding) => typeof binding === 'string' && binding.length > 0 && binding.length <= 300));
+    && (record['mcpBindings'] === undefined || Array.isArray(record['mcpBindings']) && record['mcpBindings'].every((binding) => typeof binding === 'string' && binding.length > 0 && binding.length <= 300))
+    && (record['developerApi'] === undefined || record['developerApi'] === true)
+    && (record['developerGuest'] === undefined || record['developerGuest'] === true && record['developerApi'] === true);
 }
 
 function requireScope(principal: ApiPrincipal, scope: string): boolean { return principal.scopes.includes(scope); }
@@ -119,12 +131,38 @@ export default {
     const url = new URL(request.url);
     if (url.pathname === '/healthz' && request.method === 'GET') return json({ status: 'ok', service: 'ai-agent-runner-api', placement: 'cloudflare-worker', executionWorker: 'eu-vm-agent-run' });
     if (url.pathname === '/version' && request.method === 'GET') return json({ service: 'ai-agent-runner-api', runtime: 'cloudflare-worker', contractVersion: 1, buildSha: env.BUILD_SHA ?? null });
+    const guestDownload = /^\/v1\/developer\/downloads\/(run_[0-9a-f]{64}_[0-9a-f]{24})$/.exec(url.pathname);
+    if (guestDownload) {
+      if (request.method !== 'GET') return error('METHOD_NOT_ALLOWED', 'downloads support GET only', 405);
+      if (env.DEPLOYMENT_ENV === 'production' || env.RUNNER_DEVELOPER_API_ENABLED !== 'true') return error('DEVELOPER_API_UNAVAILABLE', 'developer API is disabled on this lane', 503);
+      const object = env.RUNNER_RUNS.get(env.RUNNER_RUNS.idFromName(`task-${guestDownload[1]!.split('_')[1]}`));
+      return object.fetch(new Request(`https://runner-runs.internal/v1/runs/${guestDownload[1]}/download${url.search}`));
+    }
     let authenticated: ApiPrincipal | null;
     try { authenticated = await authenticate(request, env); } catch { return error('SERVER_MISCONFIGURED', 'Runner API authentication is not configured', 503); }
     if (!authenticated) return error('UNAUTHENTICATED', 'a valid Bearer API key is required', 401);
     let principal: ApiPrincipal;
     try { principal = await delegatedPrincipal(request, authenticated, env); }
     catch { return error('FORBIDDEN', 'invalid or expired host profile capability', 403); }
+    if (url.pathname === '/v1/developer/capabilities') {
+      if (env.DEPLOYMENT_ENV === 'production' || env.RUNNER_DEVELOPER_API_ENABLED !== 'true') return error('DEVELOPER_API_UNAVAILABLE', 'developer API is disabled on this lane', 503);
+      if (!principal.developerApi) return error('FORBIDDEN', 'developer API is not enabled for this key', 403);
+      if (request.method !== 'GET') return error('METHOD_NOT_ALLOWED', 'capabilities supports GET only', 405);
+      if (!requireScope(principal, 'runs:read')) return error('FORBIDDEN', 'runs:read scope is required', 403);
+      return developerCapabilities(env, principal);
+    }
+    if (url.pathname === '/v1/developer/webhooks') {
+      if (env.DEPLOYMENT_ENV === 'production' || env.RUNNER_DEVELOPER_API_ENABLED !== 'true') return error('DEVELOPER_API_UNAVAILABLE', 'developer API is disabled on this lane', 503);
+      if (!principal.developerApi) return error('FORBIDDEN', 'developer API is not enabled for this key', 403);
+      if (request.method !== 'GET') return error('METHOD_NOT_ALLOWED', 'webhooks supports GET only', 405);
+      if (!requireScope(principal, 'runs:read')) return error('FORBIDDEN', 'runs:read scope is required', 403);
+      return developerWebhooks(env, principal);
+    }
+    if (url.pathname === '/v1/developer/runs' || url.pathname.startsWith('/v1/developer/runs/')) {
+      if (env.DEPLOYMENT_ENV === 'production' || env.RUNNER_DEVELOPER_API_ENABLED !== 'true') return error('DEVELOPER_API_UNAVAILABLE', 'developer API is disabled on this lane', 503);
+      if (!principal.developerApi) return error('FORBIDDEN', 'developer API is not enabled for this key', 403);
+      return developerRequest(request, env, principal);
+    }
     if (url.pathname === '/v1/capabilities' && request.method === 'GET') {
       if (!requireScope(principal, 'runs:read')) return error('FORBIDDEN', 'API key does not have the required scope', 403);
       const ghaConfigured = fallbackExecutionRegions(env).includes('azure-cloud');
@@ -158,14 +196,20 @@ export default {
     }
     const path = url.pathname.split('/').filter(Boolean);
     if (path[0] !== 'v1' || path[1] !== 'runs') return error('ROUTE_NOT_FOUND', `no route for ${url.pathname}`, 404);
-    if ((path.length === 2 && request.method !== 'POST') || (path.length > 2 && !['GET', 'POST'].includes(request.method))) return error('METHOD_NOT_ALLOWED', 'method not allowed', 405);
-    if (!requireScope(principal, path.length === 2 || path[3] === 'cancel' ? 'runs:write' : 'runs:read')) return error('FORBIDDEN', 'API key does not have the required scope', 403);
+    if ((path.length === 2 && !['GET', 'POST'].includes(request.method)) || (path.length > 2 && !['GET', 'POST'].includes(request.method))) return error('METHOD_NOT_ALLOWED', 'method not allowed', 405);
+    if (!requireScope(principal, path.length === 2 && request.method === 'POST' || path[3] === 'cancel' ? 'runs:write' : 'runs:read')) return error('FORBIDDEN', 'API key does not have the required scope', 403);
     let objectName: string;
     if (path.length === 2 && request.method === 'POST') {
       let submitted: { userTaskId?: unknown };
       try { submitted = await request.clone().json() as { userTaskId?: unknown }; } catch { return error('INVALID_REQUEST', 'request body must be JSON', 400); }
       if (typeof submitted.userTaskId !== 'string' || !SAFE_ID.test(submitted.userTaskId)) return error('INVALID_REQUEST', 'userTaskId is required and must be a safe id', 400);
       objectName = `task-${await sha256(`${principal.principalId}\0${principal.profileId}\0${submitted.userTaskId}`)}`;
+    } else if (path.length === 2 && request.method === 'GET') {
+      const taskId = url.searchParams.get('userTaskId');
+      if (!taskId || !SAFE_ID.test(taskId)) return error('INVALID_REQUEST', 'userTaskId query parameter is required and must be a safe id', 400);
+      const state = url.searchParams.get('state');
+      if (state !== null && !['active', 'all'].includes(state)) return error('INVALID_REQUEST', 'state supports active or all', 400);
+      objectName = `task-${await sha256(`${principal.principalId}\0${principal.profileId}\0${taskId}`)}`;
     } else {
       const match = /^run_([0-9a-f]{64})_[0-9a-f]{24}$/.exec(path[2] ?? '');
       if (!match?.[1]) return error('INVALID_REQUEST', 'invalid run id', 400);

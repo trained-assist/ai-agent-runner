@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import type { LaunchArtifact, LaunchRequest, LaunchResult, WorkerRunStatus } from '../adapters/external-worker-adapter.js';
 import { isEnvName, isSafeId } from '../contracts/validate.js';
 import type { RunSpec } from '../contracts/run-spec.js';
+import type { LogEvent } from '../contracts/events.js';
 import { Runner } from '../runner/runner.js';
 import { isTerminalState } from '../runner/state-machine.js';
 import type { CapacityAdmission, CapacityEnvelope, CapacityReservationStore, HostUsageSampler } from './capacity-admission.js';
@@ -11,6 +12,7 @@ import { redactSecrets } from '../redact.js';
 import { checkVmWorkerBindings, type VmWorkerBindingsInventory } from './bindings-inventory.js';
 import type { VmWorkerBuildInfo } from './build-info.js';
 import { StorageError } from '../storage/errors.js';
+import { agentHistory } from './agent-history.js';
 
 const MAX_REQUEST_BYTES = 2 * 1024 * 1024;
 const MAX_ARTIFACT_RESPONSE_BYTES = 20 * 1024 * 1024;
@@ -23,6 +25,13 @@ const TEST_MCP = Object.freeze({
   tokenEnv: 'RUNNER_MCP_REGISTRY_TEST',
   proofEnv: 'RUNNER_MCP_REGISTRY_TEST_PROOF',
   configEnv: 'OPENCODE_CONFIG_CONTENT',
+});
+const USER_MCP = Object.freeze({
+  profile: 'integration-telegram-ux-v1', server: 'mem-gpt',
+  url: 'https://trained-assist-mcp-user-sandbox.skillset-apply.workers.dev/mcp',
+  scope: 'mcp:user-agent-run', tokenEnv: 'RUNNER_MCP_USER_TOKEN',
+  proofEnv: 'RUNNER_MCP_USER_PROOF', configEnv: 'OPENCODE_CONFIG_CONTENT',
+  allowedOpenCodeTools: ['mem-gpt_identity_whoami', 'mem-gpt_google_docs_connect', 'mem-gpt_google_docs_get_document'],
 });
 
 export interface VmWorkerServerOptions {
@@ -144,7 +153,7 @@ export function createVmWorkerServer(options: VmWorkerServerOptions): VmWorkerSe
       return;
     }
 
-    const runPath = /^\/v1\/runs\/([^/]+)(?:\/(status|result|cancel|logs|artifacts))?$/.exec(url.pathname);
+    const runPath = /^\/v1\/runs\/([^/]+)(?:\/(status|result|cancel|logs|artifacts|history))?$/.exec(url.pathname);
     if (!runPath) { sendJson(res, 404, { error: 'NOT_FOUND' }); return; }
     let runId: string;
     try { runId = decodeURIComponent(runPath[1]!); } catch { sendJson(res, 400, { error: 'INVALID_REQUEST' }); return; }
@@ -153,7 +162,8 @@ export function createVmWorkerServer(options: VmWorkerServerOptions): VmWorkerSe
     const snapshot = options.runner.getRun(runId);
     if (endpoint === 'status' && method === 'GET') {
       const status: WorkerRunStatus = snapshot ? stateToWorkerStatus(snapshot.state) : 'unknown';
-      sendJson(res, 200, { runId, status, ...(snapshot ? { updatedAt: snapshot.updatedAt } : {}) });
+      sendJson(res, 200, { runId, status, ...(snapshot ? { state: snapshot.state, startPhase: snapshot.startPhase, startAttempts: snapshot.startAttempts,
+        startedAt: snapshot.startedAt, updatedAt: snapshot.updatedAt } : {}) });
       return;
     }
     if (!snapshot) { sendJson(res, endpoint === 'result' ? 404 : 200, endpoint === 'result' ? { error: 'NOT_FOUND' } : { runId, status: 'unknown_run' }); return; }
@@ -161,6 +171,16 @@ export function createVmWorkerServer(options: VmWorkerServerOptions): VmWorkerSe
       const result = toLaunchResult(options, snapshot);
       if (!result) { sendJson(res, 409, { error: 'RESULT_NOT_READY' }); return; }
       sendJson(res, 200, result);
+      return;
+    }
+    if (endpoint === 'history' && method === 'GET') {
+      if (!isTerminalState(snapshot.state)) { sendJson(res, 409, { error: 'RESULT_NOT_READY' }); return; }
+      const { bytes, manifest } = agentHistory(options.runner, options.dataDir, runId);
+      if (url.searchParams.get('manifest') === '1') { sendJson(res, 200, manifest); return; }
+      res.writeHead(200, { 'content-type': 'application/json', 'content-length': String(bytes.length),
+        'content-disposition': 'attachment; filename="agent-history.json"', 'cache-control': 'private, no-store',
+        'x-content-sha256': manifest.sha256, 'x-content-type-options': 'nosniff' });
+      res.end(bytes);
       return;
     }
     if (endpoint === 'artifacts' && method === 'GET') {
@@ -201,7 +221,21 @@ export function createVmWorkerServer(options: VmWorkerServerOptions): VmWorkerSe
       return;
     }
     if (endpoint === 'logs' && method === 'GET') {
-      await streamLogs(req, res, options.runner, runId, Number(url.searchParams.get('after') ?? '0'));
+      const after = Number(url.searchParams.get('after') ?? '0');
+      if (url.searchParams.get('snapshot') === '1') {
+        if (!Number.isSafeInteger(after) || after < 0) { sendJson(res, 400, { error: 'INVALID_CURSOR' }); return; }
+        const events = options.runner.events(runId, after).filter((event): event is LogEvent => event.type === 'log'
+          && (event.payload.stream === 'stdout' || event.payload.stream === 'stderr')).slice(0, 100);
+        const cursor = events.at(-1)?.sequence ?? after;
+        sendJson(res, 200, { runId, cursor, hasMore: options.runner.events(runId, cursor).some((event) => event.type === 'log'
+          && (event.payload.stream === 'stdout' || event.payload.stream === 'stderr')),
+          state: options.runner.getRun(runId)?.state ?? 'unknown',
+          logs: events.map((event) => ({ sequence: event.sequence, stream: event.payload.stream,
+            message: event.payload.message.length > 16_000 ? event.payload.message.slice(-16_000) : event.payload.message,
+            truncated: event.payload.message.length > 16_000 })) });
+        return;
+      }
+      await streamLogs(req, res, options.runner, runId, after);
       return;
     }
     sendJson(res, 405, { error: 'METHOD_NOT_ALLOWED' });
@@ -244,22 +278,18 @@ function toRunSpec(request: LaunchRequest, options: VmWorkerServerOptions): { sp
   const runtimeEnv = { ...request.env };
   if (request.mcp) {
     const secretValues = request.mcpSecrets!;
-    const server = request.mcp.servers[TEST_MCP.server]!;
-    const headers = {
-      Authorization: `Bearer {env:${TEST_MCP.tokenEnv}}`,
-      'X-MCP-Operation': 'invocation',
-      'X-MCP-Scope': TEST_MCP.scope,
-      'X-MCP-User-Task-Id': request.userTaskId,
-      'X-MCP-Profile': request.profileId,
-      'X-MCP-Run-Id': request.runId,
-      'X-MCP-Run-Binding': `{env:${TEST_MCP.proofEnv}}`,
-    };
-    runtimeEnv[TEST_MCP.tokenEnv] = secretValues[TEST_MCP.tokenEnv]!;
-    runtimeEnv[TEST_MCP.proofEnv] = secretValues[TEST_MCP.proofEnv]!;
-    runtimeEnv[TEST_MCP.configEnv] = JSON.stringify({ mcp: {
-      [TEST_MCP.server]: { type: 'remote', url: server.url, enabled: true, headers },
-    } });
-    spec.envAllowlist = [...new Set([...spec.envAllowlist, TEST_MCP.tokenEnv, TEST_MCP.proofEnv, TEST_MCP.configEnv])];
+    const server = request.mcp.servers[TEST_MCP.server] ?? request.mcp.servers[USER_MCP.server]!;
+    const isUserCatalog = server.url === USER_MCP.url;
+    const policy = isUserCatalog ? USER_MCP : TEST_MCP;
+    const serverId = isUserCatalog ? USER_MCP.server : TEST_MCP.server;
+    const serverConfig: Record<string, unknown> = { type: 'remote', url: server.url, enabled: true, oauth: false, headers: server.headers };
+    runtimeEnv[policy.tokenEnv] = secretValues[policy.tokenEnv]!;
+    runtimeEnv[policy.proofEnv] = secretValues[policy.proofEnv]!;
+    runtimeEnv[policy.configEnv] = JSON.stringify({
+      mcp: { [serverId]: serverConfig },
+      ...(isUserCatalog ? { permission: Object.fromEntries(USER_MCP.allowedOpenCodeTools.map(tool => [tool, 'allow'])) } : {}),
+    });
+    spec.envAllowlist = [...new Set([...spec.envAllowlist, policy.tokenEnv, policy.proofEnv, policy.configEnv])];
   }
   return { spec, runtimeEnv };
 }
@@ -284,6 +314,7 @@ function parseLaunchRequest(value: unknown, options: VmWorkerServerOptions): { o
     if (!value['envAllowlist']?.includes(key) || typeof envValue !== 'string' || envValue.length > 100_000) errors.push(`env.${key} is invalid or not allowed`);
   }
   validateTestMcp(value, errors);
+  validateUserMcp(value, errors);
   if (!isRecord(value['repository']) || typeof value['repository']['fullName'] !== 'string' || typeof value['repository']['branch'] !== 'string') errors.push('repository is invalid');
   else if (!options.allowedRepositories.includes(value['repository']['fullName'])) errors.push('repository is not approved on this host');
   if (!isRecord(value['isolation']) || typeof value['isolation']['mode'] !== 'string') errors.push('isolation is invalid');
@@ -315,6 +346,7 @@ function parseLaunchRequest(value: unknown, options: VmWorkerServerOptions): { o
 function validateTestMcp(value: Record<string, any>, errors: string[]): void {
   if (value['mcp'] === undefined && value['mcpSecrets'] === undefined) return;
   const mcp = value['mcp'];
+  if (isRecord(mcp) && isRecord(mcp['servers']) && Object.keys(mcp['servers']).length === 1 && Object.hasOwn(mcp['servers'], USER_MCP.server)) return;
   const secrets = value['mcpSecrets'];
   if (!isRecord(mcp) || !isRecord(mcp['servers']) || Object.keys(mcp['servers']).length !== 1 || !isRecord(mcp['servers'][TEST_MCP.server])) {
     errors.push('mcp is not the pinned test registry attachment');
@@ -343,6 +375,36 @@ function validateTestMcp(value: Record<string, any>, errors: string[]): void {
     errors.push('mcp runtime variables are reserved');
   }
   if (value['profileId'] !== TEST_MCP.profile) errors.push('test registry MCP is restricted to its pinned profile');
+}
+
+/** The product user catalog is a second fixed sandbox endpoint; RunSpec cannot select a URL or expand its identity. */
+function validateUserMcp(value: Record<string, any>, errors: string[]): void {
+  if (value['mcp'] === undefined && value['mcpSecrets'] === undefined) return;
+  const mcp = value['mcp'];
+  if (isRecord(mcp) && isRecord(mcp['servers']) && Object.keys(mcp['servers']).length === 1 && Object.hasOwn(mcp['servers'], TEST_MCP.server)) return;
+  const secrets = value['mcpSecrets'];
+  if (!isRecord(mcp) || !isRecord(mcp['servers']) || Object.keys(mcp['servers']).length !== 1 || !isRecord(mcp['servers'][USER_MCP.server])) return;
+  const server = mcp['servers'][USER_MCP.server];
+  const headers = server['headers'];
+  const expectedHeaders: Record<string, string> = {
+    Authorization: `Bearer {env:${USER_MCP.tokenEnv}}`,
+    'X-MCP-Operation': 'invocation', 'X-MCP-Scope': USER_MCP.scope,
+    'X-MCP-User-Task-Id': String(value['userTaskId']),
+    'X-MCP-Profile': String(value['profileId']), 'X-MCP-Run-Id': String(value['runId']),
+    'X-MCP-Run-Binding': `{env:${USER_MCP.proofEnv}}`,
+  };
+  if (server['type'] !== 'remote' || server['url'] !== USER_MCP.url || server['enabled'] !== true || !isRecord(headers) ||
+      Object.keys(headers).length !== Object.keys(expectedHeaders).length || Object.entries(expectedHeaders).some(([key, expected]) => headers[key] !== expected)) {
+    errors.push('mcp server does not match the pinned user catalog policy');
+  }
+  if (!isRecord(secrets) || Object.keys(secrets).length !== 2 ||
+      !validOpaqueSecret(secrets[USER_MCP.tokenEnv]) || !validOpaqueSecret(secrets[USER_MCP.proofEnv])) {
+    errors.push('mcpSecrets must contain only the scoped user catalog token and run proof');
+  }
+  if (isRecord(value['env']) && [USER_MCP.tokenEnv, USER_MCP.proofEnv, USER_MCP.configEnv].some((name) => Object.hasOwn(value['env'], name))) {
+    errors.push('mcp runtime variables are reserved');
+  }
+  if (value['profileId'] !== USER_MCP.profile) errors.push('user catalog MCP is restricted to its pinned sandbox profile');
 }
 
 function validOpaqueSecret(value: unknown): value is string {
@@ -413,11 +475,13 @@ function toLaunchResult(options: VmWorkerServerOptions, snapshot: NonNullable<Re
     exitCode: result.exitCode,
     exitSignal: result.exitSignal,
     exitObserved: result.exitObserved,
+    ...(result.engineStart ? { engineStart: result.engineStart } : {}),
     exitReason: result.exitReason,
     stdout,
     stderr,
     answer: checkpoint?.answer.text ?? null,
     answerSource: checkpoint?.answer.source ?? null,
+    ...(result.sessionCheckpoint ? { sessionCheckpoint: result.sessionCheckpoint } : {}),
     durationMs: Number.isFinite(started) && Number.isFinite(finished) ? Math.max(0, finished - started) : 0,
     timedOut: result.exitReason === 'timeout',
     outputTruncated: stdout.length + stderr.length >= (spec?.limits.maxOutputBytes ?? 1_000_000),
@@ -455,6 +519,10 @@ async function streamLogs(req: IncomingMessage, res: ServerResponse, runner: Run
     const events = runner.events(runId, cursor);
     for (const event of events) {
       cursor = Math.max(cursor, event.sequence);
+      if (event.type === 'assistant_message') {
+        res.write(`id: ${event.sequence}\nevent: assistant_message\ndata: ${JSON.stringify(event.payload)}\n\n`);
+        continue;
+      }
       if (event.type !== 'log') continue;
       const stream = event.payload.stream;
       if (stream !== 'stdout' && stream !== 'stderr') continue;

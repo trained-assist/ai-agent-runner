@@ -61,6 +61,38 @@ describe('конфигурация воркеров', () => {
     expect(config.remoteMcp?.servers['trained-assist-registry-test']?.registryDigest).toBe(server.registryDigest);
   });
 
+  it('resolves the user catalog only for its trusted profile mapping and pinned sandbox host', async () => {
+    const { privateKey } = generateKeyPairSync('ed25519');
+    const privateKeyPkcs8DerBase64 = privateKey.export({ type: 'pkcs8', format: 'der' }).toString('base64');
+    const digest = '8c17e64a0d71123698b139bd5957a10fff71a2b15f12601a95adcde150350e71';
+    const policy = { 'mem-gpt': {
+      url: 'https://trained-assist-mcp-user-sandbox.skillset-apply.workers.dev/mcp',
+      tokenEnvName: 'RUNNER_MCP_USER_TOKEN', proofEnvName: 'RUNNER_MCP_USER_PROOF',
+      headers: { Authorization: 'Bearer {env:RUNNER_MCP_USER_TOKEN}' },
+      allowedTools: ['identity.whoami', 'google_docs.connect', 'google_docs.get_document'],
+      bindingScopes: { 'mem-gpt-user-sandbox': 'mcp:user-agent-run' }, startupTimeoutMs: 10000,
+      runnerProof: true, policyVersion: 'mem-gpt-user-run-v1', catalogueVersion: 'mem-gpt-user-catalogue-v1', registryDigest: digest,
+    } };
+    const config = loadAgentApiConfig({ ...base, EXTERNAL_WORKER_URL: 'http://127.0.0.1:8788',
+      AGENT_API_REMOTE_MCP_SERVERS: JSON.stringify(policy), RUNNER_MCP_USER_TOKEN: 'user-mcp-transport-token-1234567',
+      RUNNER_MCP_USER_SIGNING_KEY_B64: privateKeyPkcs8DerBase64,
+      AGENT_API_USER_MCP_PROFILE_USERS: JSON.stringify({ 'integration-telegram-ux-v1': 'trained-assist-product-owner' }) });
+    const context = {
+      mode: 'launch' as const, admittedAt: new Date().toISOString(), checkedAt: new Date().toISOString(),
+      startupTimeoutMs: 10000, timeoutMs: 300000, scope: 'mcp:user-agent-run',
+      runId: 'run_01234567-89ab-cdef-0123-456789abcdef', profileId: 'integration-telegram-ux-v1',
+      userTaskId: 'task-config-test', conversationId: 'conversation-config-test', ownerGeneration: 1,
+      operationId: 'agent-run', engine: 'opencode', serverId: 'mem-gpt', url: policy['mem-gpt'].url,
+      bindingRef: 'mem-gpt-user-sandbox', allowedTools: ['identity.whoami'],
+      policyVersion: 'mem-gpt-user-run-v1', catalogueVersion: 'mem-gpt-user-catalogue-v1',
+    };
+    const binding = await config.remoteMcp!.resolveBinding('mem-gpt-user-sandbox', context);
+    expect(binding).toMatchObject({ runId: context.runId, profileId: context.profileId, serverId: 'mem-gpt',
+      token: 'user-mcp-transport-token-1234567' });
+    expect(binding?.runnerProof).toBeTruthy();
+    expect(await config.remoteMcp!.resolveBinding('mem-gpt-user-sandbox', { ...context, profileId: 'unmapped-profile' })).toBeNull();
+  });
+
   it('process config resolves the pinned test binding after receipt runId creation and signs that runId', async () => {
     const mock = await startMockWorker({ autoDeliver: false });
     const { privateKey, publicKey } = generateKeyPairSync('ed25519');
@@ -98,13 +130,14 @@ describe('конфигурация воркеров', () => {
       expect(mock.launches, JSON.stringify(logs)).toHaveLength(1);
       const launch = mock.launches[0]!;
       const attachment = launch.mcp as { servers: Record<string, { headers: Record<string, string> }> };
-      const proof = attachment.servers['trained-assist-registry-test']!.headers['X-MCP-Run-Binding']!;
+      expect(attachment.servers['trained-assist-registry-test']!.headers['X-MCP-Run-Binding']).toBe('{env:RUNNER_MCP_REGISTRY_TEST_PROOF}');
+      const proof = (launch.mcpSecrets as Record<string, string>)['RUNNER_MCP_REGISTRY_TEST_PROOF']!;
       const [header, payload, signature] = proof.split('.');
       const decoded = JSON.parse(Buffer.from(payload!, 'base64url').toString('utf8')) as Record<string, unknown>;
       expect(JSON.parse(Buffer.from(header!, 'base64url').toString('utf8'))).toEqual({ alg: 'EdDSA', typ: 'JWT' });
       expect(decoded).toMatchObject({ runId: receipt.runId, sub: receipt.runId, profileId: 'integration-telegram-ux-v1', userTaskId: receipt.userTaskId, policyVersion: 'registry-fixture-policy-v1', catalogueVersion: 'catalogue-v1', registryDigest: '129ab5033964c3ed5be47414711026cc2469b3d9af90ce83ee071cba7f005ea9' });
       expect(verify(null, Buffer.from(`${header}.${payload}`), publicKey, Buffer.from(signature!, 'base64url'))).toBe(true);
-      expect(launch.mcpSecrets).toEqual({ RUNNER_MCP_REGISTRY_TEST: 'opaque-test-bearer-token-123' });
+      expect(launch.mcpSecrets).toEqual({ RUNNER_MCP_REGISTRY_TEST: 'opaque-test-bearer-token-123', RUNNER_MCP_REGISTRY_TEST_PROOF: proof });
       expect(JSON.stringify(api['opts'] ?? {})).not.toContain(privateKeyPem);
       await api.dispose();
     } finally { await mock.close(); }

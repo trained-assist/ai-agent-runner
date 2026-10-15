@@ -2,7 +2,7 @@ import { createHmac, createHash } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { describe, expect, it, onTestFinished } from 'vitest';
+import { describe, expect, it, onTestFinished, vi } from 'vitest';
 import { launchRequestFromSpec } from '../src/adapters/external-worker-adapter.js';
 import { validateRunSpec, type IngressManifestRef } from '../src/contracts/run-spec.js';
 import { PreflightError } from '../src/contracts/validate.js';
@@ -231,6 +231,38 @@ describe('task-scoped ingress artifacts', () => {
 });
 
 describe('Control Plane ingress resolver auth and transport', () => {
+  it('routes production manifests to the production Control Plane and fails closed without its credential', async () => {
+    const { createControlPlaneIngressResolverFromEnv } = await import('../src/storage/ingress-artifact.js');
+    const requests: Request[] = [];
+    const originalFetch = globalThis.fetch;
+    vi.stubGlobal('fetch', async (input: URL | Request, init?: RequestInit) => {
+      requests.push(new Request(input, init));
+      return Response.json({});
+    });
+    onTestFinished(() => { vi.stubGlobal('fetch', originalFetch); });
+    const sandbox = {
+      RUNNER_CONTROL_PLANE_URL: 'https://sandbox-cp.example.test',
+      RUNNER_CONTROL_PLANE_PRINCIPAL: 'sandbox-runner',
+      RUNNER_CONTROL_PLANE_PRINCIPAL_SECRET: 'sandbox-secret',
+    };
+    const productionPin = { ...pinFor(createHarness().makeSpec()), profileId: 'trained-assist-production' };
+    const withoutProduction = createControlPlaneIngressResolverFromEnv(sandbox)!;
+    await expect(withoutProduction.getManifest(productionPin.userTaskId, productionPin)).rejects.toMatchObject({ code: 'INGRESS_INPUT_UNAVAILABLE' });
+    expect(requests).toHaveLength(0);
+    const routed = createControlPlaneIngressResolverFromEnv({
+      ...sandbox,
+      RUNNER_CONTROL_PLANE_PRODUCTION_URL: 'https://production-cp.example.test',
+      RUNNER_CONTROL_PLANE_PRODUCTION_PRINCIPAL: 'production-runner',
+      RUNNER_CONTROL_PLANE_PRODUCTION_PRINCIPAL_SECRET: 'production-secret',
+    })!;
+    await routed.getManifest(productionPin.userTaskId, productionPin);
+    expect(requests[0]?.url).toContain('production-cp.example.test/runner/input-manifest');
+    expect(requests[0]?.headers.get('x-principal')).toBe('production-runner');
+    await routed.getManifest('sandbox-task', { ...productionPin, userTaskId: 'sandbox-task', profileId: 'integration-sandbox3-v1' });
+    expect(requests[1]?.url).toContain('sandbox-cp.example.test/runner/input-manifest');
+    expect(requests[1]?.headers.get('x-principal')).toBe('sandbox-runner');
+  });
+
   it('signs only the principal identity and rejects redirects without forwarding credentials', async () => {
     const { ControlPlaneIngressResolver } = await import('../src/storage/ingress-artifact.js');
     const calls: Request[] = [];
