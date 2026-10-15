@@ -45,6 +45,16 @@ a run carrying an ingress manifest fails closed before OpenCode starts; a partia
 configuration prevents worker startup. Ingress input materialization and profile
 workspace publication are separate capabilities.
 
+Production profile `trained-assist-production` uses a separate, read-only Control Plane
+principal. The signed France VM release accepts the narrowly scoped
+`configure-production-ingress` forced command through the protected workflow. It
+installs `RUNNER_CONTROL_PLANE_PRODUCTION_URL`,
+`RUNNER_CONTROL_PLANE_PRODUCTION_PRINCIPAL`, and
+`RUNNER_CONTROL_PLANE_PRODUCTION_PRINCIPAL_SECRET` in a root-owned systemd
+environment file. Production pins fail closed if this group is absent; sandbox pins
+continue to use the original `RUNNER_CONTROL_PLANE_*` group. Rotate the production
+credential as a paired Control Plane and VM operation.
+
 ## Install on a Linux VM
 
 GitHub Actions builds and signs an immutable release; the France sandbox deployment job

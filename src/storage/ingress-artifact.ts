@@ -42,7 +42,7 @@ export interface IngressArtifactBytes {
 }
 
 export interface IngressArtifactResolver {
-  getManifest(userTaskId: string): Promise<unknown>;
+  getManifest(userTaskId: string, pin?: IngressManifestRef): Promise<unknown>;
   getArtifact(taskId: string, pin: IngressManifestRef, artifact: IngressArtifact): Promise<IngressArtifactBytes>;
 }
 
@@ -156,13 +156,31 @@ export class ControlPlaneIngressResolver implements IngressArtifactResolver {
   }
 }
 
-export function createControlPlaneIngressResolverFromEnv(env: Record<string, string | undefined> = process.env): ControlPlaneIngressResolver | undefined {
+export function createControlPlaneIngressResolverFromEnv(env: Record<string, string | undefined> = process.env): IngressArtifactResolver | undefined {
   const baseUrl = env['RUNNER_CONTROL_PLANE_URL']?.trim();
   const principalId = env['RUNNER_CONTROL_PLANE_PRINCIPAL']?.trim();
   const secret = env['RUNNER_CONTROL_PLANE_PRINCIPAL_SECRET'];
-  if (!baseUrl && !principalId && !secret) return undefined;
-  if (!baseUrl || !principalId || !secret) throw new Error('RUNNER_CONTROL_PLANE_URL, RUNNER_CONTROL_PLANE_PRINCIPAL and RUNNER_CONTROL_PLANE_PRINCIPAL_SECRET must be configured together');
-  return new ControlPlaneIngressResolver({ baseUrl, principalId, secret });
+  const productionUrl = env['RUNNER_CONTROL_PLANE_PRODUCTION_URL']?.trim();
+  const productionPrincipal = env['RUNNER_CONTROL_PLANE_PRODUCTION_PRINCIPAL']?.trim();
+  const productionSecret = env['RUNNER_CONTROL_PLANE_PRODUCTION_PRINCIPAL_SECRET'];
+  if ((baseUrl || principalId || secret) && (!baseUrl || !principalId || !secret)) throw new Error('RUNNER_CONTROL_PLANE_URL, RUNNER_CONTROL_PLANE_PRINCIPAL and RUNNER_CONTROL_PLANE_PRINCIPAL_SECRET must be configured together');
+  if ((productionUrl || productionPrincipal || productionSecret) && (!productionUrl || !productionPrincipal || !productionSecret)) throw new Error('RUNNER_CONTROL_PLANE_PRODUCTION_URL, RUNNER_CONTROL_PLANE_PRODUCTION_PRINCIPAL and RUNNER_CONTROL_PLANE_PRODUCTION_PRINCIPAL_SECRET must be configured together');
+  const sandbox = baseUrl && principalId && secret ? new ControlPlaneIngressResolver({ baseUrl, principalId, secret }) : undefined;
+  const production = productionUrl && productionPrincipal && productionSecret
+    ? new ControlPlaneIngressResolver({ baseUrl: productionUrl, principalId: productionPrincipal, secret: productionSecret }) : undefined;
+  if (!sandbox && !production) return undefined;
+  return {
+    async getManifest(userTaskId, pin) {
+      const resolver = pin?.profileId === 'trained-assist-production' ? production : sandbox;
+      if (!resolver) throw unavailable('Control Plane ingress resolver is not configured for this profile');
+      return resolver.getManifest(userTaskId);
+    },
+    async getArtifact(taskId, pin, artifact) {
+      const resolver = pin.profileId === 'trained-assist-production' ? production : sandbox;
+      if (!resolver) throw unavailable('Control Plane ingress resolver is not configured for this profile');
+      return resolver.getArtifact(taskId, pin, artifact);
+    },
+  };
 }
 
 export async function materializeIngressManifest(
@@ -173,7 +191,7 @@ export async function materializeIngressManifest(
   if (pin.userTaskId !== target.userTaskId || pin.profileId !== target.profileId || pin.runId !== target.runId || pin.ownerGeneration !== target.ownerGeneration) {
     throw invalid('ingress manifest pin is bound to a different task, profile, run, or generation');
   }
-  const raw = await resolver.getManifest(target.userTaskId);
+  const raw = await resolver.getManifest(target.userTaskId, pin);
   const manifest = validateManifest(raw, pin, target);
   const artifacts = manifest.inputItems.flatMap((item) => item.artifacts);
   if (artifacts.length > MAX_ARTIFACTS) throw invalid('ingress manifest exceeds artifact count limit');
