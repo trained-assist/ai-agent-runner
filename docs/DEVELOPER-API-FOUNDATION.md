@@ -24,6 +24,16 @@ Content-Type: application/json
 
 The response is `202` with `runId`, `id`, `statusUrl` and `resultUrl`. Repeat submission returns `200` and the same `runId`. Read `GET /v1/developer/runs/{runId}` for status, `.../result` for terminal result, `.../events` for events, `.../artifacts` for outputs, and `POST .../cancel` to request cancellation. The underlying status and result schema are the established Runner v1 schema; for example result text is in `text`. The usual `unknown` state means execution outcome is uncertain and must be reconciled, not resubmitted automatically.
 
+Status also includes `createdAt`, `startedAt` and `finishedAt` for a client-side elapsed-time display. `startedAt` remains null until the coordinator observes execution; `finishedAt` remains null until a terminal state. Clients should compute elapsed time locally from these server timestamps, stop the timer on a terminal state, and show `unknown` as a separate uncertain state.
+
+## Accountless trial artifact links
+
+An accountless trial still needs a **server-issued Bearer API key** for admission, status and result; the public cannot start runs without a key. Provision a sandbox developer principal with `developerApi: true`, `developerGuest: true`, a dedicated profile and repository binding, and `runs:read`/`runs:write`. Set `RUNNER_GUEST_DOWNLOAD_SECRET` as a Worker secret of at least 32 characters. Guest admission fails closed if the signing secret is absent. This is operator provisioned, not anonymous self-service. Rate limits, credits and isolated execution are still required before opening it to arbitrary visitors.
+
+For a guest run, the terminal `result` keeps the existing `text` and `outputRefs` fields and additionally provides `artifacts` and `artifactExpiresAt`. Each artifact has its path, name, MIME type, byte size, SHA-256, `downloadUrl` and `expiresAt`. `GET /v1/developer/runs/{runId}/artifacts` returns the same metadata and expiry. The download URL works without an Authorization header, is signed for exactly one run and path, and expires **24 hours after the worker result is collected**. Before expiry the URL proxies the existing verified VM artifact bytes with the filename and checksum headers. After expiry both the signed URL and authenticated guest artifact route return `410 ARTIFACT_EXPIRED`. Legacy principals retain their old result and artifact contract. Files larger than the VM's current 20 MiB response limit return `413`.
+
+The 24-hour TTL is an **access TTL**, not a physical deletion guarantee. The VM export store and any repository publication can outlive it; an object-storage lifecycle/cleanup job and guest publication policy are still needed before claiming ephemeral storage or confidentiality from a public repository. Keep the guest repository private and dedicated in the sandbox. Do not log or publicly share signed URLs: possession grants download access until expiry. Rotating the signing secret revokes all outstanding links. A webhook contains a result URL, not the signed artifact links; the client retrieves them from the authenticated result.
+
 Managed mode requires `LLM_LADDER_TOKEN` and `ALLOWED_ENVIRONMENT_NAMES` to include that name. `RUNNER_DEVELOPER_MANAGED_MODEL` can pin an OpenCode model identifier, for example a tested Ladder model. The intended primary model is Xiaomi MiMo 2.6 Flash; configure its actual supported identifier only after the Ladder/VM model path has been verified. If no identifier is pinned, the existing engine default applies.
 
 BYOK accepts only an opaque connection ID, never a raw key in the request:
@@ -63,10 +73,11 @@ The receiver verifies `X-ServerlessAgence-Signature: v1=<hex>` as HMAC-SHA256 ov
 - [x] Add server-provisioned, principal-bound OpenAI BYOK connection references. Keep raw secrets out of request bodies and status responses.
 - [x] Add targeted compatibility and end-to-end fake VM tests.
 - [x] Add principal-bound terminal webhooks with signed payloads, durable retry state and delivery status.
+- [x] Add sandbox guest artifact capability URLs with a 24-hour access TTL, preserving the legacy result fields and authenticated downloads.
 - [ ] Prove a fresh isolated sandbox for each run with CPU, memory, disk, process, network and time limits. Run cross-tenant negative tests; `isolation=none` blocks public arbitrary-code use.
 - [ ] Implement organization accounts, self-service API key issuance/rotation, tenant-scoped connection creation/revocation, and GitHub App installation on selected repositories.
 - [ ] Build a transactional credit ledger: reserve before admission, trusted model/compute metering, settle once, hold unknown outcomes for reconciliation, and cap concurrent trial usage. BYOK still pays for platform execution.
-- [ ] Add durable file input, downloadable private artifacts and explicit workspace revision/saveback semantics. Do not create a new product user for every run.
+- [ ] Add durable file input, independent private artifact storage, lifecycle deletion after guest expiry, and explicit workspace revision/saveback semantics. Do not create a new product user for every run.
 - [ ] Add a trusted GitHub publisher that creates a branch and PR using a repository-scoped installation token. The agent should not hold general write credentials.
 - [ ] Pilot short-lived OpenAI workload identity federation and customer-cloud gateway/runner. Document exactly who can call the model and incur charges in each mode.
 - [ ] Test the exact Xiaomi MiMo 2.6 Flash identifier and provider path in the isolated France sandbox; pin the verified model and confirm usage accounting before using it as the managed default.

@@ -57,7 +57,8 @@ async function authenticate(request: Request, env: RunnerWorkerEnv): Promise<Api
     ...(record.repository ? { repository: record.repository } : {}),
     ...(record.tenantId ? { tenantId: record.tenantId } : {}), scopes: record.scopes,
     ...(record.engines ? { engines: record.engines } : {}), ...(record.mcpBindings ? { mcpBindings: record.mcpBindings } : {}),
-    ...(record.developerApi ? { developerApi: true } : {}), keyHash: record.keyHash } : null;
+    ...(record.developerApi ? { developerApi: true } : {}),
+    ...(record.developerGuest ? { developerGuest: true } : {}), keyHash: record.keyHash } : null;
 }
 
 async function delegatedPrincipal(request: Request, principal: ApiPrincipal, env: RunnerWorkerEnv): Promise<ApiPrincipal> {
@@ -103,7 +104,8 @@ function validKeyConfig(value: unknown): value is KeyConfig {
     && (engines === undefined || Array.isArray(engines) && engines.every((engine) => typeof engine === 'string'))
     && (validRepository || mockOnly || pinnedMcpOnly)
     && (record['mcpBindings'] === undefined || Array.isArray(record['mcpBindings']) && record['mcpBindings'].every((binding) => typeof binding === 'string' && binding.length > 0 && binding.length <= 300))
-    && (record['developerApi'] === undefined || record['developerApi'] === true);
+    && (record['developerApi'] === undefined || record['developerApi'] === true)
+    && (record['developerGuest'] === undefined || record['developerGuest'] === true && record['developerApi'] === true);
 }
 
 function requireScope(principal: ApiPrincipal, scope: string): boolean { return principal.scopes.includes(scope); }
@@ -113,6 +115,13 @@ export default {
     const url = new URL(request.url);
     if (url.pathname === '/healthz' && request.method === 'GET') return json({ status: 'ok', service: 'ai-agent-runner-api', placement: 'cloudflare-worker', executionWorker: 'eu-vm-agent-run' });
     if (url.pathname === '/version' && request.method === 'GET') return json({ service: 'ai-agent-runner-api', runtime: 'cloudflare-worker', contractVersion: 1, buildSha: env.BUILD_SHA ?? null });
+    const guestDownload = /^\/v1\/developer\/downloads\/(run_[0-9a-f]{64}_[0-9a-f]{24})$/.exec(url.pathname);
+    if (guestDownload) {
+      if (request.method !== 'GET') return error('METHOD_NOT_ALLOWED', 'downloads support GET only', 405);
+      if (env.DEPLOYMENT_ENV === 'production' || env.RUNNER_DEVELOPER_API_ENABLED !== 'true') return error('DEVELOPER_API_UNAVAILABLE', 'developer API is disabled on this lane', 503);
+      const object = env.RUNNER_RUNS.get(env.RUNNER_RUNS.idFromName(`task-${guestDownload[1]!.split('_')[1]}`));
+      return object.fetch(new Request(`https://runner-runs.internal/v1/runs/${guestDownload[1]}/download${url.search}`));
+    }
     let authenticated: ApiPrincipal | null;
     try { authenticated = await authenticate(request, env); } catch { return error('SERVER_MISCONFIGURED', 'Runner API authentication is not configured', 503); }
     if (!authenticated) return error('UNAUTHENTICATED', 'a valid Bearer API key is required', 401);

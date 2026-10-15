@@ -47,6 +47,8 @@ export interface RunnerWorkerEnv {
   RUNNER_WEBHOOKS?: string;
   /** Optional pinned OpenCode model identifier for managed developer runs. */
   RUNNER_DEVELOPER_MANAGED_MODEL?: string;
+  /** Signing key for 24-hour guest artifact download capabilities. */
+  RUNNER_GUEST_DOWNLOAD_SECRET?: string;
   MCP_TEST_AUTH_TOKEN?: string;
   MCP_TEST_RUNNER_PRIVATE_JWK?: string;
   MCP_TEST_CATALOGUE_VERSION?: string;
@@ -67,4 +69,6 @@ export interface ApiPrincipal {
   mcpBindings?: string[];
   /** Explicit opt-in for the simplified developer API. Existing CP keys remain unchanged. */
   developerApi?: boolean;
+  /** Explicitly provisioned accountless developer key. */
+  developerGuest?: boolean;
 }
