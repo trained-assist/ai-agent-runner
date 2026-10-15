@@ -59,6 +59,7 @@ function call(path: string, body?: unknown, headers: Record<string, string> = {}
 
 const body = { userTaskId: 'task-a', input: { inlinePrompt: 'say done' }, envAllowlist: [], limits: { timeoutMs: 300_000 } };
 const testMcp = { servers: [{ serverId: 'trained-assist-registry-test', transport: 'remote', url: 'https://trained-assist-mcp-host-test-160.skillset-apply.workers.dev/mcp', bindingRef: 'registry-mcp-test-160-read', allowedTools: ['registry.fixture_read'], policyVersion: 'registry-fixture-policy-v1', catalogueVersion: 'registry-fixture-catalogue-v1' }] };
+const userMcp = { servers: [{ serverId: 'mem-gpt', transport: 'remote', url: 'https://trained-assist-mcp-user-sandbox.skillset-apply.workers.dev/mcp', bindingRef: 'mem-gpt-user-sandbox', allowedTools: ['identity.whoami', 'google_docs.connect', 'google_docs.get_document'], policyVersion: 'mem-gpt-user-run-v1', catalogueVersion: 'mem-gpt-user-catalogue-v1' }] };
 
 describe('Cloudflare Runner run coordinator', () => {
   it('lists only active metadata for one task and enforces principal ownership', async () => {
@@ -616,6 +617,60 @@ describe('Cloudflare Runner run coordinator', () => {
     expect(server.headers).toMatchObject({ Authorization: 'Bearer {env:RUNNER_MCP_REGISTRY_TEST}', 'X-MCP-Operation': 'invocation', 'X-MCP-Scope': 'registry:fixture-read', 'X-MCP-Run-Id': receipt.runId, 'X-MCP-User-Task-Id': 'task-a' });
     expect(attachment.mcpSecrets).toMatchObject({ RUNNER_MCP_REGISTRY_TEST: 'test-host-bearer-token-123', RUNNER_MCP_REGISTRY_TEST_PROOF: proof });
     expect(JSON.stringify((await coordinator['read']()).runs[receipt.runId])).not.toContain('test-host-bearer-token-123');
+  });
+
+  it('attaches a short-lived per-run proof to the pinned product user catalog without persisting secrets', async () => {
+    const pair = generateKeyPairSync('ed25519');
+    const privateJwk = pair.privateKey.export({ format: 'jwk' });
+    const { coordinator, launched, env } = setup();
+    env.MCP_USER_AUTH_TOKEN = 'product-user-mcp-transport-token-123';
+    env.MCP_USER_RUNNER_PRIVATE_JWK = JSON.stringify(privateJwk);
+    env.MCP_USER_PROFILE_USER_IDS = JSON.stringify({ 'integration-telegram-ux-v1': 'sandbox-user-1' });
+    env.MCP_USER_CATALOGUE_VERSION = 'mem-gpt-user-catalogue-v1';
+    env.MCP_USER_CATALOGUE_DIGEST = '8c17e64a0d71123698b139bd5957a10fff71a2b15f12601a95adcde150350e71';
+    const mcpPrincipal: ApiPrincipal = { ...principal, principalId: 'integration-telegram-ux-v1', profileId: 'integration-telegram-ux-v1' };
+    const response = await coordinator.fetch(call('/v1/runs', { ...body, mcp: userMcp }, { 'idempotency-key': 'product-user-mcp-run' }, mcpPrincipal));
+    expect(response.status, await response.clone().text()).toBe(202);
+    const receipt = await response.json() as { runId: string };
+    await coordinator.alarm();
+    const launch = launched[0]!;
+    const attachment = { mcp: launch.mcp as { servers: Record<string, { headers: Record<string, string> }> },
+      mcpSecrets: launch.mcpSecrets as Record<string, string> };
+    expect(Object.keys(attachment.mcp.servers)).toEqual(['mem-gpt']);
+    const server = attachment.mcp.servers['mem-gpt']!;
+    expect(server.headers).toMatchObject({
+      Authorization: 'Bearer {env:RUNNER_MCP_USER_TOKEN}',
+      'X-MCP-Operation': 'invocation', 'X-MCP-Scope': 'mcp:user-agent-run',
+      'X-MCP-Run-Id': receipt.runId, 'X-MCP-User-Task-Id': 'task-a',
+      'X-MCP-Run-Binding': '{env:RUNNER_MCP_USER_PROOF}',
+    });
+    const proof = attachment.mcpSecrets['RUNNER_MCP_USER_PROOF']!;
+    const [header, payload, signature] = proof.split('.');
+    const claims = JSON.parse(Buffer.from(payload!, 'base64url').toString('utf8')) as Record<string, unknown>;
+    expect(claims).toMatchObject({ userId: 'sandbox-user-1', runId: receipt.runId, userTaskId: 'task-a',
+      profileId: 'integration-telegram-ux-v1', ownerGeneration: 1, serverId: 'mem-gpt',
+      bindingRef: 'mem-gpt-user-sandbox', scope: 'mcp:user-agent-run',
+      catalogueVersion: 'mem-gpt-user-catalogue-v1',
+      catalogueDigest: '8c17e64a0d71123698b139bd5957a10fff71a2b15f12601a95adcde150350e71' });
+    expect(verify(null, Buffer.from(`${header}.${payload}`), pair.publicKey, Buffer.from(signature!, 'base64url'))).toBe(true);
+    expect(attachment.mcpSecrets['RUNNER_MCP_USER_TOKEN']).toBe('product-user-mcp-transport-token-123');
+    expect(JSON.stringify((await coordinator['read']()).runs[receipt.runId])).not.toContain('product-user-mcp-transport-token-123');
+    expect(JSON.stringify((await coordinator['read']()).runs[receipt.runId])).not.toContain(proof);
+  });
+
+  it('refuses a user-catalog descriptor outside the trusted profile or grant lifetime before admission', async () => {
+    const { coordinator, storage, env } = setup();
+    env.MCP_USER_AUTH_TOKEN = 'product-user-mcp-transport-token-123';
+    env.MCP_USER_RUNNER_PRIVATE_JWK = JSON.stringify(generateKeyPairSync('ed25519').privateKey.export({ format: 'jwk' }));
+    env.MCP_USER_PROFILE_USER_IDS = JSON.stringify({ 'integration-telegram-ux-v1': 'sandbox-user-1' });
+    env.MCP_USER_CATALOGUE_VERSION = 'mem-gpt-user-catalogue-v1';
+    env.MCP_USER_CATALOGUE_DIGEST = '8c17e64a0d71123698b139bd5957a10fff71a2b15f12601a95adcde150350e71';
+    const owner: ApiPrincipal = { ...principal, principalId: 'integration-telegram-ux-v1', profileId: 'integration-telegram-ux-v1' };
+    const wrongProfile = await coordinator.fetch(call('/v1/runs', { ...body, mcp: userMcp }, { 'idempotency-key': 'user-mcp-wrong-profile' }, principal));
+    expect(wrongProfile.status).toBe(422);
+    const longRun = await coordinator.fetch(call('/v1/runs', { ...body, mcp: userMcp, limits: { timeoutMs: 7_200_000 } }, { 'idempotency-key': 'user-mcp-too-long' }, owner));
+    expect(longRun.status).toBe(422);
+    expect(JSON.stringify(storage.values.get('runner-v1') ?? {})).not.toContain('sandbox-user-1');
   });
 
   it('rejects unbound or altered MCP descriptors before storing a run', async () => {

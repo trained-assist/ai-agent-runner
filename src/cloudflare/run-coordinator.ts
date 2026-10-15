@@ -49,6 +49,15 @@ const MCP_TEST = Object.freeze({
   digest: '129ab5033964c3ed5be47414711026cc2469b3d9af90ce83ee071cba7f005ea9',
   tokenEnv: 'RUNNER_MCP_REGISTRY_TEST',
 });
+const MCP_USER = Object.freeze({
+  profile: 'integration-telegram-ux-v1', principal: 'integration-telegram-ux-v1',
+  server: 'mem-gpt', binding: 'mem-gpt-user-sandbox', scope: 'mcp:user-agent-run',
+  policy: 'mem-gpt-user-run-v1', audience: 'trained-assist:mcp:user', issuer: 'trained-assist-agent-runner',
+  url: 'https://trained-assist-mcp-user-sandbox.skillset-apply.workers.dev/mcp',
+  digest: '8c17e64a0d71123698b139bd5957a10fff71a2b15f12601a95adcde150350e71',
+  catalogue: 'mem-gpt-user-catalogue-v1', tokenEnv: 'RUNNER_MCP_USER_TOKEN', proofEnv: 'RUNNER_MCP_USER_PROOF',
+  tools: ['identity.whoami', 'google_docs.connect', 'google_docs.get_document'],
+});
 
 function principalOf(request: Request): ApiPrincipal | null {
   try { return JSON.parse(request.headers.get('x-runner-principal') ?? 'null') as ApiPrincipal | null; } catch { return null; }
@@ -348,25 +357,49 @@ export class RunnerRunCoordinator {
     }
     if (Array.isArray(body.input?.refs) && body.input.refs.length) return error('INPUT_REFS_UNSUPPORTED', 'input refs need a durable workspace and are not supported by this Worker API yet', 422);
     const mcp = body.mcp?.servers?.length ? body.mcp.servers : [];
-    if (!Array.isArray(mcp) || mcp.length > 1) return error('MCP_HOST_POLICY_MISSING', 'only the pinned test Registry MCP server is supported by this Worker API', 422);
+    if (!Array.isArray(mcp) || mcp.length > 1) return error('MCP_HOST_POLICY_MISSING', 'only one host-pinned MCP server is supported by this Worker API', 422);
+    let userMcp = false;
     if (mcp.length === 1) {
       const server = mcp[0];
       const fields = ['serverId', 'transport', 'url', 'bindingRef', 'allowedTools', 'policyVersion', 'catalogueVersion'];
-      if (!server || typeof server !== 'object' || Object.keys(server).some((field) => !fields.includes(field)) ||
-          principal.profileId !== MCP_TEST.profile || principal.principalId !== MCP_TEST.principal ||
-          !principal.mcpBindings?.includes(MCP_TEST.binding) || server.serverId !== MCP_TEST.server ||
-          server.transport !== 'remote' || server.url !== MCP_TEST.url || server.bindingRef !== MCP_TEST.binding ||
-          !Array.isArray(server.allowedTools) || server.allowedTools.length !== 1 || server.allowedTools[0] !== MCP_TEST.tool ||
-          server.policyVersion !== MCP_TEST.policy || typeof server.catalogueVersion !== 'string' ||
-          !/^[A-Za-z0-9._~-]{1,200}$/.test(server.catalogueVersion) ||
-          (this.env.MCP_TEST_CATALOGUE_VERSION && server.catalogueVersion !== this.env.MCP_TEST_CATALOGUE_VERSION)) {
-        return error('MCP_HOST_POLICY_MISSING', 'MCP descriptor is outside this principal’s pinned test Registry policy', 422);
-      }
-      if (!this.env.MCP_TEST_AUTH_TOKEN || !this.env.MCP_TEST_RUNNER_PRIVATE_JWK || !this.env.MCP_TEST_CATALOGUE_VERSION || !this.env.MCP_TEST_EXPIRES_AT ||
-          !Number.isFinite(Date.parse(this.env.MCP_TEST_EXPIRES_AT)) || Date.parse(this.env.MCP_TEST_EXPIRES_AT) <= Date.now()) {
-        return error('MCP_BINDING_UNAVAILABLE', 'pinned test Registry MCP secrets or lease are not configured', 503);
-      }
+      if (!server || typeof server !== 'object' || Object.keys(server).some((field) => !fields.includes(field))) return error('MCP_HOST_POLICY_MISSING', 'MCP descriptor contains unsupported fields', 422);
+      if (server.serverId === MCP_TEST.server) {
+        if (principal.profileId !== MCP_TEST.profile || principal.principalId !== MCP_TEST.principal ||
+            !principal.mcpBindings?.includes(MCP_TEST.binding) || server.transport !== 'remote' || server.url !== MCP_TEST.url || server.bindingRef !== MCP_TEST.binding ||
+            !Array.isArray(server.allowedTools) || server.allowedTools.length !== 1 || server.allowedTools[0] !== MCP_TEST.tool ||
+            server.policyVersion !== MCP_TEST.policy || typeof server.catalogueVersion !== 'string' ||
+            !/^[A-Za-z0-9._~-]{1,200}$/.test(server.catalogueVersion) ||
+            (this.env.MCP_TEST_CATALOGUE_VERSION && server.catalogueVersion !== this.env.MCP_TEST_CATALOGUE_VERSION)) {
+          return error('MCP_HOST_POLICY_MISSING', 'MCP descriptor is outside this principal’s pinned test Registry policy', 422);
+        }
+        if (!this.env.MCP_TEST_AUTH_TOKEN || !this.env.MCP_TEST_RUNNER_PRIVATE_JWK || !this.env.MCP_TEST_CATALOGUE_VERSION || !this.env.MCP_TEST_EXPIRES_AT ||
+            !Number.isFinite(Date.parse(this.env.MCP_TEST_EXPIRES_AT)) || Date.parse(this.env.MCP_TEST_EXPIRES_AT) <= Date.now()) {
+          return error('MCP_BINDING_UNAVAILABLE', 'pinned test Registry MCP secrets or lease are not configured', 503);
+        }
+      } else if (server.serverId === MCP_USER.server) {
+        if (principal.profileId !== MCP_USER.profile || principal.principalId !== MCP_USER.principal ||
+            server.transport !== 'remote' || server.url !== MCP_USER.url || server.bindingRef !== MCP_USER.binding ||
+            !Array.isArray(server.allowedTools) || server.allowedTools.length !== MCP_USER.tools.length ||
+            MCP_USER.tools.some((tool, index) => server.allowedTools[index] !== tool) ||
+            server.policyVersion !== MCP_USER.policy || server.catalogueVersion !== MCP_USER.catalogue) {
+          return error('MCP_HOST_POLICY_MISSING', 'MCP descriptor is outside this profile’s pinned user catalog policy', 422);
+        }
+        if (!this.env.MCP_USER_AUTH_TOKEN || this.env.MCP_USER_AUTH_TOKEN.length < 32 || !this.env.MCP_USER_RUNNER_PRIVATE_JWK ||
+            this.env.MCP_USER_CATALOGUE_VERSION !== MCP_USER.catalogue || this.env.MCP_USER_CATALOGUE_DIGEST !== MCP_USER.digest) {
+          return error('MCP_BINDING_UNAVAILABLE', 'pinned sandbox user catalog credentials or digest are not configured', 503);
+        }
+        let profileUsers: Record<string, string>;
+        try {
+          const parsed: unknown = JSON.parse(this.env.MCP_USER_PROFILE_USER_IDS ?? 'null');
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || Object.keys(parsed).some(profile => profile !== MCP_USER.profile) ||
+              Object.values(parsed).some(value => typeof value !== 'string' || !/^[A-Za-z0-9._:@-]{1,200}$/.test(value))) throw new Error();
+          profileUsers = parsed as Record<string, string>;
+        } catch { return error('MCP_BINDING_UNAVAILABLE', 'sandbox user catalog profile mapping is invalid', 503); }
+        if (!profileUsers[principal.profileId]) return error('MCP_BINDING_UNAVAILABLE', 'sandbox user catalog has no user mapping for this profile', 503);
+        userMcp = true;
+      } else return error('MCP_HOST_POLICY_MISSING', 'MCP server is not host approved', 422);
     }
+    if (userMcp && body.limits.timeoutMs > 7_140_000) return error('MCP_GRANT_MAX_LIFETIME', 'sandbox user catalog runs are limited to a grant lifetime of two hours', 422);
     if (body.profileWorkspace) return error('FEATURE_UNSUPPORTED', 'profile workspace is not supported by this Worker API yet', 422);
     if (body.isolation !== undefined && body.isolation?.mode !== 'none') return error('ISOLATION_UNSUPPORTED', 'the France VM worker currently supports isolation.mode=none only', 422);
     if (body.regionConstraints?.allowedRegions && !body.regionConstraints.allowedRegions.includes('eu')) return error('REGION_UNAVAILABLE', 'this Runner API only dispatches to the France EU worker', 422);
@@ -486,7 +519,9 @@ export class RunnerRunCoordinator {
           repository: { fullName: repository ?? '', branch: `agent-run/${runId}`, ...(body.repository?.revision ? { revision: body.repository.revision } : {}) },
           ...(repositoryToken ? { publicationToken: repositoryToken } : {}),
           resultUrl, isolation: body.isolation ?? { mode: 'none' }, outputs: Array.isArray(body.outputs) ? body.outputs : [],
-          ...(mcp.length ? await this.testRegistryAttachment(mcp[0], { runId, taskId, profileId: principal.profileId, timeoutMs: clampInteger(limits.timeoutMs, 300_000, 1_000, 86_400_000) }) : {}) };
+          ...(mcp.length ? userMcp
+            ? await this.userCatalogAttachment({ runId, taskId, profileId: principal.profileId, ownerGeneration, timeoutMs: clampInteger(limits.timeoutMs, 300_000, 1_000, 86_400_000) })
+            : await this.testRegistryAttachment(mcp[0], { runId, taskId, profileId: principal.profileId, timeoutMs: clampInteger(limits.timeoutMs, 300_000, 1_000, 86_400_000) }) : {}) };
       record = { requestId, runId, userTaskId: taskId, conversationId, jobId, ownerGeneration, principalId: principal.principalId, profileId: principal.profileId,
         ...(principal.developerApi ? { developerApi: true } : {}),
         ...(principal.developerGuest ? { developerGuest: true } : {}),
@@ -628,6 +663,45 @@ export class RunnerRunCoordinator {
         'X-MCP-Run-Id': context.runId, 'X-MCP-Run-Binding': '{env:RUNNER_MCP_REGISTRY_TEST_PROOF}',
       } } } },
       mcpSecrets: { [MCP_TEST.tokenEnv]: this.env.MCP_TEST_AUTH_TOKEN, RUNNER_MCP_REGISTRY_TEST_PROOF: proof },
+    };
+  }
+
+  private async userCatalogAttachment(context: { runId: string; taskId: string; profileId: string; ownerGeneration: number; timeoutMs: number }): Promise<Record<string, unknown>> {
+    let profileUsers: Record<string, string>;
+    let jwk: JsonWebKey;
+    try {
+      profileUsers = JSON.parse(this.env.MCP_USER_PROFILE_USER_IDS ?? 'null') as Record<string, string>;
+      jwk = JSON.parse(this.env.MCP_USER_RUNNER_PRIVATE_JWK ?? 'null') as JsonWebKey;
+    } catch { throw new Error('sandbox user catalog signing configuration is invalid'); }
+    const userId = profileUsers?.[context.profileId];
+    if (typeof userId !== 'string' || !/^[A-Za-z0-9._:@-]{1,200}$/.test(userId) ||
+        jwk?.kty !== 'OKP' || jwk?.crv !== 'Ed25519' || typeof jwk.d !== 'string' || typeof jwk.x !== 'string') {
+      throw new Error('sandbox user catalog subject or Ed25519 key is unavailable');
+    }
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    const exp = nowSeconds + Math.ceil(context.timeoutMs / 1000) + 60;
+    if (exp - nowSeconds > 7200) throw new Error('sandbox user catalog grant would exceed its maximum lifetime');
+    const key = await crypto.subtle.importKey('jwk', jwk, { name: 'Ed25519' }, false, ['sign']);
+    const claims = {
+      iss: MCP_USER.issuer, aud: MCP_USER.audience, sub: context.runId,
+      userId, runId: context.runId, userTaskId: context.taskId, profileId: context.profileId,
+      ownerGeneration: context.ownerGeneration, serverId: MCP_USER.server,
+      bindingRef: MCP_USER.binding, scope: MCP_USER.scope, policyVersion: MCP_USER.policy,
+      catalogueVersion: MCP_USER.catalogue, catalogueDigest: MCP_USER.digest,
+      allowedTools: MCP_USER.tools, iat: nowSeconds, exp,
+    };
+    const encode = (value: unknown): string => base64Url(new TextEncoder().encode(JSON.stringify(value)));
+    const signingInput = `${encode({ alg: 'EdDSA', typ: 'JWT' })}.${encode(claims)}`;
+    const signature = await crypto.subtle.sign({ name: 'Ed25519' }, key, new TextEncoder().encode(signingInput));
+    const proof = `${signingInput}.${base64Url(new Uint8Array(signature))}`;
+    return {
+      mcp: { servers: { [MCP_USER.server]: { type: 'remote', url: MCP_USER.url, enabled: true, headers: {
+        Authorization: `Bearer {env:${MCP_USER.tokenEnv}}`,
+        'X-MCP-Operation': 'invocation', 'X-MCP-Scope': MCP_USER.scope,
+        'X-MCP-User-Task-Id': context.taskId, 'X-MCP-Profile': context.profileId,
+        'X-MCP-Run-Id': context.runId, 'X-MCP-Run-Binding': `{env:${MCP_USER.proofEnv}}`,
+      } } } },
+      mcpSecrets: { [MCP_USER.tokenEnv]: this.env.MCP_USER_AUTH_TOKEN, [MCP_USER.proofEnv]: proof },
     };
   }
 
