@@ -26,6 +26,7 @@ jobs:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: d740a05e9442c1d0feacae2dfc673e93
       GATEWAY_REF: ${{ inputs.gateway_ref }}
+      GHA_GATEWAY_DISPATCH_TOKEN: ${{ secrets.GHA_GATEWAY_DISPATCH_TOKEN }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -66,6 +67,12 @@ jobs:
         env:
           GATEWAY_SHA: ${{ steps.gateway.outputs.sha }}
         run: npx wrangler deploy --config wrangler.toml --env sandbox --var "BUILD_SHA:$GATEWAY_SHA"
+      - name: Bind the sandbox-only GitHub dispatch credential
+        working-directory: opencode-gha-runner
+        run: |
+          set -euo pipefail
+          test -n "$GHA_GATEWAY_DISPATCH_TOKEN"
+          printf '%s' "$GHA_GATEWAY_DISPATCH_TOKEN" | npx wrangler secret put GITHUB_TOKEN --config wrangler.toml --env sandbox
       - name: Verify delivered gateway SHA
         env:
           GATEWAY_SHA: ${{ steps.gateway.outputs.sha }}
