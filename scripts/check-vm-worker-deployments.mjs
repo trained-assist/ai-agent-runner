@@ -1,5 +1,23 @@
+import { compareOpenCodeIdentity } from './opencode-release-identity.mjs';
+
 const expectedCommit = process.env.VM_WORKER_MAIN_SHA;
 if (!/^[0-9a-f]{40}$/.test(expectedCommit ?? '')) throw new Error('VM_WORKER_MAIN_SHA must be the full main commit SHA');
+const expectedRelease = {
+  tag: process.env.VM_WORKER_RELEASE_TAG,
+  version: process.env.VM_WORKER_RELEASE_VERSION,
+  sourceCommit: process.env.VM_WORKER_RELEASE_SOURCE_COMMIT,
+  opencodeVersion: process.env.VM_WORKER_OPENCODE_VERSION,
+  opencodeSourceCommit: process.env.VM_WORKER_OPENCODE_SOURCE_COMMIT,
+  opencodeBinarySha256: process.env.VM_WORKER_OPENCODE_BINARY_SHA256,
+};
+if (!/^vm-worker-v\d+\.\d+\.\d+$/.test(expectedRelease.tag ?? '')
+  || !/^\d+\.\d+\.\d+$/.test(expectedRelease.version ?? '')
+  || !/^[0-9a-f]{40}$/.test(expectedRelease.sourceCommit ?? '')
+  || !expectedRelease.opencodeVersion
+  || !/^[0-9a-f]{40}$/.test(expectedRelease.opencodeSourceCommit ?? '')
+  || !/^[0-9a-f]{64}$/.test(expectedRelease.opencodeBinarySha256 ?? '')) {
+  throw new Error('Expected verified worker release and OpenCode identity are required');
+}
 let warnings = 0;
 const warn = (label, message) => {
   warnings += 1;
@@ -32,6 +50,20 @@ for (const [region, prefix] of [['France', 'EU'], ['Russia', 'RU']]) {
     const version = await versionResponse.json();
     const ready = await readyResponse.json().catch(() => ({}));
     const deployedCommit = version?.build?.sourceCommit;
+    const deployedBuild = version?.build;
+    if (deployedBuild?.version !== expectedRelease.version || deployedCommit !== expectedRelease.sourceCommit) {
+      warn(`${region} worker release drift`, `deployed=${deployedBuild?.version ?? 'unknown'}@${deployedCommit ?? 'unknown'}; latest=${expectedRelease.tag} (${expectedRelease.version}@${expectedRelease.sourceCommit})`);
+    } else {
+      process.stdout.write(`${region}: worker release ${expectedRelease.tag} (${expectedRelease.sourceCommit}).\n`);
+    }
+    const opencode = compareOpenCodeIdentity(deployedBuild?.opencode, expectedRelease);
+    if (opencode.status === 'unknown') {
+      warn(`${region} OpenCode identity unknown`, opencode.reason);
+    } else if (opencode.status === 'drift') {
+      warn(`${region} OpenCode release drift`, `deployed=${deployedBuild.opencode.version}@${deployedBuild.opencode.sourceCommit} sha256=${deployedBuild.opencode.binarySha256}; latest=${expectedRelease.tag} ${expectedRelease.opencodeVersion}@${expectedRelease.opencodeSourceCommit} sha256=${expectedRelease.opencodeBinarySha256}; mismatches=${opencode.mismatches.join(',')}`);
+    } else {
+      process.stdout.write(`${region}: OpenCode ${expectedRelease.opencodeVersion} (${expectedRelease.opencodeSourceCommit}, ${expectedRelease.opencodeBinarySha256}) matches ${expectedRelease.tag}.\n`);
+    }
     if (!/^[0-9a-f]{40}$/.test(deployedCommit ?? '')) {
       warn(`${region} worker build unknown`, 'The worker does not report a verified source commit.');
     } else if (deployedCommit !== expectedCommit) {
