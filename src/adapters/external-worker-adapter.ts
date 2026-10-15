@@ -3,6 +3,7 @@ import { RUNNER_EVENT_SCHEMA_VERSION, type RunnerEvent } from '../contracts/even
 import { RUN_RESULT_SCHEMA_VERSION, type ExitReason, type FailureClass, type RunFailure, type RunOutcome, type RunResult } from '../contracts/result.js';
 import { validateRunResult } from '../contracts/result.js';
 import type { IngressManifestRef, OutputSpec, RunSpec } from '../contracts/run-spec.js';
+import type { SessionCheckpointRef } from '../contracts/result.js';
 import {
   ErrorCollector,
   PreflightError,
@@ -130,7 +131,7 @@ export interface LaunchRequest {
   operationId: string;
   ownerGeneration: number;
   engine: { name: string; adapterVersion: string; modelSettings?: { model?: string } };
-  input: { inlinePrompt: string };
+  input: { inlinePrompt: string; resumeSessionFrom?: { runId: string; artifactId: string } };
   cwd: string;
   envAllowlist: string[];
   env: Record<string, string>;
@@ -229,6 +230,7 @@ export interface LaunchResult {
   /** Null when the accepted execution intentionally has no repository side effects (e.g. mock-test). */
   repo: LaunchRepo | null;
   profileChanges?: { files: Array<{ path: string; sha256: string; size: number }>; deletes: string[] };
+  sessionCheckpoint?: SessionCheckpointRef;
   failure?: LaunchFailure;
 }
 
@@ -326,6 +328,7 @@ const LAUNCH_RESULT_KEYS = [
   'logUrl',
   'repo',
   'profileChanges',
+  'sessionCheckpoint',
   'failure',
 ] as const;
 
@@ -455,7 +458,10 @@ export function launchRequestFromSpec(
       adapterVersion: spec.engine.adapterVersion,
       ...(spec.engine.modelSettings?.model !== undefined ? { modelSettings: { model: spec.engine.modelSettings.model } } : {}),
     },
-    input: { inlinePrompt: prompt },
+    input: {
+      inlinePrompt: prompt,
+      ...(spec.input?.resumeSessionFrom ? { resumeSessionFrom: spec.input.resumeSessionFrom } : {}),
+    },
     cwd: spec.cwd,
     envAllowlist: [...spec.envAllowlist],
     env,
@@ -535,7 +541,7 @@ export function validateLaunchResult(input: unknown, expectedRunId: string): Val
   // настоящий opencode-шлюз его не присылает вовсе. Отсутствие этих полей — не повод
   // выбросить результат целого рана: живая проба #100 показала, что реальный ответ
   // отвергался как WORKER_PROTOCOL_INVALID, и рана с артефактами у клиента не было.
-  const OPTIONAL_RESULT_KEYS = ['failure', 'pid', 'answer', 'profileChanges', 'exitObserved'] as const;
+  const OPTIONAL_RESULT_KEYS = ['failure', 'pid', 'answer', 'profileChanges', 'exitObserved', 'sessionCheckpoint'] as const;
   checkKeys(
     input,
     LAUNCH_RESULT_KEYS,
@@ -581,7 +587,8 @@ export function validateLaunchResult(input: unknown, expectedRunId: string): Val
     input['artifacts'].forEach((artifact, index) => {
       const path = `launch.artifacts[${index}]`;
       if (!checkObject(artifact, path, collector)) return;
-      checkKeys(artifact, ['path', 'name', 'mime', 'sha256', 'size', 'objectKey'], ['path', 'name', 'mime', 'sha256', 'size'], path, collector);
+      checkKeys(artifact, ['artifactId', 'path', 'name', 'mime', 'sha256', 'size', 'objectKey'], ['path', 'name', 'mime', 'sha256', 'size'], path, collector);
+      if (artifact['artifactId'] !== undefined && !isSafeId(artifact['artifactId'])) collector.push(`${path}.artifactId: expected an artifact id`);
       checkString(artifact['path'], `${path}.path`, collector, 512);
       checkString(artifact['name'], `${path}.name`, collector, 200);
       checkString(artifact['mime'], `${path}.mime`, collector, 100);
@@ -641,6 +648,17 @@ export function validateLaunchResult(input: unknown, expectedRunId: string): Val
       } else value['deletes'].forEach((path, index) => {
         if (!isSafeRelativePath(path)) collector.push(`launch.profileChanges.deletes[${index}]: expected safe relative path`);
       });
+    }
+  }
+
+  if (input['sessionCheckpoint'] !== undefined) {
+    const checkpoint = input['sessionCheckpoint'];
+    if (checkObject(checkpoint, 'launch.sessionCheckpoint', collector)) {
+      checkKeys(checkpoint, ['artifactId', 'sessionId', 'sha256', 'size'], ['artifactId', 'sessionId', 'sha256', 'size'], 'launch.sessionCheckpoint', collector);
+      if (!isSafeId(checkpoint['artifactId'])) collector.push('launch.sessionCheckpoint.artifactId: expected a safe artifact id');
+      if (typeof checkpoint['sessionId'] !== 'string' || !/^ses_[0-7][0-9A-HJKMNP-TV-Z]{25}$/.test(checkpoint['sessionId'])) collector.push('launch.sessionCheckpoint.sessionId: expected an OpenCode session id');
+      if (typeof checkpoint['sha256'] !== 'string' || !/^[0-9a-f]{64}$/.test(checkpoint['sha256'])) collector.push('launch.sessionCheckpoint.sha256: expected sha256');
+      if (typeof checkpoint['size'] !== 'number' || !Number.isSafeInteger(checkpoint['size']) || checkpoint['size'] < 0) collector.push('launch.sessionCheckpoint.size: expected non-negative integer');
     }
   }
 
@@ -770,6 +788,7 @@ export function mapLaunchResult(
     ...(failure ? { failure } : {}),
     usage: { status: 'unknown' },
     outputRefs,
+    ...(launch.sessionCheckpoint ? { sessionCheckpoint: launch.sessionCheckpoint } : {}),
     persistence,
     persistenceReason:
       persistence === 'persisted'

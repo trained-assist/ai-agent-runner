@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { lstatSync } from 'node:fs';
+import { mkdirSync, lstatSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { EngineStartupError } from '../../contracts/validate.js';
 import type { RunSpec } from '../../contracts/run-spec.js';
@@ -12,12 +12,12 @@ export interface OpenCodeAdapterOptions {
   argv?: string[];
 }
 
-function defaultArgv(spec: RunSpec): string[] {
+function defaultArgv(spec: RunSpec, sessionId?: string): string[] {
   const prompt = spec.input?.inlinePrompt;
   if (!prompt) {
     throw new EngineStartupError('opencode run requires a host-resolved input.inlinePrompt');
   }
-  if (!spec.ingressManifest) return ['run', prompt];
+  if (!spec.ingressManifest) return ['run', prompt, '--format', 'json', ...(sessionId ? ['--session', sessionId] : [])];
   const indexPath = join(spec.cwd, '.inputs', 'ingress', spec.runId, 'input-items.json');
   try {
     if (!lstatSync(indexPath).isFile()) throw new Error('not a regular file');
@@ -29,7 +29,7 @@ function defaultArgv(spec: RunSpec): string[] {
     `${JSON.stringify(indexPath)}. Process inputItems in array order and handle each item as a unit; its text is verbatim user input and its artifacts belong with that text.`,
     'Artifact paths are relative to the index directory; read the referenced files as needed. Do not infer order from filenames.',
   ].join(' ');
-  return ['run', `${prompt}\n\n${instruction}`];
+  return ['run', `${prompt}\n\n${instruction}`, '--format', 'json', ...(sessionId ? ['--session', sessionId] : [])];
 }
 
 export class OpenCodeAdapter implements EngineAdapter {
@@ -57,7 +57,43 @@ export class OpenCodeAdapter implements EngineAdapter {
     if (ctx.spec.ingressManifest && this.options.argv) {
       throw new EngineStartupError('custom OpenCode argv cannot be used with task-scoped ingress inputs');
     }
-    const argv = this.options.argv ?? defaultArgv(ctx.spec);
+    const shouldExport = this.options.argv === undefined;
+    const checkpointPath = join(ctx.cwd, '.runner', 'opencode-session.json');
+    let sessionId: string | null = null;
+    if (ctx.spec.input?.resumeSessionFrom) {
+      if (!shouldExport) throw new EngineStartupError('custom OpenCode argv cannot resume a durable session checkpoint');
+      let parsed: { info?: { id?: unknown } };
+      try {
+        parsed = JSON.parse(readFileSync(checkpointPath, 'utf8')) as { info?: { id?: unknown } };
+      } catch {
+        throw new EngineStartupError('restored OpenCode session checkpoint is missing or invalid');
+      }
+      if (typeof parsed.info?.id !== 'string' || !/^ses_[0-7][0-9A-HJKMNP-TV-Z]{25}$/.test(parsed.info.id)) {
+        throw new EngineStartupError('restored OpenCode session checkpoint has an invalid session id');
+      }
+      sessionId = parsed.info.id;
+      const importLaunch = launchCommand(ctx, binary, ['import', checkpointPath]);
+      const imported = await new Promise<number | null>((resolve, reject) => {
+        const importer = spawn(importLaunch.command, importLaunch.args, {
+          cwd: ctx.cwd,
+          env: ctx.env,
+          stdio: ['ignore', 'ignore', 'pipe'],
+        });
+        let stderr = '';
+        importer.stderr?.setEncoding('utf8');
+        importer.stderr?.on('data', (chunk: string) => { stderr = (stderr + chunk).slice(-2000); });
+        importer.once('error', reject);
+        importer.once('close', (code) => resolve(code === 0 ? 0 : (code ?? 1)));
+        importer.once('exit', () => undefined);
+        importer.once('close', () => {
+          if (stderr.trim()) ctx.onLog('stderr', `opencode checkpoint import: ${stderr.trim()}`);
+        });
+      }).catch((error: unknown) => {
+        throw new EngineStartupError(`could not import OpenCode session checkpoint: ${String((error as Error).message)}`);
+      });
+      if (imported !== 0) throw new EngineStartupError(`OpenCode rejected the session checkpoint (exit=${String(imported)})`);
+    }
+    const argv = shouldExport ? defaultArgv(ctx.spec, sessionId ?? undefined) : this.options.argv!;
     const launch = launchCommand(ctx, binary, argv);
     const child = spawn(launch.command, launch.args, {
       cwd: ctx.cwd,
@@ -65,6 +101,82 @@ export class OpenCodeAdapter implements EngineAdapter {
       detached: true,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
-    return handleForChild(child, { onLog: ctx.onLog, onExit: ctx.onExit });
+    return handleForChild(child, {
+      onLog: (stream, line) => {
+        if (stream === 'stdout') {
+          try {
+            const event = JSON.parse(line) as { type?: unknown; sessionID?: unknown; part?: { type?: unknown; text?: unknown; time?: { end?: unknown } } };
+            if (typeof event.sessionID === 'string' && /^ses_[0-7][0-9A-HJKMNP-TV-Z]{25}$/.test(event.sessionID)) sessionId = event.sessionID;
+            if (event.type === 'text' && event.part?.type === 'text' && typeof event.part.text === 'string') {
+              if (event.part.time?.end) ctx.onLog('stdout', event.part.text);
+              else ctx.onLog('stderr', `[opencode text] ${event.part.text}`);
+              return;
+            }
+            if (typeof event.type === 'string') {
+              ctx.onLog('stderr', `[opencode ${event.type}] ${line}`);
+              return;
+            }
+          } catch {
+            // Non-JSON stdout from an older compatible CLI stays visible as text.
+          }
+        }
+        ctx.onLog(stream, line);
+      },
+      onExit: (code, signal) => {
+        if (!shouldExport) {
+          ctx.onExit(code, signal);
+          return;
+        }
+        // A completed or interrupted OpenCode run must leave a portable checkpoint
+        // before Runner finalizes and sweeps its workspace. `export` defaults to the
+        // full transcript; sanitized exports are unsuitable for resuming a session.
+        const output = join(ctx.cwd, '.runner', 'opencode-session.json');
+        if (!sessionId) {
+          ctx.onLog('stderr', 'opencode session checkpoint export skipped: CLI did not emit a session id');
+          ctx.onExit(code, signal);
+          return;
+        }
+        try {
+          mkdirSync(join(ctx.cwd, '.runner'), { recursive: true });
+          const exportLaunch = launchCommand(ctx, binary, ['export', sessionId]);
+          const exporter = spawn(exportLaunch.command, exportLaunch.args, {
+            cwd: ctx.cwd,
+            env: ctx.env,
+            stdio: ['ignore', 'pipe', 'ignore'],
+          });
+          const chunks: Buffer[] = [];
+          let size = 0;
+          let failed = false;
+          exporter.stdout?.on('data', (chunk: Buffer) => {
+            size += chunk.length;
+            if (size > 64 * 1024 * 1024) {
+              failed = true;
+              exporter.kill('SIGKILL');
+              return;
+            }
+            chunks.push(chunk);
+          });
+          exporter.once('error', () => ctx.onExit(code, signal));
+          exporter.once('close', (exportCode) => {
+            if (exportCode === 0 && !failed) {
+              try {
+                const text = Buffer.concat(chunks).toString('utf8');
+                const parsed = JSON.parse(text) as { info?: { id?: string } };
+                if (parsed.info?.id !== sessionId) throw new Error('OpenCode exported a different session id');
+                writeFileSync(output, text, { mode: 0o600 });
+              } catch (error) {
+                ctx.onLog('stderr', `opencode session checkpoint export failed: ${String(error)}`);
+              }
+            } else {
+              ctx.onLog('stderr', `opencode session checkpoint export failed (exit=${String(exportCode)}, sizeLimit=${failed})`);
+            }
+            ctx.onExit(code, signal);
+          });
+        } catch (error) {
+          ctx.onLog('stderr', `opencode session checkpoint export failed: ${String(error)}`);
+          ctx.onExit(code, signal);
+        }
+      },
+    });
   }
 }

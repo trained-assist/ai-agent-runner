@@ -44,7 +44,7 @@ describe('OpenCodeAdapter', () => {
       writeFileSync(indexPath, JSON.stringify({ inputItems: [{ text: 'context', artifacts: [{ path: '00-voice.ogg' }] }] }));
       const capturedArgs = join(cwd, 'captured-args.txt');
       const fakeOpenCode = join(cwd, 'opencode-stub.sh');
-      writeFileSync(fakeOpenCode, '#!/bin/sh\nprintf "%s\\n" "$@" > "$CAPTURE_ARGS"\n');
+      writeFileSync(fakeOpenCode, '#!/bin/sh\nif [ "$1" = "export" ]; then printf "{}\\n"; exit 0; fi\nprintf "%s\\n" "$@" > "$CAPTURE_ARGS"\n');
       chmodSync(fakeOpenCode, 0o700);
       const originalPrompt = runSpec.input?.inlinePrompt;
       runSpec.ingressManifest = {
@@ -57,6 +57,7 @@ describe('OpenCodeAdapter', () => {
         ownerGeneration: runSpec.ownerGeneration,
       };
       const { ctx, exit } = makeContext(cwd, { CAPTURE_ARGS: capturedArgs });
+      ctx.spec.input = { inlinePrompt: 'Do a task.' };
       ctx.spec = runSpec;
       const adapter = new OpenCodeAdapter({ binary: fakeOpenCode });
       await adapter.start(ctx);
@@ -67,6 +68,67 @@ describe('OpenCodeAdapter', () => {
       expect(args).toContain('Process inputItems in array order');
       expect(args).toContain('Artifact paths are relative to the index directory');
       expect(runSpec.input?.inlinePrompt).toBe(originalPrompt);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('exports the full OpenCode session before reporting process exit', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'opencode-checkpoint-'));
+    try {
+      const fakeOpenCode = join(cwd, 'opencode-stub.sh');
+      const sessionId = 'ses_01J9A3J9Y7V8W2K4M6N0PQRSTZ';
+      writeFileSync(fakeOpenCode, [
+        '#!/bin/sh',
+        'if [ "$1" = "export" ]; then',
+        '  printf \'{"info":{"id":"%s"},"messages":[]}\\n\' "$2"',
+        '  exit 0',
+        'fi',
+        'printf "%s\\n" "$@" > "$CAPTURE_ARGS"',
+        `printf '{"type":"text","sessionID":"${sessionId}","part":{"type":"text","text":"answer"}}\\n'`,
+      ].join('\n'));
+      chmodSync(fakeOpenCode, 0o700);
+      const capturedArgs = join(cwd, 'captured-args.txt');
+      const { ctx, exit } = makeContext(cwd, { CAPTURE_ARGS: capturedArgs });
+      ctx.spec.input = { inlinePrompt: 'Do a task.' };
+      const adapter = new OpenCodeAdapter({ binary: fakeOpenCode });
+      await adapter.start(ctx);
+      await exit;
+
+      const args = readFileSync(capturedArgs, 'utf8').trim().split('\n');
+      expect(args).toContain('--format');
+      expect(args).not.toContain('--session');
+      const checkpoint = JSON.parse(readFileSync(join(cwd, '.runner', 'opencode-session.json'), 'utf8')) as { info: { id: string } };
+      expect(checkpoint.info.id).toBe(sessionId);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('imports a durable prior session before continuing it with the same OpenCode session id', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'opencode-resume-'));
+    try {
+      const sessionId = 'ses_01J9A3J9Y7V8W2K4M6N0PQRSTZ';
+      mkdirSync(join(cwd, '.runner'), { recursive: true });
+      writeFileSync(join(cwd, '.runner', 'opencode-session.json'), JSON.stringify({ info: { id: sessionId }, messages: [] }));
+      const fakeOpenCode = join(cwd, 'opencode-stub.sh');
+      const capture = join(cwd, 'calls.txt');
+      writeFileSync(fakeOpenCode, [
+        '#!/bin/sh',
+        'if [ "$1" = "import" ]; then touch "$IMPORTED"; echo import >> "$CAPTURE"; exit 0; fi',
+        'if [ "$1" = "export" ]; then printf \'{"info":{"id":"%s"},"messages":[]}\\n\' "$2"; exit 0; fi',
+        '[ -f "$IMPORTED" ] || exit 9',
+        'printf "%s\\n" "$@" >> "$CAPTURE"',
+      ].join('\n'));
+      chmodSync(fakeOpenCode, 0o700);
+      const { ctx, exit } = makeContext(cwd, { CAPTURE: capture, IMPORTED: join(cwd, 'imported') });
+      ctx.spec.input = { inlinePrompt: 'Continue the task.', resumeSessionFrom: { runId: 'run-previous', artifactId: 'artifact-previous' } };
+      await new OpenCodeAdapter({ binary: fakeOpenCode }).start(ctx);
+      await exit;
+      const calls = readFileSync(capture, 'utf8');
+      expect(calls.startsWith('import\n')).toBe(true);
+      expect(calls).toContain(`--session\n${sessionId}`);
+      expect(calls).toContain('Continue the task.');
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }

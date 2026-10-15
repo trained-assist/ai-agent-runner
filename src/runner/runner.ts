@@ -10,7 +10,7 @@ import {
   type RunnerEvent,
   type RunnerEventType,
 } from '../contracts/events.js';
-import type { RunResult } from '../contracts/result.js';
+import type { RunResult, SessionCheckpointRef } from '../contracts/result.js';
 import type { RunSpec } from '../contracts/run-spec.js';
 import { stripRepositoryToken, validateRunSpec } from '../contracts/run-spec.js';
 import { ConflictError, PreflightError, SpecValidationError } from '../contracts/validate.js';
@@ -20,8 +20,9 @@ import { RunStore, type PersistedRunState } from './run-store.js';
 import { cloneRepository, resolveCloneSource } from './repository.js';
 import { ScopedEventLog, type LogSink } from './scoped-log.js';
 import { canTransition, isTerminalState, type RunState } from './state-machine.js';
-import type { BlobStore } from '../storage/blob-store.js';
+import { sha256Hex, type BlobStore } from '../storage/blob-store.js';
 import { RunExportStore, type PlannedOutput } from '../storage/export.js';
+import type { ArtifactStore } from '../storage/artifact-store.js';
 import type { UploadSessionStore } from '../storage/upload-session.js';
 import type { WorkspaceSnapshotStore } from '../storage/workspace-snapshot.js';
 import { InputMaterializer, type MaterializeReceipt } from '../storage/input-materializer.js';
@@ -283,6 +284,7 @@ interface InternalRun {
   workspaceToken: string | null;
   repositoryCommit: string | null;
   workspacePublishFailed: boolean;
+  sessionCheckpoint: SessionCheckpointRef | null;
 }
 
 /**
@@ -458,6 +460,7 @@ export class Runner {
         workspaceToken: null,
         repositoryCommit: state.profileWorkspaceCommit ?? state.result?.repositoryCommit ?? null,
         workspacePublishFailed: false,
+        sessionCheckpoint: state.result?.sessionCheckpoint ?? null,
       });
     }
   }
@@ -655,6 +658,7 @@ export class Runner {
         : spec.profileWorkspace ? spec.repository?.token ?? null : null,
       repositoryCommit: null,
       workspacePublishFailed: false,
+      sessionCheckpoint: null,
     });
     this.emit(state, 'claimed', { operationId });
     void this.execute(spec.runId).catch(() => undefined);
@@ -1273,6 +1277,47 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
    */
   private async materializeInputs(st: PersistedRunState): Promise<void> {
     const refs = st.spec.input?.refs ?? [];
+    const resume = st.spec.input?.resumeSessionFrom;
+    if (resume) {
+      if (st.spec.engine.name !== 'opencode') {
+        throw new PreflightError('MATERIALIZE_REF_INVALID', 'OpenCode session checkpoints can only resume an OpenCode run');
+      }
+      if (!this.opts.exports) {
+        throw new PreflightError('MATERIALIZE_REF_INVALID', 'this Runner has no durable artifact store for OpenCode session restore', { retryable: true });
+      }
+      const source = this.store.loadState(resume.runId);
+      if (!source || source.profileId !== st.profileId || source.userTaskId !== st.userTaskId) {
+        throw new PreflightError('MATERIALIZE_REF_INVALID', 'OpenCode session checkpoint belongs to a different profile or user task');
+      }
+      const checkpoint = source.result?.sessionCheckpoint;
+      if (!checkpoint || checkpoint.artifactId !== resume.artifactId) {
+        throw new PreflightError('MATERIALIZE_REF_INVALID', 'the referenced OpenCode session checkpoint is not committed for this run');
+      }
+      let artifact: Awaited<ReturnType<ArtifactStore['read']>>;
+      try {
+        artifact = await this.opts.exports.artifacts.read(resume.runId, resume.artifactId);
+      } catch (error) {
+        throw new PreflightError('MATERIALIZE_REF_UNAVAILABLE', `OpenCode session checkpoint could not be read: ${String((error as Error).message)}`, { retryable: true });
+      }
+      if (artifact.manifest.artifactId !== resume.artifactId || artifact.manifest.name !== 'opencode-session.json'
+        || artifact.manifest.sha256 !== checkpoint.sha256 || artifact.manifest.size !== checkpoint.size) {
+        throw new PreflightError('MATERIALIZE_REF_INVALID', 'OpenCode session checkpoint artifact metadata did not match its committed result');
+      }
+      let sessionId: unknown;
+      try {
+        const parsed = JSON.parse(artifact.bytes.toString('utf8')) as { info?: { id?: unknown } };
+        sessionId = parsed.info?.id;
+      } catch {
+        throw new PreflightError('MATERIALIZE_REF_INVALID', 'OpenCode session checkpoint is not valid exported session JSON');
+      }
+      if (typeof sessionId !== 'string' || sessionId !== checkpoint.sessionId || !/^ses_[0-7][0-9A-HJKMNP-TV-Z]{25}$/.test(sessionId)) {
+        throw new PreflightError('MATERIALIZE_REF_INVALID', 'OpenCode session checkpoint has an invalid session id');
+      }
+      const path = join(st.spec.cwd, '.runner', 'opencode-session.json');
+      mkdirSync(join(st.spec.cwd, '.runner'), { recursive: true, mode: 0o700 });
+      writeFileAtomic(path, artifact.bytes);
+      this.emit(st, 'log', { stream: 'runner', level: 'info', message: `opencode.session_checkpoint_restored sessionId=${sessionId} bytes=${artifact.bytes.length}` });
+    }
     const materializer = this.opts.inputs;
     const ingress = st.spec.ingressManifest;
     if (ingress) {
@@ -1968,6 +2013,7 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
       }
     }
     const exit = run ? this.resolveExit(run, st) : null;
+    await this.saveOpenCodeSessionCheckpoint(st, run ?? null);
     // Fast result boundary: persist the engine outcome and answer before any declared
     // output upload. The checkpoint + result are durable on the Runner host; the clean
     // room remains leased until recover() verifies remote custody and completes cleanup.
@@ -2358,6 +2404,45 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
   }
 
   /**
+   * Сохраняет полную OpenCode-сессию как внутренний ArtifactStore объект. Она не
+   * входит в пользовательские outputs и не публикуется в GitHub: результат содержит
+   * только проверенный ref для последующего same-task resume.
+   */
+  private async saveOpenCodeSessionCheckpoint(st: PersistedRunState, run: InternalRun | null): Promise<void> {
+    if (st.spec.engine.name !== 'opencode' || !run || !this.opts.exports) return;
+    const path = join(st.spec.cwd, '.runner', 'opencode-session.json');
+    if (!existsSync(path)) return;
+    try {
+      const bytes = readFileSync(path);
+      const parsed = JSON.parse(bytes.toString('utf8')) as { info?: { id?: unknown } };
+      const sessionId = parsed.info?.id;
+      if (typeof sessionId !== 'string' || !/^ses_[0-7][0-9A-HJKMNP-TV-Z]{25}$/.test(sessionId)) {
+        throw new Error('exported session has an invalid id');
+      }
+      const sha256 = sha256Hex(bytes);
+      const artifactId = `session-${sha256.slice(0, 24)}-${sha256Hex(st.runId).slice(0, 8)}`;
+      const stored = await this.opts.exports.artifacts.put({
+        runId: st.runId,
+        userTaskId: st.userTaskId,
+        profileId: st.profileId,
+        name: 'opencode-session.json',
+        mime: 'application/json',
+        bytes,
+        artifactId,
+      });
+      const verified = await this.opts.exports.artifacts.read(st.runId, artifactId);
+      if (stored.sha256 !== sha256 || verified.manifest.sha256 !== sha256 || verified.bytes.length !== bytes.length) {
+        throw new Error('stored session checkpoint failed SHA/size read-back verification');
+      }
+      run.sessionCheckpoint = { artifactId, sessionId, sha256, size: bytes.length };
+      this.emit(st, 'log', { stream: 'runner', level: 'info', message: `opencode.session_checkpoint_persisted sessionId=${sessionId} bytes=${bytes.length} sha256=${sha256}` });
+    } catch (error) {
+      const detail = truncateLine(redactSecrets(error instanceof Error ? error.message : String(error)), 300);
+      this.emit(st, 'log', { stream: 'runner', level: 'warn', message: `opencode.session_checkpoint_unavailable reason=${detail}` });
+    }
+  }
+
+  /**
    * Текст ответа агента — отдельный долговечный артефакт `answer.txt` (issue #52, шаг 2).
    *
    * Он не входит в план экспорта: план — это контракт клиента (объявленные выходы) плюс
@@ -2577,6 +2662,7 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
       ? { status: 'failed' as const, reason: 'profile saveback upload failed; the VM retained the run workspace' }
       : this.persistenceStatus(exportManifest);
     const cleanupStatus = this.cleanupStatus(this.soleCopiesOnDisk(st, exportManifest), cleanup);
+    const sessionCheckpoint = this.runs.get(st.runId)?.sessionCheckpoint ?? st.result?.sessionCheckpoint;
 
     const result: RunResult = {
       schemaVersion: 1,
@@ -2594,6 +2680,7 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
       finishedAt: this.nowIso(),
       usage: { status: 'unknown' },
       outputRefs,
+      ...(sessionCheckpoint ? { sessionCheckpoint } : {}),
       persistence: persistence.status,
       persistenceReason: persistence.reason,
       cleanup: cleanupStatus.status,

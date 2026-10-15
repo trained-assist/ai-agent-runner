@@ -433,6 +433,7 @@ function toLaunchResult(options: VmWorkerServerOptions, snapshot: NonNullable<Re
     stderr,
     answer: checkpoint?.answer.text ?? null,
     answerSource: checkpoint?.answer.source ?? null,
+    ...(result.sessionCheckpoint ? { sessionCheckpoint: result.sessionCheckpoint } : {}),
     durationMs: Number.isFinite(started) && Number.isFinite(finished) ? Math.max(0, finished - started) : 0,
     timedOut: result.exitReason === 'timeout',
     outputTruncated: stdout.length + stderr.length >= (spec?.limits.maxOutputBytes ?? 1_000_000),

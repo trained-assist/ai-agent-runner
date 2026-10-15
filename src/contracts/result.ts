@@ -26,6 +26,14 @@ export interface RunFailure {
 
 export type UsageReport = { status: 'unknown' } | { status: 'known'; usd: number };
 
+/** Internal pointer to an encrypted-at-rest OpenCode transcript; never a user artifact. */
+export interface SessionCheckpointRef {
+  artifactId: string;
+  sessionId: string;
+  sha256: string;
+  size: number;
+}
+
 export interface RunResult {
   schemaVersion: typeof RUN_RESULT_SCHEMA_VERSION;
   runId: string;
@@ -45,6 +53,7 @@ export interface RunResult {
   failure?: RunFailure;
   usage: UsageReport;
   outputRefs: string[];
+  sessionCheckpoint?: SessionCheckpointRef;
   /**
    * Сохранение выходов — отдельный от движка статус (issue #52, шаг 3/5).
    * `persisted` означает «каждый байт подтверждён чтением из долговечного хранилища»,
@@ -99,6 +108,7 @@ const RESULT_KEYS = [
   'failure',
   'usage',
   'outputRefs',
+  'sessionCheckpoint',
   'persistence',
   'persistenceReason',
   'repositoryCommit',
@@ -117,7 +127,7 @@ const OUTCOME_EXIT_REASONS: Record<RunOutcome, readonly ExitReason[]> = {
 export function validateRunResult(input: unknown): ValidationResult<RunResult> {
   const collector = new ErrorCollector();
   if (!checkObject(input, 'result', collector)) return collector.finish(undefined as never);
-  const optional = new Set(['failure', 'persistenceReason', 'repositoryCommit', 'profileChanges', 'cleanupReason', 'text']);
+  const optional = new Set(['failure', 'persistenceReason', 'repositoryCommit', 'profileChanges', 'cleanupReason', 'text', 'sessionCheckpoint']);
   const required = RESULT_KEYS.filter((key) => !optional.has(key));
   checkKeys(input, RESULT_KEYS, required, 'result', collector);
 
@@ -203,6 +213,17 @@ export function validateRunResult(input: unknown): ValidationResult<RunResult> {
 
   if (!Array.isArray(input['outputRefs'])) collector.push('result.outputRefs: expected array');
   else input['outputRefs'].forEach((ref, i) => checkString(ref, `result.outputRefs[${i}]`, collector, 500));
+
+  if (input['sessionCheckpoint'] !== undefined) {
+    const checkpoint = input['sessionCheckpoint'];
+    if (checkObject(checkpoint, 'result.sessionCheckpoint', collector)) {
+      checkKeys(checkpoint, ['artifactId', 'sessionId', 'sha256', 'size'], ['artifactId', 'sessionId', 'sha256', 'size'], 'result.sessionCheckpoint', collector);
+      if (!isSafeId(checkpoint['artifactId'])) collector.push('result.sessionCheckpoint.artifactId: expected a safe artifact id');
+      if (typeof checkpoint['sessionId'] !== 'string' || !/^ses_[0-7][0-9A-HJKMNP-TV-Z]{25}$/.test(checkpoint['sessionId'])) collector.push('result.sessionCheckpoint.sessionId: expected an OpenCode session id');
+      if (typeof checkpoint['sha256'] !== 'string' || !/^[0-9a-f]{64}$/.test(checkpoint['sha256'])) collector.push('result.sessionCheckpoint.sha256: expected sha256');
+      if (typeof checkpoint['size'] !== 'number' || !Number.isSafeInteger(checkpoint['size']) || checkpoint['size'] < 0) collector.push('result.sessionCheckpoint.size: expected non-negative integer');
+    }
+  }
 
   if (
     input['persistence'] !== 'pending' &&

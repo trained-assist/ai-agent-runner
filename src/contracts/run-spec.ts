@@ -45,6 +45,8 @@ export interface InputRef {
 export interface InputSpec {
   refs?: InputRef[];
   inlinePrompt?: string;
+  /** Import a prior OpenCode session artifact from a run of this same user task/profile. */
+  resumeSessionFrom?: { runId: string; artifactId: string };
 }
 
 export interface IngressManifestRef {
@@ -313,8 +315,19 @@ function validateEnvAllowlist(value: unknown, path: string, collector: ErrorColl
 
 function validateInput(value: unknown, path: string, collector: ErrorCollector): InputSpec | undefined {
   if (!checkObject(value, path, collector)) return undefined;
-  checkKeys(value, ['refs', 'inlinePrompt'], [], path, collector);
+  checkKeys(value, ['refs', 'inlinePrompt', 'resumeSessionFrom'], [], path, collector);
   const input: InputSpec = {};
+  if (value['resumeSessionFrom'] !== undefined) {
+    const source = value['resumeSessionFrom'];
+    if (checkObject(source, `${path}.resumeSessionFrom`, collector)) {
+      checkKeys(source, ['runId', 'artifactId'], ['runId', 'artifactId'], `${path}.resumeSessionFrom`, collector);
+      if (!isSafeId(source['runId'])) collector.push(`${path}.resumeSessionFrom.runId: expected a safe run id`);
+      if (!isSafeId(source['artifactId'])) collector.push(`${path}.resumeSessionFrom.artifactId: expected a safe artifact id`);
+      if (isSafeId(source['runId']) && isSafeId(source['artifactId'])) {
+        input.resumeSessionFrom = { runId: source['runId'], artifactId: source['artifactId'] };
+      }
+    }
+  }
   if (value['refs'] !== undefined) {
     const refs = value['refs'];
     if (checkArray(refs, `${path}.refs`, collector)) {
