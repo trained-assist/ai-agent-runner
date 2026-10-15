@@ -50,6 +50,13 @@ async function authenticate(request: Request, env: RunnerWorkerEnv): Promise<Api
         configured = [...configured, ...(raw as KeyConfig[])];
       } catch { throw new Error('RUNNER_API_KEYS_SANDBOX3 must be a valid JSON array of key hash records'); }
     }
+    if (env.RUNNER_API_KEYS_DEVELOPER !== undefined) {
+      try {
+        const raw: unknown = JSON.parse(env.RUNNER_API_KEYS_DEVELOPER);
+        if (!Array.isArray(raw) || raw.some((item) => !validKeyConfig(item) || !item.developerApi)) throw new Error('invalid developer key records');
+        configured = [...configured, ...(raw as KeyConfig[])];
+      } catch { throw new Error('RUNNER_API_KEYS_DEVELOPER must be a valid JSON array of developer key hash records'); }
+    }
   }
   const digest = await sha256(match[1]);
   const record = configured.find((entry) => entry.keyHash === digest);
