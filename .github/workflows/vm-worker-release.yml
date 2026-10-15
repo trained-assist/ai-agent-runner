@@ -3,6 +3,12 @@ name: Signed VM worker release
 on:
   push:
     tags: ['vm-worker-v*']
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing signed release to deploy to the France sandbox
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -11,6 +17,7 @@ permissions:
 
 jobs:
   build-and-attest:
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -59,7 +66,7 @@ jobs:
           cp -R dist "$STAGE/dist"
           install -m 0755 "$RUNNER_TEMP/opencode-fork/opencode" "$STAGE/opencode"
           mkdir -p "$STAGE/scripts"
-          cp scripts/deploy-vm-worker-release.sh scripts/assert-vm-worker-update-ready.mjs "$STAGE/scripts/"
+          cp scripts/deploy-vm-worker-release.sh scripts/assert-vm-worker-update-ready.mjs scripts/ai-agent-vm-worker-gha-update "$STAGE/scripts/"
           (cd "$STAGE" && npm ci --omit=dev)
           tar -czf ai-agent-vm-worker-linux-x64.tar.gz -C "$STAGE" .
           sha256sum ai-agent-vm-worker-linux-x64.tar.gz > ai-agent-vm-worker-linux-x64.tar.gz.sha256
@@ -76,3 +83,53 @@ jobs:
             ai-agent-vm-worker-linux-x64.tar.gz.sha256 \
             --title "VM worker ${{ steps.bundle.outputs.version }}" \
             --generate-notes
+
+  deploy-france-sandbox:
+    name: Deploy signed release to France sandbox
+    needs: build-and-attest
+    if: ${{ always() && (needs.build-and-attest.result == 'success' || github.event_name == 'workflow_dispatch') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: france-sandbox
+    permissions:
+      contents: read
+      attestations: read
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+      VM_DEPLOY_KEY: ${{ secrets.FRANCE_VM_RELEASE_DEPLOY_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate target release and deployment credential
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^vm-worker-v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          test -n "$VM_DEPLOY_KEY"
+      - name: Update France sandbox after active runs drain
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^vm-worker-v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          install -m 0700 -d "$RUNNER_TEMP/ssh"
+          install -m 0600 /dev/null "$RUNNER_TEMP/ssh/id_ed25519"
+          printf '%s\n' "$VM_DEPLOY_KEY" > "$RUNNER_TEMP/ssh/id_ed25519"
+          install -m 0600 deploy/vm-worker/france-deploy-known-hosts "$RUNNER_TEMP/ssh/known_hosts"
+          status=1
+          for attempt in $(seq 1 30); do
+            set +e
+            printf '%s\n' "$GH_TOKEN" | ssh -i "$RUNNER_TEMP/ssh/id_ed25519" \
+              -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+              -o UserKnownHostsFile="$RUNNER_TEMP/ssh/known_hosts" \
+              -o ConnectTimeout=15 root@169.58.15.230 "update $RELEASE_TAG"
+            status=$?
+            set -e
+            if [[ "$status" -eq 0 ]]; then
+              exit 0
+            fi
+            if [[ "$status" -ne 75 ]]; then
+              exit "$status"
+            fi
+            echo "France sandbox still has active runs; retry $attempt/30 in 30 seconds" >&2
+            sleep 30
+          done
+          echo "France sandbox did not drain within 15 minutes; rerun this workflow with the same signed release tag" >&2
+          exit 75

@@ -223,6 +223,16 @@ The Cloudflare Runner API selects the France VM worker for these sandbox lanes. 
 answers its own health/capacity and runs accepted work; it never routes to another VM or GHA.
 These lanes do not fall back to GitHub Actions when France is unavailable.
 
+The signed release workflow can deploy that same verified bundle to the France sandbox.
+It uses a dedicated forced-command SSH key restricted to `update vm-worker-vX.Y.Z`; a
+short-lived GitHub release-read token is supplied on stdin and is not persisted on the VM.
+Before changing versions, the updater waits for `/readyz` to report zero active runs and
+reservations. The cloud workflow retries only this busy state, then checks `/healthz`,
+`/version` and `/readyz` after restart and rolls back on failure. Re-running a release
+already installed with matching worker and OpenCode hashes is a no-op. This automation
+targets only the France sandbox, not Russia or production, and does not require a
+workstation scheduler.
+
 This drift check is deliberately narrower than product migration acceptance. See
 [VM-WORKER-LEGACY-COMPATIBILITY.md](VM-WORKER-LEGACY-COMPATIBILITY.md) and
 [architecture issue #174](https://github.com/trained-assist/trained-agent-architecture/issues/174):
