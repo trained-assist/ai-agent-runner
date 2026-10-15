@@ -33,6 +33,7 @@ jobs:
           git merge-base --is-ancestor "$GITHUB_SHA" origin/main
       - name: Download and verify pinned OpenCode fork
         env:
+          GH_TOKEN: ${{ github.token }}
           OPENCODE_RELEASE_TAG: mem-preview-20261015-turn-recovery-91570c76816f
           OPENCODE_VERSION: 0.0.0-turn-recovery-91570c76816f-202610151149
           OPENCODE_SOURCE_SHA: 91570c76816fa82244935521c7af4adf9ed81ec7
