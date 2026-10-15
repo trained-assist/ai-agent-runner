@@ -8,9 +8,10 @@ const target = process.env.CANARY_TARGET;
 const taskId = process.env.CANARY_TASK_ID;
 const runId = process.env.CANARY_RUN_ID;
 const apiKey = process.env.RUNNER_API_KEY_AGENT_API;
+const gatewayToken = process.env.GHA_WORKER_TOKEN;
 const cleanupTerminal = process.env.CLEANUP_TERMINAL === 'true';
 const safeId = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
-if (!Object.hasOwn(urls, target ?? '') || !safeId.test(taskId ?? '') || !/^run_[A-Za-z0-9_]{20,127}$/.test(runId ?? '') || !apiKey) {
+if (!Object.hasOwn(urls, target ?? '') || !safeId.test(taskId ?? '') || !/^run_[A-Za-z0-9_]{20,127}$/.test(runId ?? '') || !apiKey || !gatewayToken) {
   throw new Error('sandbox canary reconciliation inputs are invalid');
 }
 
@@ -37,6 +38,26 @@ console.log(JSON.stringify({ target, taskId, runId, state: status.state, engine:
 
 const events = await request(`/v1/runs/${encodeURIComponent(runId)}/events?limit=500`);
 console.log(JSON.stringify({ eventTypes: (events.events ?? []).slice(-12).map((event) => event.type ?? 'unknown') }));
+
+const gatewayUrl = 'https://opencode-gha-runner-gateway-sandbox.skillset-apply.workers.dev';
+async function gatewayRequest(path) {
+  const response = await fetch(`${gatewayUrl}${path}`, {
+    headers: { authorization: `Bearer ${gatewayToken}`, accept: 'application/json' },
+    signal: AbortSignal.timeout(20_000),
+  });
+  const body = await response.json().catch(() => null);
+  if (!response.ok) throw new Error(`gateway ${path}: HTTP ${response.status}`);
+  return body;
+}
+if (status.engine === 'azure-cloud') {
+  const gatewayStatus = await gatewayRequest(`/v1/runs/${encodeURIComponent(runId)}/status`);
+  console.log(JSON.stringify({ gatewayStatus: gatewayStatus.status, gatewayUpdatedAt: gatewayStatus.updatedAt }));
+  if (['succeeded', 'failed', 'cancelled'].includes(gatewayStatus.status)) {
+    const gatewayResult = await gatewayRequest(`/v1/runs/${encodeURIComponent(runId)}/result`);
+    console.log(JSON.stringify({ gatewayExitReason: gatewayResult.exitReason,
+      gatewayAnswerHasFixtureMarker: String(gatewayResult.answer ?? '').includes('registry-fixture-marker-160-v1') }));
+  }
+}
 
 const terminal = new Set(['succeeded', 'failed', 'cancelled', 'timed_out']);
 if (!terminal.has(status.state)) {
