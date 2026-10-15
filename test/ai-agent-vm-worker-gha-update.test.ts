@@ -21,6 +21,7 @@ describe('France sandbox GitHub Actions forced command', () => {
     expect(installer).toContain('read -r -t 15 ingress_secret');
     expect(installer).toContain('VM_WORKER_UPDATE_READINESS_FILE');
     expect(installer).toContain('chmod 0600 "$config_stage"');
+    expect(installer).toContain('cmp -s "$config_stage" "$config_file"');
     expect(installer).not.toContain('eval ');
     expect(installer).not.toContain('bash -c');
   });

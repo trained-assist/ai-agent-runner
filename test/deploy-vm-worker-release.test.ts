@@ -7,6 +7,13 @@ const releaseWorkflowPath = new URL('../.github/workflows/vm-worker-release.yml'
 const ghaUpdatePath = new URL('../scripts/ai-agent-vm-worker-gha-update', import.meta.url);
 
 describe('VM worker release updater safety contract', () => {
+  it('installs the reviewed France binding inventory from the signed bundle', async () => {
+    const updater = await readFile(updaterPath, 'utf8');
+    const workflow = await readFile(releaseWorkflowPath, 'utf8');
+    expect(workflow).toContain('cp deploy/vm-worker/inventory/france.json "$STAGE/deploy/vm-worker/inventory/"');
+    expect(updater).toContain('inventory_source="${release_dir}/deploy/vm-worker/inventory/france.json"');
+    expect(updater).toContain('install -o root -g root -m 0644 "$inventory_source" "$inventory_target"');
+  });
   it('resolves its colocated readiness helper independently of the caller cwd', async () => {
     const updater = await readFile(updaterPath, 'utf8');
     const scriptDir = updater.indexOf('script_dir=');

@@ -42,6 +42,11 @@ chown root:root "$dropin_stage"
 chmod 0644 "$dropin_stage"
 
 if [[ -e "$config_file" || -e "$dropin_file" ]]; then
+  if [[ -f "$config_file" && -f "$dropin_file" ]] \
+    && cmp -s "$config_stage" "$config_file" && cmp -s "$dropin_stage" "$dropin_file"; then
+    echo 'Production ingress credential already installed and matched'
+    exit 0
+  fi
   echo 'Production ingress is already configured; rotate it through a separate reviewed operation' >&2
   exit 1
 fi
