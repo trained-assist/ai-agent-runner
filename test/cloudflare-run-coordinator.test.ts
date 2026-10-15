@@ -554,6 +554,61 @@ describe('Cloudflare Runner run coordinator', () => {
   });
 });
 
+describe('tenant-bound model connections', () => {
+  const byokBody = { ...body, envAllowlist: [], credentialBindings: [{ type: 'openai', connectionId: 'conn-openai-a' }] };
+  function provision(env: RunnerWorkerEnv) {
+    env.RUNNER_BYOK_ENABLED = 'true';
+    env.ALLOWED_ENVIRONMENT_NAMES = 'OPENAI_API_KEY';
+    env.RUNNER_MODEL_CONNECTIONS = JSON.stringify([{ connectionId: 'conn-openai-a', principalId: principal.principalId,
+      profileId: principal.profileId, provider: 'openai', model: 'openai/gpt-5', secretBinding: 'RUNNER_MODEL_SECRET_A' }]);
+    env['RUNNER_MODEL_SECRET_A'] = 'test-only-provider-secret';
+  }
+
+  it('uses the principal-owned connection and encrypts the provider secret before storage', async () => {
+    const { coordinator, env, storage, launched } = setup();
+    provision(env);
+    const response = await coordinator.fetch(call('/v1/runs', byokBody, { 'idempotency-key': 'byok-1' }));
+    expect(response.status).toBe(202);
+    const stored = JSON.stringify(storage.values.get('runner-v1'));
+    expect(stored).not.toContain('test-only-provider-secret');
+    await coordinator.alarm();
+    expect(launched).toHaveLength(1);
+    expect(launched[0]).toMatchObject({ envAllowlist: ['OPENAI_API_KEY'], env: { OPENAI_API_KEY: 'test-only-provider-secret' },
+      engine: { modelSettings: { model: 'openai/gpt-5' } } });
+    const status = await coordinator.fetch(call(`/v1/runs/${(await response.json() as { runId: string }).runId}/status`));
+    expect(JSON.stringify(await status.json())).not.toContain('test-only-provider-secret');
+  });
+
+  it('cannot use another tenant connection or mix BYOK with managed secrets', async () => {
+    const { coordinator, env, storage } = setup();
+    provision(env);
+    const foreign = await coordinator.fetch(call('/v1/runs', byokBody, { 'idempotency-key': 'foreign' },
+      { ...principal, principalId: 'different-principal' }));
+    expect(foreign.status).toBe(404);
+    const mixed = await coordinator.fetch(call('/v1/runs', { ...byokBody, envAllowlist: ['LLM_LADDER_TOKEN'] }, { 'idempotency-key': 'mixed' }));
+    expect(mixed.status).toBe(403);
+    const missing = await coordinator.fetch(call('/v1/runs', { ...byokBody, credentialBindings: [{ type: 'openai', connectionId: 'missing' }] }, { 'idempotency-key': 'missing' }));
+    expect(missing.status).toBe(404);
+    expect((storage.values.get('runner-v1') as { runs: Record<string, unknown> }).runs).toEqual({});
+  });
+
+  it('keeps legacy requests with an empty credentialBindings array compatible', async () => {
+    const { coordinator } = setup();
+    const response = await coordinator.fetch(call('/v1/runs', { ...body, credentialBindings: [] }, { 'idempotency-key': 'legacy-empty' }));
+    expect(response.status).toBe(202);
+  });
+
+  it('does not admit BYOK on production or without the lane switch', async () => {
+    const { coordinator, env } = setup();
+    provision(env);
+    env.DEPLOYMENT_ENV = 'production';
+    expect((await coordinator.fetch(call('/v1/runs', byokBody, { 'idempotency-key': 'prod-byok' }))).status).toBe(422);
+    env.DEPLOYMENT_ENV = undefined;
+    env.RUNNER_BYOK_ENABLED = undefined;
+    expect((await coordinator.fetch(call('/v1/runs', byokBody, { 'idempotency-key': 'disabled-byok' }))).status).toBe(422);
+  });
+});
+
 describe('Cloudflare Runner API scoped active-run lookup route', () => {
   it('routes GET by exact task id and requires runs:read', async () => {
     const secret = 'production-api-key-for-test-only';

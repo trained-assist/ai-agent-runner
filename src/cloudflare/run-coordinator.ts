@@ -17,6 +17,7 @@ interface RunRecord {
 }
 interface CancellationFence { userTaskId: string; ownerGeneration: number; principalId: string; profileId: string; tenantId?: string; createdAt: string }
 interface Stored { runs: Record<string, RunRecord>; idempotency: Record<string, string>; cancellationFences?: Record<string, CancellationFence>; latestOwnerGeneration: number; requestId?: string; jobId?: string }
+interface ModelConnection { connectionId: string; principalId: string; profileId: string; tenantId?: string; provider: 'openai'; model: string; secretBinding: string }
 
 const INIT: Stored = { runs: {}, idempotency: {}, latestOwnerGeneration: 0 };
 const ACTIVE = new Set<State>(['queued', 'starting', 'running']);
@@ -282,7 +283,7 @@ export class RunnerRunCoordinator {
         return error('MCP_BINDING_UNAVAILABLE', 'pinned test Registry MCP secrets or lease are not configured', 503);
       }
     }
-    if (body.profileWorkspace || body.credentialBindings?.length) return error('FEATURE_UNSUPPORTED', 'profile workspace and credential bindings are not supported by this Worker API yet', 422);
+    if (body.profileWorkspace) return error('FEATURE_UNSUPPORTED', 'profile workspace is not supported by this Worker API yet', 422);
     if (body.isolation !== undefined && body.isolation?.mode !== 'none') return error('ISOLATION_UNSUPPORTED', 'the France VM worker currently supports isolation.mode=none only', 422);
     if (body.regionConstraints?.allowedRegions && !body.regionConstraints.allowedRegions.includes('eu')) return error('REGION_UNAVAILABLE', 'this Runner API only dispatches to the France EU worker', 422);
     const engine = typeof body.engine?.name === 'string' ? body.engine.name : (this.env.RUNNER_ENGINE || DEFAULT_ENGINE);
@@ -302,6 +303,37 @@ export class RunnerRunCoordinator {
     const envAllowlist = requestedEnv as string[];
     const launchEnv = runtimeEnv(this.env, envAllowlist);
     if (envAllowlist.some((name) => !launchEnv[name])) return error('SERVER_MISCONFIGURED', 'an approved runtime environment secret is missing', 503);
+    let boundModel: string | undefined;
+    if (body.credentialBindings !== undefined && !(Array.isArray(body.credentialBindings) && body.credentialBindings.length === 0)) {
+      if (this.env.DEPLOYMENT_ENV === 'production' || this.env.RUNNER_BYOK_ENABLED !== 'true') {
+        return error('FEATURE_UNSUPPORTED', 'hosted model connections are disabled on this lane', 422);
+      }
+      const bindings = body.credentialBindings;
+      if (!Array.isArray(bindings) || bindings.length !== 1 || !bindings[0] ||
+          Object.keys(bindings[0]).sort().join(',') !== 'connectionId,type' || bindings[0].type !== 'openai' ||
+          typeof bindings[0].connectionId !== 'string' || !SAFE_ID.test(bindings[0].connectionId)) {
+        return error('INVALID_CREDENTIAL_BINDING', 'exactly one OpenAI connectionId binding is supported', 400);
+      }
+      if (envAllowlist.length || body.engine?.modelSettings?.model !== undefined) {
+        return error('INVALID_CREDENTIAL_BINDING', 'a model connection cannot be combined with runtime secrets or a caller-selected model', 400);
+      }
+      const allowedOnWorker = new Set((this.env.ALLOWED_ENVIRONMENT_NAMES ?? '').split(',').map((name) => name.trim()));
+      if (!allowedOnWorker.has('OPENAI_API_KEY')) return error('SERVER_MISCONFIGURED', 'OpenAI BYOK is not enabled on this lane', 503);
+      let connections: ModelConnection[];
+      try {
+        const parsed: unknown = JSON.parse(this.env.RUNNER_MODEL_CONNECTIONS ?? 'null');
+        if (!Array.isArray(parsed) || parsed.some((entry) => !validModelConnection(entry))) throw new Error('invalid connections');
+        connections = parsed as ModelConnection[];
+      } catch { return error('SERVER_MISCONFIGURED', 'model connection registry is invalid', 503); }
+      const selected = connections.find((entry) => entry.connectionId === bindings[0].connectionId &&
+        entry.principalId === principal.principalId && entry.profileId === principal.profileId && entry.tenantId === principal.tenantId);
+      if (!selected) return error('MODEL_CONNECTION_NOT_FOUND', 'model connection is not available to this principal', 404);
+      const secret = this.env[selected.secretBinding];
+      if (typeof secret !== 'string' || !secret || secret.length > 100_000) return error('SERVER_MISCONFIGURED', 'model connection secret is unavailable', 503);
+      envAllowlist.push('OPENAI_API_KEY');
+      launchEnv.OPENAI_API_KEY = secret;
+      boundModel = selected.model;
+    }
     const idemKey = `${principal.principalId}\0${key}`;
     const hashInput = structuredClone(body);
     if (hashInput.repository && typeof hashInput.repository === 'object') delete hashInput.repository.token;
@@ -350,7 +382,7 @@ export class RunnerRunCoordinator {
       const resultUrl = `${this.env.RUNNER_API_PUBLIC_URL.replace(/\/+$/, '')}/v1/runs/${runId}/result`;
       const limits = body.limits;
       const launch = { runId, jobId, userTaskId: taskId, profileId: principal.profileId, conversationId, operationId: `op_${await digest(`${taskId}:${ownerGeneration}`).then((h) => h.slice(0, 24))}`,
-          ownerGeneration, engine: { name: engine, adapterVersion: body.engine?.adapterVersion ?? '1', ...(body.engine?.modelSettings?.model ? { modelSettings: { model: body.engine.modelSettings.model } } : {}) },
+          ownerGeneration, engine: { name: engine, adapterVersion: body.engine?.adapterVersion ?? '1', ...(boundModel || body.engine?.modelSettings?.model ? { modelSettings: { model: boundModel ?? body.engine.modelSettings.model } } : {}) },
           input: { inlinePrompt: `${typeof inputPrompt === 'string' ? inputPrompt : ''}${instructions ? `${inputPrompt ? '\n\nAdditional instructions: ' : ''}${instructions}` : ''}` }, cwd: `/tmp/runner/${runId}`, envAllowlist, env: launchEnv, limits: { timeoutMs: clampInteger(limits.timeoutMs, 300_000, 1_000, 86_400_000), maxOutputBytes: clampInteger(limits.maxOutputBytes, 5_000_000, 1, 100_000_000), maxLogBytes: clampInteger(limits.maxLogBytes, 5_000_000, 1, 100_000_000) },
           ...(ingressManifest ? { ingressManifest: { ...ingressManifest, userTaskId: taskId, profileId: principal.profileId, runId, ownerGeneration } } : {}),
           repository: { fullName: repository ?? '', branch: `agent-run/${runId}`, ...(body.repository?.revision ? { revision: body.repository.revision } : {}) },
@@ -668,6 +700,19 @@ function runtimeEnv(env: RunnerWorkerEnv, names: string[]): Record<string, strin
     if (typeof value === 'string') result[name] = value;
   }
   return result;
+}
+
+function validModelConnection(value: unknown): value is ModelConnection {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const entry = value as Record<string, unknown>;
+  return Object.keys(entry).every((key) => ['connectionId', 'principalId', 'profileId', 'tenantId', 'provider', 'model', 'secretBinding'].includes(key))
+    && typeof entry['connectionId'] === 'string' && SAFE_ID.test(entry['connectionId'])
+    && typeof entry['principalId'] === 'string' && entry['principalId'].length > 0
+    && typeof entry['profileId'] === 'string' && entry['profileId'].length > 0
+    && (entry['tenantId'] === undefined || typeof entry['tenantId'] === 'string' && entry['tenantId'].length > 0)
+    && entry['provider'] === 'openai'
+    && typeof entry['model'] === 'string' && /^openai\/[A-Za-z0-9._:-]{1,100}$/.test(entry['model'])
+    && typeof entry['secretBinding'] === 'string' && /^RUNNER_MODEL_SECRET_[A-Z0-9_]{1,80}$/.test(entry['secretBinding']);
 }
 
 async function encryptionKey(raw: string): Promise<CryptoKey> {
