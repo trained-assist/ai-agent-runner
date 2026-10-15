@@ -3,6 +3,7 @@ import { RunnerRunCoordinator } from '../src/cloudflare/run-coordinator.js';
 import runnerWorker from '../src/cloudflare/runner-api.js';
 import type { ApiPrincipal, DurableObjectStateLike, DurableStorage, RunnerWorkerEnv } from '../src/cloudflare/types.js';
 import { createHash, createHmac, generateKeyPairSync, verify } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 
 class MemoryStorage implements DurableStorage {
   values = new Map<string, unknown>();
@@ -724,6 +725,35 @@ describe('Cloudflare Runner run coordinator', () => {
     expect(claims).toMatchObject({ runId: receipt.runId, sub: receipt.runId, userTaskId: 'task-a', profileId: 'integration-telegram-ux-v1', principalId: 'integration-telegram-ux-v1', scope: 'registry:fixture-read', serverId: 'trained-assist-registry-test', bindingRef: 'registry-mcp-test-160-read', catalogueVersion: 'registry-fixture-catalogue-v1', registryDigest: '129ab5033964c3ed5be47414711026cc2469b3d9af90ce83ee071cba7f005ea9' });
     expect(Number(claims.exp) - Number(claims.iat)).toBe(900);
     expect(Object.keys(claims).sort()).toEqual(['allowedTools', 'aud', 'bindingRef', 'catalogueVersion', 'exp', 'iat', 'iss', 'policyVersion', 'principalId', 'profileId', 'registryDigest', 'runId', 'scope', 'serverId', 'sub', 'userTaskId'].sort());
+    const contractPath = process.env['MCP_RUN_PROOF_CONTRACT'];
+    if (contractPath) {
+      const contract = JSON.parse(readFileSync(contractPath, 'utf8')) as {
+        proof: { requiredClaims: string[]; header: Record<string, string>; issuer: string; audience: string };
+        runId: { patterns: string[] };
+        transport: { operationHeader: string; operationValue: string; scopeHeader: string; runIdHeader: string; taskIdHeader: string; proofHeader: string };
+        testTool: { serverId: string; tool: string; scope: string; profileId: string; principalId: string; bindingRef: string; policyVersion: string; catalogueVersion: string };
+      };
+      expect(Object.keys(claims).sort()).toEqual([...contract.proof.requiredClaims].sort());
+      expect(JSON.parse(Buffer.from(header!, 'base64url').toString('utf8'))).toEqual(contract.proof.header);
+      expect(claims['iss']).toBe(contract.proof.issuer);
+      expect(claims['aud']).toBe(contract.proof.audience);
+      expect(contract.runId.patterns.some((pattern) => new RegExp(pattern).test(receipt.runId))).toBe(true);
+      expect(claims['runId']).toBe(receipt.runId);
+      expect(claims['sub']).toBe(receipt.runId);
+      expect(claims['serverId']).toBe(contract.testTool.serverId);
+      expect(claims['bindingRef']).toBe(contract.testTool.bindingRef);
+      expect(claims['allowedTools']).toEqual([contract.testTool.tool]);
+      expect(claims['scope']).toBe(contract.testTool.scope);
+      expect(claims['profileId']).toBe(contract.testTool.profileId);
+      expect(claims['principalId']).toBe(contract.testTool.principalId);
+      expect(claims['policyVersion']).toBe(contract.testTool.policyVersion);
+      expect(claims['catalogueVersion']).toBe(contract.testTool.catalogueVersion);
+      expect(server.headers[contract.transport.runIdHeader]).toBe(receipt.runId);
+      expect(claims['userTaskId']).toBe(server.headers[contract.transport.taskIdHeader]);
+      expect(server.headers[contract.transport.operationHeader]).toBe(contract.transport.operationValue);
+      expect(server.headers[contract.transport.scopeHeader]).toBe(contract.testTool.scope);
+      expect(server.headers[contract.transport.proofHeader]).toBe('{env:RUNNER_MCP_REGISTRY_TEST_PROOF}');
+    }
     expect(verify(null, Buffer.from(`${header}.${payload}`), pair.publicKey, Buffer.from(signature!, 'base64url'))).toBe(true);
     expect(server.headers).toMatchObject({ Authorization: 'Bearer {env:RUNNER_MCP_REGISTRY_TEST}', 'X-MCP-Operation': 'invocation', 'X-MCP-Scope': 'registry:fixture-read', 'X-MCP-Run-Id': receipt.runId, 'X-MCP-User-Task-Id': 'task-a' });
     expect(attachment.mcpSecrets).toMatchObject({ RUNNER_MCP_REGISTRY_TEST: 'test-host-bearer-token-123', RUNNER_MCP_REGISTRY_TEST_PROOF: proof });
