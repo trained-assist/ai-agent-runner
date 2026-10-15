@@ -28,8 +28,6 @@ jobs:
       CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
       SANDBOX3_RUNNER_API_KEY: ${{ secrets.SANDBOX3_RUNNER_API_KEY }}
       SANDBOX3_PROFILE_DELEGATION_SECRET: ${{ secrets.SANDBOX3_PROFILE_DELEGATION_SECRET }}
-      RUNNER_GITHUB_CONNECTION_KEY: ${{ secrets.RUNNER_GITHUB_CONNECTION_KEY }}
-      ZEROCREDS_INTEGRATOR_TOKEN: ${{ secrets.ZEROCREDS_INTEGRATOR_TOKEN }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -55,13 +53,6 @@ jobs:
           printf '%s\n' "$identity" | grep -F "Typeformowner@gmail.com's Account" >/dev/null
       - name: Deploy the reviewed serverless Runner API Worker source
         run: npx wrangler deploy --config wrangler.sandbox3.jsonc --var BUILD_SHA:${GITHUB_SHA}
-      - name: Provision sandbox-only GitHub token intake secrets
-        run: |
-          set -euo pipefail
-          [[ "$RUNNER_GITHUB_CONNECTION_KEY" =~ ^[0-9a-f]{64}$ ]]
-          [[ "$ZEROCREDS_INTEGRATOR_TOKEN" =~ ^tok_[A-Za-z0-9]+$ ]]
-          printf '%s' "$RUNNER_GITHUB_CONNECTION_KEY" | npx wrangler secret put RUNNER_GITHUB_CONNECTION_KEY --config wrangler.sandbox3.jsonc
-          printf '%s' "$ZEROCREDS_INTEGRATOR_TOKEN" | npx wrangler secret put ZEROCREDS_INTEGRATOR_TOKEN --config wrangler.sandbox3.jsonc
       - name: Provision only the dedicated sandbox3 key registry and delegation secret
         run: node scripts/sandbox3-profile-principal.mjs
       - name: Verify the signed sandbox3 profile using read-only capabilities
