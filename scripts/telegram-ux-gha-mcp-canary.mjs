@@ -36,9 +36,9 @@ const payload = {
   userTaskId: taskId,
   routeMode: 'gha',
   engine: { name: 'azure-cloud', adapterVersion: '1' },
-  input: { inlinePrompt: 'Call the trained-assist-registry-test tool registry.fixture_read with empty arguments. Return the tool result as JSON with marker, taskId, and runId. Do not guess any values and do not edit files.' },
+  input: { inlinePrompt: 'Use the available MCP tool named trained-assist-registry-test_registry_fixture_read with empty arguments. Return its result as JSON with marker, taskId, and runId. Do not use bash, curl, webfetch, or repository source to look up the marker. If that MCP tool is unavailable, say so immediately; do not guess values or edit files.' },
   envAllowlist: ['LLM_LADDER_TOKEN'],
-  limits: { timeoutMs: 180_000, maxOutputBytes: 100_000, maxLogBytes: 200_000 },
+  limits: { timeoutMs: 300_000, maxOutputBytes: 100_000, maxLogBytes: 200_000 },
   repository: { fullName: 'trained-assist/ai-agent-runner', token: repositoryToken },
   mcp: { servers: [{
     serverId: 'trained-assist-registry-test',
@@ -59,7 +59,7 @@ console.log(`MCP canary accepted: taskId=${taskId} runId=${receipt.runId}`);
 
 let status;
 try {
-  const deadline = Date.now() + 240_000;
+  const deadline = Date.now() + 600_000;
   while (Date.now() < deadline) {
     status = await request(`/v1/runs/${encodeURIComponent(receipt.runId)}/status`);
     console.log(`MCP canary state=${status.state} engine=${status.engine} route=${status.routeMode}`);
