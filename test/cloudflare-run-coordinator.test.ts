@@ -722,6 +722,7 @@ describe('Cloudflare Runner run coordinator', () => {
     const claims = JSON.parse(Buffer.from(payload!, 'base64url').toString('utf8')) as Record<string, unknown>;
     expect(JSON.parse(Buffer.from(header!, 'base64url').toString('utf8'))).toEqual({ alg: 'EdDSA', typ: 'JWT' });
     expect(claims).toMatchObject({ runId: receipt.runId, sub: receipt.runId, userTaskId: 'task-a', profileId: 'integration-telegram-ux-v1', principalId: 'integration-telegram-ux-v1', scope: 'registry:fixture-read', serverId: 'trained-assist-registry-test', bindingRef: 'registry-mcp-test-160-read', catalogueVersion: 'registry-fixture-catalogue-v1', registryDigest: '129ab5033964c3ed5be47414711026cc2469b3d9af90ce83ee071cba7f005ea9' });
+    expect(Number(claims.exp) - Number(claims.iat)).toBe(900);
     expect(Object.keys(claims).sort()).toEqual(['allowedTools', 'aud', 'bindingRef', 'catalogueVersion', 'exp', 'iat', 'iss', 'policyVersion', 'principalId', 'profileId', 'registryDigest', 'runId', 'scope', 'serverId', 'sub', 'userTaskId'].sort());
     expect(verify(null, Buffer.from(`${header}.${payload}`), pair.publicKey, Buffer.from(signature!, 'base64url'))).toBe(true);
     expect(server.headers).toMatchObject({ Authorization: 'Bearer {env:RUNNER_MCP_REGISTRY_TEST}', 'X-MCP-Operation': 'invocation', 'X-MCP-Scope': 'registry:fixture-read', 'X-MCP-Run-Id': receipt.runId, 'X-MCP-User-Task-Id': 'task-a' });

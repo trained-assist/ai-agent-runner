@@ -652,7 +652,9 @@ export class RunnerRunCoordinator {
   private async testRegistryAttachment(server: Record<string, unknown>, context: { runId: string; taskId: string; profileId: string; timeoutMs: number }): Promise<Record<string, unknown>> {
     const expiresAt = Date.parse(this.env.MCP_TEST_EXPIRES_AT!);
     const nowSeconds = Math.floor(Date.now() / 1000);
-    const exp = Math.min(Math.floor(expiresAt / 1000), nowSeconds + Math.max(60, Math.ceil(context.timeoutMs / 1000) + 60));
+    // GHA may spend several minutes queued and provisioning before the first MCP
+    // request. Keep the proof valid for that startup window plus the run limit.
+    const exp = Math.min(Math.floor(expiresAt / 1000), nowSeconds + Math.max(60, Math.ceil(context.timeoutMs / 1000) + 600));
     if (exp <= nowSeconds) throw new Error('MCP_TEST_EXPIRES_AT lease has expired');
     let jwk: JsonWebKey;
     try { jwk = JSON.parse(this.env.MCP_TEST_RUNNER_PRIVATE_JWK!) as JsonWebKey; } catch { throw new Error('MCP_TEST_RUNNER_PRIVATE_JWK is invalid'); }
