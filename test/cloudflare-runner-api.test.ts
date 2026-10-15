@@ -180,6 +180,81 @@ describe('Cloudflare Runner API Worker', () => {
   });
 });
 
+describe('opt-in developer API', () => {
+  const token = 'developer-api-test-key';
+  async function setup(developerApi = true) {
+    const calls: Request[] = [];
+    const coordinatorFetch = vi.fn(async (request: Request) => {
+      calls.push(request);
+      if (request.method === 'POST') return Response.json({ runId: `run_${'a'.repeat(64)}_${'b'.repeat(24)}`, deduplicated: false }, { status: 202 });
+      return Response.json({ runId: `run_${'a'.repeat(64)}_${'b'.repeat(24)}`, state: 'running', lastHeartbeatAt: null });
+    });
+    const env = {
+      RUNNER_API_KEYS: JSON.stringify([{ keyHash: await sha256(token), principalId: 'developer', profileId: 'dev-profile', tenantId: 'tenant-a',
+        repository: 'team/repo', scopes: ['runs:read', 'runs:write'], ...(developerApi ? { developerApi: true } : {}) }]),
+      LLM_LADDER_TOKEN: 'managed-model-token', ALLOWED_ENVIRONMENT_NAMES: 'LLM_LADDER_TOKEN,OPENAI_API_KEY',
+      RUNNER_DEVELOPER_API_ENABLED: 'true', RUNNER_BYOK_ENABLED: 'true',
+      RUNNER_RUNS: { idFromName: vi.fn((name) => name), get: vi.fn().mockReturnValue({ fetch: coordinatorFetch }) },
+    } as unknown as RunnerWorkerEnv;
+    return { env, calls };
+  }
+
+  it('normalizes a prompt to the existing coordinator without changing its receipt and status path', async () => {
+    const { env, calls } = await setup();
+    const make = () => new Request('https://api.example/v1/developer/runs', { method: 'POST', headers: {
+      authorization: `Bearer ${token}`, 'idempotency-key': 'first-task', 'content-type': 'application/json',
+    }, body: JSON.stringify({ prompt: 'Write a small SDK', model: { mode: 'managed' }, limits: { timeoutSeconds: 120 } }) });
+    const first = await runnerApi.fetch(make(), env);
+    const second = await runnerApi.fetch(make(), env);
+    expect(first.status).toBe(202);
+    expect((await first.json() as { id: string }).id).toMatch(/^run_/);
+    const firstBody = await calls[0]!.json() as Record<string, any>;
+    const secondBody = await calls[1]!.json() as Record<string, any>;
+    expect(firstBody).toEqual(secondBody);
+    expect(firstBody).toMatchObject({ input: { inlinePrompt: 'Write a small SDK' }, envAllowlist: ['LLM_LADDER_TOKEN'], limits: { timeoutMs: 120_000 } });
+    expect(firstBody['userTaskId']).toMatch(/^dev-[0-9a-f]{48}$/);
+    expect(calls[0]!.url).toBe('https://runner-runs.internal/v1/runs');
+    expect((calls[0]!.headers.get('x-runner-principal') ?? '')).not.toContain(token);
+    const runId = `run_${'a'.repeat(64)}_${'b'.repeat(24)}`;
+    const status = await runnerApi.fetch(new Request(`https://api.example/v1/developer/runs/${runId}`, { headers: { authorization: `Bearer ${token}` } }), env);
+    expect(status.status).toBe(200);
+    expect(calls[2]!.url).toBe(`https://runner-runs.internal/v1/runs/${runId}/status`);
+  });
+
+  it('requires explicit key opt-in and refuses raw secrets or unsupported billing fields', async () => {
+    const disabled = await setup(false);
+    const url = 'https://api.example/v1/developer/runs';
+    const headers = { authorization: `Bearer ${token}`, 'idempotency-key': 'x', 'content-type': 'application/json' };
+    expect((await runnerApi.fetch(new Request(url, { method: 'POST', headers, body: JSON.stringify({ prompt: 'test', model: { mode: 'managed' } }) }), disabled.env)).status).toBe(403);
+    const { env, calls } = await setup();
+    for (const body of [
+      { prompt: 'test', model: { mode: 'byok', connectionId: 'conn-a' }, apiKey: 'raw-secret' },
+      { prompt: 'test', model: { mode: 'managed' }, billing: { maxCostUsd: 1 } },
+      { prompt: 'test', model: { mode: 'managed', connectionId: 'conn-a' } },
+    ]) expect((await runnerApi.fetch(new Request(url, { method: 'POST', headers, body: JSON.stringify(body) }), env)).status).toBe(400);
+    expect(calls).toHaveLength(0);
+  });
+
+  it('keeps developer admission closed on production and without the lane switch', async () => {
+    const { env, calls } = await setup();
+    const request = () => new Request('https://api.example/v1/developer/runs', { method: 'POST', headers: {
+      authorization: `Bearer ${token}`, 'idempotency-key': 'gated', 'content-type': 'application/json',
+    }, body: JSON.stringify({ prompt: 'test', model: { mode: 'managed' } }) });
+    expect((await runnerApi.fetch(request(), { ...env, DEPLOYMENT_ENV: 'production' })).status).toBe(503);
+    expect((await runnerApi.fetch(request(), { ...env, RUNNER_DEVELOPER_API_ENABLED: undefined })).status).toBe(503);
+    expect(calls).toHaveLength(0);
+  });
+
+  it('passes only a BYOK connection reference and keeps unrelated credentials out of the request', async () => {
+    const { env, calls } = await setup();
+    const response = await runnerApi.fetch(new Request('https://api.example/v1/developer/runs', { method: 'POST', headers: {
+      authorization: `Bearer ${token}`, 'idempotency-key': 'byok-test', 'content-type': 'application/json',
+    }, body: JSON.stringify({ prompt: 'Answer briefly', model: { mode: 'byok', connectionId: 'conn-a' } }) }), env);
+    expect(response.status).toBe(202);
+    expect(await calls[0]!.json()).toMatchObject({ envAllowlist: [], credentialBindings: [{ type: 'openai', connectionId: 'conn-a' }] });
+  });
+});
+
 describe('Cloudflare Runner delegated profile capability', () => {
   const apiKey = 'delegated-test-api-key';
   const delegationSecret = 'delegated-test-profile-secret';

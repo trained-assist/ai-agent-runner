@@ -1,4 +1,5 @@
 import type { ApiPrincipal, RunnerWorkerEnv } from './types.js';
+import { developerCapabilities, developerRequest } from './developer-api.js';
 
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const DEFAULT_ENGINE = 'eu-vm-agent-run';
@@ -55,7 +56,8 @@ async function authenticate(request: Request, env: RunnerWorkerEnv): Promise<Api
   return record ? { principalId: record.principalId, profileId: record.profileId,
     ...(record.repository ? { repository: record.repository } : {}),
     ...(record.tenantId ? { tenantId: record.tenantId } : {}), scopes: record.scopes,
-    ...(record.engines ? { engines: record.engines } : {}), ...(record.mcpBindings ? { mcpBindings: record.mcpBindings } : {}), keyHash: record.keyHash } : null;
+    ...(record.engines ? { engines: record.engines } : {}), ...(record.mcpBindings ? { mcpBindings: record.mcpBindings } : {}),
+    ...(record.developerApi ? { developerApi: true } : {}), keyHash: record.keyHash } : null;
 }
 
 async function delegatedPrincipal(request: Request, principal: ApiPrincipal, env: RunnerWorkerEnv): Promise<ApiPrincipal> {
@@ -100,7 +102,8 @@ function validKeyConfig(value: unknown): value is KeyConfig {
     && Array.isArray(record['scopes']) && record['scopes'].length > 0 && record['scopes'].every((scope) => ['runs:read', 'runs:write'].includes(String(scope)))
     && (engines === undefined || Array.isArray(engines) && engines.every((engine) => typeof engine === 'string'))
     && (validRepository || mockOnly || pinnedMcpOnly)
-    && (record['mcpBindings'] === undefined || Array.isArray(record['mcpBindings']) && record['mcpBindings'].every((binding) => typeof binding === 'string' && binding.length > 0 && binding.length <= 300));
+    && (record['mcpBindings'] === undefined || Array.isArray(record['mcpBindings']) && record['mcpBindings'].every((binding) => typeof binding === 'string' && binding.length > 0 && binding.length <= 300))
+    && (record['developerApi'] === undefined || record['developerApi'] === true);
 }
 
 function requireScope(principal: ApiPrincipal, scope: string): boolean { return principal.scopes.includes(scope); }
@@ -116,6 +119,18 @@ export default {
     let principal: ApiPrincipal;
     try { principal = await delegatedPrincipal(request, authenticated, env); }
     catch { return error('FORBIDDEN', 'invalid or expired host profile capability', 403); }
+    if (url.pathname === '/v1/developer/capabilities') {
+      if (env.DEPLOYMENT_ENV === 'production' || env.RUNNER_DEVELOPER_API_ENABLED !== 'true') return error('DEVELOPER_API_UNAVAILABLE', 'developer API is disabled on this lane', 503);
+      if (!principal.developerApi) return error('FORBIDDEN', 'developer API is not enabled for this key', 403);
+      if (request.method !== 'GET') return error('METHOD_NOT_ALLOWED', 'capabilities supports GET only', 405);
+      if (!requireScope(principal, 'runs:read')) return error('FORBIDDEN', 'runs:read scope is required', 403);
+      return developerCapabilities(env, principal);
+    }
+    if (url.pathname === '/v1/developer/runs' || url.pathname.startsWith('/v1/developer/runs/')) {
+      if (env.DEPLOYMENT_ENV === 'production' || env.RUNNER_DEVELOPER_API_ENABLED !== 'true') return error('DEVELOPER_API_UNAVAILABLE', 'developer API is disabled on this lane', 503);
+      if (!principal.developerApi) return error('FORBIDDEN', 'developer API is not enabled for this key', 403);
+      return developerRequest(request, env, principal);
+    }
     if (url.pathname === '/v1/capabilities' && request.method === 'GET') {
       if (!requireScope(principal, 'runs:read')) return error('FORBIDDEN', 'API key does not have the required scope', 403);
       return json({ schemaVersion: 1, contract: { name: 'ai-agent-runner/serverless-agent-api', version: 1 }, placement: 'cloudflare-worker', executionRegions: ['eu-vm-agent-run'] });

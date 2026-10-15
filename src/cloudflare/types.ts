@@ -37,6 +37,13 @@ export interface RunnerWorkerEnv {
   ALLOWED_ENVIRONMENT_NAMES?: string;
   LLM_LADDER_TOKEN?: string;
   OPENAI_API_KEY?: string;
+  /** Optional server-provisioned BYOK connection metadata; contains no secret values. */
+  RUNNER_MODEL_CONNECTIONS?: string;
+  /** Explicit sandbox-only gates; production stays on the existing CP path. */
+  RUNNER_DEVELOPER_API_ENABLED?: string;
+  RUNNER_BYOK_ENABLED?: string;
+  /** Optional pinned OpenCode model identifier for managed developer runs. */
+  RUNNER_DEVELOPER_MANAGED_MODEL?: string;
   MCP_TEST_AUTH_TOKEN?: string;
   MCP_TEST_RUNNER_PRIVATE_JWK?: string;
   MCP_TEST_CATALOGUE_VERSION?: string;
@@ -55,4 +62,6 @@ export interface ApiPrincipal {
   scopes: string[];
   engines?: string[];
   mcpBindings?: string[];
+  /** Explicit opt-in for the simplified developer API. Existing CP keys remain unchanged. */
+  developerApi?: boolean;
 }
