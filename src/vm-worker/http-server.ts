@@ -26,6 +26,12 @@ const TEST_MCP = Object.freeze({
   proofEnv: 'RUNNER_MCP_REGISTRY_TEST_PROOF',
   configEnv: 'OPENCODE_CONFIG_CONTENT',
 });
+const USER_MCP = Object.freeze({
+  profile: 'integration-telegram-ux-v1', server: 'mem-gpt',
+  url: 'https://trained-assist-mcp-user-sandbox.skillset-apply.workers.dev/mcp',
+  scope: 'mcp:user-agent-run', tokenEnv: 'RUNNER_MCP_USER_TOKEN',
+  proofEnv: 'RUNNER_MCP_USER_PROOF', configEnv: 'OPENCODE_CONFIG_CONTENT',
+});
 
 export interface VmWorkerServerOptions {
   runner: Runner;
@@ -271,22 +277,15 @@ function toRunSpec(request: LaunchRequest, options: VmWorkerServerOptions): { sp
   const runtimeEnv = { ...request.env };
   if (request.mcp) {
     const secretValues = request.mcpSecrets!;
-    const server = request.mcp.servers[TEST_MCP.server]!;
-    const headers = {
-      Authorization: `Bearer {env:${TEST_MCP.tokenEnv}}`,
-      'X-MCP-Operation': 'invocation',
-      'X-MCP-Scope': TEST_MCP.scope,
-      'X-MCP-User-Task-Id': request.userTaskId,
-      'X-MCP-Profile': request.profileId,
-      'X-MCP-Run-Id': request.runId,
-      'X-MCP-Run-Binding': `{env:${TEST_MCP.proofEnv}}`,
-    };
-    runtimeEnv[TEST_MCP.tokenEnv] = secretValues[TEST_MCP.tokenEnv]!;
-    runtimeEnv[TEST_MCP.proofEnv] = secretValues[TEST_MCP.proofEnv]!;
-    runtimeEnv[TEST_MCP.configEnv] = JSON.stringify({ mcp: {
-      [TEST_MCP.server]: { type: 'remote', url: server.url, enabled: true, headers },
-    } });
-    spec.envAllowlist = [...new Set([...spec.envAllowlist, TEST_MCP.tokenEnv, TEST_MCP.proofEnv, TEST_MCP.configEnv])];
+    const server = request.mcp.servers[TEST_MCP.server] ?? request.mcp.servers[USER_MCP.server]!;
+    const isUserCatalog = server.url === USER_MCP.url;
+    const policy = isUserCatalog ? USER_MCP : TEST_MCP;
+    const serverId = isUserCatalog ? USER_MCP.server : TEST_MCP.server;
+    const serverConfig: Record<string, unknown> = { type: 'remote', url: server.url, enabled: true, headers: server.headers };
+    runtimeEnv[policy.tokenEnv] = secretValues[policy.tokenEnv]!;
+    runtimeEnv[policy.proofEnv] = secretValues[policy.proofEnv]!;
+    runtimeEnv[policy.configEnv] = JSON.stringify({ mcp: { [serverId]: serverConfig } });
+    spec.envAllowlist = [...new Set([...spec.envAllowlist, policy.tokenEnv, policy.proofEnv, policy.configEnv])];
   }
   return { spec, runtimeEnv };
 }
@@ -311,6 +310,7 @@ function parseLaunchRequest(value: unknown, options: VmWorkerServerOptions): { o
     if (!value['envAllowlist']?.includes(key) || typeof envValue !== 'string' || envValue.length > 100_000) errors.push(`env.${key} is invalid or not allowed`);
   }
   validateTestMcp(value, errors);
+  validateUserMcp(value, errors);
   if (!isRecord(value['repository']) || typeof value['repository']['fullName'] !== 'string' || typeof value['repository']['branch'] !== 'string') errors.push('repository is invalid');
   else if (!options.allowedRepositories.includes(value['repository']['fullName'])) errors.push('repository is not approved on this host');
   if (!isRecord(value['isolation']) || typeof value['isolation']['mode'] !== 'string') errors.push('isolation is invalid');
@@ -342,6 +342,7 @@ function parseLaunchRequest(value: unknown, options: VmWorkerServerOptions): { o
 function validateTestMcp(value: Record<string, any>, errors: string[]): void {
   if (value['mcp'] === undefined && value['mcpSecrets'] === undefined) return;
   const mcp = value['mcp'];
+  if (isRecord(mcp) && isRecord(mcp['servers']) && Object.keys(mcp['servers']).length === 1 && Object.hasOwn(mcp['servers'], USER_MCP.server)) return;
   const secrets = value['mcpSecrets'];
   if (!isRecord(mcp) || !isRecord(mcp['servers']) || Object.keys(mcp['servers']).length !== 1 || !isRecord(mcp['servers'][TEST_MCP.server])) {
     errors.push('mcp is not the pinned test registry attachment');
@@ -370,6 +371,36 @@ function validateTestMcp(value: Record<string, any>, errors: string[]): void {
     errors.push('mcp runtime variables are reserved');
   }
   if (value['profileId'] !== TEST_MCP.profile) errors.push('test registry MCP is restricted to its pinned profile');
+}
+
+/** The product user catalog is a second fixed sandbox endpoint; RunSpec cannot select a URL or expand its identity. */
+function validateUserMcp(value: Record<string, any>, errors: string[]): void {
+  if (value['mcp'] === undefined && value['mcpSecrets'] === undefined) return;
+  const mcp = value['mcp'];
+  if (isRecord(mcp) && isRecord(mcp['servers']) && Object.keys(mcp['servers']).length === 1 && Object.hasOwn(mcp['servers'], TEST_MCP.server)) return;
+  const secrets = value['mcpSecrets'];
+  if (!isRecord(mcp) || !isRecord(mcp['servers']) || Object.keys(mcp['servers']).length !== 1 || !isRecord(mcp['servers'][USER_MCP.server])) return;
+  const server = mcp['servers'][USER_MCP.server];
+  const headers = server['headers'];
+  const expectedHeaders: Record<string, string> = {
+    Authorization: `Bearer {env:${USER_MCP.tokenEnv}}`,
+    'X-MCP-Operation': 'invocation', 'X-MCP-Scope': USER_MCP.scope,
+    'X-MCP-User-Task-Id': String(value['userTaskId']),
+    'X-MCP-Profile': String(value['profileId']), 'X-MCP-Run-Id': String(value['runId']),
+    'X-MCP-Run-Binding': `{env:${USER_MCP.proofEnv}}`,
+  };
+  if (server['type'] !== 'remote' || server['url'] !== USER_MCP.url || server['enabled'] !== true || !isRecord(headers) ||
+      Object.keys(headers).length !== Object.keys(expectedHeaders).length || Object.entries(expectedHeaders).some(([key, expected]) => headers[key] !== expected)) {
+    errors.push('mcp server does not match the pinned user catalog policy');
+  }
+  if (!isRecord(secrets) || Object.keys(secrets).length !== 2 ||
+      !validOpaqueSecret(secrets[USER_MCP.tokenEnv]) || !validOpaqueSecret(secrets[USER_MCP.proofEnv])) {
+    errors.push('mcpSecrets must contain only the scoped user catalog token and run proof');
+  }
+  if (isRecord(value['env']) && [USER_MCP.tokenEnv, USER_MCP.proofEnv, USER_MCP.configEnv].some((name) => Object.hasOwn(value['env'], name))) {
+    errors.push('mcp runtime variables are reserved');
+  }
+  if (value['profileId'] !== USER_MCP.profile) errors.push('user catalog MCP is restricted to its pinned sandbox profile');
 }
 
 function validOpaqueSecret(value: unknown): value is string {

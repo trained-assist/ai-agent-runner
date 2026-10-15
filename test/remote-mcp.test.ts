@@ -1,6 +1,6 @@
 import { describe, expect, it, vi, onTestFinished } from 'vitest';
 import { ExternalWorkerAdapter } from '../src/adapters/external-worker-adapter.js';
-import { configuredDocumentsBindingResolver, localDocumentsBindingResolver, parseRemoteMcpServerPolicies, registeredDocumentsBindingResolver, resolveRemoteMcpAttachment, type DocumentsHttpRegistration, type RemoteMcpBinding, type RemoteMcpHostOptions } from '../src/adapters/remote-mcp.js';
+import { configuredDocumentsBindingResolver, configuredUserMcpBindingResolver, localDocumentsBindingResolver, parseRemoteMcpServerPolicies, registeredDocumentsBindingResolver, resolveRemoteMcpAttachment, type DocumentsHttpRegistration, type RemoteMcpBinding, type RemoteMcpHostOptions } from '../src/adapters/remote-mcp.js';
 import { validateSubmitRequest } from '../src/api/contracts.js';
 import { validateRunSpec, type RunSpec } from '../src/contracts/run-spec.js';
 import { makeRunSpec } from './helpers.js';
@@ -10,6 +10,7 @@ import { createExternalWorkers, loadAgentApiConfig } from '../src/api/config.js'
 import { startMockWorker } from './external-worker-harness.js';
 import { StatelessStore } from '../src/api/stateless-store.js';
 import { mkdtempSync, rmSync } from 'node:fs';
+import { generateKeyPairSync, verify } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ExternalWorker } from '../src/adapters/external-worker-adapter.js';
@@ -64,6 +65,99 @@ describe('remote MCP public contract', () => {
 });
 
 describe('trusted host attachment', () => {
+  it('issues a user MCP grant bound to a trusted profile mapping and the exact run', async () => {
+    const { privateKey, publicKey } = generateKeyPairSync('ed25519');
+    const privateKeyPkcs8DerBase64 = privateKey.export({ type: 'pkcs8', format: 'der' }).toString('base64');
+    const resolver = configuredUserMcpBindingResolver({
+      token: 'x'.repeat(40), privateKeyPkcs8DerBase64,
+      profileUsers: { 'integration-telegram-ux-v1': 'sandbox-user-1' },
+      serverUrl: 'https://trained-assist-mcp-user-sandbox.skillset-apply.workers.dev/mcp',
+      serverId: 'mem-gpt', bindingRef: 'mem-gpt-user-sandbox', scope: 'mcp:user-agent-run',
+      policyVersion: 'mem-gpt-user-run-v1', catalogueVersion: 'mem-gpt-user-catalogue-v1',
+      catalogueDigest: '8c17e64a0d71123698b139bd5957a10fff71a2b15f12601a95adcde150350e71',
+      allowedTools: ['identity.whoami', 'google_docs.connect', 'google_docs.get_document'],
+    })!;
+    const context = {
+      mode: 'launch' as const, admittedAt: new Date().toISOString(), checkedAt: new Date().toISOString(),
+      startupTimeoutMs: 10000, timeoutMs: 300000, scope: 'mcp:user-agent-run',
+      runId: 'run_01234567-89ab-cdef-0123-456789abcdef', profileId: 'integration-telegram-ux-v1',
+      userTaskId: 'task-35', conversationId: 'conversation-35', ownerGeneration: 3,
+      operationId: 'agent-run', engine: 'opencode', serverId: 'mem-gpt',
+      url: 'https://trained-assist-mcp-user-sandbox.skillset-apply.workers.dev/mcp',
+      bindingRef: 'mem-gpt-user-sandbox',
+      allowedTools: ['identity.whoami', 'google_docs.get_document'],
+      policyVersion: 'mem-gpt-user-run-v1', catalogueVersion: 'mem-gpt-user-catalogue-v1',
+    };
+    const binding = await resolver('mem-gpt-user-sandbox', context);
+    expect(binding?.token).toBe('x'.repeat(40));
+    expect(binding?.runnerProof).toBeTruthy();
+    const [header, payload, signature] = binding!.runnerProof!.split('.');
+    expect(header).toBeTruthy(); expect(payload).toBeTruthy(); expect(signature).toBeTruthy();
+    const unsigned = `${header!}.${payload!}`;
+    expect(verify(null, Buffer.from(unsigned), publicKey, Buffer.from(signature!, 'base64url'))).toBe(true);
+    const claims = JSON.parse(Buffer.from(payload!, 'base64url').toString());
+    expect(claims).toMatchObject({
+      userId: 'sandbox-user-1', runId: context.runId, userTaskId: context.userTaskId,
+      profileId: context.profileId, ownerGeneration: 3, serverId: 'mem-gpt',
+      bindingRef: 'mem-gpt-user-sandbox', scope: 'mcp:user-agent-run',
+      catalogueDigest: '8c17e64a0d71123698b139bd5957a10fff71a2b15f12601a95adcde150350e71',
+      allowedTools: context.allowedTools,
+    });
+    expect(await resolver('mem-gpt-user-sandbox', { ...context, profileId: 'unmapped-profile' })).toBeNull();
+    expect(await resolver('wrong-binding', context)).toBeNull();
+    const restored = await resolver('mem-gpt-user-sandbox', { ...context,
+      mode: 'restore', admittedAt: new Date(Date.now() - 60 * 60 * 1000).toISOString() });
+    expect(Date.parse(restored!.expiresAt)).toBeGreaterThan(Date.now());
+  });
+
+  it('requires a signed runner proof when trusted host policy marks the endpoint', async () => {
+    const { spec, host, resolveBinding } = setup();
+    host.servers = { documents: { ...policies.documents, runnerProof: true, proofEnvName: 'RUNNER_MCP_DOCS_PROOF' } };
+    await expect(resolveRemoteMcpAttachment(spec, host, now)).rejects.toMatchObject({ code: 'MCP_BINDING_UNAVAILABLE' });
+    expect(resolveBinding).toHaveBeenCalledTimes(1);
+  });
+
+  it('builds the complete sandbox user-catalog attachment with private headers and scoped proof', async () => {
+    const { privateKey } = generateKeyPairSync('ed25519');
+    const privateKeyPkcs8DerBase64 = privateKey.export({ type: 'pkcs8', format: 'der' }).toString('base64');
+    const userUrl = 'https://trained-assist-mcp-user-sandbox.skillset-apply.workers.dev/mcp';
+    const digest = '8c17e64a0d71123698b139bd5957a10fff71a2b15f12601a95adcde150350e71';
+    const tools = ['identity.whoami', 'google_docs.connect', 'google_docs.get_document'];
+    const resolver = configuredUserMcpBindingResolver({ token: 'x'.repeat(40), privateKeyPkcs8DerBase64,
+      profileUsers: { 'integration-telegram-ux-v1': 'sandbox-user-1' }, serverUrl: userUrl,
+      serverId: 'mem-gpt', bindingRef: 'mem-gpt-user-sandbox', scope: 'mcp:user-agent-run',
+      policyVersion: 'mem-gpt-user-run-v1', catalogueVersion: 'mem-gpt-user-catalogue-v1',
+      catalogueDigest: digest, allowedTools: tools })!;
+    const spec = makeRunSpec({ profileId: 'integration-telegram-ux-v1', runId: 'run_01234567-89ab-cdef-0123-456789abcdef',
+      limits: { timeoutMs: 300000 }, input: { inlinePrompt: 'Check the connected identity.' },
+      credentialBindings: [{ ref: 'mem-gpt-user-sandbox', scope: 'mcp:user-agent-run' }],
+      mcp: { servers: [{ serverId: 'mem-gpt', transport: 'remote', url: userUrl,
+        bindingRef: 'mem-gpt-user-sandbox', allowedTools: tools,
+        policyVersion: 'mem-gpt-user-run-v1', catalogueVersion: 'mem-gpt-user-catalogue-v1' }] } });
+    const host: RemoteMcpHostOptions = { servers: { 'mem-gpt': {
+      url: userUrl, tokenEnvName: 'RUNNER_MCP_USER_TOKEN',
+      headers: { Authorization: 'Bearer {env:RUNNER_MCP_USER_TOKEN}' }, allowedTools: tools,
+      bindingScopes: { 'mem-gpt-user-sandbox': 'mcp:user-agent-run' }, startupTimeoutMs: 30000,
+      policyVersion: 'mem-gpt-user-run-v1', catalogueVersion: 'mem-gpt-user-catalogue-v1',
+      registryDigest: digest, runnerProof: true, proofEnvName: 'RUNNER_MCP_USER_PROOF',
+    } }, resolveBinding: resolver };
+    const attached = await resolveRemoteMcpAttachment(spec, host, new Date());
+    expect(attached?.mcp.servers['mem-gpt']?.headers).toMatchObject({
+      Authorization: 'Bearer {env:RUNNER_MCP_USER_TOKEN}',
+      'X-MCP-Operation': 'invocation', 'X-MCP-Scope': 'mcp:user-agent-run',
+      'X-MCP-Run-Id': spec.runId, 'X-MCP-User-Task-Id': spec.userTaskId,
+      'X-MCP-Profile': spec.profileId,
+      'X-MCP-Run-Binding': '{env:RUNNER_MCP_USER_PROOF}',
+    });
+    expect(attached?.mcpSecrets.RUNNER_MCP_USER_TOKEN).toBe('x'.repeat(40));
+    const proof = attached!.mcpSecrets.RUNNER_MCP_USER_PROOF!;
+    const [, payload] = proof.split('.');
+    expect(JSON.parse(Buffer.from(payload!, 'base64url').toString())).toMatchObject({
+      userId: 'sandbox-user-1', runId: spec.runId, profileId: spec.profileId,
+      userTaskId: spec.userTaskId, allowedTools: tools,
+    });
+  });
+
   it('refuses budgets over 24 hours before resolving a credential', async () => {
     const { spec, host, resolveBinding } = setup();
     host.servers = { documents: { ...policies.documents, startupTimeoutMs: 86400000 } };

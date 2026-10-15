@@ -38,7 +38,8 @@ function validateConfig(config) {
     || config.vars?.RUNNER_API_PUBLIC_URL !== PUBLIC_URL
     || config.vars?.RUNNER_ENGINE !== 'eu-vm-agent-run'
     || config.vars?.MOCK_TEST_ENABLED !== 'true'
-    || !config.vars?.ALLOWED_REPOSITORIES?.split(',').map((value) => value.trim()).includes(PROFILE_REPOSITORY)) {
+    || !config.vars?.ALLOWED_REPOSITORIES?.split(',').map((value) => value.trim()).includes(PROFILE_REPOSITORY)
+    || config.vars?.MCP_USER_PROFILE_USER_IDS !== '{"integration-telegram-ux-v1":"trained-assist-product-owner"}') {
     throw new Error('runner_sandbox_config_mismatch');
   }
 }
@@ -126,6 +127,18 @@ async function main() {
   try { mcpPrivateKey = createPrivateKey({ key: JSON.parse(mcpRunnerPrivateJwk), format: 'jwk' }); }
   catch { throw new Error('runner_sandbox_mcp_private_jwk_invalid'); }
   if (mcpPrivateKey.asymmetricKeyType !== 'ed25519') throw new Error('runner_sandbox_mcp_private_jwk_invalid');
+  const userMcpAuthToken = process.env.MCP_USER_AUTH_TOKEN?.trim();
+  const userMcpPrivateJwk = process.env.MCP_USER_RUNNER_PRIVATE_JWK?.trim();
+  if (Boolean(userMcpAuthToken) !== Boolean(userMcpPrivateJwk)) throw new Error('runner_sandbox_user_mcp_secret_pair_incomplete');
+  let userMcpPrivateKey;
+  if (userMcpAuthToken && userMcpPrivateJwk) {
+    if (userMcpAuthToken.length < 32 || userMcpAuthToken.length > 256 || !/^[A-Za-z0-9._~-]+$/.test(userMcpAuthToken)) {
+      throw new Error('runner_sandbox_user_mcp_token_invalid');
+    }
+    try { userMcpPrivateKey = createPrivateKey({ key: JSON.parse(userMcpPrivateJwk), format: 'jwk' }); }
+    catch { throw new Error('runner_sandbox_user_mcp_private_jwk_invalid'); }
+    if (userMcpPrivateKey.asymmetricKeyType !== 'ed25519') throw new Error('runner_sandbox_user_mcp_private_jwk_invalid');
+  }
   const mcpLeaseExpiry = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
   mcpLeaseExpiry.setUTCHours(23, 59, 59, 0);
   const mcpExpiresAt = mcpLeaseExpiry.toISOString();
@@ -156,9 +169,12 @@ async function main() {
     mcpBindings: ['registry-mcp-test-160-read'],
   }]);
 
-  run('npx', ['wrangler', 'deploy', '--config', CONFIG, '--var', `BUILD_SHA:${sourceSha}`,
+  const deployArgs = ['wrangler', 'deploy', '--config', CONFIG, '--var', `BUILD_SHA:${sourceSha}`,
     '--var', `MCP_TEST_CATALOGUE_VERSION:${MCP_CATALOGUE_VERSION}`,
-    '--var', `MCP_TEST_EXPIRES_AT:${mcpExpiresAt}`], { stdio: 'inherit' });
+    '--var', `MCP_TEST_EXPIRES_AT:${mcpExpiresAt}`];
+  if (userMcpPrivateKey) deployArgs.push('--var', 'MCP_USER_CATALOGUE_VERSION:mem-gpt-user-catalogue-v1',
+    '--var', 'MCP_USER_CATALOGUE_DIGEST:8c17e64a0d71123698b139bd5957a10fff71a2b15f12601a95adcde150350e71');
+  run('npx', deployArgs, { stdio: 'inherit' });
   putSecrets([
     ['RUNNER_API_KEYS', registry],
     ['AGENT_API_PROFILE_DELEGATION_SECRET', delegationSecret],
@@ -168,12 +184,16 @@ async function main() {
     ['LLM_LADDER_TOKEN', ladderToken],
     ['MCP_TEST_AUTH_TOKEN', mcpAuthToken],
     ['MCP_TEST_RUNNER_PRIVATE_JWK', mcpRunnerPrivateJwk],
+    ...(userMcpAuthToken && userMcpPrivateJwk ? [
+      ['MCP_USER_AUTH_TOKEN', userMcpAuthToken], ['MCP_USER_RUNNER_PRIVATE_JWK', userMcpPrivateJwk],
+    ] : []),
   ]);
 
   await verifyDeployment(sourceSha, apiKey, delegationSecret);
   console.log(JSON.stringify({ ok: true, worker: WORKER, sourceSha,
     placement: 'cloudflare-worker', executionWorker: 'eu-vm-agent-run',
-    profileId: PROFILE_ID, delegatedIdentityVerified: true, franceWorkerReadiness: 'ready' }));
+    profileId: PROFILE_ID, delegatedIdentityVerified: true, franceWorkerReadiness: 'ready',
+    userMcpConfigured: Boolean(userMcpPrivateKey) }));
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

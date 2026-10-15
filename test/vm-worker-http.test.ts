@@ -138,6 +138,46 @@ describe('installable VM HTTP worker', () => {
     expect(JSON.stringify(spec)).not.toContain('signed-run-bound-proof-123456');
   });
 
+  it('passes the pinned sandbox user catalog to OpenCode without persisting its token or proof', async () => {
+    const fixture = await startFixture({ allowedEnvironmentNames: ['LLM_LADDER_TOKEN'] });
+    cleanups.push(fixture.close);
+    const request = launchRequest({ profileId: 'integration-telegram-ux-v1', mcp: { servers: { 'mem-gpt': {
+      type: 'remote', url: 'https://trained-assist-mcp-user-sandbox.skillset-apply.workers.dev/mcp', enabled: true,
+      headers: {
+        Authorization: 'Bearer {env:RUNNER_MCP_USER_TOKEN}',
+        'X-MCP-Operation': 'invocation', 'X-MCP-Scope': 'mcp:user-agent-run',
+        'X-MCP-User-Task-Id': 'task-vm-worker-test', 'X-MCP-Profile': 'integration-telegram-ux-v1',
+        'X-MCP-Run-Id': RUN_ID, 'X-MCP-Run-Binding': '{env:RUNNER_MCP_USER_PROOF}',
+      },
+    } } }, mcpSecrets: { RUNNER_MCP_USER_TOKEN: 'user-catalog-bearer-token-123456',
+      RUNNER_MCP_USER_PROOF: 'signed-user-run-proof-123456' } });
+    const accepted = await launch(fixture.base, request);
+    expect(accepted.status, await accepted.clone().text()).toBe(202);
+    const { spec, runtimeEnv } = fixture.runner.startCalls[0]!;
+    expect(runtimeEnv.RUNNER_MCP_USER_TOKEN).toBe('user-catalog-bearer-token-123456');
+    expect(runtimeEnv.RUNNER_MCP_USER_PROOF).toBe('signed-user-run-proof-123456');
+    expect(runtimeEnv.OPENCODE_CONFIG_CONTENT).toContain('trained-assist-mcp-user-sandbox');
+    expect(JSON.stringify(spec)).not.toContain('user-catalog-bearer-token-123456');
+    expect(JSON.stringify(spec)).not.toContain('signed-user-run-proof-123456');
+  });
+
+  it('rejects a multi-server MCP payload even when each entry is individually pinned', async () => {
+    const fixture = await startFixture();
+    cleanups.push(fixture.close);
+    const headers = { Authorization: 'Bearer {env:RUNNER_MCP_USER_TOKEN}', 'X-MCP-Operation': 'invocation',
+      'X-MCP-Scope': 'mcp:user-agent-run', 'X-MCP-User-Task-Id': 'task-vm-worker-test',
+      'X-MCP-Profile': 'integration-telegram-ux-v1', 'X-MCP-Run-Id': RUN_ID,
+      'X-MCP-Run-Binding': '{env:RUNNER_MCP_USER_PROOF}' };
+    const response = await launch(fixture.base, launchRequest({ profileId: 'integration-telegram-ux-v1', mcp: { servers: {
+      'mem-gpt': { type: 'remote', url: 'https://trained-assist-mcp-user-sandbox.skillset-apply.workers.dev/mcp', enabled: true, headers },
+      'trained-assist-registry-test': { type: 'remote', url: 'https://trained-assist-mcp-host-test-160.skillset-apply.workers.dev/mcp', enabled: true, headers },
+    } }, mcpSecrets: { RUNNER_MCP_USER_TOKEN: 'user-catalog-bearer-token-123456',
+      RUNNER_MCP_USER_PROOF: 'signed-user-run-proof-123456',
+      RUNNER_MCP_REGISTRY_TEST: 'test-registry-bearer-token-123', RUNNER_MCP_REGISTRY_TEST_PROOF: 'signed-run-bound-proof-123456' } }));
+    expect(response.status).toBe(400);
+    expect(fixture.runner.startCalls).toHaveLength(0);
+  });
+
   it('rejects caller-selected MCP endpoints before Runner admission', async () => {
     const fixture = await startFixture();
     cleanups.push(fixture.close);

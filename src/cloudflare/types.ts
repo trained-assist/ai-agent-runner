@@ -55,6 +55,12 @@ export interface RunnerWorkerEnv {
   MCP_TEST_RUNNER_PRIVATE_JWK?: string;
   MCP_TEST_CATALOGUE_VERSION?: string;
   MCP_TEST_EXPIRES_AT?: string;
+  /** Sandbox-only service grant to the authenticated MCP Host user catalog. */
+  MCP_USER_AUTH_TOKEN?: string;
+  MCP_USER_RUNNER_PRIVATE_JWK?: string;
+  MCP_USER_PROFILE_USER_IDS?: string;
+  MCP_USER_CATALOGUE_VERSION?: string;
+  MCP_USER_CATALOGUE_DIGEST?: string;
   [binding: string]: unknown;
   RUNNER_RUNS: { idFromName(name: string): unknown; get(id: unknown): { fetch(request: Request): Promise<Response> } };
 }
