@@ -9,6 +9,7 @@ on:
 
 permissions:
   contents: read
+  attestations: read
 
 jobs:
   check-workers:
@@ -22,9 +23,35 @@ jobs:
         run: |
           git fetch --depth=1 origin main
           echo "sha=$(git rev-parse FETCH_HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Resolve latest verified VM worker and OpenCode identity
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          release_tag="$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 \
+            --json tagName,isLatest,isDraft,isPrerelease \
+            --jq '[.[] | select(.isLatest == true and .isDraft == false and .isPrerelease == false) | select(.tagName | test("^vm-worker-v[0-9]+\\.[0-9]+\\.[0-9]+$"))] | if length == 1 then .[0].tagName else error("expected exactly one latest stable vm-worker release") end')"
+          tmp="$RUNNER_TEMP/latest-worker-release"
+          mkdir -p "$tmp"
+          gh release download "$release_tag" --repo "$GITHUB_REPOSITORY" \
+            --pattern ai-agent-vm-worker-linux-x64.tar.gz \
+            --pattern ai-agent-vm-worker-linux-x64.tar.gz.sha256 --dir "$tmp"
+          (cd "$tmp" && sha256sum --check ai-agent-vm-worker-linux-x64.tar.gz.sha256)
+          gh attestation verify "$tmp/ai-agent-vm-worker-linux-x64.tar.gz" --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/vm-worker-release.yml" \
+            --source-ref "refs/tags/$release_tag" >/dev/null
+          tar -xOf "$tmp/ai-agent-vm-worker-linux-x64.tar.gz" ./dist/vm-worker/build-info.json > "$tmp/build-info.json"
+          node scripts/write-worker-release-identity.mjs "$tmp/build-info.json" "$release_tag" >> "$GITHUB_OUTPUT"
       - name: Check deployed source, health and bindings
         env:
           VM_WORKER_MAIN_SHA: ${{ steps.main.outputs.sha }}
+          VM_WORKER_RELEASE_TAG: ${{ steps.release.outputs.worker_release_tag }}
+          VM_WORKER_RELEASE_VERSION: ${{ steps.release.outputs.worker_release_version }}
+          VM_WORKER_RELEASE_SOURCE_COMMIT: ${{ steps.release.outputs.worker_release_source_commit }}
+          VM_WORKER_OPENCODE_VERSION: ${{ steps.release.outputs.opencode_version }}
+          VM_WORKER_OPENCODE_SOURCE_COMMIT: ${{ steps.release.outputs.opencode_source_commit }}
+          VM_WORKER_OPENCODE_BINARY_SHA256: ${{ steps.release.outputs.opencode_binary_sha256 }}
           EU_VM_WORKER_URL: ${{ secrets.EU_VM_WORKER_URL }}
           EU_VM_WORKER_TOKEN: ${{ secrets.EU_VM_WORKER_TOKEN }}
           RU_VM_WORKER_URL: ${{ secrets.RU_VM_WORKER_URL }}

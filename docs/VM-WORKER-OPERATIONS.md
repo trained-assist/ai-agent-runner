@@ -175,8 +175,13 @@ for rollback.
 ## Health and run tracking
 
 - `GET /healthz` is unauthenticated liveness only. HTTP 200 means the process answers.
-- `GET /version` reports the deployed version/source commit and the value-free binding
-  inventory for periodic deployment drift checks.
+- `GET /version` reports the deployed worker release/source commit, bundled OpenCode
+  version/source commit/binary SHA-256, and value-free binding inventory. The scheduled
+  GitHub drift workflow verifies the latest stable signed worker release and compares all
+  reported identities with the deployed VM; mismatch or missing identity is emitted as a
+  warning annotation with expected and actual release metadata. It observes drift but does
+  not install releases; updates still use the signed operator updater until a restricted
+  automatic deployment identity is implemented.
 - `GET /readyz` is unauthenticated readiness. HTTP 200 means Runner, OpenCode, the
   capacity store, and a fresh whole-host sample are available with room under the 60%
   admission threshold. HTTP 503 removes the worker from new-run routing. Its JSON
