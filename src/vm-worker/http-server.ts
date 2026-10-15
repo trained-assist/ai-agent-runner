@@ -31,7 +31,7 @@ const USER_MCP = Object.freeze({
   url: 'https://trained-assist-mcp-user-sandbox.skillset-apply.workers.dev/mcp',
   scope: 'mcp:user-agent-run', tokenEnv: 'RUNNER_MCP_USER_TOKEN',
   proofEnv: 'RUNNER_MCP_USER_PROOF', configEnv: 'OPENCODE_CONFIG_CONTENT',
-  allowedOpenCodeTools: ['mem_gpt_identity_whoami', 'mem_gpt_google_docs_connect', 'mem_gpt_google_docs_get_document'],
+  allowedOpenCodeTools: ['mem-gpt_identity_whoami', 'mem-gpt_google_docs_connect', 'mem-gpt_google_docs_get_document'],
 });
 
 export interface VmWorkerServerOptions {
