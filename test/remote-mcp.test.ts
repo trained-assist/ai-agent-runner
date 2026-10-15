@@ -142,6 +142,7 @@ describe('trusted host attachment', () => {
       registryDigest: digest, runnerProof: true, proofEnvName: 'RUNNER_MCP_USER_PROOF',
     } }, resolveBinding: resolver };
     const attached = await resolveRemoteMcpAttachment(spec, host, new Date());
+    expect(attached?.mcp.servers['mem-gpt']?.allowedTools).toEqual(tools);
     expect(attached?.mcp.servers['mem-gpt']?.headers).toMatchObject({
       Authorization: 'Bearer {env:RUNNER_MCP_USER_TOKEN}',
       'X-MCP-Operation': 'invocation', 'X-MCP-Scope': 'mcp:user-agent-run',

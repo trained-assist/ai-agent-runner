@@ -68,7 +68,7 @@ export type RemoteMcpBindingResolver = (
 export type ManagedRemoteMcpBindingResolver = RemoteMcpBindingResolver & { dispose?: () => Promise<void> };
 
 export interface RemoteMcpAttachment {
-  mcp: { servers: Record<string, { type: 'remote'; url: string; headers: Record<string, string>; enabled: true }> };
+  mcp: { servers: Record<string, { type: 'remote'; url: string; headers: Record<string, string>; enabled: true; allowedTools?: string[] }> };
   mcpSecrets: Record<string, string>;
 }
 
@@ -504,7 +504,7 @@ export async function resolveRemoteMcpAttachment(
       headers['X-MCP-Run-Binding'] = `{env:${proofEnvName}}`;
     }
     if (Object.values(headers).some(value => /[\r\n]/.test(value))) refuse('MCP_BINDING_SCOPE_MISMATCH');
-    attachment.mcp.servers[server.serverId] = { type: 'remote', url: policy.url, headers, enabled: true };
+    attachment.mcp.servers[server.serverId] = { type: 'remote', url: policy.url, headers, enabled: true, allowedTools: [...server.allowedTools] };
     attachment.mcpSecrets[policy.tokenEnvName] = binding.token;
     if (isTestProfile || policy.runnerProof) {
       if (Object.hasOwn(attachment.mcpSecrets, proofEnvName!)) refuse('MCP_TOKEN_NAME_CONFLICT');

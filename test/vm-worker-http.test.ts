@@ -161,9 +161,9 @@ describe('installable VM HTTP worker', () => {
     expect(JSON.parse(runtimeEnv.OPENCODE_CONFIG_CONTENT!).mcp['mem-gpt'].oauth).toBe(false);
     const openCodeConfig = JSON.parse(runtimeEnv.OPENCODE_CONFIG_CONTENT!) as { permission?: Record<string, string> };
     expect(openCodeConfig.permission).toEqual({
-      mem_gpt_identity_whoami: 'allow',
-      mem_gpt_google_docs_connect: 'allow',
-      mem_gpt_google_docs_get_document: 'allow',
+      'mem-gpt_identity_whoami': 'allow',
+      'mem-gpt_google_docs_connect': 'allow',
+      'mem-gpt_google_docs_get_document': 'allow',
     });
     expect(JSON.stringify(spec)).not.toContain('user-catalog-bearer-token-123456');
     expect(JSON.stringify(spec)).not.toContain('signed-user-run-proof-123456');
