@@ -100,7 +100,7 @@ jobs:
       attestations: read
     env:
       RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
-      GH_TOKEN: ${{ github.token }}
+      GH_TOKEN: ${{ secrets.FRANCE_VM_RELEASE_READ_TOKEN || github.token }}
       VM_DEPLOY_KEY: ${{ secrets.FRANCE_VM_RELEASE_DEPLOY_KEY }}
     steps:
       - uses: actions/checkout@v4
@@ -109,6 +109,14 @@ jobs:
           set -euo pipefail
           [[ "$RELEASE_TAG" =~ ^vm-worker-v[0-9]+\.[0-9]+\.[0-9]+$ ]]
           test -n "$VM_DEPLOY_KEY"
+          if [[ "$GH_TOKEN" =~ ^[A-Za-z0-9_]{20,300}$ ]]; then
+            echo 'GitHub release-read token matches the installed VM wrapper format.'
+          elif [[ "$GH_TOKEN" =~ ^[[:graph:]]{20,4096}$ ]]; then
+            echo 'GitHub release-read token requires the updated VM wrapper format.'
+          else
+            echo 'GitHub release-read token has an invalid format.' >&2
+            exit 2
+          fi
       - name: Update France sandbox after active runs drain
         run: |
           set -euo pipefail
