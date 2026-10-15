@@ -100,7 +100,7 @@ jobs:
       attestations: read
     env:
       RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
-      GH_TOKEN: ${{ github.token }}
+      GH_TOKEN: ${{ secrets.FRANCE_VM_RELEASE_READ_TOKEN || github.token }}
       VM_DEPLOY_KEY: ${{ secrets.FRANCE_VM_RELEASE_DEPLOY_KEY }}
     steps:
       - uses: actions/checkout@v4
