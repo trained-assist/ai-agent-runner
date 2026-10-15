@@ -65,6 +65,7 @@ if [[ ! -d "${release_dir}" ]]; then
   chmod -R go-w "${release_dir}"
 fi
 install -o root -g root -m 0755 "${release_dir}/scripts/deploy-vm-worker-release.sh" "${updater_path}"
+install -o root -g root -m 0644 "${release_dir}/scripts/assert-vm-worker-update-ready.mjs" "$(dirname -- "${updater_path}")/assert-vm-worker-update-ready.mjs"
 old_target="$(readlink -f "${root}/current" 2>/dev/null || true)"
 old_opencode_target="$(readlink -f "${opencode_path}" 2>/dev/null || true)"
 public_url="$(sed -n 's/^VM_WORKER_PUBLIC_URL=//p' "${config_file}" | tail -n 1 | sed 's/^"//;s/"$//')"
