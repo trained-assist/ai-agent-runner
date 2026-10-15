@@ -72,6 +72,18 @@ describe('installable VM HTTP worker', () => {
     expect(resultResponse.status).toBe(200);
     expect(result).toMatchObject({ runId: RUN_ID, status: 'started', exitObserved: true,
       stdout: 'worker says hello', repo: { branch: `agent-run/${RUN_ID}`, commit: null } });
+    const historyManifestResponse = await fetch(`${fixture.base}/v1/runs/${RUN_ID}/history?manifest=1`, { headers: authHeaders() });
+    expect(historyManifestResponse.status).toBe(200);
+    const historyManifest = await historyManifestResponse.json() as { path: string; sha256: string; size: number };
+    expect(historyManifest.path).toBe('__runner/agent-history.json');
+    const historyResponse = await fetch(`${fixture.base}/v1/runs/${RUN_ID}/history`, { headers: authHeaders() });
+    const historyBytes = Buffer.from(await historyResponse.arrayBuffer());
+    expect(historyResponse.status).toBe(200);
+    expect(historyBytes.length).toBe(historyManifest.size);
+    expect(createHash('sha256').update(historyBytes).digest('hex')).toBe(historyManifest.sha256);
+    expect(JSON.parse(historyBytes.toString('utf8'))).toMatchObject({ runId: RUN_ID, outcome: 'succeeded',
+      entries: [{ type: 'log', text: 'worker says hello' }, { type: 'log', text: 'diagnostic' },
+        { type: 'assistant_message', text: 'Checking the repository first.' }], answer: 'worker says hello' });
   });
 
   it('refuses a saturated host before Runner.start with the exact capacity code', async () => {

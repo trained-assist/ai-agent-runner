@@ -12,6 +12,7 @@ import { redactSecrets } from '../redact.js';
 import { checkVmWorkerBindings, type VmWorkerBindingsInventory } from './bindings-inventory.js';
 import type { VmWorkerBuildInfo } from './build-info.js';
 import { StorageError } from '../storage/errors.js';
+import { agentHistory } from './agent-history.js';
 
 const MAX_REQUEST_BYTES = 2 * 1024 * 1024;
 const MAX_ARTIFACT_RESPONSE_BYTES = 20 * 1024 * 1024;
@@ -145,7 +146,7 @@ export function createVmWorkerServer(options: VmWorkerServerOptions): VmWorkerSe
       return;
     }
 
-    const runPath = /^\/v1\/runs\/([^/]+)(?:\/(status|result|cancel|logs|artifacts))?$/.exec(url.pathname);
+    const runPath = /^\/v1\/runs\/([^/]+)(?:\/(status|result|cancel|logs|artifacts|history))?$/.exec(url.pathname);
     if (!runPath) { sendJson(res, 404, { error: 'NOT_FOUND' }); return; }
     let runId: string;
     try { runId = decodeURIComponent(runPath[1]!); } catch { sendJson(res, 400, { error: 'INVALID_REQUEST' }); return; }
@@ -163,6 +164,16 @@ export function createVmWorkerServer(options: VmWorkerServerOptions): VmWorkerSe
       const result = toLaunchResult(options, snapshot);
       if (!result) { sendJson(res, 409, { error: 'RESULT_NOT_READY' }); return; }
       sendJson(res, 200, result);
+      return;
+    }
+    if (endpoint === 'history' && method === 'GET') {
+      if (!isTerminalState(snapshot.state)) { sendJson(res, 409, { error: 'RESULT_NOT_READY' }); return; }
+      const { bytes, manifest } = agentHistory(options.runner, options.dataDir, runId);
+      if (url.searchParams.get('manifest') === '1') { sendJson(res, 200, manifest); return; }
+      res.writeHead(200, { 'content-type': 'application/json', 'content-length': String(bytes.length),
+        'content-disposition': 'attachment; filename="agent-history.json"', 'cache-control': 'private, no-store',
+        'x-content-sha256': manifest.sha256, 'x-content-type-options': 'nosniff' });
+      res.end(bytes);
       return;
     }
     if (endpoint === 'artifacts' && method === 'GET') {
