@@ -25,7 +25,29 @@ export function summarizeSessionLog(text) {
   return summary;
 }
 
-export async function inspectRun({ runId, apiKey, fetchImpl = fetch }) {
+export function summarizeSseLogs(text) {
+  const summary = { stdoutEvents: 0, stderrEvents: 0, stdoutChars: 0, stderrChars: 0, endFrame: false };
+  for (const block of text.split(/\r?\n\r?\n/)) {
+    let event = '';
+    const data = [];
+    for (const line of block.split(/\r?\n/)) {
+      if (line.startsWith('event:')) event = line.slice(6).trim();
+      if (line.startsWith('data:')) data.push(line.slice(5).trimStart());
+    }
+    if (event === 'end') { summary.endFrame = true; continue; }
+    if (event !== 'stdout' && event !== 'stderr') continue;
+    let value = data.join('\n');
+    try {
+      const parsed = JSON.parse(value);
+      if (typeof parsed === 'string') value = parsed;
+    } catch { /* Preserve legacy raw text SSE data. */ }
+    if (event === 'stdout') { summary.stdoutEvents += 1; summary.stdoutChars += value.length; }
+    else { summary.stderrEvents += 1; summary.stderrChars += value.length; }
+  }
+  return summary;
+}
+
+export async function inspectRun({ runId, apiKey, vmUrl, vmToken, fetchImpl = fetch }) {
   if (!SAFE_RUN_ID.test(runId ?? '')) throw new Error('invalid_run_id');
   if (typeof apiKey !== 'string' || apiKey.length < 32) throw new Error('production_runner_api_key_missing');
   const base = `${RUNNER_API}/v1/runs/${encodeURIComponent(runId)}`;
@@ -60,6 +82,22 @@ export async function inspectRun({ runId, apiKey, fetchImpl = fetch }) {
   }
 
   const runnerResolution = (events.events ?? []).filter(event => event.type === 'agent_exit_resolved').at(-1);
+  let vmLog = { fetched: false, httpStatus: null, summary: null };
+  if (typeof vmUrl === 'string' && vmUrl.trim() && typeof vmToken === 'string' && vmToken.length >= 32) {
+    const vmBase = new URL(vmUrl);
+    if (vmBase.protocol !== 'https:' || vmBase.username || vmBase.password || vmBase.search || vmBase.hash) {
+      throw new Error('invalid_vm_worker_url');
+    }
+    const response = await fetchImpl(new URL(`/v1/runs/${encodeURIComponent(runId)}/logs?after=0`, vmBase), {
+      headers: { authorization: `Bearer ${vmToken}`, accept: 'text/event-stream' },
+      signal: AbortSignal.timeout(20_000), redirect: 'error',
+    });
+    if (response.ok) {
+      vmLog = { fetched: true, httpStatus: response.status, summary: summarizeSseLogs(await response.text()) };
+    } else {
+      vmLog = { fetched: false, httpStatus: response.status, summary: null };
+    }
+  }
   return {
     runId,
     state: status.state ?? null,
@@ -76,11 +114,13 @@ export async function inspectRun({ runId, apiKey, fetchImpl = fetch }) {
       reason: runnerResolution.payload?.reason ?? null,
     } : null,
     savedLog,
+    vmLog,
     output: 'content_redacted; only byte and character counts are reported',
   };
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
-  const result = await inspectRun({ runId: process.env.RUN_ID?.trim(), apiKey: process.env.RUNNER_API_KEY?.trim() });
+  const result = await inspectRun({ runId: process.env.RUN_ID?.trim(), apiKey: process.env.RUNNER_API_KEY?.trim(),
+    vmUrl: process.env.RUNNER_VM_URL?.trim(), vmToken: process.env.RUNNER_VM_TOKEN?.trim() });
   console.log(JSON.stringify(result));
 }

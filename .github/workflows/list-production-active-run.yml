@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   inspect:
-    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/fix/inspect-production-run-artifacts')
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 3
     environment: production
@@ -27,5 +27,7 @@ jobs:
       - name: Inspect exact run and its saved event log without printing user content
         env:
           RUNNER_API_KEY: ${{ secrets.RUNNER_API_KEY_AGENT_API }}
+          RUNNER_VM_URL: ${{ secrets.EU_VM_WORKER_URL }}
+          RUNNER_VM_TOKEN: ${{ secrets.EU_VM_WORKER_TOKEN }}
           RUN_ID: ${{ inputs.run_id }}
         run: node scripts/inspect-production-run.mjs
