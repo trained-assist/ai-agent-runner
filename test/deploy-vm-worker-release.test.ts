@@ -14,6 +14,7 @@ describe('VM worker release updater safety contract', () => {
     expect(scriptDir).toBeLessThan(updater.indexOf('VM_WORKER_UPDATE_READINESS_FILE='));
     expect(readiness).toBeGreaterThanOrEqual(0);
     expect(updater).toContain('${BASH_SOURCE[0]}');
+    expect(updater).toContain('assert-vm-worker-update-ready.mjs" "$(dirname -- "${updater_path}")/assert-vm-worker-update-ready.mjs');
   });
 
   it('validates the endpoint before switching releases and requires readyz', async () => {
