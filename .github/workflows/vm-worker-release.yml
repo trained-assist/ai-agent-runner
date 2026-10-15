@@ -40,6 +40,9 @@ jobs:
           OPENCODE_BINARY_SHA256: f0f143113a4c53a334f53a91482503fc362851fadc873ec1fd94ae14fdf92e36
         run: |
           set -euo pipefail
+          gh api --paginate --slurp 'repos/gpt-mem/opencode-mem/releases?per_page=100' > "$RUNNER_TEMP/opencode-releases.json"
+          node scripts/assert-opencode-release-freshness.mjs "$RUNNER_TEMP/opencode-releases.json" \
+            "$OPENCODE_RELEASE_TAG" "$OPENCODE_SOURCE_SHA" "$OPENCODE_ARCHIVE_SHA256"
           asset="opencode-linux-x64.tar.gz"
           curl --fail --location --silent --show-error \
             "https://github.com/gpt-mem/opencode-mem/releases/download/${OPENCODE_RELEASE_TAG}/${asset}" \
