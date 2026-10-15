@@ -1,6 +1,36 @@
 const RUNNER_API = 'https://trained-assist-runner-api-production.skillset-apply.workers.dev';
 const SAFE_RUN_ID = /^run_[A-Za-z0-9_-]{20,160}$/;
 
+function decodeSseLog(text) {
+  const chunks = { stdout: [], stderr: [] };
+  for (const block of text.split(/\r?\n\r?\n/)) {
+    let event = '';
+    const data = [];
+    for (const line of block.split(/\r?\n/)) {
+      if (line.startsWith('event:')) event = line.slice(6).trim();
+      if (line.startsWith('data:')) data.push(line.slice(5).trimStart());
+    }
+    if (event !== 'stdout' && event !== 'stderr') continue;
+    let value = data.join('\n');
+    try {
+      const parsed = JSON.parse(value);
+      if (typeof parsed === 'string') value = parsed;
+    } catch { /* Preserve legacy raw text SSE data. */ }
+    chunks[event].push(value);
+  }
+  return `[stdout]\n${chunks.stdout.join('')}\n[stderr]\n${chunks.stderr.join('')}\n`;
+}
+
+export function redactLogSecrets(text) {
+  return text
+    .replace(/(Bearer\s+)[A-Za-z0-9._~+/-]+=*/gi, '$1[REDACTED]')
+    .replace(/\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}\b/g, '[REDACTED_GITHUB_TOKEN]')
+    .replace(/\bgithub_pat_[A-Za-z0-9_]{20,}\b/g, '[REDACTED_GITHUB_TOKEN]')
+    .replace(/\b(?:cfat_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_-]{20,}|sk-or-v1-[A-Za-z0-9_-]{20,}|xai-[A-Za-z0-9_-]{20,}|AIza[0-9A-Za-z_-]{30,})\b/g, '[REDACTED_API_KEY]')
+    .replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, '[REDACTED_PRIVATE_KEY]')
+    .replace(/((?:api[_-]?key|access[_-]?token|refresh[_-]?token|password|secret)\s*[=:]\s*)["']?[^\s"',;}]+["']?/gi, '$1[REDACTED]');
+}
+
 export function summarizeSessionLog(text) {
   const summary = { jsonLines: 0, malformedLines: 0, eventCounts: {}, agentExitResolved: null, stdoutChars: 0 };
   for (const line of text.split(/\r?\n/)) {
@@ -93,7 +123,13 @@ export async function inspectRun({ runId, apiKey, vmUrl, vmToken, fetchImpl = fe
       signal: AbortSignal.timeout(20_000), redirect: 'error',
     });
     if (response.ok) {
-      vmLog = { fetched: true, httpStatus: response.status, summary: summarizeSseLogs(await response.text()) };
+      const sseText = await response.text();
+      vmLog = { fetched: true, httpStatus: response.status, summary: summarizeSseLogs(sseText) };
+      const outputPath = process.env.VM_LOG_OUTPUT_PATH?.trim();
+      if (outputPath) {
+        const { writeFile } = await import('node:fs/promises');
+        await writeFile(outputPath, redactLogSecrets(decodeSseLog(sseText)), { mode: 0o600 });
+      }
     } else {
       vmLog = { fetched: false, httpStatus: response.status, summary: null };
     }
