@@ -47,17 +47,21 @@ workspace publication are separate capabilities.
 
 ## Install on a Linux VM
 
-Release delivery and service lifecycle are separate processes. GitHub Actions builds
-and signs an immutable release; `ai-agent-vm-worker-update <tag>` verifies and installs
-that release, switches the versioned symlink, restarts systemd, and rolls back if the
-new process is not ready. The signed bundle also carries the pinned OpenCode Linux x64
+GitHub Actions builds and signs an immutable release; the France sandbox deployment job
+then verifies and installs it after active work drains. The updater switches the versioned
+symlink, restarts systemd, and rolls back if the new process is not ready. The signed
+bundle also carries the pinned OpenCode Linux x64
 binary; the updater verifies its version and SHA-256 and points `/usr/local/bin/opencode`
 through the same `current` symlink, so rollback restores the matching binary. `/version`
 reports the Runner source commit and the OpenCode version, source commit, and binary SHA.
 `ai-agent-vm-worker.service` owns the long-running worker.
 `install-vm-worker.sh` is only a one-time bootstrap for the service account, unit,
-configuration templates, and updater. There is currently no automatic VM rollout or
-VM self-deployment: the operator invokes the updater after reviewing a release.
+configuration templates, and updater. Each worker release pins a specific OpenCode
+preview tag and its source/archive/binary hashes. Before packaging, CI compares that pin
+with the newest published `mem-preview` tag and fails if the pin is stale. A new OpenCode
+preview therefore requires an explicit pin change and worker release; builds never float
+to an unreviewed binary. The France auto-deploy is release-triggered in GitHub Actions;
+there is no workstation scheduler or VM self-update timer.
 France bootstrap also installs the host shared libraries required by headless
 Playwright Chromium. It does not install a browser or restart the worker service;
 the agent may install a pinned Playwright package and browser inside its run workspace.
@@ -222,6 +226,16 @@ recovery, and capacity reservations stay active until terminal state is observed
 The Cloudflare Runner API selects the France VM worker for these sandbox lanes. A VM only
 answers its own health/capacity and runs accepted work; it never routes to another VM or GHA.
 These lanes do not fall back to GitHub Actions when France is unavailable.
+
+The signed release workflow can deploy that same verified bundle to the France sandbox.
+It uses a dedicated forced-command SSH key restricted to `update vm-worker-vX.Y.Z`; a
+short-lived GitHub release-read token is supplied on stdin and is not persisted on the VM.
+Before changing versions, the updater waits for `/readyz` to report zero active runs and
+reservations. The cloud workflow retries only this busy state, then checks `/healthz`,
+`/version` and `/readyz` after restart and rolls back on failure. Re-running a release
+already installed with matching worker and OpenCode hashes is a no-op. This automation
+targets only the France sandbox, not Russia or production, and does not require a
+workstation scheduler.
 
 This drift check is deliberately narrower than product migration acceptance. See
 [VM-WORKER-LEGACY-COMPATIBILITY.md](VM-WORKER-LEGACY-COMPATIBILITY.md) and

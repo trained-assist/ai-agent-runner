@@ -42,6 +42,7 @@ install -d -o root -g root -m 0755 /etc/ai-agent-runner/engine-config
 install -o root -g root -m 0644 "${repo_dir}/deploy/vm-worker/engine-config/opencode.json" /etc/ai-agent-runner/engine-config/opencode.json
 install -o root -g root -m 0644 "${unit_source}" /etc/systemd/system/ai-agent-vm-worker.service
 install -o root -g root -m 0755 "${script_dir}/deploy-vm-worker-release.sh" /usr/local/sbin/ai-agent-vm-worker-update
+install -o root -g root -m 0755 "${script_dir}/ai-agent-vm-worker-gha-update" /usr/local/sbin/ai-agent-vm-worker-gha-update
 if [[ ! -e /etc/ai-agent-runner/worker.env ]]; then
   install -o root -g root -m 0600 "${env_source}" /etc/ai-agent-runner/worker.env
 fi
