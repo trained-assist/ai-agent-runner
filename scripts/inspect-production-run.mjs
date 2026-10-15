@@ -39,19 +39,23 @@ export async function inspectRun({ runId, apiKey, fetchImpl = fetch }) {
     get('status'), get('result'), get('events?cursor=0&limit=500'), get('artifacts'),
   ]);
 
-  let savedLog = { fetched: false, httpStatus: null, bytes: null, summary: null };
+  let savedLog = { fetched: false, httpStatus: null, bytes: null, summary: null, protocol: null, hostname: null };
   const logUrl = artifacts.logUrl;
   if (typeof logUrl === 'string') {
     const parsed = new URL(logUrl);
-    if (parsed.protocol !== 'https:' || !['storage.googleapis.com', 'storage.cloud.google.com'].includes(parsed.hostname)) {
-      throw new Error('unexpected_saved_log_host');
-    }
-    const response = await fetchImpl(parsed, { signal: AbortSignal.timeout(20_000), redirect: 'follow' });
-    if (response.ok) {
-      const text = await response.text();
-      savedLog = { fetched: true, httpStatus: response.status, bytes: Buffer.byteLength(text), summary: summarizeSessionLog(text) };
-    } else {
-      savedLog = { fetched: false, httpStatus: response.status, bytes: null, summary: null };
+    const googleStorageHost = parsed.hostname === 'storage.googleapis.com'
+      || parsed.hostname.endsWith('.storage.googleapis.com')
+      || parsed.hostname === 'storage.cloud.google.com'
+      || parsed.hostname.endsWith('.storage.cloud.google.com');
+    savedLog = { ...savedLog, protocol: parsed.protocol, hostname: parsed.hostname };
+    if (parsed.protocol === 'https:' && googleStorageHost) {
+      const response = await fetchImpl(parsed, { signal: AbortSignal.timeout(20_000), redirect: 'follow' });
+      if (response.ok) {
+        const text = await response.text();
+        savedLog = { ...savedLog, fetched: true, httpStatus: response.status, bytes: Buffer.byteLength(text), summary: summarizeSessionLog(text) };
+      } else {
+        savedLog = { ...savedLog, fetched: false, httpStatus: response.status };
+      }
     }
   }
 
