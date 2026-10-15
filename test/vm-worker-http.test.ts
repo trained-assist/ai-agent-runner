@@ -56,6 +56,8 @@ describe('installable VM HTTP worker', () => {
     expect(stream).toContain('event: stdout');
     expect(stream).toContain('worker says hello');
     expect(stream).toContain('event: stderr');
+    expect(stream).toContain('event: assistant_message');
+    expect(stream).toContain('Checking the repository first.');
 
     const snapshot = await fetch(`${fixture.base}/v1/runs/${RUN_ID}/logs?after=0&snapshot=1`, { headers: authHeaders() });
     expect(snapshot.status).toBe(200);
@@ -369,6 +371,9 @@ class FakeRunner {
     const at = new Date().toISOString();
     this.eventList.push({ type: 'log', sequence: 10, payload: { stream: 'stdout', message: 'worker says hello' } });
     this.eventList.push({ type: 'log', sequence: 11, payload: { stream: 'stderr', message: 'diagnostic' } });
+    this.eventList.push({ type: 'assistant_message', sequence: 12, payload: {
+      sessionId: 'ses_01J9A3J9Y7V8W2K4M6N0PQRSTZ', messageId: 'msg_01J9A3J9Y7V8W2K4M6N0PQRSTZ', text: 'Checking the repository first.',
+    } });
     this.snapshot = { runId: spec.runId, state: 'running', updatedAt: at, ownerGeneration: spec.ownerGeneration, pid: 1234, result: null, checkpoint: null };
     setTimeout(() => {
       this.state = 'succeeded';

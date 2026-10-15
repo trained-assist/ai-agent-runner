@@ -110,15 +110,70 @@ export class OpenCodeAdapter implements EngineAdapter {
       detached: true,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
+    // OpenCode emits completed text parts before the matching step_finish event.
+    // Keep one bounded buffer per assistant message and publish only when that
+    // message ends in a tool-call step; the final stop message remains covered
+    // by the ordinary terminal result path, so it is not delivered twice.
+    const pendingAssistantText = new Map<string, { sessionId: string; parts: string[]; chars: number }>();
     return handleForChild(child, {
       onLog: (stream, line) => {
         if (stream === 'stdout') {
           try {
-            const event = JSON.parse(line) as { type?: unknown; sessionID?: unknown; part?: { type?: unknown; text?: unknown; time?: { end?: unknown } } };
+            const event = JSON.parse(line) as {
+              type?: unknown;
+              sessionID?: unknown;
+              request?: { id?: unknown; sessionID?: unknown; questions?: unknown; tool?: { callID?: unknown } };
+              part?: { type?: unknown; id?: unknown; messageID?: unknown; text?: unknown; reason?: unknown; time?: { end?: unknown } };
+            };
             if (typeof event.sessionID === 'string' && /^ses_[0-7][0-9A-HJKMNP-TV-Z]{25}$/.test(event.sessionID)) sessionId = event.sessionID;
             if (event.type === 'text' && event.part?.type === 'text' && typeof event.part.text === 'string') {
-              if (event.part.time?.end) ctx.onLog('stdout', event.part.text);
+              if (event.part.time?.end) {
+                if (typeof event.sessionID === 'string' && typeof event.part.messageID === 'string') {
+                  const current = pendingAssistantText.get(event.part.messageID) ?? { sessionId: event.sessionID, parts: [], chars: 0 };
+                  const available = Math.max(0, 64_000 - current.chars);
+                  if (available > 0) {
+                    current.parts.push(event.part.text.slice(0, available));
+                    current.chars += Math.min(event.part.text.length, available);
+                  }
+                  pendingAssistantText.set(event.part.messageID, current);
+                }
+              }
               else ctx.onLog('stderr', `[opencode text] ${event.part.text}`);
+              return;
+            }
+            if (event.type === 'step_finish' && event.part?.type === 'step-finish' && typeof event.part.messageID === 'string') {
+              const pending = pendingAssistantText.get(event.part.messageID);
+              pendingAssistantText.delete(event.part.messageID);
+              if (pending && event.part.reason === 'tool-calls') {
+                const text = pending.parts.join('').trim();
+                if (text) ctx.onAssistantMessage?.({ sessionId: pending.sessionId, messageId: event.part.messageID, text });
+              } else if (pending && typeof event.part.reason === 'string' && event.part.reason !== 'unknown') {
+                const text = pending.parts.join('');
+                if (text.trim()) ctx.onLog('stdout', text);
+              }
+            }
+            if (event.type === 'question_asked') {
+              const request = event.request;
+              const rawQuestions = Array.isArray(request?.questions) ? request.questions : [];
+              const questions = rawQuestions.flatMap((raw) => {
+                if (!raw || typeof raw !== 'object') return [];
+                const item = raw as { header?: unknown; question?: unknown; multiple?: unknown; options?: unknown };
+                if (typeof item.question !== 'string' || !item.question.trim()) return [];
+                const options = Array.isArray(item.options) ? item.options.flatMap((option) => {
+                  if (!option || typeof option !== 'object') return [];
+                  const value = option as { label?: unknown; description?: unknown };
+                  if (typeof value.label !== 'string') return [];
+                  return [{ label: value.label.slice(0, 200), description: typeof value.description === 'string' ? value.description.slice(0, 500) : '' }];
+                }).slice(0, 20) : [];
+                return [{ header: typeof item.header === 'string' ? item.header.slice(0, 200) : '', question: item.question.slice(0, 5000), multiple: item.multiple === true, options }];
+              }).slice(0, 20);
+              if (typeof event.sessionID === 'string' && /^ses_[0-7][0-9A-HJKMNP-TV-Z]{25}$/.test(event.sessionID)
+                && typeof request?.id === 'string' && request.id.length > 0 && questions.length > 0) {
+                ctx.onAssistantQuestion?.({ sessionId: event.sessionID, requestId: request.id.slice(0, 200), questions,
+                  toolCallId: typeof request.tool?.callID === 'string' ? request.tool.callID.slice(0, 200) : null });
+              }
+              // The user-facing question is emitted through the structured event,
+              // not duplicated into the unstructured log stream.
               return;
             }
             if (typeof event.type === 'string') {

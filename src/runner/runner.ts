@@ -1147,6 +1147,8 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
             }
           : {}),
         onLog: (stream, line) => this.onEngineLog(runId, stream, line),
+        onAssistantMessage: (message) => this.onEngineAssistantMessage(runId, message),
+        onAssistantQuestion: (question) => this.onEngineAssistantQuestion(runId, question),
         onExit: (code, signal) => {
           void this.onEngineExit(runId, code, signal);
         },
@@ -1835,6 +1837,41 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
     if (sanitized.length === 0) return;
     if (stream === 'stdout') this.rememberAnswerLine(run, sanitized);
     this.emit(st, 'log', { stream, level: 'info', message: sanitized });
+  }
+
+  private onEngineAssistantMessage(runId: string, message: { sessionId: string; messageId: string; text: string }): void {
+    const run = this.runs.get(runId);
+    if (!run || this.disposed || isTerminalState(run.state.state)) return;
+    if (!/^ses_[0-7][0-9A-HJKMNP-TV-Z]{25}$/.test(message.sessionId) || !message.messageId.trim()) return;
+    // These are user-visible message bodies, so preserve normal paragraph/newline
+    // formatting while redacting credentials and non-printable controls.
+    const safeText = redactRunSecrets(redactSecrets(message.text), run.runtimeSecrets)
+      .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, ' ')
+      .slice(0, 64_000);
+    if (!safeText.trim()) return;
+    this.emit(run.state, 'assistant_message', { sessionId: message.sessionId, messageId: message.messageId, text: safeText });
+  }
+
+  private onEngineAssistantQuestion(runId: string, question: {
+    sessionId: string;
+    requestId: string;
+    questions: Array<{ header: string; question: string; multiple: boolean; options: Array<{ label: string; description: string }> }>;
+    toolCallId: string | null;
+  }): void {
+    const run = this.runs.get(runId);
+    if (!run || this.disposed || isTerminalState(run.state.state)) return;
+    if (!/^ses_[0-7][0-9A-HJKMNP-TV-Z]{25}$/.test(question.sessionId) || !question.requestId.trim()) return;
+    const safe = (value: string, limit: number): string => redactRunSecrets(redactSecrets(value), run.runtimeSecrets)
+      .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, ' ').slice(0, limit);
+    this.emit(run.state, 'assistant_question', {
+      sessionId: question.sessionId,
+      requestId: question.requestId.slice(0, 200),
+      toolCallId: question.toolCallId?.slice(0, 200) ?? null,
+      questions: question.questions.slice(0, 20).map(item => ({
+        header: safe(item.header, 200), question: safe(item.question, 5000), multiple: item.multiple === true,
+        options: item.options.slice(0, 20).map(option => ({ label: safe(option.label, 200), description: safe(option.description, 500) })),
+      })),
+    });
   }
 
   /**

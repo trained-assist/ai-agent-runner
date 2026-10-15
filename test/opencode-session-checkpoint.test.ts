@@ -60,7 +60,8 @@ describe('durable OpenCode session checkpoint', () => {
         'for arg in "$@"; do if [ "$previous" = "--session" ]; then session_id="$arg"; fi; previous="$arg"; done',
         'if [ -f "$EXPECTED_SESSION" ]; then [ "$(cat "$EXPECTED_SESSION")" = "$session_id" ] || exit 22; else printf "%s" "$session_id" > "$EXPECTED_SESSION"; fi',
         'if [ -f "$PWD/.runner-imported" ]; then echo "resumed" > "$PWD/.runner-resume-proof"; fi',
-        'printf \'{"type":"text","sessionID":"%s","part":{"type":"text","text":"step done"}}\\n\' "$session_id"',
+        'printf \'{"type":"text","sessionID":"%s","part":{"type":"text","id":"prt_01J9A3J9Y7V8W2K4M6N0PQRSTZ","messageID":"msg_01J9A3J9Y7V8W2K4M6N0PQRSTZ","text":"Checking the repository first.","time":{"end":1}}}\\n\' "$session_id"',
+        'printf \'{"type":"step_finish","sessionID":"%s","part":{"type":"step-finish","messageID":"msg_01J9A3J9Y7V8W2K4M6N0PQRSTZ","reason":"tool-calls"}}\\n\' "$session_id"',
       ].join('\n'));
       chmodSync(binary, 0o700);
 
@@ -83,6 +84,9 @@ describe('durable OpenCode session checkpoint', () => {
       process.env['EXPECTED_SESSION'] = expected;
       const first = h.start({ ...common, input: { inlinePrompt: 'Perform the first step.' }, envAllowlist: ['EXPECTED_SESSION'] });
       const firstResult = await h.runner.waitFor(first.receipt.runId);
+      expect(h.runner.events(first.receipt.runId).filter((event) => event.type === 'assistant_message')).toMatchObject([
+        { payload: { sessionId: 'ses_01J9A3J9Y7V8W2K4M6N0PQRSTZ', messageId: 'msg_01J9A3J9Y7V8W2K4M6N0PQRSTZ', text: 'Checking the repository first.' } },
+      ]);
       const checkpoint = firstResult.sessionCheckpoint;
       expect(checkpoint).toMatchObject({
         sourceRunId: first.receipt.runId,

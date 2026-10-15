@@ -78,6 +78,7 @@ export interface MockWorker {
   options: MockWorkerOptions;
   readonly logCursors: number[];
   pushLog(runId: string, stream: 'stdout' | 'stderr', message: string): void;
+  pushAssistantMessage(runId: string, message: { sessionId: string; messageId: string; text: string }): void;
   finishLogs(runId: string, delayedTail?: { stream: 'stdout' | 'stderr'; message: string }): void;
   close(): Promise<void>;
 }
@@ -95,7 +96,9 @@ export async function startMockWorker(options: MockWorkerOptions = {}): Promise<
   const cancels: string[] = [];
   const results: Array<Record<string, unknown>> = [];
   const live = new Set<{ runId: string; cancelled: boolean; pending: boolean }>();
-  const streamedLogs = new Map<string, Array<{ sequence: number; stream: 'stdout' | 'stderr'; message: string }>>();
+  type StreamedEvent = { sequence: number; stream: 'stdout' | 'stderr'; message: string }
+    | { sequence: number; type: 'assistant_message'; payload: { sessionId: string; messageId: string; text: string } };
+  const streamedLogs = new Map<string, StreamedEvent[]>();
   const logSubscribers = new Map<string, Set<{ response: ServerResponse; cursor: number }>>();
   const finishedLogStreams = new Set<string>();
   const logCursors: number[] = [];
@@ -192,7 +195,8 @@ export async function startMockWorker(options: MockWorkerOptions = {}): Promise<
         res.on('close', () => subscribers.delete(subscriber));
         for (const entry of streamedLogs.get(runId) ?? []) {
           if (entry.sequence > subscriber.cursor) {
-            res.write(`id: ${entry.sequence}\nevent: ${entry.stream}\ndata: ${JSON.stringify(entry.message)}\n\n`);
+            if ('type' in entry) res.write(`id: ${entry.sequence}\nevent: ${entry.type}\ndata: ${JSON.stringify(entry.payload)}\n\n`);
+            else res.write(`id: ${entry.sequence}\nevent: ${entry.stream}\ndata: ${JSON.stringify(entry.message)}\n\n`);
             subscriber.cursor = entry.sequence;
           }
         }
@@ -304,6 +308,17 @@ export async function startMockWorker(options: MockWorkerOptions = {}): Promise<
         subscriber.cursor = entry.sequence;
       }
     },
+    pushAssistantMessage(runId: string, message: { sessionId: string; messageId: string; text: string }): void {
+      const entries = streamedLogs.get(runId) ?? [];
+      const entry: StreamedEvent = { sequence: (entries.at(-1)?.sequence ?? 0) + 1, type: 'assistant_message', payload: message };
+      entries.push(entry);
+      streamedLogs.set(runId, entries);
+      for (const subscriber of logSubscribers.get(runId) ?? []) {
+        if (entry.sequence <= subscriber.cursor) continue;
+        subscriber.response.write(`id: ${entry.sequence}\nevent: assistant_message\ndata: ${JSON.stringify(message)}\n\n`);
+        subscriber.cursor = entry.sequence;
+      }
+    },
     finishLogs(runId: string, delayedTail?: { stream: 'stdout' | 'stderr'; message: string }): void {
       finishedLogStreams.add(runId);
       settings.terminalStatus = 'succeeded';
@@ -316,7 +331,8 @@ export async function startMockWorker(options: MockWorkerOptions = {}): Promise<
         for (const subscriber of logSubscribers.get(runId) ?? []) {
           for (const entry of streamedLogs.get(runId) ?? []) {
             if (entry.sequence > subscriber.cursor) {
-              subscriber.response.write(`id: ${entry.sequence}\nevent: ${entry.stream}\ndata: ${JSON.stringify(entry.message)}\n\n`);
+              if ('type' in entry) subscriber.response.write(`id: ${entry.sequence}\nevent: ${entry.type}\ndata: ${JSON.stringify(entry.payload)}\n\n`);
+              else subscriber.response.write(`id: ${entry.sequence}\nevent: ${entry.stream}\ndata: ${JSON.stringify(entry.message)}\n\n`);
               subscriber.cursor = entry.sequence;
             }
           }

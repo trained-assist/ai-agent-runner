@@ -106,6 +106,70 @@ describe('OpenCodeAdapter', () => {
     }
   });
 
+  it('forwards a typed native question without exposing it as an unstructured log', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'opencode-question-'));
+    try {
+      const sessionId = 'ses_01J9A3J9Y7V8W2K4M6N0PQRSTZ';
+      const fakeOpenCode = join(cwd, 'opencode-stub.sh');
+      writeFileSync(fakeOpenCode, [
+        '#!/bin/sh',
+        'if [ "$1" = "export" ]; then printf \'{"info":{"id":"%s"},"messages":[]}\\n\' "$2"; exit 0; fi',
+        `printf '%s\\n' '${JSON.stringify({ type: 'question_asked', sessionID: sessionId, request: { id: 'question-1', sessionID: sessionId, questions: [{ header: 'Choice', question: 'Which environment?', multiple: false, options: [{ label: 'Sandbox', description: 'Test safely' }] },], tool: { callID: 'call-1' } } })}'`,
+      ].join('\n'));
+      chmodSync(fakeOpenCode, 0o700);
+      const logs: string[] = [];
+      const questions: unknown[] = [];
+      const { ctx, exit } = makeContext(cwd, {});
+      ctx.spec.input = { inlinePrompt: 'Ask for a clarification.' };
+      ctx.onLog = (_stream, line) => logs.push(line);
+      ctx.onAssistantQuestion = (question) => questions.push(question);
+
+      await new OpenCodeAdapter({ binary: fakeOpenCode }).start(ctx);
+      await exit;
+
+      expect(questions).toEqual([{
+        sessionId,
+        requestId: 'question-1',
+        questions: [{ header: 'Choice', question: 'Which environment?', multiple: false, options: [{ label: 'Sandbox', description: 'Test safely' }] }],
+        toolCallId: 'call-1',
+      }]);
+      expect(logs.some((line) => line.includes('question-1'))).toBe(false);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('publishes one completed assistant message only when the step continues to tools', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'opencode-messages-'));
+    try {
+      const sessionId = 'ses_01J9A3J9Y7V8W2K4M6N0PQRSTZ';
+      const toolMessageId = 'msg_01J9A3J9Y7V8W2K4M6N0PQRSTZ';
+      const finalMessageId = 'msg_01J9A3J9Y7V8W2K4M6N0PQRST0';
+      const binary = join(cwd, 'opencode-stub.sh');
+      writeFileSync(binary, [
+        '#!/bin/sh',
+        'if [ "$1" = "export" ]; then printf \'{"info":{"id":"%s"},"messages":[]}\\n\' "$2"; exit 0; fi',
+        `printf '%s\\n' '${JSON.stringify({ type: 'text', sessionID: sessionId, part: { type: 'text', id: 'prt_01J9A3J9Y7V8W2K4M6N0PQRSTZ', messageID: toolMessageId, text: 'Сейчас проверю.', time: { end: 1 } } })}'`,
+        `printf '%s\\n' '${JSON.stringify({ type: 'step_finish', sessionID: sessionId, part: { type: 'step-finish', messageID: toolMessageId, reason: 'tool-calls' } })}'`,
+        `printf '%s\\n' '${JSON.stringify({ type: 'text', sessionID: sessionId, part: { type: 'text', id: 'prt_01J9A3J9Y7V8W2K4M6N0PQRST0', messageID: finalMessageId, text: 'Готово.', time: { end: 2 } } })}'`,
+        `printf '%s\\n' '${JSON.stringify({ type: 'step_finish', sessionID: sessionId, part: { type: 'step-finish', messageID: finalMessageId, reason: 'stop' } })}'`,
+      ].join('\n'));
+      chmodSync(binary, 0o700);
+      const { ctx, exit } = makeContext(cwd, {});
+      ctx.spec.input = { inlinePrompt: 'Inspect then continue.' };
+      const messages: Array<{ sessionId: string; messageId: string; text: string }> = [];
+      const outputLines: Array<{ stream: string; text: string }> = [];
+      ctx.onLog = (stream, text) => outputLines.push({ stream, text });
+      ctx.onAssistantMessage = (message) => messages.push(message);
+      await new OpenCodeAdapter({ binary }).start(ctx);
+      await exit;
+      expect(messages).toEqual([{ sessionId, messageId: toolMessageId, text: 'Сейчас проверю.' }]);
+      expect(outputLines.filter((line) => line.stream === 'stdout').map((line) => line.text)).toEqual(['Готово.']);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
   it('imports a durable prior session before continuing it with the same OpenCode session id', async () => {
     const cwd = mkdtempSync(join(tmpdir(), 'opencode-resume-'));
     try {

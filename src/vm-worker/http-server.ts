@@ -471,6 +471,10 @@ async function streamLogs(req: IncomingMessage, res: ServerResponse, runner: Run
     const events = runner.events(runId, cursor);
     for (const event of events) {
       cursor = Math.max(cursor, event.sequence);
+      if (event.type === 'assistant_message') {
+        res.write(`id: ${event.sequence}\nevent: assistant_message\ndata: ${JSON.stringify(event.payload)}\n\n`);
+        continue;
+      }
       if (event.type !== 'log') continue;
       const stream = event.payload.stream;
       if (stream !== 'stdout' && stream !== 'stderr') continue;

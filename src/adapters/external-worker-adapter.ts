@@ -250,7 +250,8 @@ export interface ExternalWorker {
   restoreMcp?(spec: RunSpec, admittedAt: string): Promise<void>;
   status(runId: string): Promise<WorkerStatusView>;
   /** Follow replayable live stdout/stderr logs when a worker exposes its SSE endpoint. */
-  streamLogs?(runId: string, after: number, signal: AbortSignal, onLog: (stream: 'stdout' | 'stderr', message: string, sequence: number) => void): Promise<{ cursor: number; completed: boolean; supported: boolean }>;
+  streamLogs?(runId: string, after: number, signal: AbortSignal, onLog: (stream: 'stdout' | 'stderr', message: string, sequence: number) => void,
+    onAssistantMessage?: (message: { sessionId: string; messageId: string; text: string }, sequence: number) => void): Promise<{ cursor: number; completed: boolean; supported: boolean }>;
   result(runId: string): Promise<LaunchResult>;
   cancel(runId: string): Promise<WorkerCancelResult>;
 }
@@ -1217,6 +1218,7 @@ export class ExternalWorkerAdapter implements ExternalWorker {
     after: number,
     signal: AbortSignal,
     onLog: (stream: 'stdout' | 'stderr', message: string, sequence: number) => void,
+    onAssistantMessage?: (message: { sessionId: string; messageId: string; text: string }, sequence: number) => void,
   ): Promise<{ cursor: number; completed: boolean; supported: boolean }> {
     const base = this.baseUrl;
     if (!base) return { cursor: after, completed: false, supported: false };
@@ -1263,6 +1265,19 @@ export class ExternalWorkerAdapter implements ExternalWorker {
               if (typeof message === 'string') {
                 cursor = sequence;
                 onLog(event, message, sequence);
+              }
+            }
+          }
+          if (event === 'assistant_message' && data.length > 0) {
+            const sequence = Number(id);
+            if (Number.isSafeInteger(sequence) && sequence > cursor) {
+              let message: unknown;
+              try { message = JSON.parse(data.join('\n')); } catch { message = null; }
+              const value = message as { sessionId?: unknown; messageId?: unknown; text?: unknown } | null;
+              if (value && typeof value.sessionId === 'string' && typeof value.messageId === 'string'
+                && typeof value.text === 'string' && value.text.length <= 64_000) {
+                cursor = sequence;
+                onAssistantMessage?.({ sessionId: value.sessionId, messageId: value.messageId, text: value.text }, sequence);
               }
             }
           }
