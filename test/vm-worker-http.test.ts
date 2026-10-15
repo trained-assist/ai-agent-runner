@@ -157,6 +157,12 @@ describe('installable VM HTTP worker', () => {
     expect(runtimeEnv.RUNNER_MCP_USER_TOKEN).toBe('user-catalog-bearer-token-123456');
     expect(runtimeEnv.RUNNER_MCP_USER_PROOF).toBe('signed-user-run-proof-123456');
     expect(runtimeEnv.OPENCODE_CONFIG_CONTENT).toContain('trained-assist-mcp-user-sandbox');
+    const openCodeConfig = JSON.parse(runtimeEnv.OPENCODE_CONFIG_CONTENT!) as { permission?: Record<string, string> };
+    expect(openCodeConfig.permission).toEqual({
+      mem_gpt_identity_whoami: 'allow',
+      mem_gpt_google_docs_connect: 'allow',
+      mem_gpt_google_docs_get_document: 'allow',
+    });
     expect(JSON.stringify(spec)).not.toContain('user-catalog-bearer-token-123456');
     expect(JSON.stringify(spec)).not.toContain('signed-user-run-proof-123456');
   });

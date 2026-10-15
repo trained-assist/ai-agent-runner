@@ -31,6 +31,7 @@ const USER_MCP = Object.freeze({
   url: 'https://trained-assist-mcp-user-sandbox.skillset-apply.workers.dev/mcp',
   scope: 'mcp:user-agent-run', tokenEnv: 'RUNNER_MCP_USER_TOKEN',
   proofEnv: 'RUNNER_MCP_USER_PROOF', configEnv: 'OPENCODE_CONFIG_CONTENT',
+  allowedOpenCodeTools: ['mem_gpt_identity_whoami', 'mem_gpt_google_docs_connect', 'mem_gpt_google_docs_get_document'],
 });
 
 export interface VmWorkerServerOptions {
@@ -284,7 +285,10 @@ function toRunSpec(request: LaunchRequest, options: VmWorkerServerOptions): { sp
     const serverConfig: Record<string, unknown> = { type: 'remote', url: server.url, enabled: true, headers: server.headers };
     runtimeEnv[policy.tokenEnv] = secretValues[policy.tokenEnv]!;
     runtimeEnv[policy.proofEnv] = secretValues[policy.proofEnv]!;
-    runtimeEnv[policy.configEnv] = JSON.stringify({ mcp: { [serverId]: serverConfig } });
+    runtimeEnv[policy.configEnv] = JSON.stringify({
+      mcp: { [serverId]: serverConfig },
+      ...(isUserCatalog ? { permission: Object.fromEntries(USER_MCP.allowedOpenCodeTools.map(tool => [tool, 'allow'])) } : {}),
+    });
     spec.envAllowlist = [...new Set([...spec.envAllowlist, policy.tokenEnv, policy.proofEnv, policy.configEnv])];
   }
   return { spec, runtimeEnv };
