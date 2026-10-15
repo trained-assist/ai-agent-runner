@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { RunnerRunCoordinator } from '../src/cloudflare/run-coordinator.js';
 import runnerWorker from '../src/cloudflare/runner-api.js';
 import type { ApiPrincipal, DurableObjectStateLike, DurableStorage, RunnerWorkerEnv } from '../src/cloudflare/types.js';
-import { createHash, generateKeyPairSync, verify } from 'node:crypto';
+import { createHash, createHmac, generateKeyPairSync, verify } from 'node:crypto';
 
 class MemoryStorage implements DurableStorage {
   values = new Map<string, unknown>();
@@ -606,6 +606,107 @@ describe('tenant-bound model connections', () => {
     env.DEPLOYMENT_ENV = undefined;
     env.RUNNER_BYOK_ENABLED = undefined;
     expect((await coordinator.fetch(call('/v1/runs', byokBody, { 'idempotency-key': 'disabled-byok' }))).status).toBe(422);
+  });
+});
+
+describe('principal-bound terminal webhooks', () => {
+  const webhookSecret = 'sandbox-webhook-signing-secret-at-least-24';
+  function provision(env: RunnerWorkerEnv) {
+    env.RUNNER_WEBHOOKS_ENABLED = 'true';
+    env.RUNNER_WEBHOOKS = JSON.stringify([{ webhookId: 'wh-a', principalId: principal.principalId,
+      profileId: principal.profileId, url: 'https://hooks.customer.com/runner', secretBinding: 'RUNNER_WEBHOOK_SECRET_A' }]);
+    env['RUNNER_WEBHOOK_SECRET_A'] = webhookSecret;
+  }
+
+  it('delivers a signed terminal event, retries a 5xx, and reports the final delivery state', async () => {
+    const { coordinator, env, storage } = setup();
+    provision(env);
+    const sent: Array<{ headers: Headers; body: string }> = [];
+    const workerFetch = env.FETCH!;
+    env.FETCH = async (input, init) => {
+      const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+      if (url.hostname !== 'hooks.customer.com') return workerFetch(input, init);
+      sent.push({ headers: new Headers(init?.headers), body: String(init?.body) });
+      expect(init?.redirect).toBe('manual');
+      return new Response(null, { status: sent.length === 1 ? 503 : 204 });
+    };
+    const submitted = await coordinator.fetch(call('/v1/runs', { ...body, webhookId: 'wh-a' }, { 'idempotency-key': 'webhook-attempt' }));
+    expect(submitted.status).toBe(202);
+    const { runId } = await submitted.json() as { runId: string };
+    await coordinator.alarm();
+    await coordinator.alarm();
+    await coordinator.alarm();
+    expect(sent).toHaveLength(1);
+    const first = sent[0]!;
+    const payload = JSON.parse(first.body) as Record<string, unknown>;
+    expect(payload).toMatchObject({ eventId: `terminal:${runId}`, type: 'run.terminal', runId, state: 'succeeded',
+      resultUrl: `https://runner-api.example/v1/developer/runs/${runId}/result`, result: { text: 'done' } });
+    expect(first.headers.get('x-serverlessagence-signature')).toBe(`v1=${createHmac('sha256', webhookSecret)
+      .update(`${first.headers.get('x-serverlessagence-timestamp')}.${first.body}`).digest('hex')}`);
+    const pending = await coordinator.fetch(call(`/v1/runs/${runId}/webhook`));
+    expect(await pending.json()).toMatchObject({ status: 'pending', attempts: 1, lastStatus: 503 });
+    const persisted = storage.values.get('runner-v1') as { runs: Record<string, { webhook: { nextAttemptAt: string } }> };
+    expect(JSON.stringify(persisted)).not.toContain(webhookSecret);
+    persisted.runs[runId]!.webhook.nextAttemptAt = new Date(0).toISOString();
+    await coordinator.alarm();
+    expect(sent).toHaveLength(2);
+    expect(JSON.parse(sent[1]!.body)).toMatchObject({ eventId: `terminal:${runId}` });
+    const delivered = await coordinator.fetch(call(`/v1/runs/${runId}/webhook`));
+    expect(await delivered.json()).toMatchObject({ status: 'delivered', attempts: 2, lastStatus: 204 });
+    await coordinator.alarm();
+    expect(sent).toHaveLength(2);
+  });
+
+  it('rejects a foreign or unregistered webhook without creating a run', async () => {
+    const { coordinator, env, storage } = setup();
+    provision(env);
+    const foreign = await coordinator.fetch(call('/v1/runs', { ...body, webhookId: 'wh-a' }, { 'idempotency-key': 'foreign-webhook' },
+      { ...principal, principalId: 'other-principal' }));
+    expect(foreign.status).toBe(404);
+    const unknown = await coordinator.fetch(call('/v1/runs', { ...body, webhookId: 'not-registered' }, { 'idempotency-key': 'unknown-webhook' }));
+    expect(unknown.status).toBe(404);
+    expect((storage.values.get('runner-v1') as { runs: Record<string, unknown> }).runs).toEqual({});
+  });
+
+  it('refuses insecure endpoint configuration and keeps production webhook admission closed', async () => {
+    const { coordinator, env } = setup();
+    provision(env);
+    env.RUNNER_WEBHOOKS = JSON.stringify([{ webhookId: 'wh-a', principalId: principal.principalId, profileId: principal.profileId,
+      url: 'http://127.0.0.1/collect', secretBinding: 'RUNNER_WEBHOOK_SECRET_A' }]);
+    expect((await coordinator.fetch(call('/v1/runs', { ...body, webhookId: 'wh-a' }, { 'idempotency-key': 'bad-url' }))).status).toBe(503);
+    provision(env);
+    env.DEPLOYMENT_ENV = 'production';
+    expect((await coordinator.fetch(call('/v1/runs', { ...body, webhookId: 'wh-a' }, { 'idempotency-key': 'prod-webhook' }))).status).toBe(422);
+  });
+
+  it('stops after eight failed deliveries and protects a pending webhook from cleanup', async () => {
+    const { coordinator, env, storage } = setup();
+    provision(env);
+    let sent = 0;
+    const workerFetch = env.FETCH!;
+    env.FETCH = async (input, init) => {
+      const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+      if (url.hostname !== 'hooks.customer.com') return workerFetch(input, init);
+      sent += 1;
+      return new Response(null, { status: 503 });
+    };
+    const submitted = await coordinator.fetch(call('/v1/runs', { ...body, webhookId: 'wh-a' }, { 'idempotency-key': 'webhook-exhaustion' }));
+    const { runId } = await submitted.json() as { runId: string };
+    await coordinator.alarm();
+    await coordinator.alarm();
+    await coordinator.alarm();
+    expect(sent).toBe(1);
+    expect((await coordinator.fetch(call('/v1/sandbox/cleanup-task', { userTaskId: body.userTaskId }))).status).toBe(409);
+    for (let attempt = 2; attempt <= 8; attempt++) {
+      const persisted = storage.values.get('runner-v1') as { runs: Record<string, { webhook: { nextAttemptAt: string } }> };
+      persisted.runs[runId]!.webhook.nextAttemptAt = new Date(0).toISOString();
+      await coordinator.alarm();
+    }
+    expect(sent).toBe(8);
+    const status = await coordinator.fetch(call(`/v1/runs/${runId}/webhook`));
+    expect(await status.json()).toMatchObject({ status: 'failed', attempts: 8, lastStatus: 503 });
+    await coordinator.alarm();
+    expect(sent).toBe(8);
   });
 });
 

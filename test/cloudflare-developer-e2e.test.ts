@@ -63,6 +63,10 @@ describe('developer API through the live coordinator contract', () => {
     expect((await status.json() as { state: string }).state).toBe('succeeded');
     const result = await runnerApi.fetch(new Request(`https://api.example/v1/developer/runs/${receipt.runId}/result`, { headers }), env);
     expect((await result.json() as { text: string }).text).toBe('SDK generated');
+    const cancel = await runnerApi.fetch(new Request(`https://api.example/v1/developer/runs/${receipt.runId}/cancel`, {
+      method: 'POST', headers,
+    }), env);
+    expect(await cancel.json()).toMatchObject({ status: 'already_terminal', runId: receipt.runId });
     const capabilities = await runnerApi.fetch(new Request('https://api.example/v1/developer/capabilities', { headers }), env);
     expect(await capabilities.json()).toMatchObject({ managedAvailable: true, features: { billing: false } });
   });

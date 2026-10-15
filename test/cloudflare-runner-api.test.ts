@@ -253,6 +253,29 @@ describe('opt-in developer API', () => {
     expect(response.status).toBe(202);
     expect(await calls[0]!.json()).toMatchObject({ envAllowlist: [], credentialBindings: [{ type: 'openai', connectionId: 'conn-a' }] });
   });
+
+  it('lists only registered webhooks and forwards only the webhook ID on submission', async () => {
+    const { env, calls } = await setup();
+    env.RUNNER_WEBHOOKS_ENABLED = 'true';
+    env.RUNNER_WEBHOOKS = JSON.stringify([
+      { webhookId: 'wh-mine', principalId: 'developer', profileId: 'dev-profile', tenantId: 'tenant-a',
+        url: 'https://hooks.customer.com/agent', secretBinding: 'RUNNER_WEBHOOK_SECRET_A' },
+      { webhookId: 'wh-foreign', principalId: 'other', profileId: 'other-profile', tenantId: 'other-tenant',
+        url: 'https://hooks.other.com/agent', secretBinding: 'RUNNER_WEBHOOK_SECRET_OTHER' },
+    ]);
+    env['RUNNER_WEBHOOK_SECRET_A'] = 'test-webhook-signing-secret-long-enough';
+    env['RUNNER_WEBHOOK_SECRET_OTHER'] = 'other-webhook-signing-secret-long-enough';
+    const list = await runnerApi.fetch(new Request('https://api.example/v1/developer/webhooks', { headers: { authorization: `Bearer ${token}` } }), env);
+    expect(await list.json()).toEqual({ webhooks: [{ webhookId: 'wh-mine', url: 'https://hooks.customer.com/agent' }] });
+    const response = await runnerApi.fetch(new Request('https://api.example/v1/developer/runs', { method: 'POST', headers: {
+      authorization: `Bearer ${token}`, 'idempotency-key': 'webhook-1', 'content-type': 'application/json',
+    }, body: JSON.stringify({ prompt: 'answer', model: { mode: 'managed' }, webhookId: 'wh-mine' }) }), env);
+    expect(response.status).toBe(202);
+    const forwarded = await calls[0]!.json() as Record<string, unknown>;
+    expect(forwarded['webhookId']).toBe('wh-mine');
+    expect(JSON.stringify(forwarded)).not.toContain('hooks.customer.com');
+    expect(JSON.stringify(forwarded)).not.toContain('test-webhook-signing-secret');
+  });
 });
 
 describe('Cloudflare Runner delegated profile capability', () => {

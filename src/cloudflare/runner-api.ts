@@ -1,5 +1,5 @@
 import type { ApiPrincipal, RunnerWorkerEnv } from './types.js';
-import { developerCapabilities, developerRequest } from './developer-api.js';
+import { developerCapabilities, developerRequest, developerWebhooks } from './developer-api.js';
 
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const DEFAULT_ENGINE = 'eu-vm-agent-run';
@@ -125,6 +125,13 @@ export default {
       if (request.method !== 'GET') return error('METHOD_NOT_ALLOWED', 'capabilities supports GET only', 405);
       if (!requireScope(principal, 'runs:read')) return error('FORBIDDEN', 'runs:read scope is required', 403);
       return developerCapabilities(env, principal);
+    }
+    if (url.pathname === '/v1/developer/webhooks') {
+      if (env.DEPLOYMENT_ENV === 'production' || env.RUNNER_DEVELOPER_API_ENABLED !== 'true') return error('DEVELOPER_API_UNAVAILABLE', 'developer API is disabled on this lane', 503);
+      if (!principal.developerApi) return error('FORBIDDEN', 'developer API is not enabled for this key', 403);
+      if (request.method !== 'GET') return error('METHOD_NOT_ALLOWED', 'webhooks supports GET only', 405);
+      if (!requireScope(principal, 'runs:read')) return error('FORBIDDEN', 'runs:read scope is required', 403);
+      return developerWebhooks(env, principal);
     }
     if (url.pathname === '/v1/developer/runs' || url.pathname.startsWith('/v1/developer/runs/')) {
       if (env.DEPLOYMENT_ENV === 'production' || env.RUNNER_DEVELOPER_API_ENABLED !== 'true') return error('DEVELOPER_API_UNAVAILABLE', 'developer API is disabled on this lane', 503);

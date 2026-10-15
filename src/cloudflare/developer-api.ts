@@ -1,8 +1,9 @@
 import type { ApiPrincipal, RunnerWorkerEnv } from './types.js';
+import { principalWebhooks } from './webhooks.js';
 
 const RUN_ID = /^run_[0-9a-f]{64}_[0-9a-f]{24}$/;
 const CONNECTION_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
-const ACTIONS = new Set(['result', 'events', 'artifacts']);
+const ACTIONS = new Set(['result', 'events', 'artifacts', 'webhook']);
 
 function failure(code: string, message: string, status: number): Response {
   return Response.json({ error: { code, message } }, { status, headers: { 'cache-control': 'no-store' } });
@@ -37,11 +38,19 @@ export function developerCapabilities(env: RunnerWorkerEnv, principal: ApiPrinci
     && typeof env[item['secretBinding']] === 'string' && allowed.has('OPENAI_API_KEY')
     && env.RUNNER_BYOK_ENABLED === 'true')
     .map((item) => ({ connectionId: item['connectionId'], provider: 'openai', model: item['model'] }));
+  let webhooks: Array<{ webhookId: string; url: string }>;
+  try { webhooks = principalWebhooks(env, principal); } catch { return failure('SERVER_MISCONFIGURED', 'webhook registry is invalid', 503); }
   return Response.json({ contractVersion: 1, execution: 'eu-vm-agent-run', isolation: 'none',
     limits: { maxTimeoutSeconds: 3600, maxPromptCharacters: 100_000 },
-    managedAvailable: managed, managedModel: env.RUNNER_DEVELOPER_MANAGED_MODEL ?? null, byokConnections, features: { status: true, result: true, events: true,
-      artifacts: true, cancel: true, billing: false, selfServiceConnections: false } },
+    managedAvailable: managed, managedModel: env.RUNNER_DEVELOPER_MANAGED_MODEL ?? null, byokConnections, webhooks,
+    features: { status: true, result: true, events: true, artifacts: true, cancel: true,
+      webhooks: env.RUNNER_WEBHOOKS_ENABLED === 'true', billing: false, selfServiceConnections: false } },
   { headers: { 'cache-control': 'no-store' } });
+}
+
+export function developerWebhooks(env: RunnerWorkerEnv, principal: ApiPrincipal): Response {
+  try { return Response.json({ webhooks: principalWebhooks(env, principal) }, { headers: { 'cache-control': 'no-store' } }); }
+  catch { return failure('SERVER_MISCONFIGURED', 'webhook registry is invalid', 503); }
 }
 
 /**
@@ -67,11 +76,15 @@ export async function developerRequest(request: Request, env: RunnerWorkerEnv, p
       if (new TextEncoder().encode(text).byteLength > 1_000_000) return failure('BODY_TOO_LARGE', 'request body exceeds 1000000 bytes', 413);
       body = JSON.parse(text);
     } catch { return failure('INVALID_REQUEST', 'request body must be JSON', 400); }
-    if (!plainObject(body) || Object.keys(body).some((field) => !['prompt', 'model', 'limits'].includes(field))) {
-      return failure('INVALID_REQUEST', 'only prompt, model and limits are supported', 400);
+    if (!plainObject(body) || Object.keys(body).some((field) => !['prompt', 'model', 'limits', 'webhookId'].includes(field))) {
+      return failure('INVALID_REQUEST', 'only prompt, model, limits and webhookId are supported', 400);
     }
     const prompt = body['prompt'];
     if (typeof prompt !== 'string' || !prompt.trim() || prompt.length > 100_000) return failure('INVALID_REQUEST', 'prompt must be non-empty and at most 100000 characters', 400);
+    const webhookId = body['webhookId'];
+    if (webhookId !== undefined && (typeof webhookId !== 'string' || !CONNECTION_ID.test(webhookId))) {
+      return failure('INVALID_REQUEST', 'webhookId must be a safe registered identifier', 400);
+    }
     const model = body['model'];
     if (!plainObject(model) || Object.keys(model).some((field) => !['mode', 'connectionId'].includes(field)) || !['managed', 'byok'].includes(String(model['mode']))) {
       return failure('INVALID_REQUEST', 'model.mode must be managed or byok', 400);
@@ -104,6 +117,7 @@ export async function developerRequest(request: Request, env: RunnerWorkerEnv, p
     const taskId = `dev-${taskHash.slice(0, 48)}`;
     const legacyBody = { userTaskId: taskId, input: { inlinePrompt: prompt }, envAllowlist,
       limits: { timeoutMs: Number(limits?.['timeoutSeconds'] ?? 300) * 1000 },
+      ...(webhookId ? { webhookId } : {}),
       ...(requestedMode === 'managed' && env.RUNNER_DEVELOPER_MANAGED_MODEL ? {
         engine: { name: env.RUNNER_ENGINE || 'eu-vm-agent-run', adapterVersion: '1', modelSettings: { model: env.RUNNER_DEVELOPER_MANAGED_MODEL } },
       } : {}),
@@ -129,6 +143,7 @@ export async function developerRequest(request: Request, env: RunnerWorkerEnv, p
   if (url.search && action !== 'events' && action !== 'artifacts') return failure('INVALID_REQUEST', 'query parameters are not supported for this action', 400);
   const object = env.RUNNER_RUNS.get(env.RUNNER_RUNS.idFromName(`task-${runId.split('_')[1]}`));
   const headers = new Headers({ 'x-runner-principal': JSON.stringify(principal) });
+  if (write) headers.set('content-type', 'application/json');
   const internalUrl = `https://runner-runs.internal/v1/runs/${runId}/${action}${url.search}`;
-  return object.fetch(new Request(internalUrl, { method: request.method, headers }));
+  return object.fetch(new Request(internalUrl, { method: request.method, headers, ...(write ? { body: '{}' } : {}) }));
 }
