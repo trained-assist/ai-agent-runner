@@ -282,7 +282,7 @@ function toRunSpec(request: LaunchRequest, options: VmWorkerServerOptions): { sp
     const isUserCatalog = server.url === USER_MCP.url;
     const policy = isUserCatalog ? USER_MCP : TEST_MCP;
     const serverId = isUserCatalog ? USER_MCP.server : TEST_MCP.server;
-    const serverConfig: Record<string, unknown> = { type: 'remote', url: server.url, enabled: true, headers: server.headers };
+    const serverConfig: Record<string, unknown> = { type: 'remote', url: server.url, enabled: true, oauth: false, headers: server.headers };
     runtimeEnv[policy.tokenEnv] = secretValues[policy.tokenEnv]!;
     runtimeEnv[policy.proofEnv] = secretValues[policy.proofEnv]!;
     runtimeEnv[policy.configEnv] = JSON.stringify({
