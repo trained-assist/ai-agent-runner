@@ -26,11 +26,11 @@ jobs:
           git merge-base --is-ancestor "$GITHUB_SHA" origin/main
       - name: Download and verify pinned OpenCode fork
         env:
-          OPENCODE_RELEASE_TAG: mem-v20261013-native-trace-af4e69c4be1e
-          OPENCODE_VERSION: 0.0.0-native-trace-af4e69c4be1e-20261013
-          OPENCODE_SOURCE_SHA: af4e69c4be1e4e36bc510cc6b1083571db4a4868
-          OPENCODE_ARCHIVE_SHA256: 7b7b57a1c8762f6735f2d794c1a455dbdd4d83b5af9cd0532eba49337570d5b3
-          OPENCODE_BINARY_SHA256: 1bed8883499b6e370208cf948b84c90a74369c934c566dab1deb501ef1cbea3d
+          OPENCODE_RELEASE_TAG: mem-preview-20261015-turn-recovery-91570c76816f
+          OPENCODE_VERSION: 0.0.0-turn-recovery-91570c76816f-202610151149
+          OPENCODE_SOURCE_SHA: 91570c76816fa82244935521c7af4adf9ed81ec7
+          OPENCODE_ARCHIVE_SHA256: ecd22b2414fc626e86b723e4adc780a350bc8fb52d1e102c718c5825c38c5a90
+          OPENCODE_BINARY_SHA256: f0f143113a4c53a334f53a91482503fc362851fadc873ec1fd94ae14fdf92e36
         run: |
           set -euo pipefail
           asset="opencode-linux-x64.tar.gz"
