@@ -1,5 +1,6 @@
 import type { ApiPrincipal, RunnerWorkerEnv } from './types.js';
 import { developerCapabilities, developerRequest, developerWebhooks } from './developer-api.js';
+import { githubConnections, githubIntake, isGithubConnectionPath, isGithubIntake } from './github-connection-api.js';
 
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const DEFAULT_ENGINE = 'eu-vm-agent-run';
@@ -122,6 +123,7 @@ export default {
     const url = new URL(request.url);
     if (url.pathname === '/healthz' && request.method === 'GET') return json({ status: 'ok', service: 'ai-agent-runner-api', placement: 'cloudflare-worker', executionWorker: 'eu-vm-agent-run' });
     if (url.pathname === '/version' && request.method === 'GET') return json({ service: 'ai-agent-runner-api', runtime: 'cloudflare-worker', contractVersion: 1, buildSha: env.BUILD_SHA ?? null });
+    if (isGithubIntake(url.pathname)) return githubIntake(request, env);
     const guestDownload = /^\/v1\/developer\/downloads\/(run_[0-9a-f]{64}_[0-9a-f]{24})$/.exec(url.pathname);
     if (guestDownload) {
       if (request.method !== 'GET') return error('METHOD_NOT_ALLOWED', 'downloads support GET only', 405);
@@ -135,6 +137,11 @@ export default {
     let principal: ApiPrincipal;
     try { principal = await delegatedPrincipal(request, authenticated, env); }
     catch { return error('FORBIDDEN', 'invalid or expired host profile capability', 403); }
+    if (isGithubConnectionPath(url.pathname)) {
+      if (env.DEPLOYMENT_ENV === 'production' || env.RUNNER_DEVELOPER_API_ENABLED !== 'true') return error('DEVELOPER_API_UNAVAILABLE', 'developer API is disabled on this lane', 503);
+      if (!principal.developerApi) return error('FORBIDDEN', 'developer API is not enabled for this key', 403);
+      return githubConnections(request, env, principal);
+    }
     if (url.pathname === '/v1/developer/capabilities') {
       if (env.DEPLOYMENT_ENV === 'production' || env.RUNNER_DEVELOPER_API_ENABLED !== 'true') return error('DEVELOPER_API_UNAVAILABLE', 'developer API is disabled on this lane', 503);
       if (!principal.developerApi) return error('FORBIDDEN', 'developer API is not enabled for this key', 403);

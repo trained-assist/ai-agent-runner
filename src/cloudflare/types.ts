@@ -51,12 +51,18 @@ export interface RunnerWorkerEnv {
   RUNNER_DEVELOPER_MANAGED_MODEL?: string;
   /** Signing key for 24-hour guest artifact download capabilities. */
   RUNNER_GUEST_DOWNLOAD_SECRET?: string;
+  /** Sandbox-only ZeroCreds integrator used to create one-time GitHub token forms. */
+  ZEROCREDS_API_URL?: string;
+  ZEROCREDS_INTEGRATOR_TOKEN?: string;
+  /** 32 random bytes encoded as 64 lowercase hex characters. */
+  RUNNER_GITHUB_CONNECTION_KEY?: string;
   MCP_TEST_AUTH_TOKEN?: string;
   MCP_TEST_RUNNER_PRIVATE_JWK?: string;
   MCP_TEST_CATALOGUE_VERSION?: string;
   MCP_TEST_EXPIRES_AT?: string;
   [binding: string]: unknown;
   RUNNER_RUNS: { idFromName(name: string): unknown; get(id: unknown): { fetch(request: Request): Promise<Response> } };
+  RUNNER_GITHUB_CONNECTIONS?: { idFromName(name: string): unknown; get(id: unknown): { fetch(request: Request): Promise<Response> } };
 }
 
 export interface ApiPrincipal {

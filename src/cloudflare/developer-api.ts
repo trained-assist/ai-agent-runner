@@ -1,5 +1,6 @@
 import type { ApiPrincipal, RunnerWorkerEnv } from './types.js';
 import { principalWebhooks } from './webhooks.js';
+import { githubConnectionConfigured } from './github-connection.js';
 
 const RUN_ID = /^run_[0-9a-f]{64}_[0-9a-f]{24}$/;
 const CONNECTION_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
@@ -44,7 +45,8 @@ export function developerCapabilities(env: RunnerWorkerEnv, principal: ApiPrinci
     limits: { maxTimeoutSeconds: 3600, maxPromptCharacters: 100_000 },
     managedAvailable: managed, managedModel: env.RUNNER_DEVELOPER_MANAGED_MODEL ?? null, byokConnections, webhooks,
     features: { status: true, result: true, events: true, artifacts: true, cancel: true,
-      webhooks: env.RUNNER_WEBHOOKS_ENABLED === 'true', billing: false, selfServiceConnections: false } },
+      webhooks: env.RUNNER_WEBHOOKS_ENABLED === 'true', billing: false, selfServiceConnections: false,
+      githubConnectionIntake: githubConnectionConfigured(env) } },
   { headers: { 'cache-control': 'no-store' } });
 }
 

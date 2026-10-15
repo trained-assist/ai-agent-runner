@@ -21,6 +21,28 @@ Authorization: Bearer <runner-api-key>
 
 Capabilities show which model modes are configured for this principal and its connection IDs. They also disclose `isolation: none`, the maximum timeout, and that billing and self-service connections are unavailable.
 
+### GitHub token connection through ZeroCreds (sandbox)
+
+The sandbox developer API can create a one-time ZeroCreds form for a GitHub personal access token. This path is separate from model BYOK and from the future trusted MCP methods; no MCP method names or executor allowlist are assumed here. The token is entered in the ZeroCreds page, posted directly to the Runner intake endpoint, checked against `GET /user` on GitHub, then stored as AES-256-GCM ciphertext in a principal-scoped Durable Object. The encryption key is a separate Worker secret. The API returns only a connection ID, GitHub account metadata, and whether that token can read or push to the principal's currently bound repository. It never returns the token. The one-time intake link expires after 15 minutes, rejects a second submission, and revocation deletes the ciphertext.
+
+```http
+POST /v1/developer/github/connections
+Authorization: Bearer <runner-api-key>
+```
+
+The response contains `connectionId`, `status: "pending"`, `formUrl` and `expiresAt`. Open `formUrl` in a browser and enter the token there. Then poll:
+
+```http
+GET /v1/developer/github/connections/{connectionId}
+Authorization: Bearer <runner-api-key>
+```
+
+The response changes to `status: "connected"` with `github.login`, numeric `github.id`, and `github.repositoryAccess` (`push`, `read` or `none`). `DELETE` on the same URL revokes the connection. A different principal/profile/tenant receives 404. Creation requires `runs:write`; status requires `runs:read`.
+
+This increment **binds and verifies** the GitHub token. It does not pass the token into an OpenCode process or accept `githubConnectionId` in a run request yet. The VM currently runs with `isolation.mode=none`, so exposing a customer PAT to its process would cross the trust boundary. A subsequent trusted MCP operation or isolated Git publisher can consume the connection after its scope and audit contract are specified. The existing run contract and repository binding remain unchanged.
+
+For the sandbox lane, bind the new `RUNNER_GITHUB_CONNECTIONS` Durable Object and set `RUNNER_GITHUB_CONNECTION_KEY` to 32 cryptographically random bytes encoded as 64 lowercase hex characters. Set `ZEROCREDS_API_URL` to the exact HTTPS form origin and `ZEROCREDS_INTEGRATOR_TOKEN` as a Worker secret for a dedicated integrator. The Runner creates a ZeroCreds session with an inline `http_post` destination containing the one-time intake capability. ZeroCreds #64 will reject inline destinations by default; before that hardening is deployed, replace this with a reviewed named-destination parameter contract or permit inline destinations only on a dedicated isolated ZeroCreds instance. Do not open a general inline destination switch on a shared production service. The API reports `githubConnectionIntake: false` or 503 if any required binding is missing. Production deployment is disabled by the developer-API gate.
+
 ```http
 POST /v1/developer/runs
 Authorization: Bearer <runner-api-key>
@@ -86,6 +108,7 @@ The receiver verifies `X-ServerlessAgence-Signature: v1=<hex>` as HMAC-SHA256 ov
 - [x] Add sandbox guest artifact capability URLs with a 24-hour access TTL, preserving the legacy result fields and authenticated downloads.
 - [ ] Prove a fresh isolated sandbox for each run with CPU, memory, disk, process, network and time limits. Run cross-tenant negative tests; `isolation=none` blocks public arbitrary-code use.
 - [ ] Implement organization accounts, self-service API key issuance/rotation, tenant-scoped connection creation/revocation, and GitHub App installation on selected repositories.
+- [ ] Promote the sandbox GitHub token intake only after the ZeroCreds named-destination contract, sandbox deployment, real form submission, GitHub identity check, revocation and legacy CP canary pass. Define trusted MCP/Git publishing operations separately; method names are undecided.
 - [ ] Build a transactional credit ledger: reserve before admission, trusted model/compute metering, settle once, hold unknown outcomes for reconciliation, and cap concurrent trial usage. BYOK still pays for platform execution.
 - [ ] Add durable file input, independent private artifact storage, lifecycle deletion after guest expiry, and explicit workspace revision/saveback semantics. Do not create a new product user for every run.
 - [ ] Add a trusted GitHub publisher that creates a branch and PR using a repository-scoped installation token. The agent should not hold general write credentials.
