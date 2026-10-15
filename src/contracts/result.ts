@@ -4,6 +4,8 @@ import { isSafeRelativePath } from '../storage/local-paths.js';
 export const RUN_RESULT_SCHEMA_VERSION = 1 as const;
 
 export type RunOutcome = 'succeeded' | 'failed' | 'cancelled';
+/** Evidence at the engine boundary; only `not_started` permits an automatic fresh attempt. */
+export type EngineStartEvidence = 'not_started' | 'started' | 'unknown';
 
 export type ExitReason =
   | 'completed'
@@ -47,6 +49,7 @@ export interface RunResult {
   exitCode: number | null;
   exitSignal: string | null;
   exitObserved: boolean;
+  engineStart?: EngineStartEvidence;
   startedAt: string;
   finishedAt: string;
   /** Captured engine answer; independent of the asynchronous artifact export phase. */
@@ -103,6 +106,7 @@ const RESULT_KEYS = [
   'exitCode',
   'exitSignal',
   'exitObserved',
+  'engineStart',
   'startedAt',
   'finishedAt',
   'text',
@@ -128,7 +132,7 @@ const OUTCOME_EXIT_REASONS: Record<RunOutcome, readonly ExitReason[]> = {
 export function validateRunResult(input: unknown): ValidationResult<RunResult> {
   const collector = new ErrorCollector();
   if (!checkObject(input, 'result', collector)) return collector.finish(undefined as never);
-  const optional = new Set(['failure', 'persistenceReason', 'repositoryCommit', 'profileChanges', 'cleanupReason', 'text', 'sessionCheckpoint']);
+  const optional = new Set(['failure', 'persistenceReason', 'repositoryCommit', 'profileChanges', 'cleanupReason', 'text', 'sessionCheckpoint', 'engineStart']);
   const required = RESULT_KEYS.filter((key) => !optional.has(key));
   checkKeys(input, RESULT_KEYS, required, 'result', collector);
 
@@ -178,6 +182,7 @@ export function validateRunResult(input: unknown): ValidationResult<RunResult> {
     }
   }
   if (typeof input['exitObserved'] !== 'boolean') collector.push('result.exitObserved: expected boolean');
+  if (input['engineStart'] !== undefined && !['not_started', 'started', 'unknown'].includes(String(input['engineStart']))) collector.push('result.engineStart: expected not_started | started | unknown');
   if (!isUtcTimestamp(input['startedAt'])) collector.push('result.startedAt: expected UTC ISO timestamp');
   if (!isUtcTimestamp(input['finishedAt'])) collector.push('result.finishedAt: expected UTC ISO timestamp');
   // Engine output may contain line breaks and tabs; it is data, not an identifier.

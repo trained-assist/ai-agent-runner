@@ -2,9 +2,46 @@ import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { isProcessAlive, isProcessGroupAlive } from '../src/adapters/engine/process-tree.js';
+import type { EngineAdapter, EngineHandle } from '../src/adapters/engine/engine-adapter.js';
 import { createHarness, waitFor } from './helpers.js';
 
 describe('worker restart recovery', () => {
+  it('retries proven pre-spawn worker crashes twice, then stops at the configured attempt limit', async () => {
+    const h = createHarness();
+    h.faults.inject('preflight', { kind: 'custom', count: 3, fn: () => new Promise<void>(() => {}) });
+    const { receipt } = h.start();
+
+    for (const expectedAttempt of [1, 2, 3]) {
+      await waitFor(() => h.runner.getRun(receipt.runId)?.startAttempts === expectedAttempt
+        && h.runner.getRun(receipt.runId)?.startPhase === 'preflight', 2_000, `preflight attempt ${expectedAttempt}`);
+      h.reopen();
+      await h.runner.recover();
+    }
+
+    await waitFor(() => h.runner.getRun(receipt.runId)?.state === 'failed', 1_000, 'retry budget exhaustion');
+    const snapshot = h.runner.getRun(receipt.runId)!;
+    expect(snapshot.startAttempts).toBe(3); // initial start + two retries
+    expect(snapshot.result?.engineStart).toBe('not_started');
+    expect(snapshot.result?.failure).toMatchObject({ code: 'WORKER_CRASH_BEFORE_ENGINE_START', retryable: false });
+    expect(h.fake.startCalls).toBe(0);
+  });
+
+  it('does not automatically retry after the durable spawn boundary is crossed', async () => {
+    const engine: EngineAdapter = { name: 'fake', async start() { return new Promise<EngineHandle>(() => {}); } };
+    const h = createHarness({ adapters: { fake: engine } });
+    const { receipt } = h.start();
+    await waitFor(() => h.runner.getRun(receipt.runId)?.startPhase === 'spawn', 2_000, 'spawn phase');
+
+    h.reopen();
+    await h.runner.recover();
+    const snapshot = h.runner.getRun(receipt.runId)!;
+    expect(snapshot.state).toBe('failed');
+    expect(snapshot.startAttempts).toBe(1);
+    expect(snapshot.result?.engineStart).toBe('unknown');
+    expect(snapshot.result?.failure?.code).toBe('WORKER_CRASH_DURING_ENGINE_START');
+    expect(h.fake.startCalls).toBe(0);
+  });
+
   it('orphaned engine: record survives, connection_lost is recorded, no hidden rerun', async () => {
     const h = createHarness({ scenario: 'timeout' });
     const spec = h.makeSpec();

@@ -233,6 +233,39 @@ describe('Cloudflare Runner run coordinator', () => {
     expect(launched).toHaveLength(1);
   });
 
+  it('does not confuse a fresh poll with worker progress while a run is stuck before process start', async () => {
+    const { coordinator, env, launched } = setup();
+    const stuckSince = new Date(Date.now() - 10 * 60_000).toISOString();
+    env.FETCH = async (input, init) => {
+      const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+      if (url.pathname === '/v1/launch') {
+        const launch = JSON.parse(String(init?.body)) as { runId: string };
+        launched.push(launch);
+        return Response.json({ runId: launch.runId, operationId: 'op-stuck-start', status: 'accepted' }, { status: 202 });
+      }
+      if (url.pathname.endsWith('/status')) return Response.json({ status: 'running', state: 'starting', startPhase: 'materialize', startAttempts: 1, startedAt: null, updatedAt: stuckSince });
+      if (url.pathname.endsWith('/logs')) return Response.json({ cursor: 0, logs: [] });
+      if (url.pathname.endsWith('/cancel')) return Response.json({ status: 'stop_pending' });
+      throw new Error(`unexpected worker request ${url.pathname}`);
+    };
+    const response = await coordinator.fetch(call('/v1/runs', body, { 'idempotency-key': 'stuck-before-engine-start' }));
+    const receipt = await response.json() as { runId: string };
+
+    await coordinator.alarm(); // accepted by France worker
+    await coordinator.alarm(); // first status poll observes starting
+    await coordinator.alarm(); // identical worker updatedAt, but successful contact
+
+    const status = await coordinator.fetch(call(`/v1/runs/${receipt.runId}/status`));
+    expect(await status.json()).toMatchObject({ state: 'starting', statusFreshness: 'fresh',
+      workerReportedUpdatedAt: stuckSince, workerProgressFreshness: 'stale', workerStartPhase: 'materialize', workerStartAttempts: 1, workerStartedAt: null });
+    expect(launched).toHaveLength(1);
+
+    // A stuck accepted run stays fenced: it must not be resent merely because
+    // progress stopped. Restart policy may act only after pre-start is proven.
+    await coordinator.alarm();
+    expect(launched).toHaveLength(1);
+  });
+
   it('proxies only a completed run output path to the VM worker', async () => {
     const { coordinator, env, storage } = setup();
     const bytes = Buffer.from('artifact bytes');

@@ -156,6 +156,14 @@ describe('валидация LaunchResult', () => {
     expect(validated.ok).toBe(true);
   });
 
+  it('preserves explicit engine-start evidence from the worker for safe retry decisions', () => {
+    const validated = validateLaunchResult(launchResult({ engineStart: 'not_started' }), 'run-1');
+    expect(validated.ok).toBe(true);
+    if (!validated.ok) return;
+    const mapping = mapLaunchResult(makeRunSpec({ runId: 'run-1' }), validated.value, TIMES);
+    expect(mapping.result.engineStart).toBe('not_started');
+  });
+
   it('ответ без answer принимается: настоящий opencode-шлюз его не присылает', () => {
     // Живая проба #100: реальный результат воркера отвергался как WORKER_PROTOCOL_INVALID
     // только из-за отсутствующего answer — рана с артефактами у клиента не было.

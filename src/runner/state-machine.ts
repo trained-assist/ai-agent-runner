@@ -6,7 +6,7 @@ export const TERMINAL_STATES: readonly RunState[] = ['succeeded', 'failed', 'can
 
 const ALLOWED: Record<RunState, readonly RunState[]> = {
   queued: ['starting', 'failed', 'cancelled'],
-  starting: ['running', 'finalizing', 'failed', 'cancelled'],
+  starting: ['queued', 'running', 'finalizing', 'failed', 'cancelled'],
   running: ['finalizing'],
   finalizing: ['succeeded', 'failed', 'cancelled'],
   succeeded: [],

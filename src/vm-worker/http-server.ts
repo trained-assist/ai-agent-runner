@@ -154,7 +154,8 @@ export function createVmWorkerServer(options: VmWorkerServerOptions): VmWorkerSe
     const snapshot = options.runner.getRun(runId);
     if (endpoint === 'status' && method === 'GET') {
       const status: WorkerRunStatus = snapshot ? stateToWorkerStatus(snapshot.state) : 'unknown';
-      sendJson(res, 200, { runId, status, ...(snapshot ? { state: snapshot.state, updatedAt: snapshot.updatedAt } : {}) });
+      sendJson(res, 200, { runId, status, ...(snapshot ? { state: snapshot.state, startPhase: snapshot.startPhase, startAttempts: snapshot.startAttempts,
+        startedAt: snapshot.startedAt, updatedAt: snapshot.updatedAt } : {}) });
       return;
     }
     if (!snapshot) { sendJson(res, endpoint === 'result' ? 404 : 200, endpoint === 'result' ? { error: 'NOT_FOUND' } : { runId, status: 'unknown_run' }); return; }
@@ -428,6 +429,7 @@ function toLaunchResult(options: VmWorkerServerOptions, snapshot: NonNullable<Re
     exitCode: result.exitCode,
     exitSignal: result.exitSignal,
     exitObserved: result.exitObserved,
+    ...(result.engineStart ? { engineStart: result.engineStart } : {}),
     exitReason: result.exitReason,
     stdout,
     stderr,

@@ -106,6 +106,55 @@ function resultOnDisk(rootDir: string, runId: string): { persistence: string; cl
 }
 
 describe('lifecycle рана: persist → проверенная уборка (issue #52, шаги 3–5)', () => {
+  it('settles a timeout before engine spawn and proves OpenCode was never invoked', async () => {
+    const engine = new WritingEngine();
+    const h = createHarness({ adapters: { fake: engine } });
+    h.faults.inject('preflight', { kind: 'custom', fn: () => new Promise<void>(() => {}) });
+    const { receipt } = h.start({ limits: { timeoutMs: 25, maxOutputBytes: 100_000, maxLogBytes: 100_000 } });
+
+    await waitFor(() => h.runner.getRun(receipt.runId)?.state === 'failed', 1000, 'pre-spawn timeout to settle');
+    const snapshot = h.runner.getRun(receipt.runId)!;
+    expect(snapshot.startPhase).toBe('preflight');
+    expect(snapshot.startedAt).toBeNull();
+    expect(snapshot.result?.failure).toMatchObject({ code: 'ENGINE_START_TIMEOUT', retryable: true });
+    expect(snapshot.result?.engineStart).toBe('not_started');
+    expect(engine.startCalls).toBe(0);
+  });
+
+  it('settles cancellation during preflight immediately and fences a late continuation', async () => {
+    const engine = new WritingEngine();
+    const h = createHarness({ adapters: { fake: engine } });
+    h.faults.inject('preflight', { kind: 'custom', fn: () => new Promise<void>(() => {}) });
+    const { receipt } = h.start({ limits: { timeoutMs: 5_000, maxOutputBytes: 100_000, maxLogBytes: 100_000 } });
+    await waitFor(() => h.runner.getRun(receipt.runId)?.startPhase === 'preflight', 1000, 'preflight start phase');
+
+    const stopped = await h.runner.cancel(receipt.runId, 1);
+    expect(stopped).toMatchObject({ status: 'stopped', state: 'cancelled' });
+    expect(h.runner.getRun(receipt.runId)?.result?.outcome).toBe('cancelled');
+    expect(engine.startCalls).toBe(0);
+  });
+
+  it('keeps an unresolved spawn fenced and visible instead of retrying an ambiguous start', async () => {
+    const engine: EngineAdapter = {
+      name: 'fake',
+      async start() { return new Promise<EngineHandle>(() => {}); },
+    };
+    const h = createHarness({ adapters: { fake: engine } });
+    const { receipt } = h.start({ limits: { timeoutMs: 1_000, maxOutputBytes: 100_000, maxLogBytes: 100_000 } });
+    await waitFor(() => h.runner.getRun(receipt.runId)?.startPhase === 'spawn', 1000, 'spawn boundary');
+    await new Promise((resolve) => setTimeout(resolve, 1_050));
+
+    const snapshot = h.runner.getRun(receipt.runId)!;
+    expect(snapshot.state).toBe('starting');
+    expect(snapshot.startPhase).toBe('spawn');
+    expect(snapshot.startedAt).toBeNull();
+    expect(snapshot.cancelRequested).toBe('timeout');
+    expect(snapshot.result).toBeNull();
+    const recovered = h.reopenWithoutDispose();
+    await recovered.recover();
+    expect(recovered.getRun(receipt.runId)?.result?.engineStart).toBe('unknown');
+  });
+
   it('does not claim a session checkpoint when the existing profile archive path is absent', async () => {
     const engine = new OpenCodeCheckpointEngine();
     const h = createHarness({ adapters: { opencode: engine }, artifactExport: true });
