@@ -856,12 +856,18 @@ export class Runner {
       }
       switch (st.state) {
         case 'queued':
-          if (this.opts.resumeQueuedRuns !== false && (st.startAttempts ?? 1) <= MAX_SAFE_START_RETRIES) {
-            st.startAttempts = (st.startAttempts ?? 1) + 1;
+          if (st.cancelRequested === 'cancel') {
+            this.completeWithoutEngine(st, 'cancelled', 'cancelled');
+            report.terminal += 1;
+          } else if (this.opts.resumeQueuedRuns !== false && (st.startAttempts ?? 1) <= MAX_SAFE_START_RETRIES + 1) {
+            // A timeout marker belongs to the previous pre-start attempt. If the
+            // worker died after it durably queued a safe retry but before cleanup
+            // launched it, recovery gives that retry a fresh start deadline.
+            st.cancelRequested = null;
             this.store.saveState(st);
             report.resumedQueued += 1;
             this.emit(st, 'log', { stream: 'runner', level: 'warn',
-              message: `engine_start_recovery attempt=${st.startAttempts}/${MAX_SAFE_START_RETRIES + 1} evidence=engine_not_started phase=queued` });
+              message: `engine_start_recovery attempt=${st.startAttempts ?? 1}/${MAX_SAFE_START_RETRIES + 1} evidence=engine_not_started phase=queued` });
             void this.execute(st.runId).catch(() => undefined);
           } else if (this.opts.resumeQueuedRuns === false) {
             this.completeWithoutEngine(st, 'failed', 'worker_crash', {

@@ -1,11 +1,61 @@
 import { describe, expect, it } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { isProcessAlive, isProcessGroupAlive } from '../src/adapters/engine/process-tree.js';
 import type { EngineAdapter, EngineHandle } from '../src/adapters/engine/engine-adapter.js';
+import type { PersistedRunState } from '../src/runner/run-store.js';
 import { createHarness, waitFor } from './helpers.js';
 
 describe('worker restart recovery', () => {
+  it('resumes an already-budgeted safe retry after restart without consuming the retry twice', async () => {
+    const h = createHarness();
+    h.faults.inject('preflight', { kind: 'custom', once: true, fn: () => new Promise<void>(() => {}) });
+    const { receipt } = h.start({ limits: { timeoutMs: 5_000, maxOutputBytes: 100_000, maxLogBytes: 100_000 } });
+    await waitFor(() => h.runner.getRun(receipt.runId)?.startPhase === 'preflight', 2_000, 'preflight start phase');
+
+    // Emulate a VM stopping after the retry decision was persisted, but before
+    // the next attempt got as far as preflight. attempt #2 is already reserved.
+    const statePath = join(h.rootDir, 'runs', receipt.runId, 'state.json');
+    const state = JSON.parse(readFileSync(statePath, 'utf8')) as PersistedRunState;
+    state.state = 'queued';
+    state.startPhase = 'queued';
+    state.startAttempts = 2;
+    state.cancelRequested = 'timeout';
+    state.pid = null;
+    state.pgid = null;
+    writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`);
+
+    const recovered = h.reopen();
+    const report = await recovered.recover();
+    expect(report.resumedQueued).toBe(1);
+    const result = await recovered.waitFor(receipt.runId, 2_000);
+    expect(result.outcome).toBe('succeeded');
+    expect(recovered.getRun(receipt.runId)?.startAttempts).toBe(2);
+    expect(h.fake.startCalls).toBe(1);
+  });
+
+  it('does not resume a queued run whose durable state contains user cancellation', async () => {
+    const h = createHarness();
+    h.faults.inject('preflight', { kind: 'custom', fn: () => new Promise<void>(() => {}) });
+    const { receipt } = h.start({ limits: { timeoutMs: 5_000, maxOutputBytes: 100_000, maxLogBytes: 100_000 } });
+    await waitFor(() => h.runner.getRun(receipt.runId)?.startPhase === 'preflight', 2_000, 'preflight start phase');
+
+    const statePath = join(h.rootDir, 'runs', receipt.runId, 'state.json');
+    const state = JSON.parse(readFileSync(statePath, 'utf8')) as PersistedRunState;
+    state.state = 'queued';
+    state.startPhase = 'queued';
+    state.cancelRequested = 'cancel';
+    state.pid = null;
+    state.pgid = null;
+    writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`);
+
+    const recovered = h.reopen();
+    await recovered.recover();
+    const result = await recovered.waitFor(receipt.runId, 2_000);
+    expect(result.outcome).toBe('cancelled');
+    expect(h.fake.startCalls).toBe(0);
+  });
+
   it('retries proven pre-spawn worker crashes twice, then stops at the configured attempt limit', async () => {
     const h = createHarness();
     h.faults.inject('preflight', { kind: 'custom', count: 3, fn: () => new Promise<void>(() => {}) });
