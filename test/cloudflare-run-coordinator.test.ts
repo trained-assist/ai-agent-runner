@@ -205,6 +205,52 @@ describe('Cloudflare Runner run coordinator', () => {
     expect(await result.json()).toMatchObject({ outcome: 'succeeded', text: 'done' });
   });
 
+  it('preserves a non-truncated OpenCode stdout answer when an older worker omits answer', async () => {
+    const { coordinator, env } = setup();
+    const previousFetch = env.FETCH!;
+    env.FETCH = async (input, init) => {
+      const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+      if (url.pathname.endsWith('/result')) {
+        return Response.json({ exitReason: 'completed', exitCode: 0, exitSignal: null, answer: null,
+          stdout: 'GitHub auth is connected.', stderr: '', outputTruncated: false, artifacts: [], logUrl: '', repo: null });
+      }
+      return previousFetch(input, init);
+    };
+    const response = await coordinator.fetch(call('/v1/runs', body, { 'idempotency-key': 'stdout-answer-fallback' }));
+    const receipt = await response.json() as { runId: string };
+    await coordinator.alarm();
+    await coordinator.alarm();
+    await coordinator.alarm();
+
+    const status = await coordinator.fetch(call(`/v1/runs/${receipt.runId}/status`));
+    expect(await status.json()).toMatchObject({ state: 'succeeded', answer: 'GitHub auth is connected.' });
+    const result = await coordinator.fetch(call(`/v1/runs/${receipt.runId}/result`));
+    expect(await result.json()).toMatchObject({ outcome: 'succeeded', text: 'GitHub auth is connected.' });
+  });
+
+  it('does not promote a truncated stdout buffer to the answer', async () => {
+    const { coordinator, env } = setup();
+    const previousFetch = env.FETCH!;
+    env.FETCH = async (input, init) => {
+      const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+      if (url.pathname.endsWith('/result')) {
+        return Response.json({ exitReason: 'completed', exitCode: 0, exitSignal: null, answer: null,
+          stdout: 'partial response', stderr: '', outputTruncated: true, artifacts: [], logUrl: '', repo: null });
+      }
+      return previousFetch(input, init);
+    };
+    const response = await coordinator.fetch(call('/v1/runs', body, { 'idempotency-key': 'truncated-stdout-answer' }));
+    const receipt = await response.json() as { runId: string };
+    await coordinator.alarm();
+    await coordinator.alarm();
+    await coordinator.alarm();
+
+    const status = await coordinator.fetch(call(`/v1/runs/${receipt.runId}/status`));
+    expect(await status.json()).toMatchObject({ state: 'succeeded', answer: null });
+    const result = await coordinator.fetch(call(`/v1/runs/${receipt.runId}/result`));
+    expect(await result.json()).not.toHaveProperty('text');
+  });
+
   it('marks a receipt-backed run unknown after stale worker status and resumes polling without relaunching', async () => {
     const { coordinator, storage, launched, env } = setup();
     const response = await coordinator.fetch(call('/v1/runs', body, { 'idempotency-key': 'stale-status-recovery' }));

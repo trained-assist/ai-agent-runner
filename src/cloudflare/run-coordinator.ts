@@ -721,7 +721,17 @@ export class RunnerRunCoordinator {
             const resultResponse = await this.worker(`/v1/runs/${run.runId}/result`);
             if (resultResponse.ok) {
               const launchResult = await resultResponse.json() as Record<string, any>;
-              run.answer = typeof launchResult.answer === 'string' ? launchResult.answer : null;
+              const explicitAnswer = typeof launchResult.answer === 'string' && launchResult.answer.trim().length > 0
+                ? launchResult.answer : null;
+              // Older VM worker releases can return a completed OpenCode stdout
+              // without the normalized `answer` checkpoint field. Preserve that
+              // captured output as a bounded fallback so the public result does
+              // not silently discard a response. Do not treat a truncated stdout
+              // buffer as a complete user answer.
+              const stdoutAnswer = !launchResult.outputTruncated && typeof launchResult.stdout === 'string'
+                && launchResult.stdout.trim().length > 0
+                ? launchResult.stdout.trim().slice(0, 100_000) : null;
+              run.answer = explicitAnswer ?? stdoutAnswer;
               run.repo = launchResult.repo && typeof launchResult.repo === 'object' ? launchResult.repo as Record<string, unknown> : null;
               run.logUrl = typeof launchResult.logUrl === 'string' && launchResult.logUrl ? launchResult.logUrl : null;
               const repo = run.repo;
