@@ -4,6 +4,38 @@ import runnerApi, { sha256 } from '../src/cloudflare/runner-api.js';
 import type { RunnerWorkerEnv } from '../src/cloudflare/types.js';
 
 describe('Cloudflare Runner API Worker', () => {
+  it('accepts a separate sandbox developer registry without changing legacy keys or production authentication', async () => {
+    const legacyKey = 'legacy-sandbox-key';
+    const developerKey = 'dedicated-developer-key';
+    const developerRecord = { keyHash: await sha256(developerKey), principalId: 'local-developer', profileId: 'local-developer',
+      repository: 'trained-assist/ai-agent-runner', scopes: ['runs:read', 'runs:write'], developerApi: true };
+    const sandbox = {
+      RUNNER_API_KEYS: JSON.stringify([{ keyHash: await sha256(legacyKey), principalId: 'legacy', profileId: 'legacy',
+        repository: 'trained-assist/ai-agent-runner', scopes: ['runs:read'] }]),
+      RUNNER_API_KEYS_DEVELOPER: JSON.stringify([developerRecord]), RUNNER_DEVELOPER_API_ENABLED: 'true',
+      RUNNER_RUNS: { idFromName: vi.fn(), get: vi.fn() },
+    } as unknown as RunnerWorkerEnv;
+    const capabilities = (key: string, env: RunnerWorkerEnv) => runnerApi.fetch(new Request('https://api.example/v1/developer/capabilities', {
+      headers: { authorization: `Bearer ${key}` },
+    }), env);
+    expect((await capabilities(developerKey, sandbox)).status).toBe(200);
+    expect((await capabilities(legacyKey, sandbox)).status).toBe(403);
+    const oldRoute = await runnerApi.fetch(new Request('https://api.example/v1/capabilities', {
+      headers: { authorization: `Bearer ${legacyKey}` },
+    }), sandbox);
+    expect(oldRoute.status).toBe(200);
+    const production = { ...sandbox, DEPLOYMENT_ENV: 'production', RUNNER_API_KEYS_PRODUCTION: '[]' };
+    expect((await capabilities(developerKey, production)).status).toBe(401);
+  });
+
+  it('fails closed for malformed sandbox developer registry', async () => {
+    const env = { RUNNER_API_KEYS: '[]', RUNNER_API_KEYS_DEVELOPER: JSON.stringify([{ principalId: 'bad' }]) } as unknown as RunnerWorkerEnv;
+    const response = await runnerApi.fetch(new Request('https://api.example/v1/capabilities', {
+      headers: { authorization: 'Bearer any-key' },
+    }), env);
+    expect(response.status).toBe(503);
+  });
+
   it('uses the dedicated production registry without replacing or reading other registries', async () => {
     const productionKey = 'production-only-key';
     const env = {

@@ -6,6 +6,14 @@ The Cloudflare Runner now has an opt-in developer route for a free-form prompt, 
 
 In an isolated sandbox lane, set `RUNNER_DEVELOPER_API_ENABLED=true` and provision a principal with a trusted repository, `runs:read` and `runs:write`, and `developerApi: true`. Existing principals without the flag cannot use these routes. The developer route is disabled when `DEPLOYMENT_ENV=production`, even if the key flag and lane switch are present. The API key remains in the usual hash-only registry. The route creates a stable internal `userTaskId` from the principal, profile and `Idempotency-Key`, then forwards the normalized run to the existing coordinator. A repeated request with the same key and body returns the same receipt; a different body conflicts.
 
+### Local OpenCode sandbox key
+
+`node scripts/setup-developer-sandbox.mjs init` creates a reusable 256-bit sandbox key at `~/.config/opencode/secrets/serverless-agent-api-key` (mode `0600`) without printing it. The local OpenCode MCP config reads that file through `{file:...}`. `init` preserves an existing valid key, so retries do not silently revoke access. The generated principal is fixed to `trained-assist/ai-agent-runner`, `eu-vm-agent-run`, and `runs:read`/`runs:write`; it has `developerApi: true` but no guest or cross-repository access.
+
+Sandbox3 accepts this principal from the separate `RUNNER_API_KEYS_DEVELOPER` secret. The base, additional, and profile registries are left intact; production authentication never reads the developer registry. The `sandbox3-live-profile-auth` workflow deploys the reviewed main SHA, then requires `SANDBOX3_DEVELOPER_API_KEY` from its `sandbox` environment and writes only the SHA-256 key record and `RUNNER_DEVELOPER_API_ENABLED=true` to the sandbox Worker. The local raw key has already been stored as that GitHub environment secret; it must not enter Git, logs, or a PR. The provisioning command checks `/version` against the exact deployed SHA before changing Worker secrets, and probes `GET /v1/developer/capabilities` afterward. `node scripts/setup-developer-sandbox.mjs status` makes the same read-only probe locally and prints only the HTTP status and non-secret capability fields.
+
+The existing sandbox currently runs an older Worker SHA. Until the new source is merged, deployed and provisioned, the local MCP tools can be discovered but remote calls will fail authentication. A successful capabilities probe proves key registration and model availability, not execution or VM compatibility; finish with a disposable `agent_run_start`/`agent_run_wait` canary and check the terminal answer and `agent-history.json` artifact.
+
 ```http
 GET /v1/developer/capabilities
 Authorization: Bearer <runner-api-key>
