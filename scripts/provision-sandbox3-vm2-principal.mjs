@@ -13,7 +13,7 @@ const records = [{
   profileId: 'sandbox3-vm2-live-canary',
   repository: 'trained-assist/ai-agent-runner',
   scopes: ['runs:read', 'runs:write'],
-  engines: ['eu-vm-agent-run'],
+  engines: ['eu-vm-agent-run', 'azure-cloud'],
 }];
 const result = spawnSync('npx', [
   'wrangler', 'secret', 'put', 'RUNNER_API_KEYS_ADDITIONAL',

@@ -4,9 +4,14 @@ const apiUrl = process.env.RUNNER_API_URL;
 const apiKey = process.env.RUNNER_API_KEY_AGENT_API;
 const runId = process.env.GITHUB_RUN_ID;
 const repositoryToken = process.env.GITHUB_TOKEN;
+const routeMode = process.env.RUNNER_ROUTE_MODE ?? 'france';
 const expectedPackageVersion = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8')).version;
 
 if (!apiUrl || !apiKey || !runId || !repositoryToken) throw new Error('sandbox3 canary environment is incomplete');
+if (!['france', 'gha', 'auto'].includes(routeMode)) throw new Error('sandbox3 canary route mode is invalid');
+if (routeMode === 'gha' && (process.env.GHA_WORKER_TOKEN?.trim().length ?? 0) < 24) {
+  throw new Error('sandbox3 direct GHA canary requires its provisioned gateway credential');
+}
 
 async function request(path, options = {}) {
   const response = await fetch(new URL(path, apiUrl), {
@@ -50,14 +55,19 @@ const capabilities = await request('/v1/capabilities');
 if (!capabilities.executionRegions?.includes('eu-vm-agent-run')) {
   throw new Error('sandbox3 API does not advertise the EU VM worker');
 }
-console.log('authenticated capabilities: EU VM worker advertised');
+if (routeMode === 'gha' && capabilities.routes?.gha?.available !== true) {
+  throw new Error('sandbox3 API does not advertise an available direct GHA route');
+}
+console.log(`authenticated capabilities: route=${routeMode}, GHA available=${capabilities.routes?.gha?.available === true}`);
 
 const idempotencyKey = `sandbox3-vm2-${runId}`;
 const terminal = new Set(['succeeded', 'failed', 'cancelled', 'timed_out']);
 const launchPayload = {
   userTaskId: idempotencyKey,
   traceId: `sandbox3-vm2-${runId}`,
-  engine: { name: 'eu-vm-agent-run', adapterVersion: '1' },
+  ...(routeMode === 'gha' ? { engine: { name: 'azure-cloud', adapterVersion: '1' } } :
+    routeMode === 'france' ? { engine: { name: 'eu-vm-agent-run', adapterVersion: '1' } } : {}),
+  routeMode,
   input: { inlinePrompt: 'Read package.json and report its name and version as one JSON object. Do not edit any files.' },
   envAllowlist: ['LLM_LADDER_TOKEN'],
   limits: { timeoutMs: 120_000, maxOutputBytes: 100_000, maxLogBytes: 200_000 },
@@ -72,7 +82,7 @@ const submitted = await request('/v1/runs', launchOptions);
 if (typeof submitted.runId !== 'string' || !submitted.runId.startsWith('run_')) {
   throw new Error('sandbox3 API returned no valid run receipt');
 }
-console.log(`run accepted: ${submitted.runId}`);
+console.log(`run accepted: ${submitted.runId}; requested route=${routeMode}`);
 console.log(`diagnostic trace id: sandbox3-vm2-${runId}`);
 
 let status;
@@ -93,7 +103,7 @@ try {
   const deadline = Date.now() + 180_000;
   while (Date.now() < deadline) {
     status = await request(`/v1/runs/${encodeURIComponent(submitted.runId)}/status`);
-    console.log(`run state: ${status.state}`);
+    console.log(`run state: ${status.state}; engine=${status.engine ?? 'unreported'}; route=${status.routeMode ?? 'unreported'}`);
     if (terminal.has(status.state)) break;
     await new Promise(resolve => setTimeout(resolve, 3_000));
   }
@@ -103,7 +113,11 @@ try {
   if (result.outcome !== 'succeeded' || !String(result.text ?? '').includes(expectedPackageVersion)) {
     throw new Error(`sandbox3 VM run failed acceptance: ${JSON.stringify({ outcome: result.outcome, exitCode: result.exitCode })}`);
   }
-  console.log(`sandbox3 VM2 end-to-end canary succeeded; package version ${expectedPackageVersion} confirmed`);
+  const expectedEngine = routeMode === 'gha' ? 'azure-cloud' : routeMode === 'france' ? 'eu-vm-agent-run' : status.engine;
+  if (status.engine !== expectedEngine || status.routeMode !== routeMode) {
+    throw new Error(`sandbox3 route mismatch: requested ${routeMode}/${expectedEngine}, observed ${status.routeMode}/${status.engine}`);
+  }
+  console.log(`sandbox3 API end-to-end canary succeeded; route=${routeMode}/${expectedEngine}; package version ${expectedPackageVersion} confirmed`);
 } finally {
   // Keep active or unknown runs for diagnosis. Remove state once terminal proof exists.
   if (!status || !terminal.has(status.state)) {

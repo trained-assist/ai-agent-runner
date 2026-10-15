@@ -2,6 +2,16 @@ name: Sandbox3 VM2 live canary
 
 on:
   workflow_dispatch:
+    inputs:
+      route_mode:
+        description: Runner API route to exercise directly (default keeps the normal France path)
+        required: true
+        default: france
+        type: choice
+        options:
+          - france
+          - gha
+          - auto
 
 permissions:
   contents: read
@@ -15,6 +25,7 @@ jobs:
       RUNNER_API_URL: https://trained-assist-runner-api-sandbox3.skillset-apply.workers.dev
       RUNNER_API_KEY_AGENT_API: ${{ secrets.RUNNER_API_KEY_AGENT_API }}
       GHA_WORKER_TOKEN: ${{ secrets.GHA_WORKER_TOKEN_SANDBOX3_AGENT_API }}
+      RUNNER_ROUTE_MODE: ${{ inputs.route_mode }}
       GITHUB_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
@@ -28,5 +39,5 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
           RUNNER_API_KEY_AGENT_API: ${{ secrets.RUNNER_API_KEY_AGENT_API }}
         run: node scripts/provision-sandbox3-vm2-principal.mjs
-      - name: Submit and verify a read-only VM2 task
+      - name: Submit and verify a read-only Runner API task
         run: node scripts/sandbox3-vm2-live-canary.mjs
