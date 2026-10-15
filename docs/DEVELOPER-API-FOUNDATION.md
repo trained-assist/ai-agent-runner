@@ -32,6 +32,8 @@ Authorization: Bearer <runner-api-key>
 
 The response contains `connectionId`, `status: "pending"`, `formUrl` and `expiresAt`. Open `formUrl` in a browser and enter the token there. Then poll:
 
+For the existing local OpenCode sandbox key, `node scripts/connect-github-sandbox.mjs start` creates the form and opens it on macOS without printing the API key. `node scripts/connect-github-sandbox.mjs status <connectionId>` checks it; `revoke <connectionId>` deletes the stored token. Pass `--no-open` when calling from a terminal without a browser.
+
 ```http
 GET /v1/developer/github/connections/{connectionId}
 Authorization: Bearer <runner-api-key>
