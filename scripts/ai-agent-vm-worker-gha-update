@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+updater='/usr/local/sbin/ai-agent-vm-worker-update'
+command="${SSH_ORIGINAL_COMMAND:-}"
+if [[ ! "$command" =~ ^update\ (vm-worker-v[0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+  echo 'Only update vm-worker-vX.Y.Z is allowed for this key' >&2
+  exit 2
+fi
+release_tag="${BASH_REMATCH[1]}"
+if ! IFS= read -r -t 15 gh_token || [[ ! "$gh_token" =~ ^[A-Za-z0-9_]{20,300}$ ]]; then
+  echo 'A short-lived GitHub release-read token is required on stdin' >&2
+  exit 2
+fi
+export GH_TOKEN="$gh_token"
+unset gh_token
+exec "$updater" "$release_tag"
