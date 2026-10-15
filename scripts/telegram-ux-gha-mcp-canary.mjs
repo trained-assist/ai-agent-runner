@@ -24,8 +24,13 @@ async function request(path, init = {}) {
   return body;
 }
 
-const capabilities = await request('/v1/capabilities');
-if (capabilities.routes?.gha?.available !== true) throw new Error('GHA route is unavailable on the Telegram UX sandbox API');
+let ghaAvailable = false;
+for (let attempt = 0; attempt < 25; attempt += 1) {
+  const capabilities = await request('/v1/capabilities');
+  if (capabilities.routes?.gha?.available === true) { ghaAvailable = true; break; }
+  if (attempt < 24) await new Promise((resolve) => setTimeout(resolve, 5_000));
+}
+if (!ghaAvailable) throw new Error('GHA route is unavailable on the Telegram UX sandbox API after propagation');
 
 const payload = {
   userTaskId: taskId,
