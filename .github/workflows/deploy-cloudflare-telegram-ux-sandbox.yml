@@ -7,6 +7,14 @@ on:
         description: Run the isolated Registry fixture tool through the GHA route after deployment
         type: boolean
         default: false
+      prior_canary_task_id:
+        description: Optional prior sandbox MCP canary task to reconcile and clean only if terminal
+        type: string
+        default: ''
+      prior_canary_run_id:
+        description: Exact run ID belonging to the prior canary task
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -48,4 +56,6 @@ jobs:
         if: inputs.run_gha_mcp_canary == true
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          PRIOR_CANARY_TASK_ID: ${{ inputs.prior_canary_task_id }}
+          PRIOR_CANARY_RUN_ID: ${{ inputs.prior_canary_run_id }}
         run: node scripts/telegram-ux-gha-mcp-canary.mjs
