@@ -7,6 +7,11 @@ on:
         description: Exact runId returned by the production Control Plane
         required: true
         type: string
+      save_redacted_vm_log:
+        description: Save the redacted VM stdout/stderr as a short-lived private Actions artifact
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -30,4 +35,13 @@ jobs:
           RUNNER_VM_URL: ${{ secrets.EU_VM_WORKER_URL }}
           RUNNER_VM_TOKEN: ${{ secrets.EU_VM_WORKER_TOKEN }}
           RUN_ID: ${{ inputs.run_id }}
+          VM_LOG_OUTPUT_PATH: ${{ inputs.save_redacted_vm_log && 'vm-run-log.txt' || '' }}
         run: node scripts/inspect-production-run.mjs
+      - name: Upload redacted VM log for diagnosis
+        if: inputs.save_redacted_vm_log
+        uses: actions/upload-artifact@v4
+        with:
+          name: redacted-vm-run-log
+          path: vm-run-log.txt
+          if-no-files-found: error
+          retention-days: 1

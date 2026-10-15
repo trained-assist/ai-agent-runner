@@ -12,6 +12,7 @@ export function summarizeSseLogs(text: string): {
   stderrChars: number;
   endFrame: boolean;
 };
+export function redactLogSecrets(text: string): string;
 export function inspectRun(options: {
   runId: string;
   apiKey: string;

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { inspectRun, summarizeSessionLog, summarizeSseLogs } from '../scripts/inspect-production-run.mjs';
+import { inspectRun, redactLogSecrets, summarizeSessionLog, summarizeSseLogs } from '../scripts/inspect-production-run.mjs';
 
 describe('production run inspector', () => {
   it('summarizes the persisted Runner journal without retaining message contents', () => {
@@ -42,6 +42,16 @@ describe('production run inspector', () => {
     const summary = summarizeSseLogs('event: stdout\ndata: "private answer"\n\nevent: stderr\ndata: "private error"\n\nevent: end\ndata: {}\n\n');
     expect(summary).toEqual({ stdoutEvents: 1, stderrEvents: 1, stdoutChars: 14, stderrChars: 13, endFrame: true });
     expect(JSON.stringify(summary)).not.toContain('private');
+  });
+
+  it('redacts credentials before a VM log is saved as an artifact', () => {
+    const log = 'authorization: Bearer abc.def\ngithub=ghp_123456789012345678901234567890\ncfat=cfat_123456789012345678901234567890\napi_key: "sensitive-value"';
+    const redacted = redactLogSecrets(log);
+    expect(redacted).not.toContain('abc.def');
+    expect(redacted).not.toContain('ghp_');
+    expect(redacted).not.toContain('cfat_');
+    expect(redacted).not.toContain('sensitive-value');
+    expect(redacted).toContain('[REDACTED]');
   });
 
   it('rejects arbitrary run IDs before making network requests', async () => {
