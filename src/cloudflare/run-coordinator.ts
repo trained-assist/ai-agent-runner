@@ -10,6 +10,12 @@ interface RunRecord {
   engine: string; state: State; sequence: number; createdAt: string; updatedAt: string; startedAt: string | null;
   finishedAt: string | null; answer: string | null; cancelRequested: boolean; launchCiphertext: string;
   lastHeartbeatAt?: string | null; logCursor?: number; output?: { stdout: string; stderr: string; updatedAt: string | null; truncated: boolean };
+  /** Worker contact and worker-reported run progress are separate signals. */
+  workerReportedUpdatedAt?: string | null;
+  workerProgressObservedAt?: string | null;
+  workerStartPhase?: string | null;
+  workerStartAttempts?: number | null;
+  workerStartedAt?: string | null;
   launchAttempts: number; result?: Record<string, unknown>; workerReceipt?: Record<string, unknown>;
   launchRejection?: { status: number; code: string; fields: string[] };
   lastError?: string;
@@ -43,10 +49,17 @@ function principalOf(request: Request): ApiPrincipal | null {
 }
 
 function view(run: RunRecord): Record<string, unknown> {
+  const progressAgeMs = run.workerReportedUpdatedAt ? Date.now() - Date.parse(run.workerReportedUpdatedAt) : null;
   return { requestId: run.requestId, userTaskId: run.userTaskId, conversationId: run.conversationId, runId: run.runId,
     ownerGeneration: run.ownerGeneration, state: run.state, engine: run.engine, cancelRequested: run.cancelRequested, connectionLost: run.state === 'unknown',
     observedAt: run.updatedAt, lastHeartbeatAt: run.lastHeartbeatAt ?? null,
     statusFreshness: run.lastHeartbeatAt && Date.now() - Date.parse(run.lastHeartbeatAt) > 30_000 ? 'stale' : run.lastHeartbeatAt ? 'fresh' : 'unobserved',
+    workerReportedUpdatedAt: run.workerReportedUpdatedAt ?? null,
+    workerProgressObservedAt: run.workerProgressObservedAt ?? null,
+    workerStartPhase: run.workerStartPhase ?? null,
+    workerStartAttempts: run.workerStartAttempts ?? null,
+    workerStartedAt: run.workerStartedAt ?? null,
+    workerProgressFreshness: progressAgeMs === null || !Number.isFinite(progressAgeMs) ? 'unobserved' : progressAgeMs > 30_000 ? 'stale' : 'fresh',
     output: run.output ?? { stdout: '', stderr: '', updatedAt: null, truncated: false },
     sequence: run.sequence, fencing: { rejected: 0 }, answer: run.answer };
 }
@@ -83,7 +96,7 @@ function refusedLaunchResult(run: RunRecord): Record<string, unknown> {
   return {
     schemaVersion: 1, runId: run.runId, jobId: run.jobId, userTaskId: run.userTaskId,
     profileId: run.profileId, ownerGeneration: run.ownerGeneration, outcome: 'failed',
-    exitReason: 'preflight_refused', exitCode: null, exitSignal: null, exitObserved: false,
+    exitReason: 'preflight_refused', exitCode: null, exitSignal: null, exitObserved: false, engineStart: 'not_started',
     startedAt: run.startedAt ?? run.createdAt, finishedAt: run.finishedAt ?? now(),
     failure: { code: code.startsWith('WORKER_') ? code : `WORKER_${code}`, failureClass: 'preflight',
       safeSummary: `The France execution worker refused the run before accepting it (HTTP ${status}, ${code}${fieldSummary}).`, retryable: false },
@@ -209,6 +222,9 @@ export class RunnerRunCoordinator {
       .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.runId.localeCompare(b.runId))
       .map((run) => ({ runId: run.runId, userTaskId: run.userTaskId, state: run.state,
         createdAt: run.createdAt, updatedAt: run.updatedAt, startedAt: run.startedAt,
+        workerStartPhase: run.workerStartPhase ?? null, workerStartAttempts: run.workerStartAttempts ?? null,
+        workerProgressFreshness: run.workerReportedUpdatedAt
+          ? Date.now() - Date.parse(run.workerReportedUpdatedAt) > 30_000 ? 'stale' : 'fresh' : 'unobserved',
         links: { status: `/v1/runs/${encodeURIComponent(run.runId)}/status`, result: `/v1/runs/${encodeURIComponent(run.runId)}/result` } }));
     return json({ runs, nextCursor: null });
   }
@@ -569,7 +585,7 @@ export class RunnerRunCoordinator {
           run.startedAt = run.createdAt;
           run.answer = 'pong';
           run.result = { schemaVersion: 1, runId: run.runId, jobId: run.jobId, userTaskId: run.userTaskId, profileId: run.profileId,
-            ownerGeneration: run.ownerGeneration, outcome: 'succeeded', exitReason: 'completed', exitCode: 0, exitSignal: null, exitObserved: true,
+            ownerGeneration: run.ownerGeneration, outcome: 'succeeded', exitReason: 'completed', exitCode: 0, exitSignal: null, exitObserved: true, engineStart: 'started',
             startedAt: run.startedAt, finishedAt, text: 'pong', usage: { status: 'unknown' }, outputRefs: [], persistence: 'not_required',
             persistenceReason: 'mock-test creates no repository or artifacts', cleanup: 'completed', cleanupReason: 'mock-test creates no workspace', logPath: `mock-test://${run.runId}` };
           transition(run, 'succeeded', { engine: 'mock-test' });
@@ -607,8 +623,15 @@ export class RunnerRunCoordinator {
         } else {
           const statusResponse = await this.worker(`/v1/runs/${run.runId}/status`);
           if (!statusResponse.ok) throw new Error(`worker status HTTP ${statusResponse.status}`);
-          const workerStatus = await statusResponse.json() as { status?: string; state?: string };
+          const workerStatus = await statusResponse.json() as { status?: string; state?: string; startPhase?: string; startAttempts?: number; startedAt?: string; updatedAt?: string };
           run.lastHeartbeatAt = now();
+          if (typeof workerStatus.startPhase === 'string') run.workerStartPhase = workerStatus.startPhase;
+          if (Number.isSafeInteger(workerStatus.startAttempts)) run.workerStartAttempts = workerStatus.startAttempts;
+          if (typeof workerStatus.startedAt === 'string') run.workerStartedAt = workerStatus.startedAt;
+          if (typeof workerStatus.updatedAt === 'string' && Number.isFinite(Date.parse(workerStatus.updatedAt))) {
+            if (workerStatus.updatedAt !== run.workerReportedUpdatedAt) run.workerProgressObservedAt = now();
+            run.workerReportedUpdatedAt = workerStatus.updatedAt;
+          }
           const logsResponse = await this.worker(`/v1/runs/${run.runId}/logs?after=${run.logCursor ?? 0}&snapshot=1`);
           if (logsResponse.ok) {
             const batch = await logsResponse.json() as { cursor?: number; logs?: Array<{ stream?: string; message?: string; truncated?: boolean }> };
@@ -648,6 +671,7 @@ export class RunnerRunCoordinator {
               const outcome = launchResult.exitReason === 'completed' ? 'succeeded' : launchResult.exitReason === 'cancelled' ? 'cancelled' : 'failed';
               run.result = { schemaVersion: 1, runId: run.runId, jobId: run.jobId, userTaskId: run.userTaskId, profileId: run.profileId, ownerGeneration: run.ownerGeneration,
                 outcome, exitReason: launchResult.exitReason ?? 'worker_crash', exitCode: launchResult.exitCode ?? null, exitSignal: launchResult.exitSignal ?? null,
+                engineStart: launchResult.engineStart === 'not_started' || launchResult.engineStart === 'started' ? launchResult.engineStart : 'unknown',
                 exitObserved: typeof launchResult.exitObserved === 'boolean' ? launchResult.exitObserved
                   : launchResult.exitCode != null || launchResult.exitSignal != null,
                 startedAt: run.startedAt ?? run.createdAt, finishedAt: now(),
@@ -662,10 +686,17 @@ export class RunnerRunCoordinator {
         if (!run.workerReceipt) {
           try {
             const statusResponse = await this.worker(`/v1/runs/${run.runId}/status`);
-            const observed = statusResponse.ok ? await statusResponse.json() as { status?: string; state?: string } : null;
+            const observed = statusResponse.ok ? await statusResponse.json() as { status?: string; state?: string; startPhase?: string; startAttempts?: number; startedAt?: string; updatedAt?: string } : null;
             if (observed?.status && !['unknown', 'unknown_run'].includes(observed.status)) {
               run.workerReceipt = { runId: run.runId, status: 'accepted', operationId: 'reconciled' };
               run.lastHeartbeatAt = now();
+              if (typeof observed.startPhase === 'string') run.workerStartPhase = observed.startPhase;
+              if (Number.isSafeInteger(observed.startAttempts)) run.workerStartAttempts = observed.startAttempts;
+              if (typeof observed.startedAt === 'string') run.workerStartedAt = observed.startedAt;
+              if (typeof observed.updatedAt === 'string' && Number.isFinite(Date.parse(observed.updatedAt))) {
+                if (observed.updatedAt !== run.workerReportedUpdatedAt) run.workerProgressObservedAt = now();
+                run.workerReportedUpdatedAt = observed.updatedAt;
+              }
               const observedState = ['succeeded', 'failed', 'cancelled'].includes(observed.status) ? observed.status as State
                 : observed.state === 'running' || observed.state === 'finalizing' ? 'running' : 'starting';
               transition(run, observedState, { reconciled: true, evidence: observedState === 'running' ? 'worker_process_state' : 'worker_accepted' });

@@ -190,6 +190,9 @@ export interface RunSnapshot {
   jobId: string;
   operationId: string;
   state: RunState;
+  startPhase: PersistedRunState['startPhase'] | null;
+  startAttempts: number;
+  startedAt: string | null;
   ownerGeneration: number;
   sequence: number;
   connectionLost: boolean;
@@ -262,6 +265,7 @@ interface InternalRun {
   waiters: Array<(result: RunResult) => void>;
   handle: EngineHandle | null;
   timers: NodeJS.Timeout[];
+  startTimer: NodeJS.Timeout | null;
   exitReceived: boolean;
   finalizePromise: Promise<RunResult> | null;
   /** Per-run сессия MCP (P13): bridge + stdio-серверы; гасится вместе с раном. */
@@ -306,6 +310,7 @@ interface ExitResolution {
 /** Потолок накопителя ответа: хвост, а не архив вывода движка. */
 const ANSWER_TAIL_MAX_LINES = 200;
 const ANSWER_TAIL_MAX_LINE = 2000;
+const MAX_SAFE_START_RETRIES = 2;
 
 /** Receipt входа без материализации: ран объявляет ноль, а не молчит о ref'ах без снимка. */
 function emptyInputReceipt(st: PersistedRunState, declared: number) {
@@ -448,6 +453,7 @@ export class Runner {
         waiters: [],
         handle: null,
         timers: [],
+        startTimer: null,
         exitReceived: Boolean(state.exit?.observed),
         finalizePromise: null,
         mcp: null,
@@ -486,6 +492,9 @@ export class Runner {
       jobId: st.jobId,
       operationId: st.operationId,
       state: st.state,
+      startPhase: st.startPhase ?? null,
+      startAttempts: st.startAttempts ?? 0,
+      startedAt: st.startedAt,
       ownerGeneration: st.ownerGeneration,
       sequence: st.sequence,
       connectionLost: st.connectionLost,
@@ -618,6 +627,8 @@ export class Runner {
       profileId: spec.profileId,
       ownerGeneration: spec.ownerGeneration,
       state: 'queued',
+      startPhase: 'queued',
+      startAttempts: 1,
       sequence: 0,
       connectionLost: false,
       orphanedPid: null,
@@ -644,6 +655,7 @@ export class Runner {
       waiters: [],
       handle: null,
       timers: [],
+      startTimer: null,
       exitReceived: false,
       finalizePromise: null,
       mcp: null,
@@ -691,6 +703,14 @@ export class Runner {
     }
 
     if (st.state === 'queued') {
+      this.completeWithoutEngine(st, 'cancelled', 'cancelled');
+      return { runId, status: 'stopped', state: st.state };
+    }
+
+    // A start-stage cancellation is terminal only while the adapter has not been
+    // invoked. execute() checks the terminal state after each awaited setup step,
+    // so late setup completion cannot cross the spawn boundary afterwards.
+    if (st.state === 'starting' && !st.startedAt && st.startPhase !== 'spawn') {
       this.completeWithoutEngine(st, 'cancelled', 'cancelled');
       return { runId, status: 'stopped', state: st.state };
     }
@@ -836,7 +856,20 @@ export class Runner {
       }
       switch (st.state) {
         case 'queued':
-          if (this.opts.resumeQueuedRuns === false) {
+          if (st.cancelRequested === 'cancel') {
+            this.completeWithoutEngine(st, 'cancelled', 'cancelled');
+            report.terminal += 1;
+          } else if (this.opts.resumeQueuedRuns !== false && (st.startAttempts ?? 1) <= MAX_SAFE_START_RETRIES + 1) {
+            // A timeout marker belongs to the previous pre-start attempt. If the
+            // worker died after it durably queued a safe retry but before cleanup
+            // launched it, recovery gives that retry a fresh start deadline.
+            st.cancelRequested = null;
+            this.store.saveState(st);
+            report.resumedQueued += 1;
+            this.emit(st, 'log', { stream: 'runner', level: 'warn',
+              message: `engine_start_recovery attempt=${st.startAttempts ?? 1}/${MAX_SAFE_START_RETRIES + 1} evidence=engine_not_started phase=queued` });
+            void this.execute(st.runId).catch(() => undefined);
+          } else if (this.opts.resumeQueuedRuns === false) {
             this.completeWithoutEngine(st, 'failed', 'worker_crash', {
               code: 'WORKER_RESTARTED_BEFORE_ENGINE_START',
               failureClass: 'runtime',
@@ -845,22 +878,52 @@ export class Runner {
             });
             report.lost += 1;
           } else {
-            report.resumedQueued += 1;
-            void this.execute(st.runId).catch(() => undefined);
+            this.completeWithoutEngine(st, 'failed', 'worker_crash', {
+              code: 'WORKER_START_RETRIES_EXHAUSTED', failureClass: 'runtime',
+              safeSummary: 'worker restarted after the automatic pre-start retry limit; no engine actions were replayed', retryable: false,
+            });
+            report.lost += 1;
           }
           break;
         case 'starting':
           report.orphanedMcp += await this.reapOrphanedMcp(run);
           if (st.pid && isProcessAlive(st.pid)) {
             await this.markOrphaned(run, report);
+          } else if (this.canRetryStartAfterRestart(st)) {
+            const lease = st.cleanRoom ? this.opts.isolation?.lease(st.runId) : null;
+            const hasLease = Boolean(lease && lease.status !== 'released');
+            if (!hasLease || await this.reconcileCleanRoom(run)) {
+              const nextAttempt = (st.startAttempts ?? 1) + 1;
+              st.startAttempts = nextAttempt;
+              st.pid = null;
+              st.pgid = null;
+              st.workerCrashed = false;
+              st.startPhase = 'queued';
+              if (this.transition(st, 'queued')) {
+                report.resumedQueued += 1;
+                this.emit(st, 'log', { stream: 'runner', level: 'warn',
+                  message: `engine_start_recovery attempt=${nextAttempt}/${MAX_SAFE_START_RETRIES + 1} evidence=engine_not_started` });
+                void this.execute(st.runId).catch(() => undefined);
+              }
+            } else {
+              st.workerCrashed = true;
+              this.store.saveState(st);
+              this.completeWithoutEngine(st, 'failed', 'worker_crash', {
+                code: 'WORKER_CRASH_BEFORE_ENGINE_START', failureClass: 'runtime',
+                safeSummary: 'worker restarted before engine spawn but clean-room recovery failed; retry was stopped safely', retryable: false,
+              });
+              report.lost += 1;
+            }
           } else {
             st.workerCrashed = true;
             this.store.saveState(st);
             this.completeWithoutEngine(st, 'failed', 'worker_crash', {
-              code: 'WORKER_CRASH',
+              code: st.startPhase === 'spawn' && !st.startedAt ? 'WORKER_CRASH_DURING_ENGINE_START' : 'WORKER_CRASH_BEFORE_ENGINE_START',
               failureClass: 'runtime',
-              safeSummary: 'worker restarted before the engine process was confirmed; no hidden rerun',
-              retryable: true,
+              safeSummary: st.startPhase === 'spawn' && !st.startedAt
+                ? 'worker restarted during an ambiguous engine spawn; no automatic rerun was made'
+                : 'worker restarted after the automatic pre-start retry limit; no hidden rerun',
+              retryable: false,
             });
             report.lost += 1;
           }
@@ -1025,6 +1088,30 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
     return true;
   }
 
+  private setStartPhase(st: PersistedRunState, phase: NonNullable<PersistedRunState['startPhase']>): void {
+    if (st.startPhase === phase) return;
+    st.startPhase = phase;
+    st.updatedAt = this.nowIso();
+    this.store.saveState(st);
+  }
+
+  private canRetryStartAfterRestart(st: PersistedRunState): boolean {
+    return st.state === 'starting' && st.startedAt === null && st.pid === null && st.pgid === null
+      && st.cancelRequested === null && (st.startAttempts ?? 0) <= MAX_SAFE_START_RETRIES
+      && ['queued', 'preflight', 'materialize', 'isolation', 'mcp'].includes(st.startPhase ?? '');
+  }
+
+  private settleStartCancellation(st: PersistedRunState): void {
+    if (st.cancelRequested === 'timeout') {
+      this.completeWithoutEngine(st, 'failed', 'startup_failure', {
+        code: 'ENGINE_START_TIMEOUT', failureClass: 'runtime',
+        safeSummary: `engine did not start during the ${st.spec.limits.timeoutMs}ms start deadline`, retryable: true,
+      });
+      return;
+    }
+    this.completeWithoutEngine(st, 'cancelled', 'cancelled');
+  }
+
   private emit(st: PersistedRunState, type: RunnerEventType, payload: unknown): RunnerEvent {
     const candidate = {
       schemaVersion: 1,
@@ -1078,20 +1165,49 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
     if (!run || this.disposed) return;
     const st = run.state;
     if (isTerminalState(st.state) || !this.transition(st, 'starting')) return;
+    const startAttempt = st.startAttempts ?? 1;
+    if (run.startTimer) clearTimeout(run.startTimer);
+    run.startTimer = null;
+    this.setStartPhase(st, 'preflight');
+    if (st.spec.limits.timeoutMs > 0) {
+      run.startTimer = setTimeout(() => {
+        run.startTimer = null;
+        if (!this.isCurrentStartAttempt(st, startAttempt) || isTerminalState(st.state) || st.startedAt) return;
+        st.cancelRequested = 'timeout';
+        this.store.saveState(st);
+        // Before `spawn`, no engine process could have received the task, so this
+        // is a safe terminal start-timeout. During spawn the outcome is ambiguous;
+        // keep it visible and fenced until adapter.start() resolves or recovery
+        // proves the process outcome.
+        if (st.startPhase === 'spawn') return;
+        if (!this.queuePreStartRetry(run, st, startAttempt, 'start_timeout')) {
+          this.completeWithoutEngine(st, 'failed', 'startup_failure', {
+            code: 'ENGINE_START_TIMEOUT', failureClass: 'runtime',
+            safeSummary: `engine did not start after ${startAttempt} attempts within the ${st.spec.limits.timeoutMs}ms start deadline`, retryable: false,
+          });
+        }
+      }, st.spec.limits.timeoutMs);
+      run.startTimer.unref?.();
+    }
 
     let handle: EngineHandle | null = null;
     let phase: 'preflight' | 'isolation' | 'mcp' | 'spawn' = 'preflight';
     try {
       await this.fireFault('preflight', runId);
       if (this.disposed) return;
+      if (!this.isCurrentStartAttempt(st, startAttempt)) return;
+      if (isTerminalState(st.state)) return;
       this.preflight(st);
       if (this.disposed) return;
       if (st.cancelRequested) {
         this.completeWithoutEngine(st, 'cancelled', 'cancelled');
         return;
       }
+      this.setStartPhase(st, 'materialize');
       await this.materialize(st);
       if (this.disposed) return;
+      if (!this.isCurrentStartAttempt(st, startAttempt)) return;
+      if (isTerminalState(st.state)) return;
       if (st.cancelRequested) {
         this.completeWithoutEngine(st, 'cancelled', 'cancelled');
         return;
@@ -1100,10 +1216,14 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
       // не «тихо» запускает движок под service UID.
       if (this.opts.isolation || st.spec.isolation?.mode === 'per_run_unix_identity') {
         phase = 'isolation';
+        this.setStartPhase(st, 'isolation');
         await this.fireFault('isolation', runId);
         if (this.disposed) return;
+        if (!this.isCurrentStartAttempt(st, startAttempt)) return;
         await this.prepareCleanRoom(run, st);
         if (this.disposed) return;
+        if (!this.isCurrentStartAttempt(st, startAttempt)) return;
+        if (isTerminalState(st.state)) return;
         if (st.cancelRequested) {
           await this.releaseCleanRoom(run, 'cancelled');
           this.completeWithoutEngine(st, 'cancelled', 'cancelled');
@@ -1116,11 +1236,18 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
       // должен иметь готовый локальный proxy. Отказ здесь валит старт, а не «тихий» ран.
       if ((st.spec.mcp?.servers.length ?? 0) > 0) {
         phase = 'mcp';
+        this.setStartPhase(st, 'mcp');
         await this.fireFault('mcp', runId);
         if (this.disposed) return;
+        if (!this.isCurrentStartAttempt(st, startAttempt)) return;
         await this.startMcpSession(run, st);
         if (this.disposed) {
           await this.stopMcpSession(run, 'worker_disposed');
+          return;
+        }
+        if (!this.isCurrentStartAttempt(st, startAttempt)) return;
+        if (isTerminalState(st.state)) {
+          await this.stopMcpSession(run, 'start_timeout');
           return;
         }
         if (st.cancelRequested) {
@@ -1132,10 +1259,13 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
       phase = 'spawn';
       await this.fireFault('spawn', runId);
       if (this.disposed) return;
+      if (!this.isCurrentStartAttempt(st, startAttempt)) return;
+      if (isTerminalState(st.state)) return;
       if (st.cancelRequested) {
-        this.completeWithoutEngine(st, 'cancelled', 'cancelled');
+        this.settleStartCancellation(st);
         return;
       }
+      this.setStartPhase(st, 'spawn');
       handle = await adapter.start({
         spec: st.spec,
         cwd: st.spec.cwd,
@@ -1158,11 +1288,25 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
         handle.dispose();
         return;
       }
+      if (!this.isCurrentStartAttempt(st, startAttempt)) {
+        handle.killTree('SIGKILL');
+        handle.dispose();
+        return;
+      }
+      if (isTerminalState(st.state) || st.cancelRequested) {
+        handle.killTree('SIGKILL');
+        handle.dispose();
+        if (!isTerminalState(st.state)) this.settleStartCancellation(st);
+        return;
+      }
       if (!handle.pid) throw new Error('engine adapter did not return a live process id');
       if (run.room) await this.assertEngineIdentity(run, st, handle.pid);
       st.pid = handle.pid;
       st.pgid = handle.pgid ?? handle.pid;
       st.startedAt = this.nowIso();
+      this.setStartPhase(st, 'started');
+      if (run.startTimer) clearTimeout(run.startTimer);
+      run.startTimer = null;
       if (!this.transition(st, 'running')) {
         handle.killTree('SIGKILL');
         return;
@@ -1177,7 +1321,7 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
         handle.dispose();
       }
       // воркер останавливается: run остаётся в starting, recover() разберёт его
-      if (this.disposed) return;
+      if (this.disposed || !this.isCurrentStartAttempt(st, startAttempt)) return;
       if (isTerminalState(st.state) || st.finalized) return;
       this.failStartPath(st, err, phase);
     }
@@ -1785,6 +1929,48 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
   private clearTimers(run: InternalRun): void {
     for (const timer of run.timers) clearTimeout(timer);
     run.timers = [];
+    this.clearStartTimer(run);
+  }
+
+  private clearStartTimer(run: InternalRun): void {
+    if (run.startTimer) clearTimeout(run.startTimer);
+    run.startTimer = null;
+  }
+
+  private isCurrentStartAttempt(st: PersistedRunState, attempt: number): boolean {
+    return (st.startAttempts ?? 1) === attempt;
+  }
+
+  private queuePreStartRetry(run: InternalRun, st: PersistedRunState, expiredAttempt: number, reason: string): boolean {
+    if (expiredAttempt >= MAX_SAFE_START_RETRIES + 1 || isTerminalState(st.state)) return false;
+    st.startAttempts = expiredAttempt + 1;
+    st.startPhase = 'queued';
+    this.clearStartTimer(run);
+    if (!this.transition(st, 'queued')) return false;
+    this.emit(st, 'log', { stream: 'runner', level: 'warn',
+      message: `engine_start_recovery attempt=${st.startAttempts}/${MAX_SAFE_START_RETRIES + 1} evidence=engine_not_started reason=${reason}` });
+    void this.preparePreStartRetry(run, st, expiredAttempt).catch(() => undefined);
+    return true;
+  }
+
+  private async preparePreStartRetry(run: InternalRun, st: PersistedRunState, expiredAttempt: number): Promise<void> {
+    try {
+      await this.stopMcpSession(run, 'start_timeout_retry');
+      if (this.disposed || isTerminalState(st.state) || (st.startAttempts ?? 0) !== expiredAttempt + 1) return;
+      if (run.room) await this.releaseCleanRoom(run, 'start_timeout_retry');
+      if (this.disposed || isTerminalState(st.state) || (st.startAttempts ?? 0) !== expiredAttempt + 1) return;
+      st.cancelRequested = null;
+      this.store.saveState(st);
+      void this.execute(st.runId).catch(() => undefined);
+    } catch (error) {
+      if (this.disposed || isTerminalState(st.state) || (st.startAttempts ?? 0) !== expiredAttempt + 1) return;
+      st.cancelRequested = null;
+      const detail = truncateLine(redactSecrets(error instanceof Error ? error.message : String(error)), 300);
+      this.completeWithoutEngine(st, 'failed', 'startup_failure', {
+        code: 'STARTUP_RETRY_CLEANUP_FAILED', failureClass: 'runtime',
+        safeSummary: `safe startup retry could not clean up pre-engine resources: ${detail}`, retryable: false,
+      });
+    }
   }
 
   private onTimeout(runId: string): void {
@@ -1931,6 +2117,7 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
     failure?: RunResult['failure'],
   ): void {
     const internalRun = this.runs.get(st.runId);
+    if (internalRun) this.clearStartTimer(internalRun);
     if (internalRun) { internalRun.runtimeEnv = {}; internalRun.runtimeSecrets = []; }
     const result: RunResult = {
       schemaVersion: 1,
@@ -1944,6 +2131,7 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
       exitCode: null,
       exitSignal: null,
       exitObserved: false,
+      engineStart: st.startPhase === 'spawn' ? 'unknown' : 'not_started',
       startedAt: st.startedAt ?? st.createdAt,
       finishedAt: this.nowIso(),
       usage: { status: 'unknown' },
@@ -2705,6 +2893,7 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
       exitCode: st.exit?.code ?? null,
       exitSignal: st.exit?.signal ?? null,
       exitObserved: st.exit?.observed ?? false,
+      engineStart: st.startedAt ? 'started' : st.startPhase === 'spawn' ? 'unknown' : 'not_started',
       startedAt: st.startedAt ?? st.createdAt,
       finishedAt: this.nowIso(),
       usage: { status: 'unknown' },

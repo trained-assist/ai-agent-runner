@@ -315,6 +315,12 @@ describe('validateRunResult', () => {
     expect(validateRunResult(validResult()).ok).toBe(true);
   });
 
+  it('accepts explicit engine-start evidence and rejects unknown evidence values', () => {
+    expect(validateRunResult(validResult({ engineStart: 'not_started' })).ok).toBe(true);
+    expect(validateRunResult(validResult({ engineStart: 'unknown' })).ok).toBe(true);
+    expect(validateRunResult(validResult({ engineStart: 'maybe' })).ok).toBe(false);
+  });
+
   it('accepts a valid failed result with structured failure', () => {
     const result = validateRunResult(
       validResult({

@@ -78,7 +78,10 @@ async function main(): Promise<void> {
     ingressResolver: createControlPlaneIngressResolverFromEnv(process.env),
     profileWorkspace,
     engineConfigTemplates,
-    resumeQueuedRuns: false,
+    // A durable queued/start-phase run has not crossed the OpenCode spawn
+    // boundary. Runner recovery applies its two-retry limit using persisted
+    // startAttempts/startPhase evidence; ambiguous spawn is still fail-closed.
+    resumeQueuedRuns: true,
     ...(errorPublisher ? { errorPublisher } : {}),
   });
   const recovery = await runner.recover();

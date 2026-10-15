@@ -35,6 +35,10 @@ export interface PersistedRunState {
   profileId: string;
   ownerGeneration: number;
   state: RunState;
+  /** Last durable pre-engine/engine-start boundary; `spawn` is potentially side-effecting. */
+  startPhase?: 'queued' | 'preflight' | 'materialize' | 'isolation' | 'mcp' | 'spawn' | 'started';
+  /** Initial execution plus at most two safe recovery attempts before engine spawn. */
+  startAttempts?: number;
   sequence: number;
   connectionLost: boolean;
   orphanedPid: number | null;

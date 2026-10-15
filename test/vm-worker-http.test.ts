@@ -66,7 +66,7 @@ describe('installable VM HTTP worker', () => {
     ] });
 
     const status = await fetch(`${fixture.base}/v1/runs/${RUN_ID}/status`, { headers: authHeaders() });
-    expect(await status.json()).toMatchObject({ runId: RUN_ID, status: 'succeeded' });
+    expect(await status.json()).toMatchObject({ runId: RUN_ID, status: 'succeeded', state: 'succeeded', startPhase: 'started', startAttempts: 1 });
     const resultResponse = await fetch(`${fixture.base}/v1/runs/${RUN_ID}/result`, { headers: authHeaders() });
     const result = await resultResponse.json();
     expect(resultResponse.status).toBe(200);
@@ -374,7 +374,7 @@ class FakeRunner {
     this.eventList.push({ type: 'assistant_message', sequence: 12, payload: {
       sessionId: 'ses_01J9A3J9Y7V8W2K4M6N0PQRSTZ', messageId: 'msg_01J9A3J9Y7V8W2K4M6N0PQRSTZ', text: 'Checking the repository first.',
     } });
-    this.snapshot = { runId: spec.runId, state: 'running', updatedAt: at, ownerGeneration: spec.ownerGeneration, pid: 1234, result: null, checkpoint: null };
+    this.snapshot = { runId: spec.runId, state: 'running', startPhase: 'started', startAttempts: 1, startedAt: at, updatedAt: at, ownerGeneration: spec.ownerGeneration, pid: 1234, result: null, checkpoint: null };
     setTimeout(() => {
       this.state = 'succeeded';
       this.snapshot!.state = 'succeeded';

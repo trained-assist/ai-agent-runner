@@ -212,6 +212,8 @@ export interface LaunchResult {
   exitSignal: string | null;
   /** Whether the worker observed process termination, even when no code/signal was available. */
   exitObserved?: boolean;
+  /** Explicit evidence at the OpenCode process boundary. */
+  engineStart?: RunResult['engineStart'];
   exitReason: ExitReason;
   stdout: string;
   stderr: string;
@@ -317,6 +319,7 @@ const LAUNCH_RESULT_KEYS = [
   'exitCode',
   'exitSignal',
   'exitObserved',
+  'engineStart',
   'exitReason',
   'stdout',
   'stderr',
@@ -542,7 +545,7 @@ export function validateLaunchResult(input: unknown, expectedRunId: string): Val
   // настоящий opencode-шлюз его не присылает вовсе. Отсутствие этих полей — не повод
   // выбросить результат целого рана: живая проба #100 показала, что реальный ответ
   // отвергался как WORKER_PROTOCOL_INVALID, и рана с артефактами у клиента не было.
-  const OPTIONAL_RESULT_KEYS = ['failure', 'pid', 'answer', 'profileChanges', 'exitObserved', 'sessionCheckpoint'] as const;
+  const OPTIONAL_RESULT_KEYS = ['failure', 'pid', 'answer', 'profileChanges', 'exitObserved', 'engineStart', 'sessionCheckpoint'] as const;
   checkKeys(
     input,
     LAUNCH_RESULT_KEYS,
@@ -564,6 +567,7 @@ export function validateLaunchResult(input: unknown, expectedRunId: string): Val
   if (input['exitCode'] !== null && typeof input['exitCode'] !== 'number') collector.push('launch.exitCode: expected number or null');
   if (input['exitSignal'] !== null && typeof input['exitSignal'] !== 'string') collector.push('launch.exitSignal: expected string or null');
   if (input['exitObserved'] !== undefined && typeof input['exitObserved'] !== 'boolean') collector.push('launch.exitObserved: expected boolean when present');
+  if (input['engineStart'] !== undefined && !['not_started', 'started', 'unknown'].includes(String(input['engineStart']))) collector.push('launch.engineStart: expected not_started | started | unknown');
   if (input['exitObserved'] === false && (input['exitCode'] !== null || input['exitSignal'] !== null)) collector.push('launch.exitObserved: false conflicts with an exit code or signal');
   if (typeof input['exitReason'] !== 'string' || !(EXIT_REASONS as readonly string[]).includes(input['exitReason'])) {
     collector.push(`launch.exitReason: expected one of ${EXIT_REASONS.join(', ')}`);
@@ -784,6 +788,7 @@ export function mapLaunchResult(
     exitCode: launch.exitCode,
     exitSignal: launch.exitSignal,
     exitObserved: launch.exitObserved ?? (launch.exitCode !== null || launch.exitSignal !== null),
+    ...(launch.engineStart ? { engineStart: launch.engineStart } : {}),
     startedAt: times.startedAt,
     finishedAt: times.finishedAt,
     ...(typeof launch.answer === 'string' ? { text: launch.answer } : {}),
