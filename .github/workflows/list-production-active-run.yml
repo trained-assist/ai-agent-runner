@@ -1,10 +1,10 @@
-name: Inspect one production Runner task
+name: Inspect one production Runner run
 
 on:
   workflow_dispatch:
     inputs:
-      user_task_id:
-        description: Exact CP userTaskId to match in the active-run list
+      run_id:
+        description: Exact runId returned by the production Control Plane
         required: true
         type: string
 
@@ -13,43 +13,19 @@ permissions:
 
 jobs:
   inspect:
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/fix/inspect-production-run-artifacts')
     runs-on: ubuntu-latest
     timeout-minutes: 3
     environment: production
     steps:
-      - name: Query the authenticated active-run list and filter locally
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Inspect exact run and its saved event log without printing user content
         env:
           RUNNER_API_KEY: ${{ secrets.RUNNER_API_KEY_AGENT_API }}
-          USER_TASK_ID: ${{ inputs.user_task_id }}
-        run: |
-          node --input-type=module <<'NODE'
-          const taskId = process.env.USER_TASK_ID?.trim() ?? '';
-          const apiKey = process.env.RUNNER_API_KEY?.trim() ?? '';
-          if (!/^[A-Za-z0-9_-]{1,128}$/.test(taskId)) throw new Error('invalid_user_task_id');
-          if (apiKey.length < 32) throw new Error('production_runner_api_key_missing');
-
-          const base = 'https://trained-assist-runner-api-production.skillset-apply.workers.dev';
-          const matches = [];
-          const url = new URL('/v1/runs', base);
-          url.searchParams.set('state', 'all');
-          url.searchParams.set('userTaskId', taskId);
-          const response = await fetch(url, {
-            headers: { authorization: `Bearer ${apiKey}` },
-            signal: AbortSignal.timeout(15_000),
-          });
-          if (!response.ok) throw new Error(`active_run_list_http_${response.status}`);
-          const page = await response.json();
-          for (const run of page.runs ?? []) {
-            if (run.userTaskId === taskId) {
-              matches.push({ runId: run.runId, state: run.state, createdAt: run.createdAt, startedAt: run.startedAt });
-            }
-          }
-
-          console.log(JSON.stringify({
-            userTaskId: taskId,
-            runRecordCount: matches.length,
-            runs: matches,
-            interpretation: matches.length ? 'run_record_found; state and startedAt distinguish accepted from started and terminal' : 'no_run_record_for_user_task_id',
-          }));
-          NODE
+          RUN_ID: ${{ inputs.run_id }}
+        run: node scripts/inspect-production-run.mjs
