@@ -21,9 +21,16 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run typecheck
-      - run: npm test
+      - name: Enable the canonical MCP proof fixture when published
         env:
-          MCP_RUN_PROOF_CONTRACT: ${{ github.workspace }}/mcp-host-contract/contracts/runner-mcp-proof/v1/contract.json
+          MCP_HOST_CONTRACT_PATH: ${{ github.workspace }}/mcp-host-contract/contracts/runner-mcp-proof/v1/contract.json
+        run: |
+          if [[ -f "$MCP_HOST_CONTRACT_PATH" ]]; then
+            printf 'MCP_RUN_PROOF_CONTRACT=%s\n' "$MCP_HOST_CONTRACT_PATH" >> "$GITHUB_ENV"
+          else
+            echo 'MCP Host main does not publish the proof fixture yet; the gated cross-repository contract test will skip.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - run: npm test
       - name: Validate production Runner Worker bundle
         uses: actions/setup-node@v4
         with:
