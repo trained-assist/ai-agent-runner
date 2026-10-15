@@ -12,6 +12,7 @@ describe('VM worker release updater safety contract', () => {
     const workflow = await readFile(releaseWorkflowPath, 'utf8');
     expect(workflow).toContain('cp deploy/vm-worker/inventory/france.json "$STAGE/deploy/vm-worker/inventory/"');
     expect(updater).toContain('inventory_source="${release_dir}/deploy/vm-worker/inventory/france.json"');
+    expect(updater).toContain("sed -n 's/^VM_WORKER_BINDINGS_INVENTORY=//p' \"$config_file\"");
     expect(updater).toContain('install -o root -g root -m 0644 "$inventory_source" "$inventory_target"');
   });
   it('resolves its colocated readiness helper independently of the caller cwd', async () => {
