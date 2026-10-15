@@ -56,6 +56,7 @@ describe('ZeroCreds GitHub token connection', () => {
     const setup = await created.json() as { connectionId: string; formUrl: string };
     expect(setup.formUrl).toBe('https://zerocreds.example/f/0123456789abcdef0123456789abcdef');
     expect(JSON.stringify(setup)).not.toContain('integrator-secret');
+    expect(formRequest?.['allow_save']).toBe(false);
     const destination = formRequest?.['destination'] as { url: string };
     expect(destination.url).toMatch(/^https:\/\/runner\.example\/v1\/developer\/github\/intake\/ghc_[0-9a-f]{32}\/[0-9a-f]{64}$/);
     const preflight = await runnerApi.fetch(new Request(destination.url, { method: 'POST', headers: { 'x-zerocreds-preflight': 'true', 'content-type': 'application/json' }, body: JSON.stringify({ _zerocreds_preflight: true }) }), env);

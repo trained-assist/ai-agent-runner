@@ -61,7 +61,7 @@ export async function githubConnections(request: Request, env: RunnerWorkerEnv, 
       body: JSON.stringify({ title: 'Подключить GitHub к ServerlessAgence',
         description: 'Токен будет проверен через GitHub и привязан к вашему подключению. Он не возвращается агенту.',
         fields: [{ name: 'token', label: 'GitHub personal access token', type: 'password', level: 'secret', required: true }],
-        destination, ttl_minutes: 15 }),
+        destination, ttl_minutes: 15, allow_save: false }),
     });
     if (!response.ok) throw new Error('zerocreds_create_failed');
     const data = await response.json() as { url?: unknown; expires_at?: unknown };
