@@ -280,7 +280,9 @@ interface InternalRun {
    * считается то, что движок напечатало последним. Накопитель ограничен, в журнал рана
    * содержимое не попадает — только источник и размер.
    */
-  answerTail: string[];
+  stdoutAnswerParts: string[];
+  stdoutAnswerChars: number;
+  stdoutAnswerBytes: number;
   /** Launch-only credentials. Deliberately memory-only and never written to RunStore. */
   runtimeEnv: Record<string, string>;
   /** Allowlisted secret values used to scrub engine output before it reaches durable logs. */
@@ -307,9 +309,6 @@ interface ExitResolution {
   answer: { present: boolean; source: 'agent_file' | 'engine_stdout' | null; chars: number; text: string };
 }
 
-/** Потолок накопителя ответа: хвост, а не архив вывода движка. */
-const ANSWER_TAIL_MAX_LINES = 200;
-const ANSWER_TAIL_MAX_LINE = 2000;
 const MAX_SAFE_START_RETRIES = 2;
 
 /** Receipt входа без материализации: ран объявляет ноль, а не молчит о ref'ах без снимка. */
@@ -460,7 +459,9 @@ export class Runner {
         mcpCleanup: null,
         mcpConfigPath: null,
         room: null,
-        answerTail: [],
+        stdoutAnswerParts: [],
+      stdoutAnswerChars: 0,
+      stdoutAnswerBytes: 0,
         runtimeEnv: {},
         runtimeSecrets: [],
         workspaceToken: null,
@@ -662,7 +663,9 @@ export class Runner {
       mcpCleanup: null,
       mcpConfigPath: null,
       room: null,
-      answerTail: [],
+      stdoutAnswerParts: [],
+      stdoutAnswerChars: 0,
+      stdoutAnswerBytes: 0,
       runtimeEnv: { ...runtimeEnv },
       runtimeSecrets: spec.profileWorkspace?.savebackToken ? [spec.profileWorkspace.savebackToken] : [],
       workspaceToken: spec.profileWorkspace?.savebackUrl
@@ -2018,10 +2021,13 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
     if (!run || this.disposed) return;
     const st = run.state;
     if (isTerminalState(st.state)) return;
-    const limit = st.spec.limits.maxOutputBytes ?? st.spec.limits.maxLogBytes ?? DEFAULT_MAX_LOG_LINE;
-    const sanitized = redactRunSecrets(redactSecrets(truncateLine(rawLine, limit)), run.runtimeSecrets).replace(/[\x00-\x1f]/g, ' ');
+    const limit = st.spec.limits.maxLogBytes ?? st.spec.limits.maxOutputBytes ?? DEFAULT_MAX_LOG_LINE;
+    // The authoritative answer is independent of the bounded one-line log
+    // projection. OpenCode can emit a complete multi-paragraph text part here.
+    const redacted = redactRunSecrets(redactSecrets(rawLine), run.runtimeSecrets);
+    if (stream === 'stdout') this.rememberAnswerLine(run, redacted.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, ' '));
+    const sanitized = truncateLine(redacted, limit).replace(/[\x00-\x1f]/g, ' ');
     if (sanitized.length === 0) return;
-    if (stream === 'stdout') this.rememberAnswerLine(run, sanitized);
     this.emit(st, 'log', { stream, level: 'info', message: sanitized });
   }
 
@@ -2060,15 +2066,29 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
     });
   }
 
-  /**
-   * Хвост stdout движка — запасной источник текста ответа (issue #52, шаг 2). Накопитель
-   * ограничен и живёт только в памяти воркера: после выхода движка хвост либо становится
-   * ответом, либо теряется вместе с процессом.
-   */
+  /** Bounded authoritative stdout, preserving paragraphs through checkpoint/saveback. */
   private rememberAnswerLine(run: InternalRun, line: string): void {
-    const tail = run.answerTail;
-    tail.push(line.length > ANSWER_TAIL_MAX_LINE ? line.slice(0, ANSWER_TAIL_MAX_LINE) : line);
-    while (tail.length > ANSWER_TAIL_MAX_LINES) tail.shift();
+    const separator = run.stdoutAnswerParts.length ? 1 : 0;
+    const available = ANSWER_MAX_CHARS - run.stdoutAnswerChars - separator;
+    const availableBytes = (run.state.spec.limits.maxOutputBytes ?? Number.POSITIVE_INFINITY) - run.stdoutAnswerBytes - separator;
+    if (available < 0 || availableBytes < 0) return;
+    let part = line.slice(0, available);
+    // Keep a valid Unicode boundary at the existing overall answer ceiling.
+    if (part.length < line.length && /[\uD800-\uDBFF]$/.test(part)) part = part.slice(0, -1);
+    let bytes = Buffer.from(part, 'utf8');
+    if (bytes.length > availableBytes) {
+      bytes = bytes.subarray(0, availableBytes);
+      const decoder = new TextDecoder('utf-8', { fatal: true });
+      // A byte ceiling can bisect a UTF-8 code point; at most three bytes
+      // need dropping before the prefix becomes valid text again.
+      for (;;) {
+        try { part = decoder.decode(bytes); break; }
+        catch { bytes = bytes.subarray(0, bytes.length - 1); }
+      }
+    }
+    run.stdoutAnswerParts.push(part);
+    run.stdoutAnswerChars += separator + part.length;
+    run.stdoutAnswerBytes += separator + bytes.length;
   }
 
   private async onEngineExit(runId: string, code: number | null, signal: string | null): Promise<void> {
@@ -2592,8 +2612,8 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
     const answer = readAgentAnswer(st.spec.cwd, manifest);
     let answerText = answer.source === 'agent_file' ? answer.text : '';
     let answerSource: 'agent_file' | 'engine_stdout' | null = answer.source;
-    if (answerText.length === 0 && run.answerTail.length > 0) {
-      answerText = run.answerTail.join('\n');
+    if (answerText.length === 0 && run.stdoutAnswerParts.length > 0) {
+      answerText = run.stdoutAnswerParts.join('\n');
       answerSource = 'engine_stdout';
     }
     if (answerText.length > ANSWER_MAX_CHARS) {

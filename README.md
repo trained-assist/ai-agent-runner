@@ -569,3 +569,18 @@ Remote MCP descriptors and trusted scoped-token attachment: [host contract](docs
 - Секреты, адреса машин и токены в репозиторий не попадают — только имена переменных и binding refs ([SANDBOX.md](https://github.com/trained-assist/trained-agent-architecture/blob/main/SANDBOX.md)).
 - Spec в журналах и state-файлах проходит валидацию с запретом неизвестных полей; stdout красится redaction'ом перед записью в events.
 - Core остаётся владельцем задачи; Runner хранит только локальные записи Run (ARCHITECTURE §3).
+
+### Complete stdout answers (architecture #276 / Runner #345)
+
+The authoritative stdout answer is captured separately from the one-line bounded
+log projection. It preserves paragraphs, line breaks, code and more than 200
+lines, without the former 2000-character per-block cut. Credential redaction
+applies before capture and log truncation. The complete answer survives in the
+checkpoint, result and answer.txt artifact through cleanup.
+
+The existing overall answer ceiling is 100000 UTF-16 code units. An explicitly
+configured maxOutputBytes additionally bounds the UTF-8 answer; prefixes retain
+valid code point boundaries. maxLogBytes limits the log projection independently
+and does not truncate the authoritative answer. Telegram message sizing belongs
+to the channel delivery owner, which sends paragraph-based parts under one
+aggregate acknowledgement.
