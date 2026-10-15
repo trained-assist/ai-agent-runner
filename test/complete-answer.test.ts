@@ -25,10 +25,10 @@ describe('complete authoritative stdout answer', () => {
     expect(checkpoint.answer.text).toBe(text);
     const artifact = await h.artifacts!.read(receipt.runId, checkpoint.answer.artifactId);
     expect(artifact.bytes.toString('utf8')).toBe(text);
-    const stdout = h.runner.events(receipt.runId).filter(e => e.type === 'log' && e.payload.stream === 'stdout');
+    const stdout = h.runner.events(receipt.runId).flatMap(e => e.type === 'log' && e.payload.stream === 'stdout' ? [e.payload] : []);
     expect(stdout).toHaveLength(1);
-    expect(String(stdout[0]!.payload.message).length).toBeLessThan(150);
-    expect(String(stdout[0]!.payload.message)).not.toContain('\n');
+    expect(String(stdout[0]!.message).length).toBeLessThan(150);
+    expect(String(stdout[0]!.message)).not.toContain('\n');
   });
   it('keeps more than 200 output lines with their paragraph separators', async () => {
     const lines = Array.from({ length: 240 }, (_, i) => i % 3 === 0 ? '' : `Requirement ${i}`);
