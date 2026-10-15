@@ -63,7 +63,7 @@ class OpenCodeCheckpointEngine extends WritingEngine {
   override readonly name = 'opencode';
 
   constructor() {
-    super({ '.runner/opencode-session.json': JSON.stringify({ info: { id: 'ses_01J9A3J9Y7V8W2K4M6N0PQRSTZ' }, messages: [{ role: 'assistant' }] }) });
+    super({ '.session-traces/ses_01J9A3J9Y7V8W2K4M6N0PQRSTZ.json': JSON.stringify({ info: { id: 'ses_01J9A3J9Y7V8W2K4M6N0PQRSTZ' }, messages: [{ role: 'assistant' }] }) });
   }
 }
 
@@ -106,17 +106,14 @@ function resultOnDisk(rootDir: string, runId: string): { persistence: string; cl
 }
 
 describe('lifecycle рана: persist → проверенная уборка (issue #52, шаги 3–5)', () => {
-  it('automatically archives the OpenCode session checkpoint through the verified output store', async () => {
+  it('does not claim a session checkpoint when the existing profile archive path is absent', async () => {
     const engine = new OpenCodeCheckpointEngine();
     const h = createHarness({ adapters: { opencode: engine }, artifactExport: true });
     const { receipt } = h.start({ engine: { name: 'opencode', adapterVersion: '1' } });
     const result = await h.runner.waitFor(receipt.runId);
 
     expect(result.outputRefs).toHaveLength(0);
-    expect(result.sessionCheckpoint).toMatchObject({ sessionId: 'ses_01J9A3J9Y7V8W2K4M6N0PQRSTZ' });
-    const archived = await h.artifacts?.read(receipt.runId, result.sessionCheckpoint!.artifactId);
-    expect(archived?.bytes.toString('utf8')).toContain('ses_01J9A3J9Y7V8W2K4M6N0PQRSTZ');
-    expect(archived?.manifest.sha256).toBe(result.sessionCheckpoint?.sha256);
+    expect(result.sessionCheckpoint).toBeUndefined();
   });
 
   it('после terminal+persist каталог и сокет рана отсутствуют, а результат и лог читаются', async () => {

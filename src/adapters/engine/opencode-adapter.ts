@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { mkdirSync, lstatSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { EngineStartupError } from '../../contracts/validate.js';
@@ -58,20 +59,28 @@ export class OpenCodeAdapter implements EngineAdapter {
       throw new EngineStartupError('custom OpenCode argv cannot be used with task-scoped ingress inputs');
     }
     const shouldExport = this.options.argv === undefined;
-    const checkpointPath = join(ctx.cwd, '.runner', 'opencode-session.json');
+    let checkpointPath: string | null = null;
     let sessionId: string | null = null;
     if (ctx.spec.input?.resumeSessionFrom) {
       if (!shouldExport) throw new EngineStartupError('custom OpenCode argv cannot resume a durable session checkpoint');
-      let parsed: { info?: { id?: unknown } };
+      const resume = ctx.spec.input.resumeSessionFrom;
+      if (resume.path !== `.session-traces/${resume.sessionId}.json`) throw new EngineStartupError('OpenCode session checkpoint path is invalid');
+      checkpointPath = join(ctx.cwd, ...resume.path.split('/'));
+      let bytes: Buffer;
       try {
-        parsed = JSON.parse(readFileSync(checkpointPath, 'utf8')) as { info?: { id?: unknown } };
+        bytes = readFileSync(checkpointPath);
       } catch {
-        throw new EngineStartupError('restored OpenCode session checkpoint is missing or invalid');
+        throw new EngineStartupError('restored OpenCode session checkpoint is missing from the profile archive');
       }
-      if (typeof parsed.info?.id !== 'string' || !/^ses_[0-7][0-9A-HJKMNP-TV-Z]{25}$/.test(parsed.info.id)) {
-        throw new EngineStartupError('restored OpenCode session checkpoint has an invalid session id');
+      let parsed: { info?: { id?: unknown } };
+      try { parsed = JSON.parse(bytes.toString('utf8')) as { info?: { id?: unknown } }; }
+      catch { throw new EngineStartupError('restored OpenCode session checkpoint is invalid JSON'); }
+      if (bytes.length !== resume.size || createHash('sha256').update(bytes).digest('hex') !== resume.sha256
+        || parsed.info?.id !== resume.sessionId || typeof parsed.info.id !== 'string'
+        || !/^ses_[0-7][0-9A-HJKMNP-TV-Z]{25}$/.test(parsed.info.id)) {
+        throw new EngineStartupError('restored OpenCode session checkpoint failed archive integrity validation');
       }
-      sessionId = parsed.info.id;
+      sessionId = resume.sessionId;
       const importLaunch = launchCommand(ctx, binary, ['import', checkpointPath]);
       const imported = await new Promise<number | null>((resolve, reject) => {
         const importer = spawn(importLaunch.command, importLaunch.args, {
@@ -130,14 +139,14 @@ export class OpenCodeAdapter implements EngineAdapter {
         // A completed or interrupted OpenCode run must leave a portable checkpoint
         // before Runner finalizes and sweeps its workspace. `export` defaults to the
         // full transcript; sanitized exports are unsuitable for resuming a session.
-        const output = join(ctx.cwd, '.runner', 'opencode-session.json');
         if (!sessionId) {
           ctx.onLog('stderr', 'opencode session checkpoint export skipped: CLI did not emit a session id');
           ctx.onExit(code, signal);
           return;
         }
         try {
-          mkdirSync(join(ctx.cwd, '.runner'), { recursive: true });
+          checkpointPath = join(ctx.cwd, '.session-traces', `${sessionId}.json`);
+          mkdirSync(join(ctx.cwd, '.session-traces'), { recursive: true, mode: 0o700 });
           const exportLaunch = launchCommand(ctx, binary, ['export', sessionId]);
           const exporter = spawn(exportLaunch.command, exportLaunch.args, {
             cwd: ctx.cwd,
@@ -163,7 +172,7 @@ export class OpenCodeAdapter implements EngineAdapter {
                 const text = Buffer.concat(chunks).toString('utf8');
                 const parsed = JSON.parse(text) as { info?: { id?: string } };
                 if (parsed.info?.id !== sessionId) throw new Error('OpenCode exported a different session id');
-                writeFileSync(output, text, { mode: 0o600 });
+                writeFileSync(checkpointPath!, text, { mode: 0o600 });
               } catch (error) {
                 ctx.onLog('stderr', `opencode session checkpoint export failed: ${String(error)}`);
               }

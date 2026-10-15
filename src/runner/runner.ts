@@ -1,4 +1,5 @@
 import { chmodSync, chownSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { EngineAdapter, EngineHandle } from '../adapters/engine/engine-adapter.js';
@@ -20,16 +21,15 @@ import { RunStore, type PersistedRunState } from './run-store.js';
 import { cloneRepository, resolveCloneSource } from './repository.js';
 import { ScopedEventLog, type LogSink } from './scoped-log.js';
 import { canTransition, isTerminalState, type RunState } from './state-machine.js';
-import { sha256Hex, type BlobStore } from '../storage/blob-store.js';
+import type { BlobStore } from '../storage/blob-store.js';
 import { RunExportStore, type PlannedOutput } from '../storage/export.js';
-import type { ArtifactStore } from '../storage/artifact-store.js';
 import type { UploadSessionStore } from '../storage/upload-session.js';
 import type { WorkspaceSnapshotStore } from '../storage/workspace-snapshot.js';
 import { InputMaterializer, type MaterializeReceipt } from '../storage/input-materializer.js';
 import { materializeIngressManifest, type IngressArtifactResolver } from '../storage/ingress-artifact.js';
 import { artifactNameFor, mimeForName } from '../storage/export-manifest.js';
 import type { RunExportManifest } from '../storage/export-manifest.js';
-import { isRegularFile, resolveExistingInsideRoot } from '../storage/local-paths.js';
+import { isRegularFile, resolveExistingInsideRoot, resolveInsideRoot } from '../storage/local-paths.js';
 import { profileKey } from '../storage/keys.js';
 import { redactSecrets, specHash, truncateLine, writeFileAtomic } from './util.js';
 import {
@@ -1282,41 +1282,30 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
       if (st.spec.engine.name !== 'opencode') {
         throw new PreflightError('MATERIALIZE_REF_INVALID', 'OpenCode session checkpoints can only resume an OpenCode run');
       }
-      if (!this.opts.exports) {
-        throw new PreflightError('MATERIALIZE_REF_INVALID', 'this Runner has no durable artifact store for OpenCode session restore', { retryable: true });
+      if (!st.spec.profileWorkspace?.snapshotUrl || !st.spec.profileWorkspace.savebackUrl) {
+        throw new PreflightError('MATERIALIZE_REF_INVALID', 'OpenCode session resume requires the existing profile archive/restore path');
       }
-      const source = this.store.loadState(resume.runId);
-      if (!source || source.profileId !== st.profileId || source.userTaskId !== st.userTaskId) {
-        throw new PreflightError('MATERIALIZE_REF_INVALID', 'OpenCode session checkpoint belongs to a different profile or user task');
+      if (resume.path !== `.session-traces/${resume.sessionId}.json`) {
+        throw new PreflightError('MATERIALIZE_REF_INVALID', 'OpenCode session checkpoint path is outside the session archive namespace');
       }
-      const checkpoint = source.result?.sessionCheckpoint;
-      if (!checkpoint || checkpoint.artifactId !== resume.artifactId) {
-        throw new PreflightError('MATERIALIZE_REF_INVALID', 'the referenced OpenCode session checkpoint is not committed for this run');
-      }
-      let artifact: Awaited<ReturnType<ArtifactStore['read']>>;
+      let bytes: Buffer;
       try {
-        artifact = await this.opts.exports.artifacts.read(resume.runId, resume.artifactId);
+        bytes = readFileSync(resolveInsideRoot(st.spec.cwd, resume.path, 'OpenCode session checkpoint'));
       } catch (error) {
-        throw new PreflightError('MATERIALIZE_REF_UNAVAILABLE', `OpenCode session checkpoint could not be read: ${String((error as Error).message)}`, { retryable: true });
-      }
-      if (artifact.manifest.artifactId !== resume.artifactId || artifact.manifest.name !== 'opencode-session.json'
-        || artifact.manifest.sha256 !== checkpoint.sha256 || artifact.manifest.size !== checkpoint.size) {
-        throw new PreflightError('MATERIALIZE_REF_INVALID', 'OpenCode session checkpoint artifact metadata did not match its committed result');
+        throw new PreflightError('MATERIALIZE_REF_UNAVAILABLE', `OpenCode session checkpoint was not restored from the profile archive: ${String((error as Error).message)}`, { retryable: true });
       }
       let sessionId: unknown;
       try {
-        const parsed = JSON.parse(artifact.bytes.toString('utf8')) as { info?: { id?: unknown } };
+        const parsed = JSON.parse(bytes.toString('utf8')) as { info?: { id?: unknown } };
         sessionId = parsed.info?.id;
       } catch {
         throw new PreflightError('MATERIALIZE_REF_INVALID', 'OpenCode session checkpoint is not valid exported session JSON');
       }
-      if (typeof sessionId !== 'string' || sessionId !== checkpoint.sessionId || !/^ses_[0-7][0-9A-HJKMNP-TV-Z]{25}$/.test(sessionId)) {
-        throw new PreflightError('MATERIALIZE_REF_INVALID', 'OpenCode session checkpoint has an invalid session id');
+      if (bytes.length !== resume.size || createHash('sha256').update(bytes).digest('hex') !== resume.sha256
+        || typeof sessionId !== 'string' || sessionId !== resume.sessionId || !/^ses_[0-7][0-9A-HJKMNP-TV-Z]{25}$/.test(sessionId)) {
+        throw new PreflightError('MATERIALIZE_REF_INVALID', 'OpenCode session checkpoint failed profile archive integrity validation');
       }
-      const path = join(st.spec.cwd, '.runner', 'opencode-session.json');
-      mkdirSync(join(st.spec.cwd, '.runner'), { recursive: true, mode: 0o700 });
-      writeFileAtomic(path, artifact.bytes);
-      this.emit(st, 'log', { stream: 'runner', level: 'info', message: `opencode.session_checkpoint_restored sessionId=${sessionId} bytes=${artifact.bytes.length}` });
+      this.emit(st, 'log', { stream: 'runner', level: 'info', message: `opencode.session_checkpoint_restored sessionId=${sessionId} bytes=${bytes.length} sourceRunId=${resume.sourceRunId}` });
     }
     const materializer = this.opts.inputs;
     const ingress = st.spec.ingressManifest;
@@ -2404,38 +2393,41 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
   }
 
   /**
-   * Сохраняет полную OpenCode-сессию как внутренний ArtifactStore объект. Она не
-   * входит в пользовательские outputs и не публикуется в GitHub: результат содержит
-   * только проверенный ref для последующего same-task resume.
+   * Привязывает OpenCode transcript к существующему profile saveback/archive. Полные
+   * bytes идут по действующей политике heavy objects в GCS, а GitHub profile держит
+   * только архивный ref; отдельный ArtifactStore для сессий не создаётся.
    */
   private async saveOpenCodeSessionCheckpoint(st: PersistedRunState, run: InternalRun | null): Promise<void> {
-    if (st.spec.engine.name !== 'opencode' || !run || !this.opts.exports) return;
-    const path = join(st.spec.cwd, '.runner', 'opencode-session.json');
-    if (!existsSync(path)) return;
+    if (st.spec.engine.name !== 'opencode' || !run || !st.spec.profileWorkspace?.savebackUrl) return;
+    const sessionDir = join(st.spec.cwd, '.session-traces');
+    if (!existsSync(sessionDir)) return;
     try {
-      const bytes = readFileSync(path);
+      const changed = st.result?.profileChanges?.files ?? [];
+      const names = changed.map((file) => file.path.match(/^\.session-traces\/(ses_[0-7][0-9A-HJKMNP-TV-Z]{25})\.json$/)?.[1]).filter((id): id is string => !!id);
+      const resumed = st.spec.input?.resumeSessionFrom;
+      const candidateIds = [...new Set([...names, ...(resumed ? [resumed.sessionId] : [])])];
+      let selected: { sessionId: string; path: string; bytes: Buffer } | undefined;
+      for (const sessionId of candidateIds) {
+        const relativePath = `.session-traces/${sessionId}.json`;
+        let bytes: Buffer;
+        try { bytes = readFileSync(resolveInsideRoot(st.spec.cwd, relativePath, 'OpenCode session checkpoint')); }
+        catch { continue; }
+        const expected = changed.find((file) => file.path === relativePath);
+        const archivedResume = resumed?.path === relativePath && resumed.sha256 === createHash('sha256').update(bytes).digest('hex') && resumed.size === bytes.length;
+        if ((expected && expected.sha256 === createHash('sha256').update(bytes).digest('hex') && expected.size === bytes.length) || archivedResume) {
+          selected = { sessionId, path: relativePath, bytes };
+          break;
+        }
+      }
+      if (!selected) return;
+      const { sessionId, path: relativePath, bytes } = selected;
       const parsed = JSON.parse(bytes.toString('utf8')) as { info?: { id?: unknown } };
-      const sessionId = parsed.info?.id;
-      if (typeof sessionId !== 'string' || !/^ses_[0-7][0-9A-HJKMNP-TV-Z]{25}$/.test(sessionId)) {
+      if (parsed.info?.id !== sessionId || !/^ses_[0-7][0-9A-HJKMNP-TV-Z]{25}$/.test(sessionId)) {
         throw new Error('exported session has an invalid id');
       }
-      const sha256 = sha256Hex(bytes);
-      const artifactId = `session-${sha256.slice(0, 24)}-${sha256Hex(st.runId).slice(0, 8)}`;
-      const stored = await this.opts.exports.artifacts.put({
-        runId: st.runId,
-        userTaskId: st.userTaskId,
-        profileId: st.profileId,
-        name: 'opencode-session.json',
-        mime: 'application/json',
-        bytes,
-        artifactId,
-      });
-      const verified = await this.opts.exports.artifacts.read(st.runId, artifactId);
-      if (stored.sha256 !== sha256 || verified.manifest.sha256 !== sha256 || verified.bytes.length !== bytes.length) {
-        throw new Error('stored session checkpoint failed SHA/size read-back verification');
-      }
-      run.sessionCheckpoint = { artifactId, sessionId, sha256, size: bytes.length };
-      this.emit(st, 'log', { stream: 'runner', level: 'info', message: `opencode.session_checkpoint_persisted sessionId=${sessionId} bytes=${bytes.length} sha256=${sha256}` });
+      const sha256 = createHash('sha256').update(bytes).digest('hex');
+      run.sessionCheckpoint = { sourceRunId: names.includes(sessionId) ? st.runId : resumed?.sourceRunId ?? st.runId, sessionId, path: relativePath, sha256, size: bytes.length };
+      this.emit(st, 'log', { stream: 'runner', level: 'info', message: `opencode.session_checkpoint_archived sessionId=${sessionId} bytes=${bytes.length} sha256=${sha256}` });
     } catch (error) {
       const detail = truncateLine(redactSecrets(error instanceof Error ? error.message : String(error)), 300);
       this.emit(st, 'log', { stream: 'runner', level: 'warn', message: `opencode.session_checkpoint_unavailable reason=${detail}` });

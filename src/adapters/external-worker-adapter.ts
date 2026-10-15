@@ -131,7 +131,7 @@ export interface LaunchRequest {
   operationId: string;
   ownerGeneration: number;
   engine: { name: string; adapterVersion: string; modelSettings?: { model?: string } };
-  input: { inlinePrompt: string; resumeSessionFrom?: { runId: string; artifactId: string } };
+  input: { inlinePrompt: string; resumeSessionFrom?: { sourceRunId: string; sessionId: string; path: string; sha256: string; size: number } };
   cwd: string;
   envAllowlist: string[];
   env: Record<string, string>;
@@ -654,9 +654,10 @@ export function validateLaunchResult(input: unknown, expectedRunId: string): Val
   if (input['sessionCheckpoint'] !== undefined) {
     const checkpoint = input['sessionCheckpoint'];
     if (checkObject(checkpoint, 'launch.sessionCheckpoint', collector)) {
-      checkKeys(checkpoint, ['artifactId', 'sessionId', 'sha256', 'size'], ['artifactId', 'sessionId', 'sha256', 'size'], 'launch.sessionCheckpoint', collector);
-      if (!isSafeId(checkpoint['artifactId'])) collector.push('launch.sessionCheckpoint.artifactId: expected a safe artifact id');
+      checkKeys(checkpoint, ['sourceRunId', 'sessionId', 'path', 'sha256', 'size'], ['sourceRunId', 'sessionId', 'path', 'sha256', 'size'], 'launch.sessionCheckpoint', collector);
+      if (!isSafeId(checkpoint['sourceRunId'])) collector.push('launch.sessionCheckpoint.sourceRunId: expected a safe run id');
       if (typeof checkpoint['sessionId'] !== 'string' || !/^ses_[0-7][0-9A-HJKMNP-TV-Z]{25}$/.test(checkpoint['sessionId'])) collector.push('launch.sessionCheckpoint.sessionId: expected an OpenCode session id');
+      if (typeof checkpoint['path'] !== 'string' || checkpoint['path'] !== `.session-traces/${String(checkpoint['sessionId'])}.json`) collector.push('launch.sessionCheckpoint.path: expected the session archive path');
       if (typeof checkpoint['sha256'] !== 'string' || !/^[0-9a-f]{64}$/.test(checkpoint['sha256'])) collector.push('launch.sessionCheckpoint.sha256: expected sha256');
       if (typeof checkpoint['size'] !== 'number' || !Number.isSafeInteger(checkpoint['size']) || checkpoint['size'] < 0) collector.push('launch.sessionCheckpoint.size: expected non-negative integer');
     }

@@ -26,10 +26,11 @@ export interface RunFailure {
 
 export type UsageReport = { status: 'unknown' } | { status: 'known'; usd: number };
 
-/** Internal pointer to an encrypted-at-rest OpenCode transcript; never a user artifact. */
+/** Pointer into the existing profile archive; transcript bytes are held by its GCS heavy-object path. */
 export interface SessionCheckpointRef {
-  artifactId: string;
+  sourceRunId: string;
   sessionId: string;
+  path: string;
   sha256: string;
   size: number;
 }
@@ -217,9 +218,10 @@ export function validateRunResult(input: unknown): ValidationResult<RunResult> {
   if (input['sessionCheckpoint'] !== undefined) {
     const checkpoint = input['sessionCheckpoint'];
     if (checkObject(checkpoint, 'result.sessionCheckpoint', collector)) {
-      checkKeys(checkpoint, ['artifactId', 'sessionId', 'sha256', 'size'], ['artifactId', 'sessionId', 'sha256', 'size'], 'result.sessionCheckpoint', collector);
-      if (!isSafeId(checkpoint['artifactId'])) collector.push('result.sessionCheckpoint.artifactId: expected a safe artifact id');
+      checkKeys(checkpoint, ['sourceRunId', 'sessionId', 'path', 'sha256', 'size'], ['sourceRunId', 'sessionId', 'path', 'sha256', 'size'], 'result.sessionCheckpoint', collector);
+      if (!isSafeId(checkpoint['sourceRunId'])) collector.push('result.sessionCheckpoint.sourceRunId: expected a safe run id');
       if (typeof checkpoint['sessionId'] !== 'string' || !/^ses_[0-7][0-9A-HJKMNP-TV-Z]{25}$/.test(checkpoint['sessionId'])) collector.push('result.sessionCheckpoint.sessionId: expected an OpenCode session id');
+      if (typeof checkpoint['path'] !== 'string' || checkpoint['path'] !== `.session-traces/${String(checkpoint['sessionId'])}.json`) collector.push('result.sessionCheckpoint.path: expected the session archive path');
       if (typeof checkpoint['sha256'] !== 'string' || !/^[0-9a-f]{64}$/.test(checkpoint['sha256'])) collector.push('result.sessionCheckpoint.sha256: expected sha256');
       if (typeof checkpoint['size'] !== 'number' || !Number.isSafeInteger(checkpoint['size']) || checkpoint['size'] < 0) collector.push('result.sessionCheckpoint.size: expected non-negative integer');
     }

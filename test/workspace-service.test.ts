@@ -307,7 +307,9 @@ describe('publish → prepare: the persistent state survives the run', () => {
     const h = harness({ policyTextMaxBytes: 1024 });
     await ensureProfile(h, ALICE);
     const heavy = Buffer.alloc(4096, 7);
-    const a = runWorkspace({ 'notes/a.md': 'text\n', 'media/blob.bin': heavy });
+    const session = Buffer.from('{"info":{"id":"ses_01J5Y5H0AH4Q4NXJ6P4C3P5V2K"},"messages":[]}');
+    const sessionPath = '.session-traces/ses_01J5Y5H0AH4Q4NXJ6P4C3P5V2K.json';
+    const a = runWorkspace({ 'notes/a.md': 'text\n', 'media/blob.bin': heavy, [sessionPath]: session });
     const publication = await h.service.publishRunChanges({
       operationId: 'pub-heavy',
       ...ALICE,
@@ -317,20 +319,29 @@ describe('publish → prepare: the persistent state survives the run', () => {
     });
     expect(publication.status).toBe('published');
     const change = publication.changes.find((item) => item.path === 'media/blob.bin');
+    const sessionChange = publication.changes.find((item) => item.path === sessionPath);
     expect(change?.artifact?.key).toMatch(/^profiles\/alice\/workspace\/wspub-/);
     expect(change?.sha256).toBe(change?.artifact?.sha256);
+    expect(sessionChange?.artifact?.key).toMatch(/^profiles\/alice\/workspace\/wspub-/);
+    expect(sessionChange?.sha256).toBe(sessionChange?.artifact?.sha256);
 
     const tree = remoteTree(h.admin, `${OWNER}/profile-alice`);
     expect(Object.keys(tree)).not.toContain('media/blob.bin');
     expect(tree['.trained-assist/artifacts.json']).toContain('media/blob.bin');
+    expect(Object.keys(tree)).not.toContain(sessionPath);
+    expect(tree['.trained-assist/artifacts.json']).toContain(sessionPath);
 
     const bytes = await h.objects.get(change?.artifact?.key ?? '');
     expect(bytes.equals(heavy)).toBe(true);
+    const archivedSession = await h.objects.get(sessionChange?.artifact?.key ?? '');
+    expect(archivedSession.equals(session)).toBe(true);
 
     const prepared = await h.service.prepareProfileWorkspace({ operationId: 'prep-heavy', ...ALICE });
     const entry = prepared.manifest.find((item) => item.path === 'media/blob.bin');
+    const sessionEntry = prepared.manifest.find((item) => item.path === sessionPath);
     expect(entry?.artifact?.key).toBe(change?.artifact?.key);
-    expect(prepared.artifacts).toBe(1);
+    expect(sessionEntry?.artifact?.key).toBe(sessionChange?.artifact?.key);
+    expect(prepared.artifacts).toBe(2);
   });
 
   it('a tampered artifact is reported as a warning instead of a manifest entry', async () => {

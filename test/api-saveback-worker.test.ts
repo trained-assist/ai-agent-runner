@@ -1,12 +1,11 @@
 import { createHash } from 'node:crypto';
-import { execFileSync, spawn } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import { createServer, type Server } from 'node:http';
 import { chmodSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import type { EngineAdapter } from '../src/adapters/engine/engine-adapter.js';
-import { handleForChild } from '../src/adapters/engine/process-tree.js';
+import { OpenCodeAdapter } from '../src/adapters/engine/opencode-adapter.js';
 import { Runner } from '../src/runner/runner.js';
 import { createApiSavebackWorker } from '../src/workspace/api-saveback-worker.js';
 import { makeRunSpec } from './helpers.js';
@@ -15,7 +14,7 @@ describe('France VM API-owned profile saveback', () => {
   const closers: Array<() => Promise<void>> = [];
   afterEach(async () => { for (const close of closers.splice(0)) await close(); });
 
-  it('downloads a pinned snapshot, uploads only modifications, records deletions, and keeps the capability out of Runner state', async () => {
+  it('archives the OpenCode transcript through existing profile saveback alongside workspace changes', async () => {
     const root = mkdtempSync(join(tmpdir(), 'vm-api-profile-saveback-'));
     const profile = join(root, 'profile');
     mkdirSync(profile, { recursive: true });
@@ -59,18 +58,21 @@ describe('France VM API-owned profile saveback', () => {
 
     const dataDir = join(root, 'worker-data');
     const workspace = join(dataDir, 'workspaces', 'run_vm_profile');
-    const engine: EngineAdapter = {
-      name: 'fake',
-      async start(context) {
-        const source = "const fs=require('node:fs');fs.writeFileSync('state.md','after\\n');fs.unlinkSync('remove.md');fs.writeFileSync('new.md','new file\\n');console.log('saveback fixture complete');";
-        const child = spawn(process.execPath, ['-e', source], { cwd: context.cwd, env: context.env, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
-        return handleForChild(child, { onLog: context.onLog, onExit: context.onExit });
-      },
-    };
-    const runner = new Runner({ rootDir: join(root, 'runner'), adapters: { fake: engine }, profileWorkspace: createApiSavebackWorker(dataDir) });
+    const sessionId = 'ses_01J5Y5H0AH4Q4NXJ6P4C3P5V2K';
+    const binary = join(root, 'opencode-stub.sh');
+    writeFileSync(binary, [
+      '#!/bin/sh',
+      'if [ "$1" = "export" ]; then printf \'{"info":{"id":"%s"},"messages":[]}\\n\' "$2"; exit 0; fi',
+      "printf 'after\\n' > state.md; rm -f remove.md; printf 'new file\\n' > new.md",
+      `printf '{"type":"text","sessionID":"${sessionId}","part":{"type":"text","text":"saveback fixture complete","time":{"start":1,"end":2}}}\\n'`,
+    ].join('\n'));
+    chmodSync(binary, 0o700);
+    const runner = new Runner({ rootDir: join(root, 'runner'), adapters: { opencode: new OpenCodeAdapter({ binary }) }, profileWorkspace: createApiSavebackWorker(dataDir) });
     closers.push(async () => runner.dispose());
     const spec = makeRunSpec({
       runId: 'run_vm_profile', cwd: workspace,
+      engine: { name: 'opencode', adapterVersion: '1' },
+      input: { inlinePrompt: 'Save profile and session fixture.' },
       repository: { fullName: 'owner/profile', revision: 'a'.repeat(40) },
       profileWorkspace: {
         bindingId: 'binding-a', snapshotUrl: `${base}/snapshot`, snapshotSha256, snapshotSize: archiveBytes.length,
@@ -81,15 +83,22 @@ describe('France VM API-owned profile saveback', () => {
     runner.start(spec);
     const result = await runner.waitFor(spec.runId, 15_000);
 
-    expect(result.outcome).toBe('succeeded');
+    expect(result.outcome, JSON.stringify(result)).toBe('succeeded');
     expect(result.profileChanges).toEqual({
       files: [
+        { path: `.session-traces/${sessionId}.json`, sha256: expect.any(String), size: expect.any(Number) },
         { path: 'new.md', sha256: createHash('sha256').update('new file\n').digest('hex'), size: 9 },
         { path: 'state.md', sha256: createHash('sha256').update('after\n').digest('hex'), size: 6 },
       ],
       deletes: ['remove.md'],
     });
+    expect(result.sessionCheckpoint).toMatchObject({
+      sourceRunId: spec.runId, sessionId, path: `.session-traces/${sessionId}.json`,
+      sha256: result.profileChanges?.files.find((file) => file.path === `.session-traces/${sessionId}.json`)?.sha256,
+      size: result.profileChanges?.files.find((file) => file.path === `.session-traces/${sessionId}.json`)?.size,
+    });
     expect(uploads.map(({ path, text }) => ({ path, text }))).toEqual([
+      { path: `.session-traces/${sessionId}.json`, text: expect.stringContaining(sessionId) },
       { path: 'new.md', text: 'new file\n' },
       { path: 'state.md', text: 'after\n' },
     ]);

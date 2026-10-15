@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { createHash } from 'node:crypto';
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -98,7 +99,7 @@ describe('OpenCodeAdapter', () => {
       const args = readFileSync(capturedArgs, 'utf8').trim().split('\n');
       expect(args).toContain('--format');
       expect(args).not.toContain('--session');
-      const checkpoint = JSON.parse(readFileSync(join(cwd, '.runner', 'opencode-session.json'), 'utf8')) as { info: { id: string } };
+      const checkpoint = JSON.parse(readFileSync(join(cwd, '.session-traces', `${sessionId}.json`), 'utf8')) as { info: { id: string } };
       expect(checkpoint.info.id).toBe(sessionId);
     } finally {
       rmSync(cwd, { recursive: true, force: true });
@@ -109,8 +110,10 @@ describe('OpenCodeAdapter', () => {
     const cwd = mkdtempSync(join(tmpdir(), 'opencode-resume-'));
     try {
       const sessionId = 'ses_01J9A3J9Y7V8W2K4M6N0PQRSTZ';
-      mkdirSync(join(cwd, '.runner'), { recursive: true });
-      writeFileSync(join(cwd, '.runner', 'opencode-session.json'), JSON.stringify({ info: { id: sessionId }, messages: [] }));
+      mkdirSync(join(cwd, '.session-traces'), { recursive: true });
+      const sessionBytes = Buffer.from(JSON.stringify({ info: { id: sessionId }, messages: [] }));
+      const checkpointPath = `.session-traces/${sessionId}.json`;
+      writeFileSync(join(cwd, ...checkpointPath.split('/')), sessionBytes);
       const fakeOpenCode = join(cwd, 'opencode-stub.sh');
       const capture = join(cwd, 'calls.txt');
       writeFileSync(fakeOpenCode, [
@@ -122,7 +125,11 @@ describe('OpenCodeAdapter', () => {
       ].join('\n'));
       chmodSync(fakeOpenCode, 0o700);
       const { ctx, exit } = makeContext(cwd, { CAPTURE: capture, IMPORTED: join(cwd, 'imported') });
-      ctx.spec.input = { inlinePrompt: 'Continue the task.', resumeSessionFrom: { runId: 'run-previous', artifactId: 'artifact-previous' } };
+      ctx.spec.profileWorkspace = { bindingId: 'profile-a', snapshotUrl: 'https://example.test/snapshot', snapshotSha256: 'a'.repeat(64), snapshotSize: 1, savebackUrl: 'https://example.test/saveback', artifacts: [], excludedPatterns: [] };
+      ctx.spec.input = { inlinePrompt: 'Continue the task.', resumeSessionFrom: {
+        sourceRunId: 'run-previous', sessionId, path: checkpointPath,
+        sha256: createHash('sha256').update(sessionBytes).digest('hex'), size: sessionBytes.length,
+      } };
       await new OpenCodeAdapter({ binary: fakeOpenCode }).start(ctx);
       await exit;
       const calls = readFileSync(capture, 'utf8');
