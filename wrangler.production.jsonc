@@ -1,6 +1,7 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "trained-assist-runner-api-production",
+  "account_id": "d740a05e9442c1d0feacae2dfc673e93",
   "main": "src/cloudflare/index.ts",
   "compatibility_date": "2026-10-09",
   "workers_dev": true,
@@ -13,6 +14,7 @@
     "DEPLOYMENT_ENV": "production",
     "RUNNER_API_PUBLIC_URL": "https://trained-assist-runner-api-production.skillset-apply.workers.dev",
     "RUNNER_ENGINE": "eu-vm-agent-run",
+    "GHA_WORKER_URL": "https://opencode-gha-runner-gateway.skillset-apply.workers.dev",
     "MOCK_TEST_ENABLED": "false",
     "ALLOWED_REPOSITORIES": "trained-assist/ai-agent-runner",
     "ALLOWED_ENVIRONMENT_NAMES": "LLM_LADDER_TOKEN"

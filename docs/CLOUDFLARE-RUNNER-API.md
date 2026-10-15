@@ -74,10 +74,35 @@ the target ownership boundary. Do not extend that handoff; move provisioning to 
 production secrets and remove the CP copy only after Runner readiness and CP authentication are
 verified. See architecture [#208](https://github.com/trained-assist/trained-agent-architecture/issues/208).
 
-`eu-vm-agent-run` is the default and only engine in these sandbox configurations. A GHA runner
-is not a fallback. If France cannot accept the job, the task reports an error or unknown
-outcome; the API does not silently move execution elsewhere. The sandbox-only `mock-test`
-engine returns fixed `pong` without calling the VM or a model.
+`eu-vm-agent-run` remains the default and primary execution route. Production, sandbox3 and
+the Telegram UX sandbox each configure a GHA/Azure gateway as a secondary route. Capacity
+cutover is enabled independently per Worker only when its Runner-owned `GHA_WORKER_TOKEN` is
+provisioned. Each environment has a distinct named gateway credential, so sandbox tokens can
+be rotated or revoked without touching production or other clients. The provisioning command
+installs each generated value in that environment's gateway, Runner API and GitHub Actions
+environment, then checks authenticated gateway access without creating a run. Capabilities
+continues to list France in `executionRegions` and reports `azure-cloud` separately in
+`fallbackExecutionRegions` only when both URL and credential are present. `POST /v1/runs`
+accepts optional `routeMode`: `auto` (default; France, then GHA only after a confirmed
+pre-admission capacity refusal), `france` (France only), or `gha` (GHA/Azure only). For
+`routeMode: "gha"`, `engine.name` must be `azure-cloud`; the authenticated principal must also
+allow that engine. Capabilities includes per-route availability under `routes`. In auto mode,
+the cutover occurs only after France returns the typed pre-admission refusal
+`503 { accepted: false, code: "WORKER_CAPACITY" }`; the same run and operation identity is then
+persisted against `azure-cloud` before dispatch. Other refusals do not trigger this cutover. An
+accepted or ambiguous France launch is reconciled on France and never started again on GHA.
+The production fallback remains disabled until its separately reviewed secret provisioning and
+deployment are completed. The isolated `cp-sandbox3` mock-only Worker remains independent and
+never advertises or invokes either real worker. The sandbox-only `mock-test` engine returns
+fixed `pong` without calling a worker or model.
+
+The three real Worker targets are `sandbox3` (GHA sandbox gateway), `telegram-ux-v1` (GHA
+sandbox gateway), and `production` (GHA production gateway). Provision each with a distinct
+client ID: `sandbox3_agent_api` / `wrangler.sandbox3.jsonc` / GitHub environment `sandbox`,
+`telegram_ux_v1_agent_api` / `wrangler.telegram-ux-v1.jsonc` / `sandbox`, and
+`production_agent_api` / `wrangler.production.jsonc` / `production`. The gateway environment is
+`sandbox` for the first two and `production` for the base production gateway. `cp-sandbox3` is
+deliberately excluded because it is an isolated mock contract test.
 
 ## Configuration
 
@@ -149,6 +174,11 @@ Worker secrets:
   any partial or delegated capability is rejected.
 - `VM_WORKER_URL`: HTTPS address of the France execution worker route.
 - `VM_WORKER_TOKEN`: the France worker's current Bearer credential.
+- `GHA_WORKER_URL`: non-secret HTTPS address of the GHA/Azure gateway; configured as a Worker var
+  for production, sandbox3 and Telegram UX sandbox.
+- `GHA_WORKER_TOKEN`: this Runner environment's GHA gateway client Bearer credential, stored as a Runner
+  Worker secret. It is distinct from the gateway primary credential and never goes to CP,
+  France, or task input. If absent, the API remains France-only.
 - `RUN_LAUNCH_ENCRYPTION_KEY`: stable random value of at least 32 characters. The Durable
   Object stores encrypted launch bodies; keep this key stable while any run is active.
 - `MCP_TEST_AUTH_TOKEN`: test-only Bearer shared with `trained-assist-mcp-host-test-160`.

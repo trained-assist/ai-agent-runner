@@ -1,6 +1,7 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "trained-assist-runner-api-telegram-ux-v1-sandbox",
+  "account_id": "d740a05e9442c1d0feacae2dfc673e93",
   "main": "src/cloudflare/index.ts",
   "compatibility_date": "2026-10-09",
   "workers_dev": true,
@@ -26,6 +27,7 @@
   "vars": {
     "RUNNER_API_PUBLIC_URL": "https://trained-assist-runner-api-telegram-ux-v1-sandbox.skillset-apply.workers.dev",
     "RUNNER_ENGINE": "eu-vm-agent-run",
+    "GHA_WORKER_URL": "https://opencode-gha-runner-gateway-sandbox.skillset-apply.workers.dev",
     "MOCK_TEST_ENABLED": "true",
     "SANDBOX_CLEANUP_PROFILES": "integration-telegram-ux-v1",
     "ALLOWED_REPOSITORIES": "trained-assist/ai-agent-runner",

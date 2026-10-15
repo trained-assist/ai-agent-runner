@@ -206,6 +206,116 @@ describe('Cloudflare Runner run coordinator', () => {
     expect(await result.json()).toMatchObject({ outcome: 'succeeded', text: 'done' });
   });
 
+  it('cuts over from France to GHA only on confirmed pre-admission capacity refusal and pins the run there', async () => {
+    const { coordinator, env, storage } = setup();
+    env.GHA_WORKER_URL = 'https://gha.example';
+    env.GHA_WORKER_TOKEN = 'gha-worker-secret-for-test-only';
+    const calls: Array<{ host: string; path: string; authorization: string; body?: Record<string, unknown> }> = [];
+    let ghaStatusPolls = 0;
+    env.FETCH = async (input, init) => {
+      const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+      const headers = new Headers(init?.headers);
+      const parsedBody = typeof init?.body === 'string' ? JSON.parse(init.body) as Record<string, unknown> : undefined;
+      calls.push({ host: url.host, path: url.pathname, authorization: headers.get('authorization') ?? '', ...(parsedBody ? { body: parsedBody } : {}) });
+      if (url.host === 'france.example') return Response.json({ accepted: false, code: 'WORKER_CAPACITY', cpuPercent: 60.1 }, { status: 503 });
+      if (url.pathname === '/v1/launch') return Response.json({ runId: parsedBody?.['runId'], operationId: 'op-test', status: 'accepted' }, { status: 202 });
+      if (url.pathname.endsWith('/status')) return Response.json({ status: ++ghaStatusPolls === 1 ? 'running' : 'succeeded' });
+      if (url.pathname.endsWith('/result')) return Response.json({ exitReason: 'completed', exitCode: 0, exitSignal: null, answer: 'done on GHA', artifacts: [], logUrl: '', repo: null });
+      return Response.json({ status: 'cancelled' });
+    };
+
+    const submitted = await coordinator.fetch(call('/v1/runs', body, { 'idempotency-key': 'capacity-cutover' }));
+    const receipt = await submitted.json() as { runId: string };
+    await coordinator.alarm();
+
+    const launchCalls = calls.filter((entry) => entry.path === '/v1/launch');
+    expect(launchCalls.map((entry) => entry.host)).toEqual(['france.example', 'gha.example']);
+    expect(launchCalls[0]?.authorization).toBe('Bearer worker-secret');
+    expect(launchCalls[1]?.authorization).toBe('Bearer gha-worker-secret-for-test-only');
+    expect(launchCalls[1]?.body).toMatchObject({ runId: receipt.runId, operationId: launchCalls[0]?.body?.['operationId'], engine: { name: 'azure-cloud' } });
+    expect(storage.values.get('runner-v1')).toMatchObject({ runs: { [receipt.runId]: { engine: 'azure-cloud', state: 'starting' } } });
+
+    const recovered = new RunnerRunCoordinator({ storage, blockConcurrencyWhile: async (fn) => fn() }, env);
+    await recovered.alarm();
+    await recovered.alarm();
+    expect(calls.filter((entry) => entry.path.endsWith('/status')).every((entry) => entry.host === 'gha.example')).toBe(true);
+    expect(calls.filter((entry) => entry.path.endsWith('/result')).every((entry) => entry.host === 'gha.example')).toBe(true);
+    const result = await coordinator.fetch(call(`/v1/runs/${receipt.runId}/result`));
+    expect(await result.json()).toMatchObject({ outcome: 'succeeded', text: 'done on GHA' });
+  });
+
+  it('supports strict France and strict GHA API routes in addition to auto selection', async () => {
+    const france = setup();
+    france.env.GHA_WORKER_URL = 'https://gha.example';
+    france.env.GHA_WORKER_TOKEN = 'gha-worker-secret-for-test-only';
+    const franceHosts: string[] = [];
+    france.env.FETCH = async (input) => {
+      const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+      franceHosts.push(url.host);
+      return Response.json({ accepted: false, code: 'WORKER_CAPACITY' }, { status: 503 });
+    };
+    const franceAccepted = await france.coordinator.fetch(call('/v1/runs', { ...body, routeMode: 'france' }, { 'idempotency-key': 'strict-france' }));
+    expect(franceAccepted.status).toBe(202);
+    const franceReceipt = await franceAccepted.json() as { runId: string };
+    await france.coordinator.alarm();
+    expect(franceHosts).toEqual(['france.example']);
+    expect(await (await france.coordinator.fetch(call(`/v1/runs/${franceReceipt.runId}/result`))).json()).toMatchObject({ outcome: 'failed', failure: { code: 'WORKER_CAPACITY' } });
+
+    const gha = setup();
+    gha.env.GHA_WORKER_URL = 'https://gha.example';
+    gha.env.GHA_WORKER_TOKEN = 'gha-worker-secret-for-test-only';
+    const ghaHosts: string[] = [];
+    gha.env.FETCH = async (input, init) => {
+      const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+      ghaHosts.push(url.host);
+      const launch = JSON.parse(String(init?.body)) as { runId: string };
+      return Response.json({ runId: launch.runId, operationId: 'op-gha', status: 'accepted' }, { status: 202 });
+    };
+    const ghaAccepted = await gha.coordinator.fetch(call('/v1/runs', { ...body, routeMode: 'gha', engine: { name: 'azure-cloud', adapterVersion: '1' } }, { 'idempotency-key': 'strict-gha' }));
+    expect(ghaAccepted.status).toBe(202);
+    const ghaReceipt = await ghaAccepted.json() as { runId: string };
+    await gha.coordinator.alarm();
+    expect(ghaHosts).toEqual(['gha.example']);
+    expect(gha.storage.values.get('runner-v1')).toMatchObject({ runs: { [ghaReceipt.runId]: { engine: 'azure-cloud', routeMode: 'gha', state: 'starting' } } });
+    expect(await (await gha.coordinator.fetch(call(`/v1/runs/${ghaReceipt.runId}/status`))).json()).toMatchObject({ engine: 'azure-cloud', routeMode: 'gha', state: 'starting' });
+  });
+
+  it('does not cut over to GHA for a non-capacity France refusal', async () => {
+    const { coordinator, env } = setup();
+    env.GHA_WORKER_URL = 'https://gha.example';
+    env.GHA_WORKER_TOKEN = 'gha-worker-secret-for-test-only';
+    const hosts: string[] = [];
+    env.FETCH = async (input) => {
+      const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+      hosts.push(url.host);
+      return Response.json({ accepted: false, code: 'WORKER_PROFILE_WORKSPACE_UNSUPPORTED' }, { status: 503 });
+    };
+    const submitted = await coordinator.fetch(call('/v1/runs', body, { 'idempotency-key': 'no-cutover-on-other-refusal' }));
+    const receipt = await submitted.json() as { runId: string };
+    await coordinator.alarm();
+    expect(hosts).toEqual(['france.example']);
+    const result = await coordinator.fetch(call(`/v1/runs/${receipt.runId}/result`));
+    expect(await result.json()).toMatchObject({ outcome: 'failed', failure: { code: 'WORKER_PROFILE_WORKSPACE_UNSUPPORTED' } });
+  });
+
+  it('keeps sandbox3 France-only when the optional GHA credential is not provisioned', async () => {
+    const { coordinator, env } = setup();
+    env.GHA_WORKER_URL = 'https://gha.example';
+    const hosts: string[] = [];
+    env.FETCH = async (input) => {
+      const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+      hosts.push(url.host);
+      return Response.json({ accepted: false, code: 'WORKER_CAPACITY' }, { status: 503 });
+    };
+    const submitted = await coordinator.fetch(call('/v1/runs', body, { 'idempotency-key': 'capacity-without-gha-secret' }));
+    const receipt = await submitted.json() as { runId: string };
+    await coordinator.alarm();
+    expect(hosts).toEqual(['france.example']);
+    const result = await coordinator.fetch(call(`/v1/runs/${receipt.runId}/result`));
+    expect(await result.json()).toMatchObject({ outcome: 'failed', failure: { code: 'WORKER_CAPACITY' } });
+  });
+
+  // Regressions from current main: preserve answers, stale-status recovery and process-start visibility.
   it('preserves a non-truncated OpenCode stdout answer when an older worker omits answer', async () => {
     const { coordinator, env } = setup();
     const previousFetch = env.FETCH!;

@@ -9,7 +9,7 @@ interface RunRecord {
   requestId: string; runId: string; userTaskId: string; conversationId: string; jobId: string;
   ownerGeneration: number;
   principalId: string; profileId: string; tenantId?: string; idempotencyKey: string; payloadHash: string;
-  engine: string; state: State; sequence: number; createdAt: string; updatedAt: string; startedAt: string | null;
+  engine: string; routeMode: 'auto' | 'france' | 'gha'; state: State; sequence: number; createdAt: string; updatedAt: string; startedAt: string | null;
   finishedAt: string | null; answer: string | null; cancelRequested: boolean; launchCiphertext: string;
   lastHeartbeatAt?: string | null; logCursor?: number; output?: { stdout: string; stderr: string; updatedAt: string | null; truncated: boolean };
   /** Worker contact and worker-reported run progress are separate signals. */
@@ -40,6 +40,8 @@ const MAX_WEBHOOK_ATTEMPTS = 8;
 const GUEST_ARTIFACT_TTL_MS = 24 * 60 * 60_000;
 const now = (): string => new Date().toISOString();
 const stateKey = 'runner-v1';
+const FRANCE_ENGINE = 'eu-vm-agent-run';
+const GHA_ENGINE = 'azure-cloud';
 const MCP_TEST = Object.freeze({
   profile: 'integration-telegram-ux-v1', principal: 'integration-telegram-ux-v1',
   server: 'trained-assist-registry-test', binding: 'registry-mcp-test-160-read',
@@ -81,7 +83,7 @@ async function guestDownloadUrl(env: RunnerWorkerEnv, run: RunRecord, path: stri
 function view(run: RunRecord): Record<string, unknown> {
   const progressAgeMs = run.workerReportedUpdatedAt ? Date.now() - Date.parse(run.workerReportedUpdatedAt) : null;
   return { requestId: run.requestId, userTaskId: run.userTaskId, conversationId: run.conversationId, runId: run.runId,
-    ownerGeneration: run.ownerGeneration, state: run.state, engine: run.engine, cancelRequested: run.cancelRequested, connectionLost: run.state === 'unknown',
+    ownerGeneration: run.ownerGeneration, state: run.state, engine: run.engine, routeMode: run.routeMode ?? 'auto', cancelRequested: run.cancelRequested, connectionLost: run.state === 'unknown',
     createdAt: run.createdAt, startedAt: run.startedAt, finishedAt: run.finishedAt,
     observedAt: run.updatedAt, lastHeartbeatAt: run.lastHeartbeatAt ?? null,
     statusFreshness: run.lastHeartbeatAt && Date.now() - Date.parse(run.lastHeartbeatAt) > 30_000 ? 'stale' : run.lastHeartbeatAt ? 'fresh' : 'unobserved',
@@ -103,6 +105,12 @@ function workerRefusalCode(body: unknown, status: number): string {
     }
   }
   return `HTTP_${status}`;
+}
+
+function isConfirmedCapacityRefusal(body: unknown, status: number): boolean {
+  return status === 503 && !!body && typeof body === 'object' && !Array.isArray(body)
+    && (body as Record<string, unknown>)['accepted'] === false
+    && (body as Record<string, unknown>)['code'] === 'WORKER_CAPACITY';
 }
 
 function workerRefusalFields(body: unknown): string[] {
@@ -130,7 +138,7 @@ function refusedLaunchResult(run: RunRecord): Record<string, unknown> {
     exitReason: 'preflight_refused', exitCode: null, exitSignal: null, exitObserved: false, engineStart: 'not_started',
     startedAt: run.startedAt ?? run.createdAt, finishedAt: run.finishedAt ?? now(),
     failure: { code: code.startsWith('WORKER_') ? code : `WORKER_${code}`, failureClass: 'preflight',
-      safeSummary: `The France execution worker refused the run before accepting it (HTTP ${status}, ${code}${fieldSummary}).`, retryable: false },
+      safeSummary: `The ${run.engine} execution worker refused the run before accepting it (HTTP ${status}, ${code}${fieldSummary}).`, retryable: false },
     usage: { status: 'unknown' }, outputRefs: [], persistence: 'not_required',
     persistenceReason: 'The execution worker did not accept the run; there is nothing to persist.',
     cleanup: 'completed', cleanupReason: 'No execution receipt was issued by the worker.',
@@ -262,7 +270,7 @@ export class RunnerRunCoordinator {
     if (!sourcePath || sourcePath.length > 512 || /[\x00-\x1f\x7f]/.test(sourcePath)) return error('INVALID_REQUEST', 'a valid artifact path is required', 400);
     if (!run.artifacts.some((artifact) => artifact['path'] === sourcePath)) return error('NOT_FOUND', 'artifact path is not part of this run', 404);
     const query = new URLSearchParams({ path: sourcePath });
-    const response = await this.worker(sourcePath === AGENT_HISTORY_PATH && run.developerApi
+    const response = await this.worker(run.engine, sourcePath === AGENT_HISTORY_PATH && run.developerApi
       ? `/v1/runs/${encodeURIComponent(run.runId)}/history`
       : `/v1/runs/${encodeURIComponent(run.runId)}/artifacts?${query.toString()}`, 'GET', undefined, 30_000);
     const headers = new Headers({ 'cache-control': 'private, no-store', 'x-content-type-options': 'nosniff' });
@@ -335,7 +343,7 @@ export class RunnerRunCoordinator {
       body = JSON.parse(text) as Record<string, any>;
     } catch { return error('INVALID_REQUEST', 'request body must be JSON', 400); }
     if (!body || typeof body !== 'object' || Array.isArray(body)) return error('INVALID_REQUEST', 'request body must be an object', 400);
-    const allowedFields = new Set(['userTaskId', 'conversationId', 'engine', 'input', 'ingressManifest', 'envAllowlist', 'limits', 'deadline', 'regionConstraints', 'credentialBindings', 'mcp', 'budget', 'result', 'outputs', 'traceId', 'instructions', 'repository', 'isolation', 'webhookId']);
+    const allowedFields = new Set(['userTaskId', 'conversationId', 'engine', 'routeMode', 'input', 'ingressManifest', 'envAllowlist', 'limits', 'deadline', 'regionConstraints', 'credentialBindings', 'mcp', 'budget', 'result', 'outputs', 'traceId', 'instructions', 'repository', 'isolation', 'webhookId']);
     const unknownFields = Object.keys(body).filter((name) => !allowedFields.has(name));
     if (unknownFields.length) return error('INVALID_REQUEST', 'request contains unsupported fields', 400, { errors: unknownFields.map((name) => `request.${name}: unknown field`) });
     if (!Array.isArray(body.envAllowlist) || !body.limits || !Number.isSafeInteger(body.limits.timeoutMs) || body.limits.timeoutMs <= 0 || body.limits.timeoutMs > 86_400_000) return error('INVALID_REQUEST', 'envAllowlist and a valid limits.timeoutMs are required', 400);
@@ -402,10 +410,16 @@ export class RunnerRunCoordinator {
     if (userMcp && body.limits.timeoutMs > 7_140_000) return error('MCP_GRANT_MAX_LIFETIME', 'sandbox user catalog runs are limited to a grant lifetime of two hours', 422);
     if (body.profileWorkspace) return error('FEATURE_UNSUPPORTED', 'profile workspace is not supported by this Worker API yet', 422);
     if (body.isolation !== undefined && body.isolation?.mode !== 'none') return error('ISOLATION_UNSUPPORTED', 'the France VM worker currently supports isolation.mode=none only', 422);
-    if (body.regionConstraints?.allowedRegions && !body.regionConstraints.allowedRegions.includes('eu')) return error('REGION_UNAVAILABLE', 'this Runner API only dispatches to the France EU worker', 422);
-    const engine = typeof body.engine?.name === 'string' ? body.engine.name : (this.env.RUNNER_ENGINE || DEFAULT_ENGINE);
-    const mockTest = engine === 'mock-test';
-    if ((engine !== (this.env.RUNNER_ENGINE || DEFAULT_ENGINE) && !(mockTest && this.env.MOCK_TEST_ENABLED === 'true')) || (principal.engines && !principal.engines.includes(engine))) return error('FORBIDDEN', 'requested engine is not allowed for this key', 403);
+    const routeMode = body.routeMode === undefined ? 'auto' : body.routeMode;
+    if (routeMode !== 'auto' && routeMode !== 'france' && routeMode !== 'gha') return error('INVALID_REQUEST', 'routeMode must be auto, france, or gha', 400);
+    if (routeMode === 'gha' && !this.hasGhaWorker()) return error('ROUTE_UNAVAILABLE', 'the GHA/Azure route is not configured for this Runner API', 503);
+    if (routeMode !== 'gha' && body.regionConstraints?.allowedRegions && !body.regionConstraints.allowedRegions.includes('eu')) return error('REGION_UNAVAILABLE', 'this Runner API only dispatches to the France EU worker', 422);
+    const mockTest = body.engine?.name === 'mock-test' && this.env.MOCK_TEST_ENABLED === 'true';
+    const engine = mockTest ? 'mock-test' : routeMode === 'gha' ? GHA_ENGINE : FRANCE_ENGINE;
+    if (routeMode !== 'gha' && engine === GHA_ENGINE) return error('INVALID_REQUEST', 'use routeMode=gha to select the GHA/Azure execution route', 400);
+    if (routeMode === 'gha' && body.engine?.name !== undefined && body.engine.name !== GHA_ENGINE) return error('INVALID_REQUEST', 'engine.name must be azure-cloud when routeMode=gha', 400);
+    if (!mockTest && body.engine?.name !== undefined && body.engine.name !== engine) return error('INVALID_REQUEST', `engine.name must be ${engine} for routeMode=${routeMode}`, 400);
+    if ((engine !== FRANCE_ENGINE && engine !== GHA_ENGINE && !(mockTest && this.env.MOCK_TEST_ENABLED === 'true')) || (principal.engines && !principal.engines.includes(engine))) return error('FORBIDDEN', 'requested engine is not allowed for this key', 403);
     const allowedRepositories = new Set(this.env.ALLOWED_REPOSITORIES.split(',').map((item) => item.trim()).filter(Boolean));
     const requestedRepository = body.repository?.fullName;
     if (principal.repository && requestedRepository && requestedRepository !== principal.repository) return error('REPOSITORY_BINDING_MISMATCH', 'request repository does not match the authenticated profile binding', 403);
@@ -525,9 +539,9 @@ export class RunnerRunCoordinator {
       record = { requestId, runId, userTaskId: taskId, conversationId, jobId, ownerGeneration, principalId: principal.principalId, profileId: principal.profileId,
         ...(principal.developerApi ? { developerApi: true } : {}),
         ...(principal.developerGuest ? { developerGuest: true } : {}),
-        ...(principal.tenantId ? { tenantId: principal.tenantId } : {}), idempotencyKey: idemKey, payloadHash, engine, state: 'queued', sequence: 0,
+        ...(principal.tenantId ? { tenantId: principal.tenantId } : {}), idempotencyKey: idemKey, payloadHash, engine, routeMode, state: 'queued', sequence: 0,
         createdAt: time, updatedAt: time, startedAt: null, finishedAt: null, answer: null, cancelRequested: false, launchAttempts: 0, events: [], artifacts: [], repo: null, logUrl: null,
-        ...(webhook ? { webhook } : {}), launchCiphertext: await encrypt(JSON.stringify(launch), this.env.RUN_LAUNCH_ENCRYPTION_KEY) };
+        ...(webhook ? { webhook } : {}), launchCiphertext: await encrypt(JSON.stringify(launch), this.env.RUN_LAUNCH_ENCRYPTION_KEY) }
       nextEvent(record, 'run_queued');
       stored.runs[runId] = record;
       stored.idempotency[idemKey] = runId;
@@ -604,7 +618,7 @@ export class RunnerRunCoordinator {
     });
     if (failure) return failure;
     if (runToCancel?.workerReceipt) {
-      try { await this.worker(`/v1/runs/${runToCancel.runId}/cancel`, 'POST', {}); }
+      try { await this.worker(runToCancel.engine, `/v1/runs/${runToCancel.runId}/cancel`, 'POST', {}); }
       catch { /* durable cancelRequested is reconciled by the alarm */ }
     }
     if (runToCancel) await this.state.storage.setAlarm(Date.now() + 100);
@@ -630,7 +644,7 @@ export class RunnerRunCoordinator {
     if (failure) return failure;
     if (!run) return error('NOT_FOUND', `unknown run ${runId}`, 404);
     if (TERMINAL.has(run.state)) return json({ runId, status: 'already_terminal', state: run.state });
-    if (run.workerReceipt) await this.worker(`/v1/runs/${runId}/cancel`, 'POST', {});
+    if (run.workerReceipt) await this.worker(run.engine, `/v1/runs/${runId}/cancel`, 'POST', {});
     await this.state.storage.setAlarm(Date.now() + 100);
     return json({ runId, status: run.workerReceipt ? 'stop_pending' : 'stopped', state: run.state }, run.workerReceipt ? 202 : 200);
   }
@@ -730,31 +744,47 @@ export class RunnerRunCoordinator {
           changed = true;
           continue;
         }
-        if (run.cancelRequested && run.workerReceipt) await this.worker(`/v1/runs/${run.runId}/cancel`, 'POST', {});
+        if (run.cancelRequested && run.workerReceipt) await this.worker(run.engine, `/v1/runs/${run.runId}/cancel`, 'POST', {});
         if (!run.workerReceipt) {
-          run.launchAttempts += 1;
-          transition(run, 'starting');
-          const launch = JSON.parse(await decrypt(run.launchCiphertext, this.env.RUN_LAUNCH_ENCRYPTION_KEY)) as Record<string, unknown>;
-          const response = await this.worker('/v1/launch', 'POST', launch);
-          if (!response.ok) {
-            if (response.status < 500 || response.status === 503) {
+          for (;;) {
+            run.launchAttempts += 1;
+            transition(run, 'starting');
+            const launch = JSON.parse(await decrypt(run.launchCiphertext, this.env.RUN_LAUNCH_ENCRYPTION_KEY)) as Record<string, unknown>;
+            const response = await this.worker(run.engine, '/v1/launch', 'POST', launch);
+            if (!response.ok) {
               const rejection = await response.clone().json().catch(() => null);
               const code = workerRefusalCode(rejection, response.status);
-              const fields = workerRefusalFields(rejection);
-              run.launchRejection = { status: response.status, code, fields };
-              run.result = refusedLaunchResult(run);
-              transition(run, 'failed', { reason: `worker_rejected_${response.status}`, code, ...(fields.length ? { fields } : {}) });
-              run.lastError = `worker launch rejected with HTTP ${response.status}`;
-              changed = true;
-              continue;
+              if ((run.routeMode === 'auto' || !run.routeMode) && run.engine === FRANCE_ENGINE && isConfirmedCapacityRefusal(rejection, response.status) && this.hasGhaWorker()) {
+                const engine = launch['engine'] as Record<string, unknown> | undefined;
+                if (!engine || engine['name'] !== FRANCE_ENGINE) throw new Error('France launch engine does not match its persisted route');
+                launch['engine'] = { ...engine, name: GHA_ENGINE };
+                run.engine = GHA_ENGINE;
+                run.launchCiphertext = await encrypt(JSON.stringify(launch), this.env.RUN_LAUNCH_ENCRYPTION_KEY);
+                run.lastError = 'France refused before admission: WORKER_CAPACITY';
+                transition(run, 'queued', { reason: 'capacity_cutover', from: FRANCE_ENGINE, to: GHA_ENGINE, code });
+                // Persist route and updated launch before contacting the next worker. A crash
+                // after this write resumes against GHA with the same run/operation identity.
+                await this.writeRun(run);
+                continue;
+              }
+              if (response.status < 500 || response.status === 503) {
+                const fields = workerRefusalFields(rejection);
+                run.launchRejection = { status: response.status, code, fields };
+                run.result = refusedLaunchResult(run);
+                transition(run, 'failed', { reason: `worker_rejected_${response.status}`, code, ...(fields.length ? { fields } : {}) });
+                run.lastError = `worker launch rejected with HTTP ${response.status}`;
+                changed = true;
+                break;
+              }
+              throw new Error(`worker launch HTTP ${response.status}`);
             }
-            throw new Error(`worker launch HTTP ${response.status}`);
+            run.workerReceipt = await response.json() as Record<string, unknown>;
+            // A 202 receipt proves durable admission only. The next worker status
+            // poll must report process state before the run is marked running.
+            break;
           }
-          run.workerReceipt = await response.json() as Record<string, unknown>;
-          // A 202 receipt proves durable admission only. The next worker status
-          // poll must report the process state before we say it has started.
         } else {
-          const statusResponse = await this.worker(`/v1/runs/${run.runId}/status`);
+          const statusResponse = await this.worker(run.engine, `/v1/runs/${run.runId}/status`);
           if (!statusResponse.ok) throw new Error(`worker status HTTP ${statusResponse.status}`);
           const workerStatus = await statusResponse.json() as { status?: string; state?: string; startPhase?: string; startAttempts?: number; startedAt?: string; updatedAt?: string };
           run.lastHeartbeatAt = now();
@@ -765,7 +795,7 @@ export class RunnerRunCoordinator {
             if (workerStatus.updatedAt !== run.workerReportedUpdatedAt) run.workerProgressObservedAt = now();
             run.workerReportedUpdatedAt = workerStatus.updatedAt;
           }
-          const logsResponse = await this.worker(`/v1/runs/${run.runId}/logs?after=${run.logCursor ?? 0}&snapshot=1`);
+          const logsResponse = await this.worker(run.engine, `/v1/runs/${run.runId}/logs?after=${run.logCursor ?? 0}&snapshot=1`);
           if (logsResponse.ok) {
             const batch = await logsResponse.json() as { cursor?: number; logs?: Array<{ stream?: string; message?: string; truncated?: boolean }> };
             const output = run.output ?? { stdout: '', stderr: '', updatedAt: null, truncated: false };
@@ -792,7 +822,7 @@ export class RunnerRunCoordinator {
             if (run.state !== observedState) transition(run, observedState,
               observedState === 'running' ? { evidence: 'worker_process_state' } : { evidence: 'worker_accepted' });
           } else if (['succeeded', 'failed', 'cancelled'].includes(workerStatus?.status ?? '')) {
-            const resultResponse = await this.worker(`/v1/runs/${run.runId}/result`);
+            const resultResponse = await this.worker(run.engine, `/v1/runs/${run.runId}/result`);
             if (resultResponse.ok) {
               const launchResult = await resultResponse.json() as Record<string, any>;
               const explicitAnswer = typeof launchResult.answer === 'string' && launchResult.answer.trim().length > 0
@@ -812,7 +842,7 @@ export class RunnerRunCoordinator {
               run.artifacts = Array.isArray(launchResult.artifacts) ? launchResult.artifacts.filter((artifact: Record<string, any>) => !run.developerApi || artifact.path !== AGENT_HISTORY_PATH).map((artifact: Record<string, any>) => ({ ...artifact,
                 url: repo && typeof repo['fullName'] === 'string' ? `https://github.com/${repo['fullName']}/${typeof repo['commit'] === 'string' && repo['commit'] ? `blob/${repo['commit']}` : `tree/${String(repo['branch'] ?? '')}`}/${String(artifact.path ?? '').split('/').map(encodeURIComponent).join('/')}` : String(artifact.path ?? '') })) : [];
               if (run.developerApi) {
-                const history = await this.worker(`/v1/runs/${run.runId}/history?manifest=1`);
+                const history = await this.worker(run.engine, `/v1/runs/${run.runId}/history?manifest=1`);
                 if (history.ok) {
                   const manifest = await history.json() as Record<string, unknown>;
                   if (manifest['path'] === AGENT_HISTORY_PATH && manifest['name'] === 'agent-history.json'
@@ -843,7 +873,7 @@ export class RunnerRunCoordinator {
                 outputRefs: run.artifacts.map((artifact) => String(run.developerGuest ? artifact['downloadUrl'] : artifact['url'])),
                 ...(run.developerApi ? { artifacts: run.artifacts } : {}),
                 ...(run.developerGuest ? { artifactExpiresAt: run.artifactExpiresAt } : {}),
-                persistence: run.artifacts.length ? 'persisted' : 'not_required', persistenceReason: run.artifacts.length ? run.developerGuest ? 'artifacts were exported by the execution worker' : `artifacts are committed to ${String(repo?.['fullName'] ?? 'the repository')}` : 'the worker reported no artifacts', cleanup: 'completed', cleanupReason: 'execution workspace is owned by the France VM worker', logPath: run.logUrl ?? `vm-run:${run.runId}` };
+                persistence: run.artifacts.length ? 'persisted' : 'not_required', persistenceReason: run.artifacts.length ? run.developerGuest ? 'artifacts were exported by the execution worker' : `artifacts are committed to ${String(repo?.['fullName'] ?? 'the repository')}` : 'the worker reported no artifacts', cleanup: 'completed', cleanupReason: 'execution workspace is owned by the selected worker', logPath: run.logUrl ?? `worker-run:${run.runId}` };
               transition(run, outcome, { exitReason: launchResult.exitReason });
             }
           }
@@ -852,7 +882,7 @@ export class RunnerRunCoordinator {
         const message = cause instanceof Error ? cause.message : String(cause);
         if (!run.workerReceipt) {
           try {
-            const statusResponse = await this.worker(`/v1/runs/${run.runId}/status`);
+            const statusResponse = await this.worker(run.engine, `/v1/runs/${run.runId}/status`);
             const observed = statusResponse.ok ? await statusResponse.json() as { status?: string; state?: string; startPhase?: string; startAttempts?: number; startedAt?: string; updatedAt?: string } : null;
             if (observed?.status && !['unknown', 'unknown_run'].includes(observed.status)) {
               run.workerReceipt = { runId: run.runId, status: 'accepted', operationId: 'reconciled' };
@@ -916,11 +946,27 @@ export class RunnerRunCoordinator {
     if (Number.isFinite(nextAlarm)) await this.state.storage.setAlarm(Math.max(Date.now() + 100, nextAlarm));
   }
 
-  private async worker(path: string, method = 'GET', body?: unknown, timeoutMs = 8_000): Promise<Response> {
-    const base = this.env.VM_WORKER_URL.replace(/\/+$/, '');
-    if (!/^https:\/\//.test(base)) throw new Error('VM_WORKER_URL must be an https origin');
+  private hasGhaWorker(): boolean {
+    const token = this.env.GHA_WORKER_TOKEN?.trim() ?? '';
+    try {
+      const url = new URL(this.env.GHA_WORKER_URL?.trim() ?? '');
+      return url.protocol === 'https:' && !url.username && !url.password && !url.hash && token.length >= 24;
+    } catch { return false; }
+  }
+
+  private async worker(engine: string, path: string, method = 'GET', body?: unknown, timeoutMs = 8_000): Promise<Response> {
+    const route = engine === FRANCE_ENGINE
+      ? { base: this.env.VM_WORKER_URL, token: this.env.VM_WORKER_TOKEN }
+      : engine === GHA_ENGINE
+        ? { base: this.env.GHA_WORKER_URL, token: this.env.GHA_WORKER_TOKEN }
+        : null;
+    if (!route) throw new Error(`worker route is not supported for ${engine}`);
+    const { base: baseValue, token } = route;
+    if (!baseValue || !token) throw new Error(`worker route is not configured for ${engine}`);
+    const base = baseValue.replace(/\/+$/, '');
+    if (!/^https:\/\//.test(base)) throw new Error(`worker URL must be an https origin for ${engine}`);
     const send = this.env.FETCH ?? fetch;
-    return send(`${base}${path}`, { method, headers: { authorization: `Bearer ${this.env.VM_WORKER_TOKEN}`, ...(body === undefined ? {} : { 'content-type': 'application/json' }) }, ...(body === undefined ? {} : { body: JSON.stringify(body) }), signal: AbortSignal.timeout(timeoutMs) });
+    return send(`${base}${path}`, { method, headers: { authorization: `Bearer ${token}`, ...(body === undefined ? {} : { 'content-type': 'application/json' }) }, ...(body === undefined ? {} : { body: JSON.stringify(body) }), signal: AbortSignal.timeout(timeoutMs) });
   }
 
   private async read(): Promise<Stored> { return await this.state.storage.get<Stored>(stateKey) ?? structuredClone(INIT); }
