@@ -39,6 +39,7 @@ jobs:
       CANARY_RUN_ID: ${{ inputs.run_id }}
       CLEANUP_TERMINAL: ${{ inputs.cleanup_terminal }}
       RUNNER_API_KEY_AGENT_API: ${{ secrets.RUNNER_API_KEY_AGENT_API }}
+      GHA_WORKER_TOKEN: ${{ inputs.target == 'telegram' && secrets.GHA_WORKER_TOKEN_TELEGRAM_UX_V1_AGENT_API || secrets.GHA_WORKER_TOKEN_SANDBOX3_AGENT_API }}
     steps:
       - uses: actions/checkout@v4
         with:
