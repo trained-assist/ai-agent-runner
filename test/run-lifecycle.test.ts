@@ -116,9 +116,22 @@ describe('lifecycle рана: persist → проверенная уборка (i
     const snapshot = h.runner.getRun(receipt.runId)!;
     expect(snapshot.startPhase).toBe('preflight');
     expect(snapshot.startedAt).toBeNull();
-    expect(snapshot.result?.failure).toMatchObject({ code: 'ENGINE_START_TIMEOUT', retryable: true });
+    expect(snapshot.result?.failure).toMatchObject({ code: 'ENGINE_START_TIMEOUT', retryable: false });
     expect(snapshot.result?.engineStart).toBe('not_started');
+    expect(snapshot.startAttempts).toBe(3);
     expect(engine.startCalls).toBe(0);
+  });
+
+  it('retries a hung pre-spawn setup once and starts the engine only on the second attempt', async () => {
+    const engine = new WritingEngine();
+    const h = createHarness({ adapters: { fake: engine } });
+    h.faults.inject('preflight', { kind: 'custom', once: true, fn: () => new Promise<void>(() => {}) });
+    const { receipt } = h.start({ limits: { timeoutMs: 250, maxOutputBytes: 100_000, maxLogBytes: 100_000 } });
+
+    const result = await h.runner.waitFor(receipt.runId, 2_000);
+    expect(result.outcome).toBe('succeeded');
+    expect(h.runner.getRun(receipt.runId)?.startAttempts).toBe(2);
+    expect(engine.startCalls).toBe(1);
   });
 
   it('settles cancellation during preflight immediately and fences a late continuation', async () => {

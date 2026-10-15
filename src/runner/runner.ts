@@ -628,7 +628,7 @@ export class Runner {
       ownerGeneration: spec.ownerGeneration,
       state: 'queued',
       startPhase: 'queued',
-      startAttempts: 0,
+      startAttempts: 1,
       sequence: 0,
       connectionLost: false,
       orphanedPid: null,
@@ -856,7 +856,14 @@ export class Runner {
       }
       switch (st.state) {
         case 'queued':
-          if (this.opts.resumeQueuedRuns === false) {
+          if (this.opts.resumeQueuedRuns !== false && (st.startAttempts ?? 1) <= MAX_SAFE_START_RETRIES) {
+            st.startAttempts = (st.startAttempts ?? 1) + 1;
+            this.store.saveState(st);
+            report.resumedQueued += 1;
+            this.emit(st, 'log', { stream: 'runner', level: 'warn',
+              message: `engine_start_recovery attempt=${st.startAttempts}/${MAX_SAFE_START_RETRIES + 1} evidence=engine_not_started phase=queued` });
+            void this.execute(st.runId).catch(() => undefined);
+          } else if (this.opts.resumeQueuedRuns === false) {
             this.completeWithoutEngine(st, 'failed', 'worker_crash', {
               code: 'WORKER_RESTARTED_BEFORE_ENGINE_START',
               failureClass: 'runtime',
@@ -865,8 +872,11 @@ export class Runner {
             });
             report.lost += 1;
           } else {
-            report.resumedQueued += 1;
-            void this.execute(st.runId).catch(() => undefined);
+            this.completeWithoutEngine(st, 'failed', 'worker_crash', {
+              code: 'WORKER_START_RETRIES_EXHAUSTED', failureClass: 'runtime',
+              safeSummary: 'worker restarted after the automatic pre-start retry limit; no engine actions were replayed', retryable: false,
+            });
+            report.lost += 1;
           }
           break;
         case 'starting':
@@ -878,6 +888,7 @@ export class Runner {
             const hasLease = Boolean(lease && lease.status !== 'released');
             if (!hasLease || await this.reconcileCleanRoom(run)) {
               const nextAttempt = (st.startAttempts ?? 1) + 1;
+              st.startAttempts = nextAttempt;
               st.pid = null;
               st.pgid = null;
               st.workerCrashed = false;
@@ -1148,22 +1159,25 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
     if (!run || this.disposed) return;
     const st = run.state;
     if (isTerminalState(st.state) || !this.transition(st, 'starting')) return;
-    st.startAttempts = (st.startAttempts ?? 0) + 1;
-    this.store.saveState(st);
+    const startAttempt = st.startAttempts ?? 1;
+    if (run.startTimer) clearTimeout(run.startTimer);
+    run.startTimer = null;
     this.setStartPhase(st, 'preflight');
     if (st.spec.limits.timeoutMs > 0) {
       run.startTimer = setTimeout(() => {
-        if (isTerminalState(st.state) || st.startedAt) return;
+        run.startTimer = null;
+        if (!this.isCurrentStartAttempt(st, startAttempt) || isTerminalState(st.state) || st.startedAt) return;
         st.cancelRequested = 'timeout';
         this.store.saveState(st);
         // Before `spawn`, no engine process could have received the task, so this
         // is a safe terminal start-timeout. During spawn the outcome is ambiguous;
         // keep it visible and fenced until adapter.start() resolves or recovery
         // proves the process outcome.
-        if (st.startPhase !== 'spawn') {
+        if (st.startPhase === 'spawn') return;
+        if (!this.queuePreStartRetry(run, st, startAttempt, 'start_timeout')) {
           this.completeWithoutEngine(st, 'failed', 'startup_failure', {
             code: 'ENGINE_START_TIMEOUT', failureClass: 'runtime',
-            safeSummary: `engine did not start during the ${st.spec.limits.timeoutMs}ms start deadline`, retryable: true,
+            safeSummary: `engine did not start after ${startAttempt} attempts within the ${st.spec.limits.timeoutMs}ms start deadline`, retryable: false,
           });
         }
       }, st.spec.limits.timeoutMs);
@@ -1175,6 +1189,7 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
     try {
       await this.fireFault('preflight', runId);
       if (this.disposed) return;
+      if (!this.isCurrentStartAttempt(st, startAttempt)) return;
       if (isTerminalState(st.state)) return;
       this.preflight(st);
       if (this.disposed) return;
@@ -1185,6 +1200,7 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
       this.setStartPhase(st, 'materialize');
       await this.materialize(st);
       if (this.disposed) return;
+      if (!this.isCurrentStartAttempt(st, startAttempt)) return;
       if (isTerminalState(st.state)) return;
       if (st.cancelRequested) {
         this.completeWithoutEngine(st, 'cancelled', 'cancelled');
@@ -1197,8 +1213,10 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
         this.setStartPhase(st, 'isolation');
         await this.fireFault('isolation', runId);
         if (this.disposed) return;
+        if (!this.isCurrentStartAttempt(st, startAttempt)) return;
         await this.prepareCleanRoom(run, st);
         if (this.disposed) return;
+        if (!this.isCurrentStartAttempt(st, startAttempt)) return;
         if (isTerminalState(st.state)) return;
         if (st.cancelRequested) {
           await this.releaseCleanRoom(run, 'cancelled');
@@ -1215,11 +1233,13 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
         this.setStartPhase(st, 'mcp');
         await this.fireFault('mcp', runId);
         if (this.disposed) return;
+        if (!this.isCurrentStartAttempt(st, startAttempt)) return;
         await this.startMcpSession(run, st);
         if (this.disposed) {
           await this.stopMcpSession(run, 'worker_disposed');
           return;
         }
+        if (!this.isCurrentStartAttempt(st, startAttempt)) return;
         if (isTerminalState(st.state)) {
           await this.stopMcpSession(run, 'start_timeout');
           return;
@@ -1233,6 +1253,7 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
       phase = 'spawn';
       await this.fireFault('spawn', runId);
       if (this.disposed) return;
+      if (!this.isCurrentStartAttempt(st, startAttempt)) return;
       if (isTerminalState(st.state)) return;
       if (st.cancelRequested) {
         this.settleStartCancellation(st);
@@ -1257,6 +1278,11 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
         },
       });
       if (this.disposed) {
+        handle.killTree('SIGKILL');
+        handle.dispose();
+        return;
+      }
+      if (!this.isCurrentStartAttempt(st, startAttempt)) {
         handle.killTree('SIGKILL');
         handle.dispose();
         return;
@@ -1289,7 +1315,7 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
         handle.dispose();
       }
       // воркер останавливается: run остаётся в starting, recover() разберёт его
-      if (this.disposed) return;
+      if (this.disposed || !this.isCurrentStartAttempt(st, startAttempt)) return;
       if (isTerminalState(st.state) || st.finalized) return;
       this.failStartPath(st, err, phase);
     }
@@ -1897,8 +1923,48 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
   private clearTimers(run: InternalRun): void {
     for (const timer of run.timers) clearTimeout(timer);
     run.timers = [];
+    this.clearStartTimer(run);
+  }
+
+  private clearStartTimer(run: InternalRun): void {
     if (run.startTimer) clearTimeout(run.startTimer);
     run.startTimer = null;
+  }
+
+  private isCurrentStartAttempt(st: PersistedRunState, attempt: number): boolean {
+    return (st.startAttempts ?? 1) === attempt;
+  }
+
+  private queuePreStartRetry(run: InternalRun, st: PersistedRunState, expiredAttempt: number, reason: string): boolean {
+    if (expiredAttempt >= MAX_SAFE_START_RETRIES + 1 || isTerminalState(st.state)) return false;
+    st.startAttempts = expiredAttempt + 1;
+    st.startPhase = 'queued';
+    this.clearStartTimer(run);
+    if (!this.transition(st, 'queued')) return false;
+    this.emit(st, 'log', { stream: 'runner', level: 'warn',
+      message: `engine_start_recovery attempt=${st.startAttempts}/${MAX_SAFE_START_RETRIES + 1} evidence=engine_not_started reason=${reason}` });
+    void this.preparePreStartRetry(run, st, expiredAttempt).catch(() => undefined);
+    return true;
+  }
+
+  private async preparePreStartRetry(run: InternalRun, st: PersistedRunState, expiredAttempt: number): Promise<void> {
+    try {
+      await this.stopMcpSession(run, 'start_timeout_retry');
+      if (this.disposed || isTerminalState(st.state) || (st.startAttempts ?? 0) !== expiredAttempt + 1) return;
+      if (run.room) await this.releaseCleanRoom(run, 'start_timeout_retry');
+      if (this.disposed || isTerminalState(st.state) || (st.startAttempts ?? 0) !== expiredAttempt + 1) return;
+      st.cancelRequested = null;
+      this.store.saveState(st);
+      void this.execute(st.runId).catch(() => undefined);
+    } catch (error) {
+      if (this.disposed || isTerminalState(st.state) || (st.startAttempts ?? 0) !== expiredAttempt + 1) return;
+      st.cancelRequested = null;
+      const detail = truncateLine(redactSecrets(error instanceof Error ? error.message : String(error)), 300);
+      this.completeWithoutEngine(st, 'failed', 'startup_failure', {
+        code: 'STARTUP_RETRY_CLEANUP_FAILED', failureClass: 'runtime',
+        safeSummary: `safe startup retry could not clean up pre-engine resources: ${detail}`, retryable: false,
+      });
+    }
   }
 
   private onTimeout(runId: string): void {
@@ -2045,8 +2111,7 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
     failure?: RunResult['failure'],
   ): void {
     const internalRun = this.runs.get(st.runId);
-    if (internalRun?.startTimer) clearTimeout(internalRun.startTimer);
-    if (internalRun) internalRun.startTimer = null;
+    if (internalRun) this.clearStartTimer(internalRun);
     if (internalRun) { internalRun.runtimeEnv = {}; internalRun.runtimeSecrets = []; }
     const result: RunResult = {
       schemaVersion: 1,
