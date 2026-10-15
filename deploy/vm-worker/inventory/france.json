@@ -25,6 +25,9 @@
     {"name":"RUNNER_GIT_TOKEN","required":false,"secret":true,"source":"systemd:/etc/ai-agent-runner/worker.env; provision via approved secret manager","owner":"UNASSIGNED — assign named owner","restoreClass":"import-or-reissue"},
     {"name":"RUNNER_CONTROL_PLANE_URL","source":"systemd:/etc/ai-agent-runner/worker.env; CP ingress resolver","owner":"UNASSIGNED — assign named owner","required":false,"secret":false},
     {"name":"RUNNER_CONTROL_PLANE_PRINCIPAL","source":"systemd:/etc/ai-agent-runner/worker.env; CP ingress resolver","owner":"UNASSIGNED — assign named owner","required":false,"secret":false},
-    {"name":"RUNNER_CONTROL_PLANE_PRINCIPAL_SECRET","source":"systemd:/etc/ai-agent-runner/worker.env; CP ingress resolver","owner":"UNASSIGNED — assign named owner","required":false,"secret":true,"restoreClass":"rotate-as-pair"}
+    {"name":"RUNNER_CONTROL_PLANE_PRINCIPAL_SECRET","source":"systemd:/etc/ai-agent-runner/worker.env; CP ingress resolver","owner":"UNASSIGNED — assign named owner","required":false,"secret":true,"restoreClass":"rotate-as-pair"},
+    {"name":"RUNNER_CONTROL_PLANE_PRODUCTION_URL","source":"systemd:/etc/ai-agent-runner/production-ingress.env","owner":"trained-assist platform","required":false,"secret":false},
+    {"name":"RUNNER_CONTROL_PLANE_PRODUCTION_PRINCIPAL","source":"systemd:/etc/ai-agent-runner/production-ingress.env","owner":"trained-assist platform","required":false,"secret":false},
+    {"name":"RUNNER_CONTROL_PLANE_PRODUCTION_PRINCIPAL_SECRET","source":"systemd:/etc/ai-agent-runner/production-ingress.env","owner":"trained-assist platform","required":false,"secret":true,"restoreClass":"rotate-as-pair"}
   ]
 }

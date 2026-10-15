@@ -3,8 +3,11 @@ set -euo pipefail
 
 updater='/usr/local/sbin/ai-agent-vm-worker-update'
 command="${SSH_ORIGINAL_COMMAND:-}"
+if [[ "$command" == 'configure-production-ingress' ]]; then
+  exec /usr/local/sbin/ai-agent-vm-worker-configure-production-ingress
+fi
 if [[ ! "$command" =~ ^update\ (vm-worker-v[0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
-  echo 'Only update vm-worker-vX.Y.Z is allowed for this key' >&2
+  echo 'Only update vm-worker-vX.Y.Z or configure-production-ingress is allowed for this key' >&2
   exit 2
 fi
 release_tag="${BASH_REMATCH[1]}"

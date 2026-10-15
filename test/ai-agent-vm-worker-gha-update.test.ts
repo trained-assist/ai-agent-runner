@@ -12,4 +12,16 @@ describe('France sandbox GitHub Actions forced command', () => {
     expect(script).not.toContain('eval ');
     expect(script).not.toContain('bash -c');
   });
+
+  it('allows only the fixed production ingress configuration command and keeps its secret on stdin', async () => {
+    const wrapper = await readFile(new URL('../scripts/ai-agent-vm-worker-gha-update', import.meta.url), 'utf8');
+    const installer = await readFile(new URL('../scripts/ai-agent-vm-worker-configure-production-ingress', import.meta.url), 'utf8');
+    expect(wrapper).toContain("[[ \"$command\" == 'configure-production-ingress' ]]");
+    expect(wrapper).toContain('exec /usr/local/sbin/ai-agent-vm-worker-configure-production-ingress');
+    expect(installer).toContain('read -r -t 15 ingress_secret');
+    expect(installer).toContain('VM_WORKER_UPDATE_READINESS_FILE');
+    expect(installer).toContain('chmod 0600 "$config_stage"');
+    expect(installer).not.toContain('eval ');
+    expect(installer).not.toContain('bash -c');
+  });
 });

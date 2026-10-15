@@ -70,7 +70,7 @@ jobs:
           cp -R dist "$STAGE/dist"
           install -m 0755 "$RUNNER_TEMP/opencode-fork/opencode" "$STAGE/opencode"
           mkdir -p "$STAGE/scripts"
-          cp scripts/deploy-vm-worker-release.sh scripts/assert-vm-worker-update-ready.mjs scripts/ai-agent-vm-worker-gha-update "$STAGE/scripts/"
+          cp scripts/deploy-vm-worker-release.sh scripts/assert-vm-worker-update-ready.mjs scripts/ai-agent-vm-worker-gha-update scripts/ai-agent-vm-worker-configure-production-ingress "$STAGE/scripts/"
           (cd "$STAGE" && npm ci --omit=dev)
           tar -czf ai-agent-vm-worker-linux-x64.tar.gz -C "$STAGE" .
           sha256sum ai-agent-vm-worker-linux-x64.tar.gz > ai-agent-vm-worker-linux-x64.tar.gz.sha256
