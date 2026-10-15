@@ -1,0 +1,50 @@
+name: Reconcile sandbox canary
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Isolated Runner API sandbox containing the canary
+        required: true
+        type: choice
+        options:
+          - sandbox3
+          - telegram
+      task_id:
+        description: Exact canary userTaskId
+        required: true
+        type: string
+      run_id:
+        description: Exact canary runId
+        required: true
+        type: string
+      cleanup_terminal:
+        description: Delete this task only after terminal status and result proof
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  reconcile:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: sandbox
+    env:
+      CANARY_TARGET: ${{ inputs.target }}
+      CANARY_TASK_ID: ${{ inputs.task_id }}
+      CANARY_RUN_ID: ${{ inputs.run_id }}
+      CLEANUP_TERMINAL: ${{ inputs.cleanup_terminal }}
+      RUNNER_API_KEY_AGENT_API: ${{ secrets.RUNNER_API_KEY_AGENT_API }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node scripts/reconcile-sandbox-canary.mjs
