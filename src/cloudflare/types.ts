@@ -42,6 +42,9 @@ export interface RunnerWorkerEnv {
   /** Explicit sandbox-only gates; production stays on the existing CP path. */
   RUNNER_DEVELOPER_API_ENABLED?: string;
   RUNNER_BYOK_ENABLED?: string;
+  RUNNER_WEBHOOKS_ENABLED?: string;
+  /** Reviewed endpoint metadata; signing secrets live in separate Worker secret bindings. */
+  RUNNER_WEBHOOKS?: string;
   /** Optional pinned OpenCode model identifier for managed developer runs. */
   RUNNER_DEVELOPER_MANAGED_MODEL?: string;
   MCP_TEST_AUTH_TOKEN?: string;

@@ -1,5 +1,6 @@
 import type { ApiPrincipal, DurableObjectStateLike, RunnerWorkerEnv } from './types.js';
 import { DEFAULT_ENGINE, SAFE_ID, error, json } from './runner-api.js';
+import { deliverTerminalWebhook, resolveWebhook, type WebhookConnection, type WebhookDelivery } from './webhooks.js';
 
 type State = 'queued' | 'starting' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'unknown';
 interface RunRecord {
@@ -14,6 +15,7 @@ interface RunRecord {
   lastError?: string;
   artifacts: Array<Record<string, unknown>>; repo: Record<string, unknown> | null; logUrl: string | null;
   events: Array<Record<string, unknown>>;
+  webhook?: WebhookDelivery;
 }
 interface CancellationFence { userTaskId: string; ownerGeneration: number; principalId: string; profileId: string; tenantId?: string; createdAt: string }
 interface Stored { runs: Record<string, RunRecord>; idempotency: Record<string, string>; cancellationFences?: Record<string, CancellationFence>; latestOwnerGeneration: number; requestId?: string; jobId?: string }
@@ -23,6 +25,7 @@ const INIT: Stored = { runs: {}, idempotency: {}, latestOwnerGeneration: 0 };
 const ACTIVE = new Set<State>(['queued', 'starting', 'running']);
 const TERMINAL = new Set<State>(['succeeded', 'failed', 'cancelled']);
 const UNKNOWN_RECONCILE_MS = 30 * 60_000;
+const MAX_WEBHOOK_ATTEMPTS = 8;
 const now = (): string => new Date().toISOString();
 const stateKey = 'runner-v1';
 const MCP_TEST = Object.freeze({
@@ -182,6 +185,13 @@ export class RunnerRunCoordinator {
           return new Response(response.body, { status: response.status, headers });
         }
         return json({ runId, conversationId: run.conversationId, userTaskId: run.userTaskId, repo: run.repo, branchUrl: null, mergeUrl: null, count: run.artifacts.length, artifacts: run.artifacts, logUrl: run.logUrl, note: run.artifacts.length ? 'artifacts are committed by the VM worker to the run branch' : 'the VM worker reported no artifacts' });
+      case 'webhook':
+        if (request.method !== 'GET') return error('METHOD_NOT_ALLOWED', 'webhook supports GET only', 405);
+        if (!run.webhook) return error('WEBHOOK_NOT_CONFIGURED', 'run has no webhook', 404);
+        return json({ runId, webhookId: run.webhook.webhookId, status: run.webhook.deliveredAt ? 'delivered' : run.webhook.exhaustedAt ? 'failed' : 'pending',
+          attempts: run.webhook.attempts, nextAttemptAt: run.webhook.deliveredAt || run.webhook.exhaustedAt ? null : run.webhook.nextAttemptAt,
+          deliveredAt: run.webhook.deliveredAt ?? null, lastStatus: run.webhook.lastStatus ?? null,
+          lastError: run.webhook.lastError ?? null });
       case 'cancel': return request.method === 'POST' ? this.cancel(request, runId, principal) : error('METHOD_NOT_ALLOWED', 'cancel supports POST only', 405);
       default: return error('ROUTE_NOT_FOUND', `no route for ${url.pathname}`, 404);
     }
@@ -220,6 +230,7 @@ export class RunnerRunCoordinator {
       }
       if (entries.some((run) => !owns(run, principal))) return error('FORBIDDEN', 'task state is not owned by this principal', 403);
       if (entries.some((run) => ACTIVE.has(run.state) || run.state === 'unknown' || !TERMINAL.has(run.state))) return error('RUN_NOT_TERMINAL', 'active or unknown runs cannot be cleaned up', 409);
+      if (entries.some((run) => run.webhook && !run.webhook.deliveredAt && !run.webhook.exhaustedAt)) return error('WEBHOOK_DELIVERY_PENDING', 'pending webhook delivery cannot be cleaned up', 409);
       // This Durable Object is keyed to one task ID. Remove the whole record so
       // idempotency keys, owner generations, events, and results are reset too.
       const fences = Object.fromEntries(Object.entries(stored.cancellationFences ?? {}).filter(([, fence]) => fence.userTaskId === body.userTaskId));
@@ -242,7 +253,7 @@ export class RunnerRunCoordinator {
       body = JSON.parse(text) as Record<string, any>;
     } catch { return error('INVALID_REQUEST', 'request body must be JSON', 400); }
     if (!body || typeof body !== 'object' || Array.isArray(body)) return error('INVALID_REQUEST', 'request body must be an object', 400);
-    const allowedFields = new Set(['userTaskId', 'conversationId', 'engine', 'input', 'ingressManifest', 'envAllowlist', 'limits', 'deadline', 'regionConstraints', 'credentialBindings', 'mcp', 'budget', 'result', 'outputs', 'traceId', 'instructions', 'repository', 'isolation']);
+    const allowedFields = new Set(['userTaskId', 'conversationId', 'engine', 'input', 'ingressManifest', 'envAllowlist', 'limits', 'deadline', 'regionConstraints', 'credentialBindings', 'mcp', 'budget', 'result', 'outputs', 'traceId', 'instructions', 'repository', 'isolation', 'webhookId']);
     const unknownFields = Object.keys(body).filter((name) => !allowedFields.has(name));
     if (unknownFields.length) return error('INVALID_REQUEST', 'request contains unsupported fields', 400, { errors: unknownFields.map((name) => `request.${name}: unknown field`) });
     if (!Array.isArray(body.envAllowlist) || !body.limits || !Number.isSafeInteger(body.limits.timeoutMs) || body.limits.timeoutMs <= 0 || body.limits.timeoutMs > 86_400_000) return error('INVALID_REQUEST', 'envAllowlist and a valid limits.timeoutMs are required', 400);
@@ -334,6 +345,19 @@ export class RunnerRunCoordinator {
       launchEnv.OPENAI_API_KEY = secret;
       boundModel = selected.model;
     }
+    let webhook: WebhookDelivery | undefined;
+    if (body.webhookId !== undefined) {
+      if (this.env.DEPLOYMENT_ENV === 'production' || this.env.RUNNER_WEBHOOKS_ENABLED !== 'true') return error('FEATURE_UNSUPPORTED', 'webhook delivery is disabled on this lane', 422);
+      if (typeof body.webhookId !== 'string' || !SAFE_ID.test(body.webhookId)) return error('INVALID_REQUEST', 'webhookId must be a safe ID', 400);
+      let connection: WebhookConnection | null;
+      try { connection = resolveWebhook(this.env, principal, body.webhookId); }
+      catch { return error('SERVER_MISCONFIGURED', 'webhook registry is invalid', 503); }
+      if (!connection) return error('WEBHOOK_NOT_FOUND', 'webhook is not available to this principal', 404);
+      const secret = this.env[connection.secretBinding];
+      if (typeof secret !== 'string' || secret.length < 24) return error('SERVER_MISCONFIGURED', 'webhook signing secret is unavailable', 503);
+      webhook = { webhookId: connection.webhookId, url: connection.url, secretBinding: connection.secretBinding,
+        attempts: 0, nextAttemptAt: now() };
+    }
     const idemKey = `${principal.principalId}\0${key}`;
     const hashInput = structuredClone(body);
     if (hashInput.repository && typeof hashInput.repository === 'object') delete hashInput.repository.token;
@@ -346,7 +370,8 @@ export class RunnerRunCoordinator {
       const stored = await tx.get<Stored>(stateKey) ?? structuredClone(INIT);
       const expiration = Date.now() - 24 * 60 * 60 * 1000;
       for (const [oldRunId, oldRun] of Object.entries(stored.runs)) {
-        if (TERMINAL.has(oldRun.state) && oldRun.finishedAt && Date.parse(oldRun.finishedAt) < expiration) {
+        if (TERMINAL.has(oldRun.state) && oldRun.finishedAt && Date.parse(oldRun.finishedAt) < expiration
+          && (!oldRun.webhook || oldRun.webhook.deliveredAt || oldRun.webhook.exhaustedAt)) {
           delete stored.runs[oldRunId];
           for (const [oldKey, mappedRun] of Object.entries(stored.idempotency)) if (mappedRun === oldRunId) delete stored.idempotency[oldKey];
         }
@@ -391,7 +416,8 @@ export class RunnerRunCoordinator {
           ...(mcp.length ? await this.testRegistryAttachment(mcp[0], { runId, taskId, profileId: principal.profileId, timeoutMs: clampInteger(limits.timeoutMs, 300_000, 1_000, 86_400_000) }) : {}) };
       record = { requestId, runId, userTaskId: taskId, conversationId, jobId, ownerGeneration, principalId: principal.principalId, profileId: principal.profileId,
         ...(principal.tenantId ? { tenantId: principal.tenantId } : {}), idempotencyKey: idemKey, payloadHash, engine, state: 'queued', sequence: 0,
-        createdAt: time, updatedAt: time, startedAt: null, finishedAt: null, answer: null, cancelRequested: false, launchAttempts: 0, events: [], artifacts: [], repo: null, logUrl: null, launchCiphertext: await encrypt(JSON.stringify(launch), this.env.RUN_LAUNCH_ENCRYPTION_KEY) };
+        createdAt: time, updatedAt: time, startedAt: null, finishedAt: null, answer: null, cancelRequested: false, launchAttempts: 0, events: [], artifacts: [], repo: null, logUrl: null,
+        ...(webhook ? { webhook } : {}), launchCiphertext: await encrypt(JSON.stringify(launch), this.env.RUN_LAUNCH_ENCRYPTION_KEY) };
       nextEvent(record, 'run_queued');
       stored.runs[runId] = record;
       stored.idempotency[idemKey] = runId;
@@ -656,10 +682,40 @@ export class RunnerRunCoordinator {
       changed = true;
     }
     if (changed) await Promise.all(pendingRuns.map((run) => this.writeRun(run)));
-    if (Object.values(stored.runs).some((run) => ACTIVE.has(run.state)
-      || run.state === 'unknown' && !!run.workerReceipt && Date.now() - Date.parse(run.updatedAt) < UNKNOWN_RECONCILE_MS)) {
-      await this.state.storage.setAlarm(Date.now() + 5_000);
+    const afterPolling = await this.read();
+    for (const run of Object.values(afterPolling.runs)) {
+      const delivery = run.webhook;
+      if (!TERMINAL.has(run.state) || !delivery || delivery.deliveredAt || delivery.exhaustedAt
+        || Date.parse(delivery.nextAttemptAt) > Date.now()) continue;
+      // Persist an attempt and a future retry before network I/O. A crash after
+      // receiver acceptance can cause a duplicate; eventId lets receivers dedupe.
+      delivery.attempts += 1;
+      delivery.nextAttemptAt = new Date(Date.now() + Math.min(300_000, 5_000 * 2 ** (delivery.attempts - 1))).toISOString();
+      await this.writeRun(run);
+      try {
+        const status = await deliverTerminalWebhook(this.env, delivery, run);
+        delivery.lastStatus = status;
+        if (status >= 200 && status < 300) {
+          delivery.deliveredAt = now();
+          delivery.lastError = undefined;
+        } else delivery.lastError = `HTTP_${status}`;
+      } catch { delivery.lastError = 'delivery_failed'; }
+      if (!delivery.deliveredAt && delivery.attempts >= MAX_WEBHOOK_ATTEMPTS) delivery.exhaustedAt = now();
+      await this.writeRun(run);
     }
+    const latest = await this.read();
+    const activeNext = Object.values(latest.runs).some((run) => ACTIVE.has(run.state)
+      || run.state === 'unknown' && !!run.workerReceipt && Date.now() - Date.parse(run.updatedAt) < UNKNOWN_RECONCILE_MS)
+      ? Date.now() + 5_000 : Infinity;
+    let webhookNext = Infinity;
+    for (const run of Object.values(latest.runs)) {
+      if (TERMINAL.has(run.state) && run.webhook && !run.webhook.deliveredAt && !run.webhook.exhaustedAt) {
+        const dueAt = Date.parse(run.webhook.nextAttemptAt);
+        webhookNext = Math.min(webhookNext, Number.isFinite(dueAt) ? dueAt : Date.now() + 5_000);
+      }
+    }
+    const nextAlarm = Math.min(activeNext, webhookNext);
+    if (Number.isFinite(nextAlarm)) await this.state.storage.setAlarm(Math.max(Date.now() + 100, nextAlarm));
   }
 
   private async worker(path: string, method = 'GET', body?: unknown, timeoutMs = 8_000): Promise<Response> {

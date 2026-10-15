@@ -1,6 +1,6 @@
 # Developer API foundation and release checklist
 
-The Cloudflare Runner now has an opt-in developer route for a free-form prompt and a server-provisioned OpenAI connection. It uses the existing task-keyed Durable Object for admission, idempotency, launch reconciliation, status, events, result, artifacts and cancellation. The current Control Plane contract at `/v1/runs` is unchanged. This is a working API path for trusted sandbox principals, not a self-service paid service: the current VM accepts `isolation.mode=none`, and there is no credit ledger or automatic customer onboarding.
+The Cloudflare Runner now has an opt-in developer route for a free-form prompt, a server-provisioned OpenAI connection and an optional terminal webhook. It uses the existing task-keyed Durable Object for admission, idempotency, launch reconciliation, status, events, result, artifacts and cancellation. The current Control Plane contract at `/v1/runs` is unchanged. This is a working API path for trusted sandbox principals, not a self-service paid service: the current VM accepts `isolation.mode=none`, and there is no credit ledger or automatic customer onboarding.
 
 ## Current request contract
 
@@ -42,12 +42,27 @@ Example metadata only:
 
 `credentialBindings: []` in the old request remains accepted. Existing key registries, routes, repository binding, signed profile delegation and worker callback URLs are untouched. The developer route uses the authenticated principal's repository; it does not accept a repository token or an arbitrary checkout target. No direct prompt may override the principal's repository or model connection.
 
+## Terminal webhook and copyable URL
+
+In the isolated sandbox lane, set `RUNNER_WEBHOOKS_ENABLED=true`. Provision `RUNNER_WEBHOOKS` as JSON metadata with `webhookId`, `principalId`, `profileId`, optional `tenantId`, a reviewed HTTPS `url`, and `secretBinding` named `RUNNER_WEBHOOK_SECRET_<ID>`. Provision that binding as a Worker secret of at least 24 characters. The URL must be a public DNS hostname using HTTPS on port 443; redirects are not followed. The API checks the complete principal/profile/tenant identity before accepting a webhook ID. This delivery path is disabled when `DEPLOYMENT_ENV=production`.
+
+`GET /v1/developer/webhooks` returns the caller's registered `{webhookId, url}` entries. An authenticated console can present the URL with a **Copy my webhook** button; the API does not expose other tenants' URLs. Treat webhook URLs with secret path segments as credentials. Webhook registration and rotation are operator-managed in this increment.
+
+```json
+{"prompt":"Generate an SDK","model":{"mode":"managed"},"webhookId":"wh_customer_a"}
+```
+
+The run uses the existing `Idempotency-Key` rule. On a terminal `succeeded`, `failed` or `cancelled` state, the Durable Object sends one `run.terminal` event to the pinned URL. The payload contains `eventId: terminal:<runId>`, run ID, terminal state, occurrence time, an absolute `resultUrl`, and a result summary. Summary text is capped at 16,000 characters; retrieve the complete result through the authenticated API. An `unknown` run has no terminal event.
+
+The receiver verifies `X-ServerlessAgence-Signature: v1=<hex>` as HMAC-SHA256 over `<X-ServerlessAgence-Timestamp>.<raw JSON body>` using its configured signing secret. It should reject stale timestamps and deduplicate by `X-ServerlessAgence-Delivery` or `eventId`. Any 2xx acknowledges delivery. Other statuses, redirects and timeouts retry with exponential backoff, up to eight attempts. Network ambiguity can produce a duplicate after the receiver accepted the first request. `GET /v1/developer/runs/{runId}/webhook` reports `pending`, `delivered` or `failed`, attempts and last HTTP status. Pending delivery blocks sandbox cleanup; completed or exhausted delivery can be cleaned normally.
+
 ## Product and infrastructure work before public beta
 
 - [x] Add a simplified, opt-in run route and capabilities probe without changing the Control Plane route.
 - [x] Preserve idempotency, status, result, events and cancellation through the existing coordinator.
 - [x] Add server-provisioned, principal-bound OpenAI BYOK connection references. Keep raw secrets out of request bodies and status responses.
 - [x] Add targeted compatibility and end-to-end fake VM tests.
+- [x] Add principal-bound terminal webhooks with signed payloads, durable retry state and delivery status.
 - [ ] Prove a fresh isolated sandbox for each run with CPU, memory, disk, process, network and time limits. Run cross-tenant negative tests; `isolation=none` blocks public arbitrary-code use.
 - [ ] Implement organization accounts, self-service API key issuance/rotation, tenant-scoped connection creation/revocation, and GitHub App installation on selected repositories.
 - [ ] Build a transactional credit ledger: reserve before admission, trusted model/compute metering, settle once, hold unknown outcomes for reconciliation, and cap concurrent trial usage. BYOK still pays for platform execution.
@@ -57,9 +72,12 @@ Example metadata only:
 - [ ] Test the exact Xiaomi MiMo 2.6 Flash identifier and provider path in the isolated France sandbox; pin the verified model and confirm usage accounting before using it as the managed default.
 - [ ] Exercise duplicate submit, conflicting idempotency, lost callback, revoked BYOK secret, cancellation, timeout, VM refusal, and credit exhaustion against the sandbox deployment. Preserve the existing CP/Telegram canary.
 - [ ] Build a real authenticated web console and connect the landing playground only after the public admission, billing and isolation gates pass.
+- [ ] Add self-service webhook registration, challenge/verification, rotation and redrive after an exhausted delivery. Show the registered endpoint and **Copy my webhook** in the authenticated console.
 
 ## Compatibility and verification gates
 
-For any change to admission, launch or result mapping, run `npm run typecheck`, `npm test`, `npm run build`, and both sandbox Worker dry runs. The focused tests are `test/cloudflare-runner-api.test.ts`, `test/cloudflare-run-coordinator.test.ts` and `test/cloudflare-developer-e2e.test.ts`; existing `test/api-http.test.ts` and `test/e2e-loop.test.ts` cover the older Node API. Check both a legacy CP request and a developer request in the same test cycle. Local fake VM tests establish contract compatibility but cannot prove provider execution or VM isolation.
+For any change to admission, launch or result mapping, run `npm run typecheck`, `npm test`, `npm run build`, and both sandbox Worker dry runs. The focused tests are `test/cloudflare-runner-api.test.ts`, `test/cloudflare-run-coordinator.test.ts` and `test/cloudflare-developer-e2e.test.ts`; existing `test/api-http.test.ts` and `test/e2e-loop.test.ts` cover the older Node API. Check both a legacy CP request and a developer request in the same test cycle. Webhook acceptance additionally checks signature verification, retry after 5xx, tenant denial, endpoint validation, pending cleanup and the eight-attempt limit. Local fake VM tests establish contract compatibility but cannot prove provider execution or VM isolation.
 
 A sandbox deployment needs the repository's signed release and reviewed deployment path. Keep the production worker and legacy agent untouched until the exact sandbox SHA has passed live canaries, including model execution, callback/result delivery and old CP flows. See `docs/CLOUDFLARE-RUNNER-API.md` and `AGENTS.md` for the current environment boundaries.
+
+For a live webhook canary, provision a dedicated sandbox receiver and signing secret, then enable the two sandbox lane switches for one test principal. Submit a managed run with a new idempotency key and `webhookId`; require the same run ID on replay, a terminal status, one verified event ID at the receiver, a valid HMAC and a result URL that returns the same terminal result to the authenticated caller. Make the receiver respond `503` once, then `204`; require the delivery status to change from `pending` to `delivered` with two attempts and the same event ID. Repeat with a foreign principal, a revoked signing secret, a cancelled run and a worker refusal. Run the existing CP/Telegram canary on the same source SHA before treating the change as compatible. Keep the receiver and keys in the isolated sandbox; do not enable the developer route on production while `isolation=none` and billing is absent.
