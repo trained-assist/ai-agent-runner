@@ -131,8 +131,9 @@ describe('installable VM HTTP worker', () => {
     expect(spec.envAllowlist).toContain('OPENCODE_CONFIG_CONTENT');
     expect(runtimeEnv.RUNNER_MCP_REGISTRY_TEST).toBe('test-registry-bearer-token-123');
     expect(runtimeEnv.RUNNER_MCP_REGISTRY_TEST_PROOF).toBe('signed-run-bound-proof-123456');
-    const config = JSON.parse(runtimeEnv.OPENCODE_CONFIG_CONTENT!) as { mcp: Record<string, { url: string; headers: Record<string, string> }> };
+    const config = JSON.parse(runtimeEnv.OPENCODE_CONFIG_CONTENT!) as { mcp: Record<string, { url: string; oauth: boolean; headers: Record<string, string> }> };
     expect(config.mcp['trained-assist-registry-test']!.url).toBe('https://trained-assist-mcp-host-test-160.skillset-apply.workers.dev/mcp');
+    expect(config.mcp['trained-assist-registry-test']!.oauth).toBe(false);
     expect(config.mcp['trained-assist-registry-test']!.headers.Authorization).toBe('Bearer {env:RUNNER_MCP_REGISTRY_TEST}');
     expect(JSON.stringify(spec)).not.toContain('test-registry-bearer-token-123');
     expect(JSON.stringify(spec)).not.toContain('signed-run-bound-proof-123456');
@@ -157,6 +158,7 @@ describe('installable VM HTTP worker', () => {
     expect(runtimeEnv.RUNNER_MCP_USER_TOKEN).toBe('user-catalog-bearer-token-123456');
     expect(runtimeEnv.RUNNER_MCP_USER_PROOF).toBe('signed-user-run-proof-123456');
     expect(runtimeEnv.OPENCODE_CONFIG_CONTENT).toContain('trained-assist-mcp-user-sandbox');
+    expect(JSON.parse(runtimeEnv.OPENCODE_CONFIG_CONTENT!).mcp['mem-gpt'].oauth).toBe(false);
     const openCodeConfig = JSON.parse(runtimeEnv.OPENCODE_CONFIG_CONTENT!) as { permission?: Record<string, string> };
     expect(openCodeConfig.permission).toEqual({
       mem_gpt_identity_whoami: 'allow',
