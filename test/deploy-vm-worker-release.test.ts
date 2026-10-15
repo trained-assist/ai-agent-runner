@@ -6,6 +6,16 @@ const operationsPath = new URL('../docs/VM-WORKER-OPERATIONS.md', import.meta.ur
 const releaseWorkflowPath = new URL('../.github/workflows/vm-worker-release.yml', import.meta.url);
 
 describe('VM worker release updater safety contract', () => {
+  it('resolves its colocated readiness helper independently of the caller cwd', async () => {
+    const updater = await readFile(updaterPath, 'utf8');
+    const scriptDir = updater.indexOf('script_dir=');
+    const readiness = updater.indexOf('"${script_dir}/assert-vm-worker-update-ready.mjs"');
+    expect(scriptDir).toBeGreaterThanOrEqual(0);
+    expect(scriptDir).toBeLessThan(updater.indexOf('VM_WORKER_UPDATE_READINESS_FILE='));
+    expect(readiness).toBeGreaterThanOrEqual(0);
+    expect(updater).toContain('${BASH_SOURCE[0]}');
+  });
+
   it('validates the endpoint before switching releases and requires readyz', async () => {
     const updater = await readFile(updaterPath, 'utf8');
     const workflow = await readFile(releaseWorkflowPath, 'utf8');

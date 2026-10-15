@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
   echo "Run with sudo: ai-agent-vm-worker-update vm-worker-vX.Y.Z" >&2
   exit 1
