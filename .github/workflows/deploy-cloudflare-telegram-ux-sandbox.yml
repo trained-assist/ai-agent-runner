@@ -2,6 +2,11 @@ name: Deploy Telegram UX Cloudflare Runner sandbox
 
 on:
   workflow_dispatch:
+    inputs:
+      run_gha_mcp_canary:
+        description: Run the isolated Registry fixture tool through the GHA route after deployment
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -39,3 +44,8 @@ jobs:
       - run: npx vitest run test/cloudflare-runner-api.test.ts test/cloudflare-run-coordinator.test.ts test/cloudflare-sandbox-deploy.test.ts
       - run: npm run worker:dry-run:telegram-ux
       - run: node tools/deploy-cloudflare-telegram-ux-sandbox.mjs
+      - name: Verify a GHA Registry MCP tool call
+        if: inputs.run_gha_mcp_canary == true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node scripts/telegram-ux-gha-mcp-canary.mjs

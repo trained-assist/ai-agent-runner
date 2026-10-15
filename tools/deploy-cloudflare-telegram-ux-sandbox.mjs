@@ -165,7 +165,7 @@ async function main() {
   const registry = JSON.stringify([{
     keyHash, principalId: PRINCIPAL_ID, profileId: PROFILE_ID, tenantId: TENANT_ID,
     repository: PROFILE_REPOSITORY,
-    scopes: ['runs:read', 'runs:write'], engines: ['eu-vm-agent-run'],
+    scopes: ['runs:read', 'runs:write'], engines: ['eu-vm-agent-run', 'azure-cloud'],
     mcpBindings: ['registry-mcp-test-160-read'],
   }]);
 
