@@ -152,19 +152,30 @@ const payload = {
   result = await read(`/v1/runs/${encodeURIComponent(receipt.runId)}/result`);
   assertIdentity(result, 'result', receipt.runId);
   const answer = String(result.text ?? '');
+  const hasFixtureProof = answer.includes('registry-fixture-marker-160-v1') && answer.includes(taskId) && answer.includes(receipt.runId);
+  if (hasFixtureProof) {
+    await stage('mcp_connection', 'verified', { evidence: 'run-bound fixture result returned by the pinned MCP server' });
+    await stage('tools_list', 'verified', { evidence: 'the successful call used the only tool in the pinned allowlist' });
+    await stage('tools_call', 'verified', { marker: 'registry-fixture-marker-160-v1', taskId, runId: receipt.runId });
+  } else {
+    await stage('mcp_proof', 'failed', { reason: 'fixture marker or task/run identity is missing from the API result' });
+  }
+  const artifactPushFailed = JSON.stringify(result).includes('ARTIFACTS_PUSH_FAILED');
+  await stage('api_result', 'verified', {
+    state: status.state,
+    executionOutcome: result.outcome ?? 'unknown',
+    publicationOutcome: artifactPushFailed ? 'failed' : result.failure ? 'failed' : 'no failure reported',
+    failureCode: result.failure?.code ?? (artifactPushFailed ? 'ARTIFACTS_PUSH_FAILED' : null),
+  });
   if (status.state !== 'succeeded' || result.outcome !== 'succeeded') {
     throw new Error(`MCP canary failed: state=${status.state}, outcome=${result.outcome}, code=${result.failure?.code ?? 'none'}`);
   }
-  if (result.failure || JSON.stringify(result).includes('ARTIFACTS_PUSH_FAILED')) {
+  if (result.failure || artifactPushFailed) {
     throw new Error(`MCP canary result has a contradictory finalization failure: ${result.failure?.code ?? 'ARTIFACTS_PUSH_FAILED'}`);
   }
-  if (!answer.includes('registry-fixture-marker-160-v1') || !answer.includes(taskId) || !answer.includes(receipt.runId)) {
+  if (!hasFixtureProof) {
     throw new Error('MCP fixture invocation is unproven: result lacks the fixture marker and this run’s IDs');
   }
-  await stage('mcp_connection', 'verified', { evidence: 'signed fixture result returned' });
-  await stage('tools_list', 'verified', { evidence: 'the fixture-backed run selected the only tool in its pinned allowlist' });
-  await stage('tools_call', 'verified', { marker: 'registry-fixture-marker-160-v1', taskId, runId: receipt.runId });
-  await stage('api_result', 'verified', { state: status.state, outcome: result.outcome });
   console.log(`MCP fixture call verified: marker=registry-fixture-marker-160-v1 taskId=${taskId} runId=${receipt.runId}`);
   } finally {
     if (receipt?.runId && (!status || !terminal.has(status.state))) {
