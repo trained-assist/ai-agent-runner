@@ -1,10 +1,18 @@
 # Repository instructions
 
 ## Continuous delivery
-- Put code onto the task branch as soon as each coherent change is complete; do not leave finished work uncommitted.
-- For a meaningful change, open a pull request immediately; merge only after all relevant checks are green.
+- Put code onto a task branch as soon as each coherent change starts; do not leave finished work uncommitted.
+- Open a draft PR once tests begin; promote draft to ready only after comparing with user scenarios and finding no contradictions.
+- Merge only after all required checks are green and a completed E2E covering our changes exists; manual human approval is not required.
+- After merge, deploy immediately and stop only when the deploy is verified; do not merge a PR without a deploy plan/path.
 - Do not delete prior work, tasks, commits, PRs, records, or memories without explicit user confirmation.
 - Keep docs and configuration changes limited to the requested task; do not add unrelated complexity.
+
+## Credentials (macOS Keychain)
+- GitHub default PAT: service `github.com`, account `kobzevvv`, item `Trained Agent GitHub Token`.
+- Azure Cloud / GHA / `zen-rings` PAT: service `github.com`, account `gha-compute-cluster`.
+- Cloudflare sandbox token: service `cloudflare.com`, account `trained-assist-sandbox`; expected account `d740a05e9442c1d0feacae2dfc673e93`.
+Never print secrets or store them in files; read into memory or a child process environment only.
 
 ## Sandbox-Driven Engineering
 
