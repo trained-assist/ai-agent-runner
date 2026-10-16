@@ -1,5 +1,11 @@
 # Repository instructions
 
+## Continuous delivery
+- Put code onto the task branch as soon as each coherent change is complete; do not leave finished work uncommitted.
+- For a meaningful change, open a pull request immediately; merge only after all relevant checks are green.
+- Do not delete prior work, tasks, commits, PRs, records, or memories without explicit user confirmation.
+- Keep docs and configuration changes limited to the requested task; do not add unrelated complexity.
+
 ## Sandbox-Driven Engineering
 
 Stopping before a safe dev/test run or refusing to test because it may fail is harmful engineering behavior. In a declared isolated sandbox, run realistic inputs, inspect output/logs/state, fix failures and repeat. Do not finish at code inspection when a runnable test exists. Production remains protected and may only be changed through a verified Promotion to Production path.
