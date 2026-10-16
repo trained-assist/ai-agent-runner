@@ -10,6 +10,23 @@ export const KEY_PATH = join(homedir(), '.config/opencode/secrets/serverless-age
 const WORKER = 'trained-assist-runner-api-sandbox3';
 const CONFIG = 'wrangler.sandbox3.jsonc';
 
+export async function waitForBuildSha(expectedSha, {
+  fetchImpl = fetch,
+  sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  delays = [0, 1_000, 2_000, 4_000, 8_000, 15_000, 30_000, 60_000],
+} = {}) {
+  if (!/^[0-9a-f]{40}$/.test(expectedSha || '')) throw new Error('expected_build_sha_required');
+  for (const delay of delays) {
+    if (delay) await sleep(delay);
+    try {
+      const response = await fetchImpl(`${API_ORIGIN}/version`, { signal: AbortSignal.timeout(10_000) });
+      const build = response.ok ? await response.json() : null;
+      if (build?.buildSha === expectedSha) return build;
+    } catch { /* Cloudflare propagation can briefly serve the previous Worker revision. */ }
+  }
+  throw new Error('sandbox_build_sha_mismatch');
+}
+
 export function developerRecord(key) {
   if (typeof key !== 'string' || !/^sra_sb_[A-Za-z0-9_-]{43}$/.test(key)) throw new Error('developer_key_invalid');
   return {
@@ -86,9 +103,7 @@ async function provision(expectedSha) {
   if (!/^[0-9a-f]{40}$/.test(expectedSha || '')) throw new Error('expected_build_sha_required');
   const token = process.env.CLOUDFLARE_API_TOKEN ?? process.env.CF_API_TOKEN;
   if (!token) throw new Error('cloudflare_sandbox_token_missing');
-  const version = await fetch(`${API_ORIGIN}/version`, { signal: AbortSignal.timeout(10_000) });
-  const build = version.ok ? await version.json() : null;
-  if (build?.buildSha !== expectedSha) throw new Error('sandbox_build_sha_mismatch');
+  await waitForBuildSha(expectedSha);
   const record = developerRecord(activeKey());
   for (const [name, value] of [
     ['RUNNER_API_KEYS_DEVELOPER', JSON.stringify([record])],

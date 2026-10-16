@@ -1,6 +1,9 @@
 name: Deploy and pair isolated sandbox3 live profile auth
 
 on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
   workflow_dispatch:
     inputs:
       provision_sandbox3_profile:
@@ -18,11 +21,15 @@ concurrency:
 
 jobs:
   provision:
-    if: github.ref == 'refs/heads/main' && inputs.provision_sandbox3_profile == true
+    if: >-
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.provision_sandbox3_profile == true)
+      ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.conclusion == 'success')
     runs-on: ubuntu-latest
     timeout-minutes: 15
     environment: sandbox
     env:
+      SOURCE_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
       CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: d740a05e9442c1d0feacae2dfc673e93
       CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
@@ -31,7 +38,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
           persist-credentials: false
       - uses: actions/setup-node@v4
         with:
@@ -52,7 +59,7 @@ jobs:
           printf '%s\n' "$identity" | grep -F 'd740a05e9442c1d0feacae2dfc673e93' >/dev/null
           printf '%s\n' "$identity" | grep -F "Typeformowner@gmail.com's Account" >/dev/null
       - name: Deploy the reviewed serverless Runner API Worker source
-        run: npx wrangler deploy --config wrangler.sandbox3.jsonc --var BUILD_SHA:${GITHUB_SHA}
+        run: npx wrangler deploy --config wrangler.sandbox3.jsonc --var BUILD_SHA:${SOURCE_SHA}
       - name: Provision only the dedicated sandbox3 key registry and delegation secret
         run: node scripts/sandbox3-profile-principal.mjs
       - name: Verify the signed sandbox3 profile using read-only capabilities
@@ -62,7 +69,7 @@ jobs:
           SANDBOX3_DEVELOPER_API_KEY: ${{ secrets.SANDBOX3_DEVELOPER_API_KEY }}
         run: |
           test -n "$SANDBOX3_DEVELOPER_API_KEY"
-          node scripts/setup-developer-sandbox.mjs provision "$GITHUB_SHA"
+          node scripts/setup-developer-sandbox.mjs provision "$SOURCE_SHA"
       - name: Upload sanitized profile-auth evidence
         if: always() && hashFiles('sandbox3-profile-auth-evidence.json') != ''
         uses: actions/upload-artifact@v4
