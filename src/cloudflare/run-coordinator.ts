@@ -22,7 +22,7 @@ interface RunRecord {
   workerFinalizingObservedAt?: string | null;
   logsPending?: boolean;
   launchAttempts: number; result?: Record<string, unknown>; workerReceipt?: Record<string, unknown>;
-  launchRejection?: { status: number; code: string; fields: string[] };
+  launchRejection?: { status: number; code: string; fields: string[]; capacityDiagnostics?: string };
   lastError?: string;
   artifacts: Array<Record<string, unknown>>; repo: Record<string, unknown> | null; logUrl: string | null;
   events: Array<Record<string, unknown>>;
@@ -134,18 +134,37 @@ function workerRefusalFields(body: unknown): string[] {
   return [...fields];
 }
 
+function capacityRefusalDiagnostics(body: unknown): string | undefined {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return undefined;
+  const value = body as Record<string, unknown>;
+  const percent = (key: string) => typeof value[key] === 'number' && Number.isFinite(value[key])
+    && value[key] >= 0 && value[key] <= 100 ? `${value[key].toFixed(1)}%` : undefined;
+  const parts = [
+    percent('cpuPercent') ? `measured CPU ${percent('cpuPercent')}` : undefined,
+    percent('memoryPercent') ? `measured RAM ${percent('memoryPercent')}` : undefined,
+    percent('projectedCpuPercent') ? `projected CPU ${percent('projectedCpuPercent')}` : undefined,
+    percent('projectedMemoryPercent') ? `projected RAM ${percent('projectedMemoryPercent')}` : undefined,
+    Number.isSafeInteger(value.activeReservations) && (value.activeReservations as number) >= 0
+      ? `${value.activeReservations} active reservations` : undefined,
+    typeof value.sampledAt === 'string' && Number.isFinite(Date.parse(value.sampledAt))
+      ? `sampled ${new Date(value.sampledAt).toISOString()}` : undefined,
+  ].filter((part): part is string => !!part);
+  return parts.length ? parts.join(', ') : undefined;
+}
+
 function refusedLaunchResult(run: RunRecord): Record<string, unknown> {
   const status = run.launchRejection?.status ?? Number(run.lastError?.match(/HTTP (4\d\d)/)?.[1] ?? 400);
   const code = run.launchRejection?.code ?? 'WORKER_LAUNCH_REJECTED';
   const fields = run.launchRejection?.fields ?? [];
   const fieldSummary = fields.length ? `; rejected fields: ${fields.join(', ')}` : '';
+  const capacitySummary = run.launchRejection?.capacityDiagnostics ? `; ${run.launchRejection.capacityDiagnostics}` : '';
   return {
     schemaVersion: 1, runId: run.runId, jobId: run.jobId, userTaskId: run.userTaskId,
     profileId: run.profileId, ownerGeneration: run.ownerGeneration, outcome: 'failed',
     exitReason: 'preflight_refused', exitCode: null, exitSignal: null, exitObserved: false, engineStart: 'not_started',
     startedAt: run.startedAt ?? run.createdAt, finishedAt: run.finishedAt ?? now(),
     failure: { code: code.startsWith('WORKER_') ? code : `WORKER_${code}`, failureClass: 'preflight',
-      safeSummary: `The ${run.engine} execution worker refused the run before accepting it (HTTP ${status}, ${code}${fieldSummary}).`, retryable: false },
+      safeSummary: `The ${run.engine} execution worker refused the run before accepting it (HTTP ${status}, ${code}${fieldSummary}${capacitySummary}).`, retryable: false },
     usage: { status: 'unknown' }, outputRefs: [], persistence: 'not_required',
     persistenceReason: 'The execution worker did not accept the run; there is nothing to persist.',
     cleanup: 'completed', cleanupReason: 'No execution receipt was issued by the worker.',
@@ -959,7 +978,8 @@ export class RunnerRunCoordinator {
               }
               if (response.status < 500 || response.status === 503) {
                 const fields = workerRefusalFields(rejection);
-                run.launchRejection = { status: response.status, code, fields };
+                run.launchRejection = { status: response.status, code, fields,
+                  ...(code === 'WORKER_CAPACITY' ? { capacityDiagnostics: capacityRefusalDiagnostics(rejection) } : {}) };
                 run.result = refusedLaunchResult(run);
                 transition(run, 'failed', { reason: `worker_rejected_${response.status}`, code, ...(fields.length ? { fields } : {}) });
                 run.lastError = `worker launch rejected with HTTP ${response.status}`;
