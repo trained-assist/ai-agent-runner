@@ -5,6 +5,8 @@ is installed in three places: a named client secret on the correct GHA gateway, 
 Worker's `GHA_WORKER_TOKEN`, and a GitHub Actions environment secret for the corresponding
 repository environment. The command never prints the value, refuses to overwrite any existing
 copy, and verifies gateway authentication without creating a run.
+Production may deploy without this optional credential: capabilities then report
+`routes.gha.available: false` and strict GHA runs fail closed while France stays independently usable.
 
 | Runner API Worker | Client ID | Runner config | Gateway URL/environment | GitHub environment |
 | --- | --- | --- | --- | --- |

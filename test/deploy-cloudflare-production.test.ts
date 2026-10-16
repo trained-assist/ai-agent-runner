@@ -24,7 +24,8 @@ describe('production Runner provisioning contract', () => {
     expect(() => productionRunnerPrincipalRecord('too-short')).toThrow('production_runner_api_key_invalid');
   });
 
-  it('requires the serverless API contract, France and strict GHA route capabilities', () => {
+  it('checks the serverless API, France and configured or fail-closed GHA capability', () => {
+    process.env.GHA_WORKER_TOKEN_PRODUCTION_AGENT_API = 'g'.repeat(24);
     expect(hasExpectedProductionCapabilities({
       contract: { name: 'ai-agent-runner/serverless-agent-api' },
       placement: 'cloudflare-worker', executionRegions: ['eu-vm-agent-run'],
@@ -34,6 +35,12 @@ describe('production Runner provisioning contract', () => {
       contract: { name: 'ai-agent-runner/serverless-agent-api' },
       placement: 'cloudflare-worker', executionRegions: ['mock-test'],
     })).toBe(false);
+    delete process.env.GHA_WORKER_TOKEN_PRODUCTION_AGENT_API;
+    expect(hasExpectedProductionCapabilities({
+      contract: { name: 'ai-agent-runner/serverless-agent-api' },
+      placement: 'cloudflare-worker', executionRegions: ['eu-vm-agent-run'],
+      fallbackExecutionRegions: [], routes: { gha: { available: false, engine: null } },
+    })).toBe(true);
     expect(hasExpectedProductionCapabilities({
       contract: { name: 'ai-agent-runner/serverless-agent-api' },
       placement: 'cloudflare-worker', executionRegions: ['eu-vm-agent-run'],
