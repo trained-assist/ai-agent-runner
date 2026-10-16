@@ -170,15 +170,23 @@ jobs:
           node --input-type=module <<'NODE'
           const token = process.env.GHA_WORKER_TOKEN_PRODUCTION_AGENT_API;
           const probeId = 'provisioning-auth-production_agent_api';
-          const response = await fetch(`https://opencode-gha-runner-gateway.skillset-apply.workers.dev/v1/runs/${probeId}/status`, {
-            headers: { authorization: `Bearer ${token}`, 'user-agent': 'trained-assist-runner-provisioner/1.0' },
-            signal: AbortSignal.timeout(10_000),
-          });
-          const body = await response.json().catch(() => null);
-          if (response.status !== 200 || body?.runId !== probeId || body?.status !== 'unknown') {
-            throw new Error('production GHA gateway credential probe failed');
+          let lastStatus = 0;
+          for (const delayMs of [0, 1_000, 2_000, 4_000, 8_000, 15_000, 30_000]) {
+            if (delayMs) await new Promise((resolve) => setTimeout(resolve, delayMs));
+            try {
+              const response = await fetch(`https://opencode-gha-runner-gateway.skillset-apply.workers.dev/v1/runs/${probeId}/status`, {
+                headers: { authorization: `Bearer ${token}`, 'user-agent': 'trained-assist-runner-provisioner/1.0' },
+                signal: AbortSignal.timeout(10_000),
+              });
+              lastStatus = response.status;
+              const body = await response.json().catch(() => null);
+              if (response.status === 200 && body?.runId === probeId && body?.status === 'unknown') {
+                console.log('Production GHA gateway credential probe passed; token value was not displayed.');
+                process.exit(0);
+              }
+            } catch {}
           }
-          console.log('Production GHA gateway credential probe passed; token value was not displayed.');
+          throw new Error(`production GHA gateway credential probe failed after propagation retries (HTTP ${lastStatus})`);
           NODE
       - name: Verify delivered production gateway SHA
         env:
