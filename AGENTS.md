@@ -8,6 +8,10 @@
 - Do not delete prior work, tasks, commits, PRs, records, or memories without explicit user confirmation.
 - Keep docs and configuration changes limited to the requested task; do not add unrelated complexity.
 
+## Prohibitions and restrictions
+
+Самые опасные требования — запреты и ограничения прав. Перед тем как где-то что-то запретить, отключить или ограничить права, агент обязан собрать и показать evidence: что защищается, какие наблюдения/тесты/инциденты это поддерживают, какие альтернативы рассмотрены, что теряется. Правило и источник: [AGENTS.md (architecture)](https://github.com/trained-assist/trained-agent-architecture/blob/main/AGENTS.md).
+
 ## Credentials (macOS Keychain)
 - GitHub default PAT: service `github.com`, account `kobzevvv`, item `Trained Agent GitHub Token`.
 - Azure Cloud / GHA / `zen-rings` PAT: service `github.com`, account `gha-compute-cluster`.
