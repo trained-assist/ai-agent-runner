@@ -251,6 +251,20 @@ npm run worker:dry-run:sandbox3
 npm run worker:dry-run:telegram-ux
 ```
 
+The manual **Telegram UX sandbox GHA MCP canary** workflow runs the read-only Registry
+fixture through the already deployed Telegram UX Runner API and GHA gateway. It does not
+deploy either Worker or rebuild the gateway. Run it from `main`; its `sandbox` environment
+provides the API key, and its run-scoped repository token is used only for the fixed
+`trained-assist/ai-agent-runner` target. The workflow serializes canaries and uploads a
+sanitized evidence artifact with task/run identity, route, engine, stage outcomes and cleanup
+result. It retries only read-only capability/status/result requests on transient HTTP or
+network errors. An ambiguous or nonterminal run is retained for reconciliation.
+
+The canary accepts success only when the API result belongs to the submitted task and run,
+reports terminal success on `azure-cloud`/`gha`, contains the pinned fixture marker and both
+IDs, and has no `ARTIFACTS_PUSH_FAILED` contradiction. Cleanup requires an identity-matched
+terminal status and result first. A green GHA job alone is not execution proof.
+
 The Worker handles authenticated submit, status, result, events, artifact metadata, and cancel.
 It encrypts launch data at rest, deduplicates idempotency keys, increments `ownerGeneration`
 for later attempts, and reconciles lost launch responses using the same France worker run ID.
