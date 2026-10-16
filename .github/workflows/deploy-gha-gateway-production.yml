@@ -1,0 +1,173 @@
+name: Deploy GHA gateway to production
+
+on:
+  workflow_dispatch:
+    inputs:
+      gateway_sha:
+        description: Exact GHA gateway commit to verify and deploy
+        required: true
+        type: string
+      sandbox_run_id:
+        description: Successful sandbox gateway deployment run for this exact GHA commit
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: opencode-gha-gateway-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: vovalikessmoothy-png/opencode-gha-runner
+          ref: ${{ inputs.gateway_sha }}
+          path: opencode-gha-runner
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Validate exact source, sandbox evidence, and production credentials
+        env:
+          GATEWAY_SHA: ${{ inputs.gateway_sha }}
+          SANDBOX_RUN_ID: ${{ inputs.sandbox_run_id }}
+          GH_TOKEN: ${{ github.token }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CF_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          [[ "$GATEWAY_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$SANDBOX_RUN_ID" =~ ^[0-9]{1,20}$ ]]
+          test -n "$CLOUDFLARE_API_TOKEN" || { echo 'production environment secret CF_API_TOKEN is missing' >&2; exit 1; }
+          [[ "$CLOUDFLARE_ACCOUNT_ID" == 'd740a05e9442c1d0feacae2dfc673e93' ]] || {
+            echo 'production environment CF_ACCOUNT_ID does not match the configured Cloudflare account' >&2
+            exit 1
+          }
+          git -C opencode-gha-runner fetch origin main --quiet
+          git -C opencode-gha-runner merge-base --is-ancestor "$GATEWAY_SHA" FETCH_HEAD || {
+            echo 'gateway source SHA must already be merged into GHA gateway main' >&2
+            exit 1
+          }
+          run="$(gh run view "$SANDBOX_RUN_ID" --repo vovalikessmoothy-png/opencode-gha-runner --json conclusion,workflowName,headBranch)"
+          RUN_JSON="$run" node --input-type=module <<'NODE'
+          const run = JSON.parse(process.env.RUN_JSON);
+          if (run.conclusion !== 'success' || run.workflowName !== 'Deploy GHA gateway sandbox' || run.headBranch !== 'main') {
+            throw new Error('sandbox evidence must be a successful Deploy GHA gateway sandbox run from main');
+          }
+          NODE
+          curl --fail --silent --show-error 'https://opencode-gha-runner-gateway-sandbox.skillset-apply.workers.dev/version' -o "$RUNNER_TEMP/gateway-version.json"
+          GATEWAY_SHA="$GATEWAY_SHA" node -e 'const x=require(process.argv[1]); if(x.service!=="opencode-gha-runner-gateway"||x.buildSha!==process.env.GATEWAY_SHA) process.exit(1)' "$RUNNER_TEMP/gateway-version.json" || {
+            echo 'sandbox gateway currently serving a different source SHA' >&2
+            exit 1
+          }
+          cd opencode-gha-runner
+          identity="$(npx --yes wrangler@3.99.0 whoami 2>&1)"
+          printf '%s\n' "$identity" | grep -F "$CLOUDFLARE_ACCOUNT_ID" >/dev/null || {
+            echo 'Cloudflare credential does not target the configured production account' >&2
+            exit 1
+          }
+      - name: Verify gateway and production configuration
+        working-directory: opencode-gha-runner
+        env:
+          GATEWAY_SHA: ${{ inputs.gateway_sha }}
+        run: |
+          set -euo pipefail
+          npm ci --no-audit --no-fund
+          npm run verify
+          npx wrangler deploy --dry-run --config wrangler.toml --var "BUILD_SHA:$GATEWAY_SHA"
+      - name: Find or create production D1 and render the production binding
+        working-directory: opencode-gha-runner
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CF_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          import { readFile, writeFile } from 'node:fs/promises';
+          const accountId = process.env.CLOUDFLARE_ACCOUNT_ID;
+          const token = process.env.CLOUDFLARE_API_TOKEN;
+          const expectedName = 'opencode-gha-runner-gateway-state';
+          const endpoint = `https://api.cloudflare.com/client/v4/accounts/${accountId}/d1/database`;
+          async function list() {
+            const matches = [];
+            for (let page = 1; ; page += 1) {
+              const response = await fetch(`${endpoint}?per_page=100&page=${page}`, { headers: { authorization: `Bearer ${token}` } });
+              const body = await response.json();
+              if (!response.ok || !body.success) throw new Error(`D1 listing failed with HTTP ${response.status}`);
+              matches.push(...body.result.filter((database) => database.name === expectedName));
+              if (page >= (body.result_info?.total_pages ?? 1)) return matches;
+            }
+          }
+          let matches = await list();
+          if (matches.length === 0) {
+            const response = await fetch(endpoint, {
+              method: 'POST',
+              headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+              body: JSON.stringify({ name: expectedName }),
+            });
+            const body = await response.json();
+            if (!response.ok || !body.success) {
+              // A concurrent workflow may have created the named database after our list.
+              matches = await list();
+              if (matches.length !== 1) throw new Error(`D1 creation failed with HTTP ${response.status}`);
+            } else {
+              matches = [body.result];
+            }
+          }
+          if (matches.length !== 1 || !/^[0-9a-f-]{36}$/i.test(matches[0].uuid)) {
+            throw new Error(`Expected exactly one valid production D1 named ${expectedName}`);
+          }
+          const template = await readFile('wrangler.production.toml', 'utf8');
+          if (!template.includes('"__RUN_DB_ID__"')) throw new Error('Production D1 template placeholder is missing');
+          await writeFile('wrangler.production.generated.toml', template.replace('"__RUN_DB_ID__"', JSON.stringify(matches[0].uuid)), { mode: 0o600 });
+          console.log(`Using production D1 ${expectedName} (${matches[0].uuid})`);
+          NODE
+      - name: Validate rendered production binding
+        working-directory: opencode-gha-runner
+        env:
+          GATEWAY_SHA: ${{ inputs.gateway_sha }}
+        run: npx wrangler deploy --dry-run --config wrangler.production.generated.toml --var "BUILD_SHA:$GATEWAY_SHA"
+      - name: Apply production D1 migrations
+        working-directory: opencode-gha-runner
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CF_ACCOUNT_ID }}
+        run: npx wrangler d1 migrations apply opencode-gha-runner-gateway-state --config wrangler.production.generated.toml --remote
+      - name: Deploy production gateway with D1 and reconciliation schedule
+        working-directory: opencode-gha-runner
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CF_ACCOUNT_ID }}
+          GATEWAY_SHA: ${{ inputs.gateway_sha }}
+        run: npx wrangler deploy --config wrangler.production.generated.toml --var "BUILD_SHA:$GATEWAY_SHA"
+      - name: Verify delivered production gateway SHA
+        env:
+          GATEWAY_SHA: ${{ inputs.gateway_sha }}
+        run: |
+          set -euo pipefail
+          url='https://opencode-gha-runner-gateway.skillset-apply.workers.dev/version'
+          for attempt in $(seq 1 12); do
+            if curl --fail --silent --show-error "$url" -o "$RUNNER_TEMP/gateway-production-version.json"; then
+              if GATEWAY_SHA="$GATEWAY_SHA" node -e 'const x=require(process.argv[1]); if(x.service==="opencode-gha-runner-gateway"&&x.buildSha===process.env.GATEWAY_SHA) process.exit(0); process.exit(1)' "$RUNNER_TEMP/gateway-production-version.json"; then
+                printf 'Production gateway source SHA: %s\n' "$GATEWAY_SHA" >> "$GITHUB_STEP_SUMMARY"
+                exit 0
+              fi
+            fi
+            sleep 5
+          done
+          echo 'production gateway did not report the deployed source SHA' >&2
+          exit 1
