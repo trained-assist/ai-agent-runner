@@ -820,7 +820,12 @@ export class RunnerRunCoordinator {
             // next decision; the coordinator must preserve this uncertainty.
             transition(run, 'unknown', { reason: 'worker_no_longer_knows_run' });
           } else if (workerStatus.status === 'running' || workerStatus.status === 'accepted') {
-            const observedState: State = workerStatus.state === 'running' || workerStatus.state === 'finalizing' ? 'running' : 'starting';
+            // Some external workers (including the GHA gateway) expose their
+            // lifecycle in `status`; VM workers also provide a more detailed
+            // `state`. A reported `status: running` is already execution proof.
+            const workerReportsProcess = workerStatus.state === 'running' || workerStatus.state === 'finalizing'
+              || (workerStatus.state === undefined && workerStatus.status === 'running');
+            const observedState: State = workerReportsProcess ? 'running' : 'starting';
             if (run.state !== observedState) transition(run, observedState,
               observedState === 'running' ? { evidence: 'worker_process_state' } : { evidence: 'worker_accepted' });
           } else if (['succeeded', 'failed', 'cancelled'].includes(workerStatus?.status ?? '')) {
