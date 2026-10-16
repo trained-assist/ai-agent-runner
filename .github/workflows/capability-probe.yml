@@ -61,18 +61,22 @@ jobs:
           echo "playwright: OK" >> "$GITHUB_STEP_SUMMARY"
 
       - name: opencode headless — установка и поведение без конфига
+        continue-on-error: true # диагностика доступности, не gate для продуктовых изменений
         run: |
-          npm install -g opencode-ai >/dev/null 2>&1
-          opencode --version
+          npm install -g opencode-ai
           set +e
+          VERSION=$(opencode --version 2>&1)
+          VERSION_CODE=$?
           OUT=$(timeout 60 opencode run "reply with exactly: pong" 2>&1)
           CODE=$?
           set -e
+          echo "opencode --version exit=$VERSION_CODE"
+          echo "$VERSION"
           echo "opencode run exit=$CODE"
           echo "$OUT" | tail -5
           {
             echo "### opencode в CI"
-            echo "- \`opencode --version\`: \`$(opencode --version)\`"
+            echo "- \`opencode --version\` exit=$VERSION_CODE: \`$VERSION\`"
             echo "- без провайдера/токена: exit=$CODE (ожидаем отказ авторизации — рабочая схема pr-autofix: свой \`opencode.json\` → llm-ladder + \`LLM_LADDER_TOKEN\`, флаг \`-m ladder/<model>\`)"
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
