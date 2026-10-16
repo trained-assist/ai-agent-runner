@@ -848,7 +848,14 @@ export class AgentApi {
       if (progress && isTerminalApiState(progress.state)) continue;
       // Движок берём из отметки о приёме, а не из заявки: ран мог быть принят вторым
       // движком цепочки, и поллер обязан спрашивать именно его (issue #100).
-      const worker = (entry.workerId ? this.workers.find((candidate) => (candidate.workerId ?? candidate.name) === entry.workerId && candidate.name === entry.engine) : undefined) ?? this.workerFor(entry.engine);
+      const exact = entry.workerId
+        ? this.workers.find((candidate) => (candidate.workerId ?? candidate.name) === entry.workerId && candidate.name === entry.engine)
+        : undefined;
+      if (entry.workerId && !exact) this.log({ event: 'poll_resume_endpoint_missing', runId: record.runId, workerId: entry.workerId, engine: entry.engine });
+      // Fallback: a pinned endpoint can disappear from a later config during its life;
+      // try the first configured endpoint of the same logical engine rather than silently
+      // dropping the accepted run and leaving it unpolled forever.
+      const worker = exact ?? this.workerFor(entry.engine);
       if (!worker) continue;
       this.store.setPinnedWorker(record.runId, this.workerIdOf(worker));
       const restored = this.store.open(record.runId, record.createdAt, entry.engine, entry.workerId);
@@ -952,6 +959,7 @@ export class AgentApi {
         event: accepted.receipt ? 'worker_accepted' : 'worker_reconciled',
         runId: record.runId,
         engine: accepted.engine,
+        workerId: this.workerIdOf(accepted.worker),
         worker: accepted.worker.baseUrl,
         ...(accepted.receipt
           ? { operationId: accepted.receipt.operationId, statusUrl: accepted.receipt.statusUrl }
