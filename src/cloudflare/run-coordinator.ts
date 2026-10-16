@@ -277,11 +277,15 @@ export class RunnerRunCoordinator {
       case 'log': {
         if (request.method !== 'GET') return error('METHOD_NOT_ALLOWED', 'log supports GET only', 405);
         let refreshed: string | null = null;
+        let failureCode: string | null = null;
         try {
           const response = await this.worker(run.engine, `/v1/runs/${encodeURIComponent(runId)}/log-url`);
           if (response.ok) {
-            const value = await response.json() as { logUrl?: unknown };
+            const value = await response.json() as { logUrl?: unknown; failureCode?: unknown };
             if (typeof value.logUrl === 'string') refreshed = value.logUrl;
+            if (typeof value.failureCode === 'string') failureCode = value.failureCode;
+          } else {
+            failureCode = `WORKER_HTTP_${response.status}`;
           }
         } catch {
           // Report an unavailable log below; never turn a temporary signer failure
@@ -289,6 +293,7 @@ export class RunnerRunCoordinator {
         }
         const target = retrievableLogUrl(refreshed);
         if (!target) return json({ runId, logUrl: run.logUrl, retrievable: false,
+          ...(failureCode ? { failureCode } : {}),
           note: run.logUrl ? 'the worker could not issue a fresh Google Storage download URL' : 'the worker has not published a retrievable session log' });
         return new Response(null, { status: 302, headers: { location: target, 'cache-control': 'private, no-store' } });
       }

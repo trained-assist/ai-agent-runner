@@ -165,12 +165,12 @@ export function createVmWorkerServer(options: VmWorkerServerOptions): VmWorkerSe
     if (!isSafeId(runId)) { sendJson(res, 400, { error: 'INVALID_REQUEST' }); return; }
     const endpoint = runPath[2] ?? 'status';
     if (endpoint === 'log-url' && method === 'GET') {
-      const logUrl = await freshSessionLogUrl(options, runId);
-      if (!logUrl) {
-        sendJson(res, 200, { runId, logUrl: null, retrievable: false, note: 'no durable session log is available in Google Storage' });
+      const fresh = await freshSessionLogUrl(options, runId);
+      if (!fresh.logUrl) {
+        sendJson(res, 200, { runId, logUrl: null, retrievable: false, failureCode: fresh.failureCode, note: 'no durable session log is available in Google Storage' });
         return;
       }
-      sendJson(res, 200, { runId, logUrl, retrievable: true });
+      sendJson(res, 200, { runId, logUrl: fresh.logUrl, retrievable: true });
       return;
     }
     const snapshot = options.runner.getRun(runId);
@@ -528,7 +528,8 @@ async function durableSessionLogUrl(options: VmWorkerServerOptions, snapshot: No
       ? (store as unknown as { bucketName: string }).bucketName
       : (typeof (store as unknown as { name?: unknown }).name === 'string' ? (store as unknown as { name: string }).name : null);
     if (bucketName) return `https://storage.googleapis.com/${bucketName}/${key}`;
-  } catch {
+  } catch (error) {
+    process.stderr.write(`${JSON.stringify({ event: 'session_log_upload_failed', runId: snapshot.runId, failureCode: storageFailureCode(error) })}\n`);
     // Keep the run truthful: if durable persistence fails, the caller receives the
     // non-retrievable local reference instead of a broken GCS URL.
   }
@@ -539,17 +540,31 @@ function blobStoreOf(options: VmWorkerServerOptions): BlobStore | null {
   return options.blobStore ?? options.storage ?? options.blob ?? null;
 }
 
-async function freshSessionLogUrl(options: VmWorkerServerOptions, runId: string): Promise<string | null> {
+async function freshSessionLogUrl(options: VmWorkerServerOptions, runId: string): Promise<{ logUrl: string | null; failureCode?: string }> {
   const store = blobStoreOf(options);
-  if (!store?.head || !store.shareUrl) return null;
+  if (!store?.head || !store.shareUrl) return { logUrl: null, failureCode: 'BLOB_STORE_UNAVAILABLE' };
   const key = `runs/${encodeURIComponent(runId)}/events.jsonl`;
   try {
     await store.head(key);
     const shared = await store.shareUrl(key, { expiresAt: new Date(Date.now() + 10 * 60 * 1000) });
-    return shared?.url && /^https:\/\//.test(shared.url) ? shared.url : null;
-  } catch {
-    return null;
+    return shared?.url && /^https:\/\//.test(shared.url)
+      ? { logUrl: shared.url }
+      : { logUrl: null, failureCode: 'SIGNED_URL_INVALID' };
+  } catch (error) {
+    return { logUrl: null, failureCode: storageFailureCode(error) };
   }
+}
+
+function storageFailureCode(error: unknown): string {
+  if (error instanceof StorageError) return error.code;
+  if (error && typeof error === 'object') {
+    const code = (error as { code?: unknown; status?: unknown; statusCode?: unknown }).code;
+    const status = (error as { status?: unknown; statusCode?: unknown }).status ?? (error as { statusCode?: unknown }).statusCode;
+    if (typeof status === 'number' && status >= 400 && status < 600) return `GCS_HTTP_${status}`;
+    if (typeof code === 'number' && code >= 400 && code < 600) return `GCS_HTTP_${code}`;
+    if (typeof code === 'string' && /^[A-Z][A-Z0-9_]{0,39}$/.test(code)) return `GCS_${code}`;
+  }
+  return 'GCS_STORAGE_ERROR';
 }
 
 function observeProcessTreeExit(options: VmWorkerServerOptions, operationId: string, runId: string): void {
