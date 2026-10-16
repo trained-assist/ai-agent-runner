@@ -8,6 +8,8 @@ import { StatelessStore } from '../src/api/stateless-store.js';
 import type { Principal } from '../src/api/auth.js';
 import { adapterFor, startMockWorker, type MockWorkerOptions } from './external-worker-harness.js';
 import { ExternalWorkerAdapter } from '../src/adapters/external-worker-adapter.js';
+import { PreflightError } from '../src/contracts/validate.js';
+import type { ExternalWorker } from '../src/adapters/external-worker-adapter.js';
 
 /**
  * Правила приёма stateless-ядра (epic #74): идемпотентность в памяти, границы движка,
@@ -59,6 +61,85 @@ async function waitForCondition(condition: () => boolean, timeoutMs = 5000, labe
 }
 
 describe('stateless AgentApi: приём запроса', () => {
+  it('accepts five concurrent requests and queues confirmed capacity refusals until the worker frees up', async () => {
+    let full = true;
+    let capacityRefusals = 0;
+    const acceptedRuns: string[] = [];
+    const logEntries: Record<string, unknown>[] = [];
+    const worker = {
+      name: 'azure-dynamic-ip-agent-run', baseUrl: 'https://worker.example',
+      async launch(spec: { runId: string; operationId: string }) {
+        if (full) {
+          capacityRefusals += 1;
+          throw new PreflightError('WORKER_CAPACITY', 'worker at capacity');
+        }
+        acceptedRuns.push(spec.runId);
+        return { runId: spec.runId, operationId: spec.operationId, status: 'accepted' as const,
+          statusUrl: 'https://worker.example/status', resultUrl: 'https://worker.example/result' };
+      },
+      async status(runId: string) { return { runId, status: 'running' as const }; },
+      async result() { throw new Error('result should not be polled during this test'); },
+      async cancel(runId: string) { return { status: 'unknown_run' as const, runId }; },
+    } as unknown as ExternalWorker;
+    const api = new AgentApi({ workers: [worker], logger: (entry) => logEntries.push(entry) });
+    onTestFinished(() => api.dispose());
+
+    const receipts = await Promise.all(Array.from({ length: 5 }, (_, index) => Promise.resolve(api.submit(
+      alpha, `capacity-burst-${index}`, body({ userTaskId: `capacity-burst-${index}` }),
+    ))));
+    expect(receipts).toHaveLength(5);
+    expect(new Set(receipts.map((receipt) => receipt.runId)).size).toBe(5);
+    await waitForCondition(() => capacityRefusals >= 5, 2_000, 'five confirmed capacity refusals');
+    expect(receipts.every((receipt) => api.status(alpha, receipt.runId).state === 'queued')).toBe(true);
+    expect(logEntries.filter((entry) => entry['event'] === 'worker_capacity_queued')).toHaveLength(5);
+
+    full = false;
+    await waitForCondition(() => acceptedRuns.length === 5, 5_000, 'all queued requests to be accepted');
+    expect(receipts.every((receipt) => api.status(alpha, receipt.runId).state === 'running')).toBe(true);
+    expect(logEntries.filter((entry) => entry['event'] === 'worker_capacity_queue_drained')).toHaveLength(5);
+    expect(new Set(acceptedRuns)).toEqual(new Set(receipts.map((receipt) => receipt.runId)));
+  });
+
+  it('restores a confirmed-capacity queue after an API restart without changing run identity', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'runner-capacity-resume-'));
+    const journal = join(directory, 'admissions.jsonl');
+    onTestFinished(() => rmSync(directory, { recursive: true, force: true }));
+    const refusalWorker = {
+      name: 'azure-dynamic-ip-agent-run', baseUrl: 'https://worker.example',
+      async launch() { throw new PreflightError('WORKER_CAPACITY', 'worker at capacity'); },
+      async status(runId: string) { return { runId, status: 'unknown' as const }; },
+      async result() { throw new Error('no run was accepted'); },
+      async cancel(runId: string) { return { status: 'unknown_run' as const, runId }; },
+    } as unknown as ExternalWorker;
+    const firstStore = new StatelessStore({}, journal, true);
+    const firstLog: Record<string, unknown>[] = [];
+    const initialApi = new AgentApi({ workers: [refusalWorker], store: firstStore, logger: (entry) => firstLog.push(entry) });
+    const receipt = initialApi.submit(alpha, 'capacity-restart', body({ userTaskId: 'capacity-restart' }));
+    await waitForCondition(() => firstLog.some((entry) => entry['event'] === 'worker_capacity_queued'), 2_000, 'capacity queued before restart');
+    await initialApi.dispose();
+
+    const launchCalls: string[] = [];
+    const availableWorker = {
+      name: 'azure-dynamic-ip-agent-run', baseUrl: 'https://worker.example',
+      async launch(spec: { runId: string; operationId: string }) {
+        launchCalls.push(spec.runId);
+        return { runId: spec.runId, operationId: spec.operationId, status: 'accepted' as const,
+          statusUrl: 'https://worker.example/status', resultUrl: 'https://worker.example/result' };
+      },
+      async status(runId: string) { return { runId, status: 'running' as const }; },
+      async result() { throw new Error('result should not be polled during this test'); },
+      async cancel(runId: string) { return { status: 'unknown_run' as const, runId }; },
+    } as unknown as ExternalWorker;
+    const restoredStore = new StatelessStore({}, journal, true);
+    const restored = new AgentApi({ workers: [availableWorker], store: restoredStore });
+    onTestFinished(() => restored.dispose());
+    expect(restored.resumeDispatched()).toBe(1);
+    await waitForCondition(() => launchCalls.length === 1, 2_000, 'queued run resumed after restart');
+    await waitForCondition(() => restored.status(alpha, receipt.runId).state === 'running', 2_000, 'queued run accepted after restart');
+    expect(launchCalls).toEqual([receipt.runId]);
+    expect(restored.status(alpha, receipt.runId).state).toBe('running');
+  });
+
   it('без Idempotency-Key — MISSING_IDEMPOTENCY_KEY', async () => {
     const api = await makeApi();
     let thrown: ApiError | null = null;
