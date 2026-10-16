@@ -145,6 +145,9 @@ export function createVmWorkerServer(options: VmWorkerServerOptions): VmWorkerSe
           ...('cpuPercent' in admission && admission.cpuPercent !== undefined ? { cpuPercent: admission.cpuPercent } : {}),
           ...('memoryPercent' in admission && admission.memoryPercent !== undefined ? { memoryPercent: admission.memoryPercent } : {}),
           ...('sampledAt' in admission && admission.sampledAt !== undefined ? { sampledAt: admission.sampledAt } : {}),
+          ...('projectedCpuPercent' in admission && admission.projectedCpuPercent !== undefined ? { projectedCpuPercent: admission.projectedCpuPercent } : {}),
+          ...('projectedMemoryPercent' in admission && admission.projectedMemoryPercent !== undefined ? { projectedMemoryPercent: admission.projectedMemoryPercent } : {}),
+          ...('activeReservations' in admission && admission.activeReservations !== undefined ? { activeReservations: admission.activeReservations } : {}),
         });
         return;
       }

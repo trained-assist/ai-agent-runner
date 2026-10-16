@@ -66,6 +66,9 @@ export interface CapacityRefusal {
   cpuPercent?: number;
   memoryPercent?: number;
   sampledAt?: string;
+  projectedCpuPercent?: number;
+  projectedMemoryPercent?: number;
+  activeReservations?: number;
 }
 
 export type AdmissionResult<T> = AcceptedReservation<T> | CapacityRefusal | UncertainReservation;
@@ -141,6 +144,9 @@ export class CapacityAdmission {
             ...(Number.isFinite(sample.cpuPercent) ? { cpuPercent: sample.cpuPercent } : {}),
             ...(Number.isFinite(sample.memoryPercent) ? { memoryPercent: sample.memoryPercent } : {}),
             ...(Number.isFinite(Date.parse(sample.sampledAt)) ? { sampledAt: sample.sampledAt } : {}),
+            projectedCpuPercent: sample.cpuPercent,
+            projectedMemoryPercent: sample.memoryPercent,
+            activeReservations: tx.list().filter((item) => item.active).length,
           } };
         }
         const active = [...this.activeReservations(tx)];
@@ -150,6 +156,8 @@ export class CapacityAdmission {
           return { kind: 'refused', result: {
             accepted: false, httpStatus: 503, code: 'WORKER_CAPACITY',
             cpuPercent: sample.cpuPercent, memoryPercent: sample.memoryPercent, sampledAt: sample.sampledAt,
+            projectedCpuPercent: projectedCpu, projectedMemoryPercent: projectedMemory,
+            activeReservations: active.length,
           } };
         }
         // Commit a durable pending tombstone before any start-side effect. A crash or
