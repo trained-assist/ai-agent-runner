@@ -96,7 +96,11 @@ describe('installable VM HTTP worker', () => {
         return { sha256: 'test-sha256', size: Buffer.byteLength(bytes), generation: '1' };
       },
       get: async (key) => uploads.get(key) ?? Buffer.alloc(0),
-      head: async (key) => ({ size: uploads.get(key)?.length ?? 0, generation: '1' }),
+      head: async (key) => {
+        const bytes = uploads.get(key);
+        if (!bytes) throw new StorageError('BLOB_NOT_FOUND', `missing test blob ${key}`);
+        return { size: bytes.length, generation: '1' };
+      },
       shareUrl: async (key) => ({ url: `https://storage.googleapis.com/agent-logs/${key}?signature=fresh`, expiresAt: new Date(Date.now() + 600_000).toISOString() }),
     };
     const fixture = await startFixture({ blobStore });
@@ -118,6 +122,10 @@ describe('installable VM HTTP worker', () => {
     const fresh = await fetch(`${fixture.base}/v1/runs/${RUN_ID}/log-url`, { headers: authHeaders() });
     expect(fresh.status).toBe(200);
     expect(await fresh.json()).toMatchObject({ runId: RUN_ID, logUrl: result.logUrl, retrievable: true });
+
+    uploads.delete(logKey);
+    const missing = await fetch(`${fixture.base}/v1/runs/${RUN_ID}/log-url`, { headers: authHeaders() });
+    expect(await missing.json()).toMatchObject({ runId: RUN_ID, retrievable: false, failureCode: 'BLOB_NOT_FOUND' });
   });
 
   it('refuses a saturated host before Runner.start with the exact capacity code', async () => {
