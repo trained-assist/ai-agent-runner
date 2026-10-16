@@ -89,8 +89,9 @@ describe('installable VM HTTP worker', () => {
 
   it('uploads the completed Runner event journal to GCS and mints a fresh signed URL on demand', async () => {
     const uploads = new Map<string, Buffer>();
-    const blobStore: BlobStore = {
+    const blobStore: BlobStore & { bucketName: string } = {
       backend: 'gcs',
+      bucketName: 'agent-logs',
       put: async (key, bytes) => {
         uploads.set(key, Buffer.from(bytes));
         return { sha256: 'test-sha256', size: Buffer.byteLength(bytes), generation: '1' };
@@ -101,7 +102,7 @@ describe('installable VM HTTP worker', () => {
         if (!bytes) throw new StorageError('BLOB_NOT_FOUND', `missing test blob ${key}`);
         return { size: bytes.length, generation: '1' };
       },
-      shareUrl: async (key) => ({ url: `https://storage.googleapis.com/agent-logs/${key}?signature=fresh`, expiresAt: new Date(Date.now() + 600_000).toISOString() }),
+      shareUrl: async () => { throw new StorageError('BLOB_BACKEND_UNSUPPORTED', 'signing is not configured'); },
     };
     const fixture = await startFixture({ blobStore });
     cleanups.push(fixture.close);
@@ -112,19 +113,21 @@ describe('installable VM HTTP worker', () => {
     const resultResponse = await fetch(`${fixture.base}/v1/runs/${RUN_ID}/result`, { headers: authHeaders() });
     const result = await resultResponse.json() as { logUrl: string };
     expect(resultResponse.status).toBe(200);
-    expect(result.logUrl).toBe(`https://storage.googleapis.com/agent-logs/runs/${RUN_ID}/events.jsonl?signature=fresh`);
+    expect(result.logUrl).toBe(`gs://agent-logs/runs/${RUN_ID}/events.jsonl`);
     const logKey = `runs/${RUN_ID}/events.jsonl`;
     const saved = uploads.get(logKey);
     expect(saved).toBeDefined();
     const events = saved!.toString('utf8').trim().split('\n').map((line) => JSON.parse(line) as { type: string });
     expect(events.map((event) => event.type)).toEqual(['log', 'log', 'assistant_message']);
 
-    const fresh = await fetch(`${fixture.base}/v1/runs/${RUN_ID}/log-url`, { headers: authHeaders() });
-    expect(fresh.status).toBe(200);
-    expect(await fresh.json()).toMatchObject({ runId: RUN_ID, logUrl: result.logUrl, retrievable: true });
+    const content = await fetch(`${fixture.base}/v1/runs/${RUN_ID}/log`, { headers: authHeaders() });
+    expect(content.status).toBe(200);
+    expect(content.headers.get('content-type')).toContain('application/x-ndjson');
+    expect(content.headers.get('x-content-sha256')).toMatch(/^[0-9a-f]{64}$/);
+    expect(await content.text()).toContain('"type":"assistant_message"');
 
     uploads.delete(logKey);
-    const missing = await fetch(`${fixture.base}/v1/runs/${RUN_ID}/log-url`, { headers: authHeaders() });
+    const missing = await fetch(`${fixture.base}/v1/runs/${RUN_ID}/log`, { headers: authHeaders() });
     expect(await missing.json()).toMatchObject({ runId: RUN_ID, retrievable: false, failureCode: 'BLOB_NOT_FOUND' });
   });
 

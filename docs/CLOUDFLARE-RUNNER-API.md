@@ -279,10 +279,10 @@ When mapping a France result, it preserves the worker's explicit `exitObserved` 
 from exit code/signal; older worker results remain compatible through the legacy inference.
 Durable Objects are sharded by principal, profile, and task hash.
 
-`GET /v1/runs/{runId}/log` asks the France VM to mint a fresh, short-lived Google Storage URL
-for the durable event journal and returns `302 Location`. It returns `{ retrievable: false, ... }`
-when the object or signer is unavailable. Use this endpoint instead of retaining the `logUrl`
-embedded in `/artifacts` or `/events`, since that URL expires.
+`GET /v1/runs/{runId}/log` streams the durable JSONL event journal from Google Storage through
+the authenticated France VM. It returns `{ retrievable: false, failureCode, ... }` when the
+object cannot be read. Use this endpoint instead of retaining the expiring `logUrl` embedded
+in `/artifacts` or `/events`; streaming does not depend on GCS signed-URL IAM permissions.
 
 ### Live lifecycle and OpenCode output stream
 

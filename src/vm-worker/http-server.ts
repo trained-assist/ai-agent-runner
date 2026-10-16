@@ -158,19 +158,29 @@ export function createVmWorkerServer(options: VmWorkerServerOptions): VmWorkerSe
       return;
     }
 
-    const runPath = /^\/v1\/runs\/([^/]+)(?:\/(status|result|cancel|logs|artifacts|history|log-url))?$/.exec(url.pathname);
+    const runPath = /^\/v1\/runs\/([^/]+)(?:\/(status|result|cancel|logs|artifacts|history|log))?$/.exec(url.pathname);
     if (!runPath) { sendJson(res, 404, { error: 'NOT_FOUND' }); return; }
     let runId: string;
     try { runId = decodeURIComponent(runPath[1]!); } catch { sendJson(res, 400, { error: 'INVALID_REQUEST' }); return; }
     if (!isSafeId(runId)) { sendJson(res, 400, { error: 'INVALID_REQUEST' }); return; }
     const endpoint = runPath[2] ?? 'status';
-    if (endpoint === 'log-url' && method === 'GET') {
-      const fresh = await freshSessionLogUrl(options, runId);
-      if (!fresh.logUrl) {
-        sendJson(res, 200, { runId, logUrl: null, retrievable: false, failureCode: fresh.failureCode, note: 'no durable session log is available in Google Storage' });
+    if (endpoint === 'log' && method === 'GET') {
+      const store = blobStoreOf(options);
+      if (!store?.get || !store.head) {
+        sendJson(res, 200, { runId, retrievable: false, failureCode: 'BLOB_STORE_UNAVAILABLE' });
         return;
       }
-      sendJson(res, 200, { runId, logUrl: fresh.logUrl, retrievable: true });
+      const key = `runs/${encodeURIComponent(runId)}/events.jsonl`;
+      try {
+        await store.head(key);
+        const bytes = await store.get(key);
+        res.writeHead(200, { 'content-type': 'application/x-ndjson; charset=utf-8', 'content-length': String(bytes.length),
+          'cache-control': 'private, no-store', 'x-content-sha256': createHash('sha256').update(bytes).digest('hex'),
+          'x-content-type-options': 'nosniff' });
+        res.end(bytes);
+      } catch (error) {
+        sendJson(res, 200, { runId, retrievable: false, failureCode: storageFailureCode(error) });
+      }
       return;
     }
     const snapshot = options.runner.getRun(runId);
@@ -520,14 +530,18 @@ async function durableSessionLogUrl(options: VmWorkerServerOptions, snapshot: No
     const key = `runs/${encodeURIComponent(snapshot.runId)}/events.jsonl`;
     await store.put(key, bytes);
     if (typeof store.shareUrl === 'function') {
-      const shared = await store.shareUrl(key, { expiresAt: new Date(Date.now() + 10 * 60 * 1000) });
-      const candidate = Array.isArray(shared) ? shared[0] : (shared && typeof shared === 'object' ? (shared as { url?: unknown }).url : shared);
-      if (typeof candidate === 'string' && /^https?:\/\//.test(candidate)) return candidate;
+      try {
+        const shared = await store.shareUrl(key, { expiresAt: new Date(Date.now() + 10 * 60 * 1000) });
+        const candidate = Array.isArray(shared) ? shared[0] : (shared && typeof shared === 'object' ? (shared as { url?: unknown }).url : shared);
+        if (typeof candidate === 'string' && /^https:\/\//.test(candidate)) return candidate;
+      } catch (error) {
+        process.stderr.write(`${JSON.stringify({ event: 'session_log_signed_url_unavailable', runId: snapshot.runId, failureCode: storageFailureCode(error) })}\n`);
+      }
     }
     const bucketName = typeof (store as unknown as { bucketName?: unknown }).bucketName === 'string'
       ? (store as unknown as { bucketName: string }).bucketName
       : (typeof (store as unknown as { name?: unknown }).name === 'string' ? (store as unknown as { name: string }).name : null);
-    if (bucketName) return `https://storage.googleapis.com/${bucketName}/${key}`;
+    if (bucketName) return `gs://${bucketName}/${key}`;
   } catch (error) {
     process.stderr.write(`${JSON.stringify({ event: 'session_log_upload_failed', runId: snapshot.runId, failureCode: storageFailureCode(error) })}\n`);
     // Keep the run truthful: if durable persistence fails, the caller receives the
@@ -538,21 +552,6 @@ async function durableSessionLogUrl(options: VmWorkerServerOptions, snapshot: No
 
 function blobStoreOf(options: VmWorkerServerOptions): BlobStore | null {
   return options.blobStore ?? options.storage ?? options.blob ?? null;
-}
-
-async function freshSessionLogUrl(options: VmWorkerServerOptions, runId: string): Promise<{ logUrl: string | null; failureCode?: string }> {
-  const store = blobStoreOf(options);
-  if (!store?.head || !store.shareUrl) return { logUrl: null, failureCode: 'BLOB_STORE_UNAVAILABLE' };
-  const key = `runs/${encodeURIComponent(runId)}/events.jsonl`;
-  try {
-    await store.head(key);
-    const shared = await store.shareUrl(key, { expiresAt: new Date(Date.now() + 10 * 60 * 1000) });
-    return shared?.url && /^https:\/\//.test(shared.url)
-      ? { logUrl: shared.url }
-      : { logUrl: null, failureCode: 'SIGNED_URL_INVALID' };
-  } catch (error) {
-    return { logUrl: null, failureCode: storageFailureCode(error) };
-  }
 }
 
 function storageFailureCode(error: unknown): string {
