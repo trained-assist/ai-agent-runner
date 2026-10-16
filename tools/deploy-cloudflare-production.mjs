@@ -24,7 +24,7 @@ export function productionRunnerPrincipalRecord(apiKey) {
     profileId: PROFILE_ID,
     repository: PROFILE_REPOSITORY,
     scopes: ['runs:read', 'runs:write'],
-    engines: ['eu-vm-agent-run'],
+    engines: ['eu-vm-agent-run', 'azure-cloud'],
   };
 }
 
@@ -32,7 +32,11 @@ export function hasExpectedProductionCapabilities(body) {
   return body?.contract?.name === API_CONTRACT_NAME
     && body?.placement === 'cloudflare-worker'
     && Array.isArray(body?.executionRegions)
-    && body.executionRegions.includes('eu-vm-agent-run');
+    && body.executionRegions.includes('eu-vm-agent-run')
+    && Array.isArray(body?.fallbackExecutionRegions)
+    && body.fallbackExecutionRegions.includes('azure-cloud')
+    && body?.routes?.gha?.available === true
+    && body?.routes?.gha?.engine === 'azure-cloud';
 }
 
 function required(name, minimumLength = 1) {
@@ -128,6 +132,7 @@ async function main() {
   const encryptionKey = required('RUN_LAUNCH_ENCRYPTION_KEY', 32);
   const franceToken = required('EU_VM_WORKER_TOKEN', 24);
   const ladderToken = required('LLM_LADDER_TOKEN', 1);
+  const ghaWorkerToken = required('GHA_WORKER_TOKEN_PRODUCTION_AGENT_API', 24);
   const franceUrl = await verifyFranceWorker(required('EU_VM_WORKER_URL'), franceToken);
   const sourceSha = process.env.SOURCE_SHA?.trim() ?? '';
   if (!/^[a-f0-9]{40}$/.test(sourceSha)) throw new Error('production_runner_source_sha_invalid');
@@ -155,13 +160,14 @@ async function main() {
     ['RUN_LAUNCH_ENCRYPTION_KEY', encryptionKey],
     ['VM_WORKER_URL', franceUrl],
     ['VM_WORKER_TOKEN', franceToken],
+    ['GHA_WORKER_TOKEN', ghaWorkerToken],
     ['LLM_LADDER_TOKEN', ladderToken],
   ]);
 
   await verifyDeployment(sourceSha, apiKey, delegationSecret);
   console.log(JSON.stringify({ ok: true, worker: WORKER, sourceSha,
     principalId: PRINCIPAL_ID, profileId: PROFILE_ID, executionWorker: 'eu-vm-agent-run',
-    franceWorkerReadiness: 'ready', authenticatedCapabilities: 'passed', delegatedProfile: 'passed',
+    franceWorkerReadiness: 'ready', ghaRouteReadiness: 'passed', authenticatedCapabilities: 'passed', delegatedProfile: 'passed',
     taskCreated: false }));
 }
 

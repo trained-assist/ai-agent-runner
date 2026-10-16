@@ -54,6 +54,7 @@ jobs:
           RUN_LAUNCH_ENCRYPTION_KEY: ${{ secrets.RUN_LAUNCH_ENCRYPTION_KEY }}
           EU_VM_WORKER_URL: ${{ secrets.EU_VM_WORKER_URL }}
           EU_VM_WORKER_TOKEN: ${{ secrets.EU_VM_WORKER_TOKEN }}
+          GHA_WORKER_TOKEN_PRODUCTION_AGENT_API: ${{ secrets.GHA_WORKER_TOKEN_PRODUCTION_AGENT_API }}
           LLM_LADDER_TOKEN: ${{ secrets.LLM_LADDER_TOKEN }}
         run: |
           set -euo pipefail
@@ -106,5 +107,6 @@ jobs:
           RUN_LAUNCH_ENCRYPTION_KEY: ${{ secrets.RUN_LAUNCH_ENCRYPTION_KEY }}
           EU_VM_WORKER_URL: ${{ secrets.EU_VM_WORKER_URL }}
           EU_VM_WORKER_TOKEN: ${{ secrets.EU_VM_WORKER_TOKEN }}
+          GHA_WORKER_TOKEN_PRODUCTION_AGENT_API: ${{ secrets.GHA_WORKER_TOKEN_PRODUCTION_AGENT_API }}
           LLM_LADDER_TOKEN: ${{ secrets.LLM_LADDER_TOKEN }}
         run: node tools/deploy-cloudflare-production.mjs
