@@ -99,6 +99,8 @@ async function main(): Promise<void> {
     allowedRepositories,
     allowedEnvironmentNames,
     allowedCallbackOrigins,
+    blobStore: storage,
+    storage,
     envelope: { cpuPercent: positivePercent('VM_WORKER_CPU_RESERVATION_PCT'), memoryPercent: positivePercent('VM_WORKER_MEMORY_RESERVATION_PCT') },
     buildInfo: readVmWorkerBuildInfo(),
     bindingsInventory,
