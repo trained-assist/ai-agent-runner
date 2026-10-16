@@ -58,6 +58,8 @@ attention. Existing credentials must use a separately reviewed rotation procedur
 
 Do not provision production or deploy the production Runner configuration until the reviewed
 source is merged and the production deployment workflow's exact-SHA sandbox gate passes. After
-provisioning, confirm `/v1/capabilities` reports `executionRegions: ["eu-vm-agent-run"]` and
-`fallbackExecutionRegions: ["azure-cloud"]`. That indicates both routes are configured; a
-live controlled capacity-refusal canary is still required to prove fallback execution.
+provisioning, confirm `/v1/capabilities` reports France in `executionRegions`, `azure-cloud`
+in `fallbackExecutionRegions`, and `routes.gha.available: true`. The production principal
+explicitly allows both `eu-vm-agent-run` and `azure-cloud`. Strict requests using
+`routeMode: "gha"` dispatch only to Azure/GHA and fail closed if the route is unavailable;
+automatic capacity fallback remains a separate behavior and canary.

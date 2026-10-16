@@ -14,7 +14,7 @@ describe('production Runner provisioning contract', () => {
       profileId: 'trained-assist-production',
       repository: 'trained-assist/ai-agent-runner',
       scopes: ['runs:read', 'runs:write'],
-      engines: ['eu-vm-agent-run'],
+      engines: ['eu-vm-agent-run', 'azure-cloud'],
     });
     expect(JSON.stringify(record)).not.toContain(apiKey);
   });
@@ -24,14 +24,20 @@ describe('production Runner provisioning contract', () => {
     expect(() => productionRunnerPrincipalRecord('too-short')).toThrow('production_runner_api_key_invalid');
   });
 
-  it('requires the serverless API contract and France execution capability', () => {
+  it('requires the serverless API contract, France and strict GHA route capabilities', () => {
     expect(hasExpectedProductionCapabilities({
       contract: { name: 'ai-agent-runner/serverless-agent-api' },
       placement: 'cloudflare-worker', executionRegions: ['eu-vm-agent-run'],
+      fallbackExecutionRegions: ['azure-cloud'], routes: { gha: { available: true, engine: 'azure-cloud' } },
     })).toBe(true);
     expect(hasExpectedProductionCapabilities({
       contract: { name: 'ai-agent-runner/serverless-agent-api' },
       placement: 'cloudflare-worker', executionRegions: ['mock-test'],
+    })).toBe(false);
+    expect(hasExpectedProductionCapabilities({
+      contract: { name: 'ai-agent-runner/serverless-agent-api' },
+      placement: 'cloudflare-worker', executionRegions: ['eu-vm-agent-run'],
+      fallbackExecutionRegions: ['azure-cloud'], routes: { gha: { available: false, engine: null } },
     })).toBe(false);
     expect(hasExpectedProductionCapabilities({
       contract: { name: 'other' }, placement: 'cloudflare-worker', executionRegions: ['eu-vm-agent-run'],
