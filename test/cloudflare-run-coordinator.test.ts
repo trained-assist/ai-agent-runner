@@ -379,6 +379,25 @@ describe('Cloudflare Runner run coordinator', () => {
     expect(storage.values.get('runner-v1')).toMatchObject({ runs: { [receipt.runId]: { state: 'starting', capacityRetryAt: undefined, capacityRetryAttempts: 0 } } });
   });
 
+  it('rejects strict GHA before admission when the GHA credential is absent, without contacting France', async () => {
+    const { coordinator, env, storage } = setup();
+    env.GHA_WORKER_URL = 'https://gha.example';
+    const hosts: string[] = [];
+    env.FETCH = async (input) => {
+      const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+      hosts.push(url.host);
+      return Response.json({ accepted: false, code: 'WORKER_CAPACITY' }, { status: 503 });
+    };
+    const submitted = await coordinator.fetch(call('/v1/runs', {
+      ...body, routeMode: 'gha', engine: { name: 'azure-cloud', adapterVersion: '1' },
+    }, { 'idempotency-key': 'strict-gha-without-secret' }));
+    expect(submitted.status).toBe(503);
+    expect(await submitted.json()).toMatchObject({ error: { code: 'ROUTE_UNAVAILABLE' } });
+    expect(hosts).toEqual([]);
+    const persisted = storage.values.get('runner-v1') as { runs?: Record<string, unknown> } | undefined;
+    expect(Object.values(persisted?.runs ?? {})).toEqual([]);
+  });
+
   it('accepts five concurrent submissions and drains them after capacity returns', async () => {
     const { coordinator, env, storage } = setup();
     let full = true;
