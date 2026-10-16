@@ -454,12 +454,13 @@ async function readBody(req: IncomingMessage): Promise<string> {
 
 export function adapterFor(
   worker: MockWorker,
-  options: { token?: string; env?: Record<string, string>; deadlineMs?: number; acceptDeadlineMs?: number; engineName?: string; noResultBase?: boolean } = {},
+  options: { token?: string; env?: Record<string, string>; deadlineMs?: number; acceptDeadlineMs?: number; engineName?: string; workerId?: string; noResultBase?: boolean } = {},
 ): ExternalWorkerAdapter {
   return new ExternalWorkerAdapter({
     baseUrl: worker.baseUrl,
     ...(options.token ? { token: options.token } : {}),
     ...(options.engineName ? { engineName: options.engineName } : {}),
+    ...(options.workerId ? { workerId: options.workerId } : {}),
     ...(options.env ? { env: options.env } : {}),
     deadlineMs: options.deadlineMs ?? 5000,
     // Бюджет приёма рана — свой у каждого движка (issue #100); без него он равен deadlineMs.

@@ -217,6 +217,7 @@ describe('конфигурация воркеров', () => {
     expect(config.workers).toEqual([
       {
         engine: 'azure-dynamic-ip-agent-run',
+        workerId: 'azure-dynamic-ip-agent-run',
         baseUrl: 'https://worker.example',
         token: 'secret',
         launchDeadlineMs: 600000,
@@ -262,6 +263,59 @@ describe('конфигурация воркеров', () => {
         ]),
       }),
     ).toThrowError(/declared twice/);
+  });
+
+  it('endpoint pool: движок повторяется с distinct workerId — разрешено и сохраняет workerId', () => {
+    const config = loadAgentApiConfig({
+      ...base,
+      AGENT_API_WORKERS: JSON.stringify([
+        { engine: 'eu-vm-agent-run', workerId: 'eu-a', baseUrl: 'https://a.example', token: 'a' },
+        { engine: 'eu-vm-agent-run', workerId: 'eu-b', baseUrl: 'https://b.example', token: 'b' },
+        { engine: 'azure-dynamic-ip-agent-run', baseUrl: 'https://g.example', token: 'g' },
+      ]),
+      AGENT_API_ENGINE_CHAIN: 'eu-vm-agent-run,azure-dynamic-ip-agent-run',
+    });
+    expect(config.workers.map((w) => ({ engine: w.engine, workerId: w.workerId }))).toEqual([
+      { engine: 'eu-vm-agent-run', workerId: 'eu-a' },
+      { engine: 'eu-vm-agent-run', workerId: 'eu-b' },
+      { engine: 'azure-dynamic-ip-agent-run', workerId: 'azure-dynamic-ip-agent-run' },
+    ]);
+    expect(config.engineChain).toEqual(['eu-vm-agent-run', 'azure-dynamic-ip-agent-run']);
+  });
+
+  it('endpoint pool: повторный engine без workerId — отказ declared twice', () => {
+    expect(() =>
+      loadAgentApiConfig({
+        ...base,
+        AGENT_API_WORKERS: JSON.stringify([
+          { engine: 'eu-vm-agent-run', baseUrl: 'https://a.example' },
+          { engine: 'eu-vm-agent-run', baseUrl: 'https://b.example' },
+        ]),
+      }),
+    ).toThrowError(/declared twice/);
+  });
+
+  it('endpoint pool: повторный workerId — отказ', () => {
+    expect(() =>
+      loadAgentApiConfig({
+        ...base,
+        AGENT_API_WORKERS: JSON.stringify([
+          { engine: 'eu-vm-agent-run', workerId: 'eu-a', baseUrl: 'https://a.example' },
+          { engine: 'eu-vm-agent-run', workerId: 'eu-a', baseUrl: 'https://b.example' },
+        ]),
+      }),
+    ).toThrowError(/declared twice/);
+  });
+
+  it('endpoint pool: несовместимая engine/region — отказ', () => {
+    expect(() =>
+      loadAgentApiConfig({
+        ...base,
+        AGENT_API_WORKERS: JSON.stringify([
+          { engine: 'eu-vm-agent-run', region: 'ru', baseUrl: 'https://eu.example' },
+        ]),
+      }),
+    ).toThrowError(/assigned to region "eu"/);
   });
 
   it('не http(s) URL воркера — отказ до старта', () => {

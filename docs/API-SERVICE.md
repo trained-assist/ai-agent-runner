@@ -57,7 +57,7 @@ API больше не используется** и удаляется отде�
 
 | Переменная | Смысл |
 |---|---|
-| `AGENT_API_WORKERS` | JSON-список `[{engine, baseUrl, token}]`; `submit` выбирает воркер по `request.engine.name`, неизвестное имя → `ENGINE_NOT_ALLOWED`. Переопределяет `EXTERNAL_WORKER_*` |
+| `AGENT_API_WORKERS` | JSON-список `[{engine, workerId?, region?, baseUrl, token, acceptDeadlineMs?}]`. Несколько endpoint'ов одного логического `engine` различаются по стабильному `workerId` (порядок entry = порядок предложений при refused; capacity overflow идёт endpoint→sibling→GHA). Неизвестное engine name → `ENGINE_NOT_ALLOWED`. Переопределяет `EXTERNAL_WORKER_*` |
 
 Принимаются также имена из ТЗ воркера — `DYNAMIC_IP_AZURE_URL` / `DYNAMIC_IP_AZURE_TOKEN`,
 но `EXTERNAL_WORKER_*` приоритетнее.

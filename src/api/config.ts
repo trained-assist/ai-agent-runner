@@ -22,6 +22,13 @@ export const DEFAULT_API_HOST = '0.0.0.0';
 export interface WorkerConfig {
   /** Имя движка, которым этот воркер отвечает: `azure-dynamic-ip-agent-run`, `eu-vm-agent-run`, … */
   engine: string;
+  /**
+   * Стабильный идентификатор endpoint'а (issue #136): позволяет двум VM принадлежать одному
+   * логическому движку `eu-vm-agent-run` без новых имён движков. По умолчанию равен `engine`.
+   */
+  workerId: string;
+  /** Регион для валидации engine/region (eu/ru/gha). */
+  region?: string;
   baseUrl: string;
   token: string;
   launchDeadlineMs: number;
@@ -117,6 +124,7 @@ function parseWorkers(
     return [
       {
         engine: env['EXTERNAL_WORKER_ENGINE']?.trim() || EXTERNAL_WORKER_ENGINE,
+        workerId: env['EXTERNAL_WORKER_ENGINE']?.trim() || EXTERNAL_WORKER_ENGINE,
         baseUrl,
         token: env['EXTERNAL_WORKER_TOKEN']?.trim() || env['DYNAMIC_IP_AZURE_TOKEN']?.trim() || '',
         launchDeadlineMs,
@@ -134,7 +142,7 @@ function parseWorkers(
   if (!Array.isArray(parsed) || (parsed.length === 0 && !allowEmpty)) {
     throw new Error(`AGENT_API_WORKERS: expected a ${allowEmpty ? 'JSON' : 'non-empty JSON'} array of {engine, baseUrl, token}`);
   }
-  const seen = new Set<string>();
+  const seenWorkerIds = new Set<string>();
   return parsed.map((entry, index) => {
     if (typeof entry !== 'object' || entry === null) throw new Error(`AGENT_API_WORKERS[${index}]: expected an object`);
     const record = entry as Record<string, unknown>;
@@ -143,11 +151,39 @@ function parseWorkers(
     const token = typeof record['token'] === 'string' ? record['token'].trim() : '';
     if (!engine) throw new Error(`AGENT_API_WORKERS[${index}].engine: required`);
     if (!/^https?:\/\//.test(baseUrl)) throw new Error(`AGENT_API_WORKERS[${index}].baseUrl: expected an http(s) URL`);
-    if (seen.has(engine)) throw new Error(`AGENT_API_WORKERS: engine "${engine}" is declared twice`);
-    seen.add(engine);
+    const workerId = (typeof record['workerId'] === 'string' && record['workerId'].trim())
+      ? record['workerId'].trim()
+      : engine;
+    if (workerId.length === 0 || workerId.length > 100 || !/^[A-Za-z0-9._:-]+$/.test(workerId)) {
+      throw new Error(`AGENT_API_WORKERS[${index}].workerId: expected a non-empty safe id (1-100 chars)`);
+    }
+    if (seenWorkerIds.has(workerId)) {
+      throw new Error(`AGENT_API_WORKERS: worker id "${workerId}" is declared twice${workerId === engine ? ` (engine "${engine}": endpoints sharing one engine need distinct workerId values)` : ''}`);
+    }
+    seenWorkerIds.add(workerId);
+    let region: string | undefined;
+    if (record['region'] !== undefined && record['region'] !== null) {
+      if (typeof record['region'] !== 'string' || !/^(eu|ru|gha|global)$/.test(record['region'].trim())) {
+        throw new Error(`AGENT_API_WORKERS[${index}].region: expected one of eu, ru, gha, global`);
+      }
+      region = record['region'].trim();
+    }
+    const KNOWN_ENGINE_REGIONS: Record<string, string> = {
+      'eu-vm-agent-run': 'eu',
+      'rf-vm-agent-run': 'ru',
+      'azure-cloud': 'gha',
+      'dynamic-ip-azure-agent-run': 'gha',
+      'azure-dynamic-ip-agent-run': 'gha',
+    };
+    const knownRegion = KNOWN_ENGINE_REGIONS[engine];
+    if (region && knownRegion && region !== knownRegion) {
+      throw new Error(`AGENT_API_WORKERS[${index}]: engine "${engine}" is assigned to region "${knownRegion}", not "${region}"`);
+    }
     // Бюджет приёма свой у каждого движка (issue #100): не задан — общий из env.
     return {
       engine,
+      workerId,
+      ...(region ? { region } : {}),
       baseUrl,
       token,
       launchDeadlineMs,
@@ -354,6 +390,7 @@ export function loadAgentApiConfig(env: Record<string, string | undefined> = pro
 export function createExternalWorkers(config: AgentApiProcessConfig, log?: (entry: Record<string, unknown>) => void, resolveBinding?: RemoteMcpBindingResolver): ExternalWorkerAdapter[] {
   return config.workers.map(worker => new ExternalWorkerAdapter({
     engineName: worker.engine,
+    workerId: worker.workerId,
     baseUrl: worker.baseUrl,
     env: config.env,
     ...(config.publicUrl ? { baseUrlForResult: config.publicUrl } : {}),

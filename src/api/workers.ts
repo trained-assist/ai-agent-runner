@@ -14,6 +14,9 @@ export function createExternalWorkers(config: AgentApiProcessConfig, log: (entry
     (worker) =>
       new ExternalWorkerAdapter({
         engineName: worker.engine,
+        // endpoint identity follows the logical engine by default; multi-endpoint
+        // entries of one engine keep identity through WorkerConfig.workerId (#136).
+        workerId: worker.workerId,
         baseUrl: worker.baseUrl,
         ...(worker.token ? { token: worker.token } : {}),
         // Пул значений окружения рана. Без него `LaunchRequest.env` пуст, и воркер не

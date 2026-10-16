@@ -248,6 +248,8 @@ export interface ExternalWorker {
   dispose?(): Promise<void>;
   readonly remoteMcpEnabled?: boolean;
   readonly name: string;
+  /** Stable endpoint identity (engine name by default) — distinguishes VMs of one logical engine. */
+  readonly workerId?: string;
   readonly baseUrl: string | null;
   /** Квитанция запуска, а не финальный результат (асинхронный контракт, #73). */
   launch(spec: RunSpec, admittedAt?: string): Promise<LaunchReceipt>;
@@ -294,6 +296,8 @@ export interface ExternalWorkerOptions {
    * объявляют свои имена: движок — это адрес исполнителя, а не его внутренняя деталь.
    */
   engineName?: string;
+  /** Stable endpoint identity; defaults to engineName when absent. */
+  workerId?: string;
   token?: string;
   /**
    * Хостовый пул значений окружения. В `LaunchRequest.env` уходит только пересечение с
@@ -1074,6 +1078,7 @@ export class ExternalWorkerAdapter implements ExternalWorker {
   readonly remoteMcpEnabled: boolean;
   private readonly remoteMcp: RemoteMcpHostOptions | undefined;
   readonly name: string;
+  readonly workerId: string;
   readonly baseUrl: string | null;
   private readonly token: string | undefined;
   private readonly env: Record<string, string>;
@@ -1092,6 +1097,7 @@ export class ExternalWorkerAdapter implements ExternalWorker {
     } : undefined;
     this.remoteMcpEnabled = Object.keys(this.remoteMcp?.servers ?? {}).length > 0;
     this.name = options.engineName ?? EXTERNAL_WORKER_ENGINE;
+    this.workerId = options.workerId ?? this.name;
     this.baseUrl = options.baseUrl;
     this.token = options.token;
     this.env = options.env ?? {};
