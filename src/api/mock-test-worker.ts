@@ -12,6 +12,7 @@ export const MOCK_TEST_ANSWER = 'pong';
  */
 export class MockTestWorker implements ExternalWorker {
   readonly name = MOCK_TEST_ENGINE;
+  readonly workerId = MOCK_TEST_ENGINE;
   readonly baseUrl = null;
   private readonly results = new Map<string, LaunchResult>();
 

@@ -121,16 +121,25 @@ replacement a unique `VM_WORKER_ID`; keep the regional engine (`eu-vm-agent-run`
 France or `rf-vm-agent-run` for Russia). Verify `systemctl`, `/healthz`, `/version`,
 `/readyz`, and a small canary run before pointing the central API at the replacement.
 
-The router currently accepts only one `AGENT_API_WORKERS` entry per engine and rejects
-duplicate engine names. Therefore a second VM in the same region cannot yet be attached
-as a concurrent replica to add capacity. For a replacement, update that one engine's
-`baseUrl` and token in central `AGENT_API_WORKERS`; keep
-`AGENT_API_ENGINE_CHAIN=eu-vm-agent-run,rf-vm-agent-run,azure-dynamic-ip-agent-run`.
-The scheduled GitHub drift check also has one URL/token pair per region, so update the
-matching `EU_VM_WORKER_*` or `RU_VM_WORKER_*` repository secrets to the replacement.
-Adding multiple same-region VMs requires a router change that models endpoints under a
-single regional engine and selects among their health/capacity; do not assign a fake
-engine name to bypass the duplicate check.
+Starting with the endpoint-pool router (`trained-assist/ai-agent-runner#399`), the registry
+accepts several `AGENT_API_WORKERS` entries for the same logical engine, as long as each
+endpoint has a distinct `workerId` (stable identity for the VM/endpoint, e.g.
+`eu-vm2-sandbox` / `eu-vm3-sandbox`). The runner then proposes endpoints in declaration
+order and, on a definitive pre-acceptance refusal of one (unavailable, timeout, capacity
+refusal on the last endpoint of the engine), advances to the next endpoint of the same
+engine and only afterwards to the next engine in `AGENT_API_ENGINE_CHAIN`
+(e.g. `eu-vm-agent-run,rf-vm-agent-run,azure-dynamic-ip-agent-run`).
+
+For a replacement, update that endpoint's `baseUrl` and token for its existing
+`workerId`; do not reuse a secret across two hosts. A run accepted by an endpoint is
+pinned to it for status/result/cancel/reconcile, including after an API restart.
+The scheduled GitHub drift check probes one URL/token pair per region, so a second
+endpoint needs its own secret pair and an explicit drift entry (extension pending in
+https://github.com/trained-assist/ai-agent-runner/issues/401).
+
+Do not assign a fake unique engine name to a VM to bypass the previous single-endpoint
+limit: same region is still the same logical engine (`eu-vm-agent-run`). RU remains
+outside the EU agent pool.
 
 Prerequisites: Node.js 20+, systemd, GitHub CLI (`gh`), curl, an authenticated
 read-only GitHub token for release/attestation reads, an installed OpenCode binary,

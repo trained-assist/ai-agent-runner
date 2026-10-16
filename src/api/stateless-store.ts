@@ -28,9 +28,9 @@ export const STATELESS_STORE_SCHEMA_VERSION = 2 as const;
 export type JournalLine =
   | { kind: 'admission'; record: AdmissionRecord }
   | { kind: 'prepared'; runId: string; repository: { fullName: string; revision?: string }; profileWorkspace?: RunSpec['profileWorkspace'] }
-  | { kind: 'launch_intent'; runId: string; engine: string; at: string }
+  | { kind: 'launch_intent'; runId: string; engine: string; at: string; workerId?: string }
   | { kind: 'launch_refused'; runId: string; at: string; code: string }
-  | { kind: 'dispatched'; runId: string; engine: string; at: string }
+  | { kind: 'dispatched'; runId: string; engine: string; at: string; workerId?: string }
   | { kind: 'worker_log_cursor'; runId: string; sourceSequence: number; apiSequence: number }
   | { kind: 'completed'; runId: string; patch: CompletedRunPatch };
 
@@ -80,6 +80,8 @@ export interface RunProgress {
    * квитанции — тот, который ран принял. Клиент видит его в `RunStatusView.engine`.
    */
   engine: string;
+  /** Закреплённый endpoint (workerId) для cancel/polling после приёмки. */
+  workerId: string | null;
   publication: { status: string; committedRevision: string | null; conflictId: string | null; publicationId: string | null; reason: string | null } | null;
 }
 
@@ -151,7 +153,7 @@ export class StatelessStore {
   private readonly persistPath: string | null;
   private readonly strictPersistence: boolean;
   /** Раны, отправленные воркеру: нужны, чтобы поллеры пережили рестарт API. */
-  private readonly dispatched = new Map<string, { runId: string; engine: string; at: string }>();
+  private readonly dispatched = new Map<string, { runId: string; engine: string; at: string; workerId?: string }>();
   private readonly workerLogCursors = new Map<string, { sourceSequence: number; apiSequence: number }>();
 
   constructor(limits: Partial<StatelessStoreLimits> = {}, persistPath: string | null = null, strictPersistence = false) {
@@ -185,16 +187,17 @@ export class StatelessStore {
   }
 
   /** Ран принят воркером: помечаем, чтобы поллер пережил рестарт API. */
-  appendDispatched(runId: string, engine: string, at: string): void {
-    this.write({ kind: 'dispatched', runId, engine, at });
-    this.dispatched.set(runId, { runId, engine, at });
+  /** Ран принят воркером: помечаем, чтобы поллер пережил рестарт API. workerId — закреплённый endpoint. */
+  appendDispatched(runId: string, engine: string, at: string, workerId?: string): void {
+    this.write({ kind: 'dispatched', runId, engine, at, workerId });
+    this.dispatched.set(runId, { runId, engine, at, workerId });
     const run = this.progress.get(runId);
-    if (run) { run.state = 'running'; run.updatedAt = at; }
+    if (run) { run.workerId = workerId ?? run.workerId; run.state = 'running'; run.updatedAt = at; }
   }
 
-  appendLaunchIntent(runId: string, engine: string, at: string): void {
-    this.write({ kind: 'launch_intent', runId, engine, at });
-    this.dispatched.set(runId, { runId, engine, at });
+  appendLaunchIntent(runId: string, engine: string, at: string, workerId?: string): void {
+    this.write({ kind: 'launch_intent', runId, engine, at, workerId });
+    this.dispatched.set(runId, { runId, engine, at, workerId });
   }
 
   /** A typed no-admission response is proof that this attempt is safe to retry later. */
@@ -221,8 +224,13 @@ export class StatelessStore {
   }
 
   /** Раны, отправленные воркеру. */
-  dispatchedRuns(): Array<{ runId: string; engine: string; at: string }> {
+  dispatchedRuns(): Array<{ runId: string; engine: string; at: string; workerId?: string }> {
     return [...this.dispatched.values()];
+  }
+
+  /** Закреплённый endpoint (workerId) для run, если знаем. */
+  dispatchedWorkerId(runId: string): string | undefined {
+    return this.dispatched.get(runId)?.workerId;
   }
 
   private write(line: JournalLine): void {
@@ -268,7 +276,7 @@ export class StatelessStore {
         }
         if (entry.kind === 'dispatched' || entry.kind === 'launch_intent') {
           if (typeof entry.runId === 'string' && entry.runId.length > 0) {
-            this.dispatched.set(entry.runId, { runId: entry.runId, engine: String(entry.engine ?? ''), at: String(entry.at ?? '') });
+            this.dispatched.set(entry.runId, { runId: entry.runId, engine: String(entry.engine ?? ''), at: String(entry.at ?? ''), ...(typeof entry.workerId === 'string' ? { workerId: entry.workerId } : {}) });
           }
           continue;
         }
@@ -370,9 +378,13 @@ export class StatelessStore {
     return [...this.byAdmission.values()];
   }
 
-  open(runId: string, startedAt: string, engine?: string): RunProgress {
+  open(runId: string, startedAt: string, engine?: string, workerId?: string | null): RunProgress {
     const existing = this.progress.get(runId);
-    if (existing) return existing;
+    if (existing) {
+      if (workerId !== undefined) existing.workerId = workerId;
+      if (engine && !existing.engine) existing.engine = engine;
+      return existing;
+    }
     const created: RunProgress = {
       state: 'queued',
       sequence: this.workerLogCursors.get(runId)?.apiSequence ?? 0,
@@ -392,6 +404,7 @@ export class StatelessStore {
       // Движок попытки: до приёма рана это первый кандидат цепочки, дальше его двигает
       // `setEngine` по мере отказов (issue #100).
       engine: engine ?? '',
+      workerId: workerId ?? null,
       publication: null,
     };
     this.progress.set(runId, created);
@@ -411,6 +424,14 @@ export class StatelessStore {
     const run = this.progress.get(runId);
     if (!run || run.engine === engine) return;
     run.engine = engine;
+    run.updatedAt = new Date().toISOString();
+  }
+
+  /** Закрепить endpoint (workerId) для рана после приёмки (пул endpoint'ов, #136). */
+  setPinnedWorker(runId: string, workerId: string): void {
+    const run = this.progress.get(runId);
+    if (!run) return;
+    run.workerId = workerId;
     run.updatedAt = new Date().toISOString();
   }
 

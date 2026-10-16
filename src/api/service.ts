@@ -610,7 +610,8 @@ export class AgentApi {
     // Отмена уходит тому, кто реально держит ран: при цепочке движков это может быть не тот
     // движок, который назвал клиент (issue #100).
     const engine = run.engine || record.spec.engine.name;
-    const worker = this.workerFor(engine);
+    const pinnedWorkerId = run.workerId ?? this.store.dispatchedWorkerId(record.runId);
+    const worker = (pinnedWorkerId ? this.workers.find((candidate) => (candidate.workerId ?? candidate.name) === pinnedWorkerId && candidate.name === engine) : undefined) ?? this.workerFor(engine);
     if (!worker) {
       throw new ApiError('INTERNAL', `run ${runId} names engine "${engine}", which is not configured on this API`);
     }
@@ -792,7 +793,7 @@ export class AgentApi {
 
   health(): {
     status: 'ok';
-    workers: Array<{ engine: string; baseUrl: string | null }>;
+    workers: Array<{ engine: string; workerId: string; baseUrl: string | null }>;
     /** Приоритетная цепочка движков в порядке проб; пустая — цепочка не объявлена. */
     engineChain: string[];
     runs: number;
@@ -802,7 +803,7 @@ export class AgentApi {
     const counts = this.store.counts();
     return {
       status: 'ok',
-      workers: this.workers.map((worker) => ({ engine: worker.name, baseUrl: worker.baseUrl })),
+      workers: this.workers.map((worker) => ({ engine: worker.name, workerId: worker.workerId ?? worker.name, baseUrl: worker.baseUrl })),
       engineChain: [...this.chain],
       ...counts,
     };
@@ -847,9 +848,17 @@ export class AgentApi {
       if (progress && isTerminalApiState(progress.state)) continue;
       // Движок берём из отметки о приёме, а не из заявки: ран мог быть принят вторым
       // движком цепочки, и поллер обязан спрашивать именно его (issue #100).
-      const worker = this.workerFor(entry.engine);
+      const exact = entry.workerId
+        ? this.workers.find((candidate) => (candidate.workerId ?? candidate.name) === entry.workerId && candidate.name === entry.engine)
+        : undefined;
+      if (entry.workerId && !exact) this.log({ event: 'poll_resume_endpoint_missing', runId: record.runId, workerId: entry.workerId, engine: entry.engine });
+      // Fallback: a pinned endpoint can disappear from a later config during its life;
+      // try the first configured endpoint of the same logical engine rather than silently
+      // dropping the accepted run and leaving it unpolled forever.
+      const worker = exact ?? this.workerFor(entry.engine);
       if (!worker) continue;
-      const restored = this.store.open(record.runId, record.createdAt, entry.engine);
+      this.store.setPinnedWorker(record.runId, this.workerIdOf(worker));
+      const restored = this.store.open(record.runId, record.createdAt, entry.engine, entry.workerId);
       // Восстановление журнала приёма после рестарта (issue #117): store.open() создаёт
       // RunProgress с пустыми events/sequence=0, иначе events() после рестарта оказывается
       // пустым. Дописываем те же admissionEvents, что и execute() — claimed и
@@ -907,8 +916,8 @@ export class AgentApi {
   }
 
   private async execute(record: AdmissionRecord): Promise<void> {
-    const candidates = this.chainOf(record);
-    const run = this.store.open(record.runId, record.createdAt, candidates[0] ?? record.spec.engine.name);
+    const chain = this.chainOf(record);
+    const run = this.store.open(record.runId, record.createdAt, chain[0] ?? record.spec.engine.name);
     const startedAt = this.nowIso();
     run.state = 'running';
     run.updatedAt = startedAt;
@@ -916,13 +925,13 @@ export class AgentApi {
     this.store.append(record.runId, admissionEvents(record.spec, startedAt));
     this.inFlight.add(record.runId);
     try {
-      if (this.opts.profileWorkspace && candidates.length === 0) {
+      if (this.opts.profileWorkspace && chain.length === 0) {
         this.finalize(record, workerTransportFailure(record.spec, new PreflightError(
           'PROFILE_SAVEBACK_UNSUPPORTED', 'no configured worker can accept profile snapshot saveback', { retryable: false },
         ), { startedAt, finishedAt: this.nowIso() }));
         return;
       }
-      if (this.opts.profileWorkspace && candidates[0] !== MOCK_TEST_ENGINE) {
+      if (this.opts.profileWorkspace && chain[0] !== MOCK_TEST_ENGINE) {
         try {
           const prepared = await this.opts.profileWorkspace.prepare(this.principalFor(record), record.runId);
           record.spec.repository = { fullName: prepared.repository, revision: prepared.baseRevision };
@@ -950,6 +959,7 @@ export class AgentApi {
         event: accepted.receipt ? 'worker_accepted' : 'worker_reconciled',
         runId: record.runId,
         engine: accepted.engine,
+        workerId: this.workerIdOf(accepted.worker),
         worker: accepted.worker.baseUrl,
         ...(accepted.receipt
           ? { operationId: accepted.receipt.operationId, statusUrl: accepted.receipt.statusUrl }
@@ -958,7 +968,8 @@ export class AgentApi {
       // Ран принят воркером. Помечаем ДО старта поллера: если процесс упадёт между
       // здесь и терминальным состоянием, новый процесс должен поллер перезапустить —
       // иначе результат потерян, а повтор клиента с новым ключом завёл бы второй ран.
-      this.store.appendDispatched(record.runId, accepted.engine, this.nowIso());
+      this.store.appendDispatched(record.runId, accepted.engine, this.nowIso(), this.workerIdOf(accepted.worker));
+      this.store.setPinnedWorker(record.runId, this.workerIdOf(accepted.worker));
       this.startWorkerLogStream(record, accepted.worker);
       void this.pollUntilTerminal(record, accepted.worker, startedAt);
     } finally {
@@ -980,7 +991,17 @@ export class AgentApi {
    * текущий движок, знает ли он ран, — и переходит дальше только при отрицательном ответе.
    */
   private async acceptOnChain(record: AdmissionRecord, startedAt: string): Promise<ChainAcceptance | null> {
-    const candidates = this.chainOf(record);
+    const logicalCandidates = this.chainOf(record);
+    // Endpoint pool (#136): one logical engine may have several endpoints (VMs).
+    const candidates: { engine: string; worker: ExternalWorker | null }[] = [];
+    for (const engineName of logicalCandidates) {
+      const endpoints = this.endpointsFor(engineName);
+      if (endpoints.length === 0) {
+        candidates.push({ engine: engineName, worker: null });
+      } else {
+        for (const endpoint of endpoints) candidates.push({ engine: engineName, worker: endpoint });
+      }
+    }
     let capacityRetries = 0;
     let capacityQueuedAt: number | null = null;
     for (;;) {
@@ -988,8 +1009,8 @@ export class AgentApi {
       let lastWorker: ExternalWorker | null = null;
       let lastError: unknown = null;
       for (let index = 0; index < candidates.length; index += 1) {
-        const engine = candidates[index]!;
-        const worker = this.workerFor(engine);
+        const engine = candidates[index]!.engine;
+        const worker = candidates[index]!.worker;
         if (!worker) {
           attempts.push({ engine, code: 'WORKER_NOT_CONFIGURED', summary: 'no worker is configured for this engine' });
           continue;
@@ -998,7 +1019,7 @@ export class AgentApi {
         // Движок попытки виден клиенту сразу: цепочка двигается по ранe, а не молча меняет
         // исполнителя под ногами у того, кто опрашивает статус.
         this.store.setEngine(record.runId, engine);
-        this.store.appendLaunchIntent(record.runId, engine, this.nowIso());
+        this.store.appendLaunchIntent(record.runId, engine, this.nowIso(), worker ? this.workerIdOf(worker) : undefined);
         try {
           const receipt = await worker.launch(this.specForEngine(record, engine));
           if (capacityQueuedAt !== null) this.log({ event: 'worker_capacity_queue_drained', requestId: record.requestId,
@@ -1009,23 +1030,27 @@ export class AgentApi {
           lastError = err;
           if (err instanceof PreflightError && err.code === 'WORKER_CAPACITY') {
             attempts.push({ engine, code: err.code, summary: err.message });
-            // A measured 60% cutoff preserves 40% of each VM for host services. Send
-            // this new operation directly to GHA; do not consume the next regional VM.
-            const ghaIndex = isRegionalVmEngine(engine)
-              ? candidates.findIndex((candidate, candidateIndex) => candidateIndex > index && isGhaEngine(candidate))
-              : -1;
-            const nextIndex = isRegionalVmEngine(engine) ? (ghaIndex >= 0 ? ghaIndex : candidates.length) : index + 1;
-            for (let skipped = index + 1; skipped < nextIndex; skipped += 1) {
-              attempts.push({ engine: candidates[skipped]!, code: 'CAPACITY_CUTOVER', summary: 'skipped regional VM after capacity refusal' });
+            // Пул endpoint'ов (#136, #137): capacity-refusal на endpoint 1 → пробуем
+            // sibling-endpoint того же логического движка. Только после исчерпания пула
+            // движка (regional) пропускаем остальные региональные движки и уходим в GHA,
+            // сохраняя 40% запас на каждом хосте.
+            let nextIndex = index + 1;
+            const sameEngineSibling = candidates[index + 1]?.engine === engine;
+            if (!sameEngineSibling && isRegionalVmEngine(engine)) {
+              const ghaIndex = candidates.findIndex((candidate, candidateIndex) => candidateIndex > index && isGhaEngine(candidate.engine));
+              nextIndex = ghaIndex >= 0 ? ghaIndex : candidates.length;
+              for (let skipped = index + 1; skipped < nextIndex; skipped += 1) {
+                attempts.push({ engine: candidates[skipped]!.engine, code: 'CAPACITY_CUTOVER', summary: 'skipped regional VM after capacity refusal' });
+              }
             }
-            const next = candidates[nextIndex];
+            const next = candidates[nextIndex]?.engine;
             this.log({ event: 'engine_chain_advance', runId: record.runId, engine, code: err.code, next: next ?? null, attempts: attempts.length, operationId: record.spec.operationId });
             index = nextIndex - 1;
             continue;
           }
           if (err instanceof PreflightError && (err.code === 'WORKER_CAPACITY_UNKNOWN' || err.code === 'WORKER_ADMISSION_UNAVAILABLE')) {
             attempts.push({ engine, code: err.code, summary: err.message });
-            const next = candidates[index + 1];
+            const next = candidates[index + 1]?.engine;
             this.log({ event: 'engine_chain_advance', runId: record.runId, engine, code: err.code, next: next ?? null, attempts: attempts.length, operationId: record.spec.operationId });
             continue;
           }
@@ -1053,7 +1078,7 @@ export class AgentApi {
             return null;
           }
           attempts.push({ engine, code: launchFailureCode(err), summary: err instanceof Error ? err.message : String(err) });
-          const next = candidates[index + 1];
+          const next = candidates[index + 1]?.engine;
           this.log({
             event: 'engine_chain_advance',
             runId: record.runId,
@@ -1088,8 +1113,8 @@ export class AgentApi {
       }
       // Один кандидат — это не цепочка, а закреплённый клиентом движок: отказ остаётся его
       // собственным кодом, а не общим «цепочка исчерпана».
-      if (candidates.length === 1) {
-        this.log({ event: 'run_failed', runId: record.runId, engine: candidates[0], message: lastError instanceof Error ? lastError.message : String(lastError) });
+      if (logicalCandidates.length === 1) {
+        this.log({ event: 'run_failed', runId: record.runId, engine: logicalCandidates[0], message: lastError instanceof Error ? lastError.message : String(lastError) });
         this.finalize(record, workerTransportFailure(record.spec, lastError, { startedAt, finishedAt: this.nowIso() }, { workerBaseUrl: lastWorker?.baseUrl ?? null }));
         return null;
       }
@@ -1259,12 +1284,30 @@ export class AgentApi {
   }
 
   /** Воркер по имени движка. Имя движка — это адрес воркера, а не его внутренняя деталь. */
+  private endpointsFor(engineName: string): ExternalWorker[] {
+    // Порядок = порядок регистрации в AGENT_API_WORKERS (пул endpoint'ов).
+    return this.workers.filter((worker) => worker.name === engineName);
+  }
+
   private workerFor(engineName: string): ExternalWorker | undefined {
+    // Первый endpoint — совместимость со старым сценарием «один воркер = один движок».
     return this.workers.find((worker) => worker.name === engineName);
   }
 
+  private resolveEndpoint(engineName: string, workerId?: string | null): ExternalWorker | undefined {
+    if (workerId) {
+      const exact = this.workers.find((worker) => worker.name === engineName && (worker.workerId ?? worker.name) === workerId);
+      if (exact) return exact;
+    }
+    return this.workerFor(engineName);
+  }
+
+  private workerIdOf(worker: ExternalWorker): string {
+    return worker.workerId ?? worker.name;
+  }
+
   private engineNames(): string[] {
-    return [...this.workers.map((worker) => worker.name)].sort();
+    return [...new Set(this.workers.map((worker) => worker.name))].sort();
   }
 
   /** Единственное место, где ран становится терминальным. */
