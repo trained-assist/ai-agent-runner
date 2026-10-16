@@ -343,7 +343,9 @@ export class RunnerRunCoordinator {
       body = JSON.parse(text) as Record<string, any>;
     } catch { return error('INVALID_REQUEST', 'request body must be JSON', 400); }
     if (!body || typeof body !== 'object' || Array.isArray(body)) return error('INVALID_REQUEST', 'request body must be an object', 400);
-    const allowedFields = new Set(['userTaskId', 'conversationId', 'engine', 'routeMode', 'input', 'ingressManifest', 'envAllowlist', 'limits', 'deadline', 'regionConstraints', 'credentialBindings', 'mcp', 'budget', 'result', 'outputs', 'traceId', 'instructions', 'repository', 'isolation', 'webhookId']);
+    const allowedFields = new Set(['userTaskId', 'conversationId', 'engine', 'routeMode', 'input', 'ingressManifest', 'envAllowlist', 'limits', 'deadline', 'regionConstraints', 'credentialBindings', 'mcp', 'budget', 'result', 'outputs', 'publicationMode', 'traceId', 'instructions', 'repository', 'isolation', 'webhookId']);
+    if (body.publicationMode !== undefined && body.publicationMode !== 'git' && body.publicationMode !== 'none') return error('INVALID_REQUEST', 'publicationMode must be git or none', 400);
+    if (body.publicationMode === 'none' && ((Array.isArray(body.outputs) && body.outputs.length > 0) || body.profileWorkspace !== undefined)) return error('INVALID_REQUEST', 'publicationMode none cannot be combined with outputs or profileWorkspace', 400);
     const unknownFields = Object.keys(body).filter((name) => !allowedFields.has(name));
     if (unknownFields.length) return error('INVALID_REQUEST', 'request contains unsupported fields', 400, { errors: unknownFields.map((name) => `request.${name}: unknown field`) });
     if (!Array.isArray(body.envAllowlist) || !body.limits || !Number.isSafeInteger(body.limits.timeoutMs) || body.limits.timeoutMs <= 0 || body.limits.timeoutMs > 86_400_000) return error('INVALID_REQUEST', 'envAllowlist and a valid limits.timeoutMs are required', 400);
@@ -532,7 +534,7 @@ export class RunnerRunCoordinator {
           ...(ingressManifest ? { ingressManifest: { ...ingressManifest, userTaskId: taskId, profileId: principal.profileId, runId, ownerGeneration } } : {}),
           repository: { fullName: repository ?? '', branch: `agent-run/${runId}`, ...(body.repository?.revision ? { revision: body.repository.revision } : {}) },
           ...(repositoryToken ? { publicationToken: repositoryToken } : {}),
-          resultUrl, isolation: body.isolation ?? { mode: 'none' }, outputs: Array.isArray(body.outputs) ? body.outputs : [],
+          resultUrl, isolation: body.isolation ?? { mode: 'none' }, outputs: Array.isArray(body.outputs) ? body.outputs : [], ...(body.publicationMode ? { publicationMode: body.publicationMode } : {}),
           ...(mcp.length ? userMcp
             ? await this.userCatalogAttachment({ runId, taskId, profileId: principal.profileId, ownerGeneration, timeoutMs: clampInteger(limits.timeoutMs, 300_000, 1_000, 86_400_000) })
             : await this.testRegistryAttachment(mcp[0], { runId, taskId, profileId: principal.profileId, timeoutMs: clampInteger(limits.timeoutMs, 300_000, 1_000, 86_400_000) }) : {}) };
@@ -880,7 +882,7 @@ export class RunnerRunCoordinator {
                 outputRefs: run.artifacts.map((artifact) => String(run.developerGuest ? artifact['downloadUrl'] : artifact['url'])),
                 ...(run.developerApi ? { artifacts: run.artifacts } : {}),
                 ...(run.developerGuest ? { artifactExpiresAt: run.artifactExpiresAt } : {}),
-                persistence: run.artifacts.length ? 'persisted' : 'not_required', persistenceReason: run.artifacts.length ? run.developerGuest ? 'artifacts were exported by the execution worker' : `artifacts are committed to ${String(repo?.['fullName'] ?? 'the repository')}` : 'the worker reported no artifacts', cleanup: 'completed', cleanupReason: 'execution workspace is owned by the selected worker', logPath: run.logUrl ?? `worker-run:${run.runId}` };
+                persistence: run.artifacts.length ? 'persisted' : 'not_required', publicationOutcome: launchResult.publicationOutcome ?? (launchResult.failure?.code === 'ARTIFACTS_PUSH_FAILED' ? 'failed' : run.artifacts.length ? 'published' : 'not_requested'), persistenceReason: run.artifacts.length ? run.developerGuest ? 'artifacts were exported by the execution worker' : `artifacts are committed to ${String(repo?.['fullName'] ?? 'the repository')}` : 'the worker reported no artifacts', cleanup: 'completed', cleanupReason: 'execution workspace is owned by the selected worker', logPath: run.logUrl ?? `worker-run:${run.runId}` };
               transition(run, outcome, { exitReason: launchResult.exitReason });
             }
           }

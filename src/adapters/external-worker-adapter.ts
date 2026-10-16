@@ -167,7 +167,8 @@ export interface LaunchRequest {
    */
   resultUrl: string;
   isolation: { mode: string };
-  outputs?: Array<{ path: string; name?: string; mime?: string }>;
+  outputs?: Array<{ path: string; name?: string; mime?: string }> ;
+  publicationMode?: 'git' | 'none';
 }
 
 /**
@@ -234,6 +235,7 @@ export interface LaunchResult {
   profileChanges?: { files: Array<{ path: string; sha256: string; size: number }>; deletes: string[] };
   sessionCheckpoint?: SessionCheckpointRef;
   failure?: LaunchFailure;
+  publicationOutcome?: 'published' | 'not_requested' | 'failed';
 }
 
 export interface WorkerCancelResult {
@@ -334,6 +336,7 @@ const LAUNCH_RESULT_KEYS = [
   'profileChanges',
   'sessionCheckpoint',
   'failure',
+  'publicationOutcome',
 ] as const;
 
 const LAUNCH_FAILURE_KEYS = ['code', 'failureClass', 'safeSummary', 'retryable'] as const;
@@ -501,6 +504,7 @@ export function launchRequestFromSpec(
     isolation: { mode: spec.isolation?.mode ?? 'none' },
     ...options.remoteMcpAttachment,
     ...(outputs.length > 0 ? { outputs } : {}),
+    ...(spec.publicationMode ? { publicationMode: spec.publicationMode } : {}),
   };
 }
 
@@ -545,7 +549,7 @@ export function validateLaunchResult(input: unknown, expectedRunId: string): Val
   // настоящий opencode-шлюз его не присылает вовсе. Отсутствие этих полей — не повод
   // выбросить результат целого рана: живая проба #100 показала, что реальный ответ
   // отвергался как WORKER_PROTOCOL_INVALID, и рана с артефактами у клиента не было.
-  const OPTIONAL_RESULT_KEYS = ['failure', 'pid', 'answer', 'profileChanges', 'exitObserved', 'engineStart', 'sessionCheckpoint'] as const;
+  const OPTIONAL_RESULT_KEYS = ['failure', 'pid', 'answer', 'profileChanges', 'exitObserved', 'engineStart', 'sessionCheckpoint', 'publicationOutcome'] as const;
   checkKeys(
     input,
     LAUNCH_RESULT_KEYS,
@@ -668,6 +672,7 @@ export function validateLaunchResult(input: unknown, expectedRunId: string): Val
     }
   }
 
+  if (input['publicationOutcome'] !== undefined && !(['published', 'not_requested', 'failed'] as const).includes(input['publicationOutcome'] as 'published' | 'not_requested' | 'failed')) collector.push('launch.publicationOutcome: expected published | not_requested | failed');
   const failure = input['failure'];
   if (failure !== undefined) {
     if (!checkObject(failure, 'launch.failure', collector)) {
@@ -797,6 +802,9 @@ export function mapLaunchResult(
     outputRefs,
     ...(launch.sessionCheckpoint ? { sessionCheckpoint: launch.sessionCheckpoint } : {}),
     persistence,
+    publicationOutcome: launch.publicationOutcome ?? (launch.failure?.code === 'ARTIFACTS_PUSH_FAILED'
+      ? 'failed'
+      : launch.repo?.commit && !/^0{40}$/.test(launch.repo.commit) ? 'published' : 'not_requested'),
     persistenceReason:
       persistence === 'persisted'
         ? `artifacts are committed to ${repo?.fullName ?? 'the user repository'} at ${repo?.commit ?? 'unknown'}; the API keeps no bytes`

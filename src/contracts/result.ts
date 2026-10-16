@@ -64,6 +64,7 @@ export interface RunResult {
    * `not_required` — выходы не объявлялись, `failed` — ни один выход не сохранён.
    */
   persistence: 'pending' | 'persisted' | 'failed' | 'not_required';
+  publicationOutcome?: 'published' | 'not_requested' | 'failed';
   /** Причина статуса сохранения (какой выход остался единственной копией и почему). */
   persistenceReason?: string;
   /** Commit published by a profile-workspace worker; never contains credentials. */
@@ -115,6 +116,7 @@ const RESULT_KEYS = [
   'outputRefs',
   'sessionCheckpoint',
   'persistence',
+  'publicationOutcome',
   'persistenceReason',
   'repositoryCommit',
   'profileChanges',
@@ -132,7 +134,7 @@ const OUTCOME_EXIT_REASONS: Record<RunOutcome, readonly ExitReason[]> = {
 export function validateRunResult(input: unknown): ValidationResult<RunResult> {
   const collector = new ErrorCollector();
   if (!checkObject(input, 'result', collector)) return collector.finish(undefined as never);
-  const optional = new Set(['failure', 'persistenceReason', 'repositoryCommit', 'profileChanges', 'cleanupReason', 'text', 'sessionCheckpoint', 'engineStart']);
+  const optional = new Set(['failure', 'persistenceReason', 'repositoryCommit', 'profileChanges', 'cleanupReason', 'text', 'sessionCheckpoint', 'engineStart', 'publicationOutcome']);
   const required = RESULT_KEYS.filter((key) => !optional.has(key));
   checkKeys(input, RESULT_KEYS, required, 'result', collector);
 
@@ -245,6 +247,7 @@ export function validateRunResult(input: unknown): ValidationResult<RunResult> {
   }
   // согласованность: сохранение обязано объясняться, иначе «почему не persisted» не прочитать
   if (input['persistenceReason'] !== undefined) checkString(input['persistenceReason'], 'result.persistenceReason', collector, 500);
+  if (input['publicationOutcome'] !== undefined && !(['published', 'not_requested', 'failed'] as const).includes(input['publicationOutcome'] as 'published' | 'not_requested' | 'failed')) collector.push('result.publicationOutcome: expected published | not_requested | failed');
   if (input['cleanupReason'] !== undefined) checkString(input['cleanupReason'], 'result.cleanupReason', collector, 500);
   if (input['persistence'] === 'failed' && typeof input['cleanupReason'] !== 'string') {
     collector.push('result.cleanupReason: a failed persistence must carry the cleanup reason');
