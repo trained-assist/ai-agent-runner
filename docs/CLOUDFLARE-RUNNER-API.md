@@ -272,12 +272,17 @@ reports terminal success on `azure-cloud`/`gha`, contains the pinned fixture mar
 IDs, and has no `ARTIFACTS_PUSH_FAILED` contradiction. Cleanup requires an identity-matched
 terminal status and result first. A green GHA job alone is not execution proof.
 
-The Worker handles authenticated submit, status, result, events, artifact metadata, and cancel.
+The Worker handles authenticated submit, status, result, events, artifact metadata, log download, and cancel.
 It encrypts launch data at rest, deduplicates idempotency keys, increments `ownerGeneration`
 for later attempts, and reconciles lost launch responses using the same France worker run ID.
 When mapping a France result, it preserves the worker's explicit `exitObserved` fact separately
 from exit code/signal; older worker results remain compatible through the legacy inference.
 Durable Objects are sharded by principal, profile, and task hash.
+
+`GET /v1/runs/{runId}/log` asks the France VM to mint a fresh, short-lived Google Storage URL
+for the durable event journal and returns `302 Location`. It returns `{ retrievable: false, ... }`
+when the object or signer is unavailable. Use this endpoint instead of retaining the `logUrl`
+embedded in `/artifacts` or `/events`, since that URL expires.
 
 ### Live lifecycle and OpenCode output stream
 

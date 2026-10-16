@@ -117,6 +117,24 @@ try {
   if (status.engine !== expectedEngine || status.routeMode !== routeMode) {
     throw new Error(`sandbox3 route mismatch: requested ${routeMode}/${expectedEngine}, observed ${status.routeMode}/${status.engine}`);
   }
+  const logResponse = await fetch(new URL(`/v1/runs/${encodeURIComponent(submitted.runId)}/log`, apiUrl), {
+    headers: { authorization: `Bearer ${apiKey}`, accept: 'application/json' },
+    redirect: 'manual', signal: AbortSignal.timeout(20_000),
+  });
+  if (logResponse.status !== 302) {
+    const body = await logResponse.text();
+    throw new Error(`sandbox3 log endpoint did not redirect (${logResponse.status}): ${body.slice(0, 500)}`);
+  }
+  const logUrl = logResponse.headers.get('location');
+  if (!logUrl || new URL(logUrl).hostname !== 'storage.googleapis.com' || new URL(logUrl).protocol !== 'https:') {
+    throw new Error('sandbox3 log endpoint returned no HTTPS Google Storage URL');
+  }
+  const downloadedLog = await fetch(logUrl, { signal: AbortSignal.timeout(20_000) });
+  if (!downloadedLog.ok) throw new Error(`sandbox3 Google Storage log download failed (${downloadedLog.status})`);
+  const logText = await downloadedLog.text();
+  const logEvents = logText.split('\n').filter(Boolean).map((line) => JSON.parse(line));
+  if (logEvents.length === 0) throw new Error('sandbox3 Google Storage session log is empty');
+  console.log(`session log retrieved from Google Storage; ${logEvents.length} JSONL events verified`);
   console.log(`sandbox3 API end-to-end canary succeeded; route=${routeMode}/${expectedEngine}; package version ${expectedPackageVersion} confirmed`);
 } finally {
   // Keep active or unknown runs for diagnosis. Remove state once terminal proof exists.

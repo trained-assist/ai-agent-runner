@@ -274,6 +274,24 @@ export class RunnerRunCoordinator {
         return json({ runId, conversationId: run.conversationId, userTaskId: run.userTaskId, repo: run.developerGuest ? null : run.repo, branchUrl: null, mergeUrl: null, count: run.artifacts.length, artifacts: run.artifacts, logUrl: run.logUrl,
           ...(run.developerGuest ? { expiresAt: run.artifactExpiresAt ?? null } : {}),
           note: run.artifacts.length ? run.developerGuest ? 'guest downloads expire 24 hours after result collection' : 'artifacts are committed by the VM worker to the run branch' : 'the VM worker reported no artifacts' });
+      case 'log': {
+        if (request.method !== 'GET') return error('METHOD_NOT_ALLOWED', 'log supports GET only', 405);
+        let refreshed: string | null = null;
+        try {
+          const response = await this.worker(run.engine, `/v1/runs/${encodeURIComponent(runId)}/log-url`);
+          if (response.ok) {
+            const value = await response.json() as { logUrl?: unknown };
+            if (typeof value.logUrl === 'string') refreshed = value.logUrl;
+          }
+        } catch {
+          // Report an unavailable log below; never turn a temporary signer failure
+          // into a redirect to an expired URL saved with the original result.
+        }
+        const target = retrievableLogUrl(refreshed);
+        if (!target) return json({ runId, logUrl: run.logUrl, retrievable: false,
+          note: run.logUrl ? 'the worker could not issue a fresh Google Storage download URL' : 'the worker has not published a retrievable session log' });
+        return new Response(null, { status: 302, headers: { location: target, 'cache-control': 'private, no-store' } });
+      }
       case 'webhook':
         if (request.method !== 'GET') return error('METHOD_NOT_ALLOWED', 'webhook supports GET only', 405);
         if (!run.webhook) return error('WEBHOOK_NOT_CONFIGURED', 'run has no webhook', 404);
@@ -1258,6 +1276,16 @@ function runtimeEnv(env: RunnerWorkerEnv, names: string[]): Record<string, strin
     if (typeof value === 'string') result[name] = value;
   }
   return result;
+}
+
+function retrievableLogUrl(value: string | null): string | null {
+  if (!value) return null;
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:' && url.hostname === 'storage.googleapis.com' ? url.href : null;
+  } catch {
+    return null;
+  }
 }
 
 function validModelConnection(value: unknown): value is ModelConnection {
