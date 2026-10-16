@@ -258,6 +258,26 @@ When mapping a France result, it preserves the worker's explicit `exitObserved` 
 from exit code/signal; older worker results remain compatible through the legacy inference.
 Durable Objects are sharded by principal, profile, and task hash.
 
+### Live lifecycle and OpenCode output stream
+
+`GET /v1/runs/{runId}/events` keeps its JSON page contract and also accepts
+`Accept: text/event-stream`. An SSE request without a cursor starts with a `snapshot` event;
+reconnect with `Last-Event-ID` (or `?cursor=`) to replay later events. Event IDs are the
+per-run sequence. Delivery can repeat an event, so clients deduplicate by ID. When a cursor
+falls outside the retained journal, the API emits `reset` with the current status snapshot and
+its new sequence instead of claiming complete replay. JSON pages return `hasMore` and
+`resetRequired` accurately. Capabilities declare JSON/SSE, the 128-event replay window and
+15-second idle heartbeat.
+
+The stream reports durable queue/dispatch/state transitions, OpenCode startup phases, changed
+worker progress timestamps, redacted stdout/stderr chunks, finalizing, and terminal result.
+Heartbeat and real output remain separate signals; no percentage is inferred. The Coordinator
+polls worker status/log cursors every second while at least one SSE subscriber is connected,
+otherwise every five seconds. It stores bounded per-run output events before waking listeners;
+slow consumers have a one-frame stream buffer and can reconnect from their last sequence.
+Closing a stream only removes that listener and never cancels the run. The existing JSON
+polling path and Node API SSE behavior are unchanged.
+
 ### Cancel when the submit receipt is missing
 
 `POST /v1/runs/cancel-by-idempotency-key` accepts `{ userTaskId, idempotencyKey, ownerGeneration }`
@@ -277,7 +297,7 @@ proof after allocating `runId`, bounds it by `MCP_TEST_EXPIRES_AT`, and keeps th
 inside the encrypted launch and `mcpSecrets`. Other MCP descriptors fail closed.
 
 Profile workspace provisioning/saveback, generic input refs, binary artifact download,
-GCS log publication, SSE, the complete `/v1/capabilities` document, and multi-engine fallback
+GCS log publication, the complete `/v1/capabilities` document, and multi-engine fallback
 remain unsupported. Task-scoped `ingressManifest` pins are accepted only in the exact
 `cp-input-manifest:<userTaskId>` form with a lowercase SHA-256 version, then enriched with the
 admitted profile/run/generation and forwarded to the France VM launch request. The VM must have

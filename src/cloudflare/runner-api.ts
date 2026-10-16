@@ -166,7 +166,9 @@ export default {
     if (url.pathname === '/v1/capabilities' && request.method === 'GET') {
       if (!requireScope(principal, 'runs:read')) return error('FORBIDDEN', 'API key does not have the required scope', 403);
       const ghaConfigured = fallbackExecutionRegions(env).includes('azure-cloud');
-      return json({ schemaVersion: 1, contract: { name: 'ai-agent-runner/serverless-agent-api', version: 1 }, placement: 'cloudflare-worker', executionRegions: [DEFAULT_ENGINE], fallbackExecutionRegions: ghaConfigured ? ['azure-cloud'] : [], routes: { auto: { primary: DEFAULT_ENGINE, fallback: ghaConfigured ? 'azure-cloud' : null }, france: { available: true, fallback: false }, gha: { available: ghaConfigured, engine: ghaConfigured ? 'azure-cloud' : null } } });
+      return json({ schemaVersion: 1, contract: { name: 'ai-agent-runner/serverless-agent-api', version: 1 }, placement: 'cloudflare-worker',
+        events: { transports: ['json', 'sse'], replayable: true, cursor: 'sequence', retainedPerRun: 128, heartbeatSeconds: 15 },
+        executionRegions: [DEFAULT_ENGINE], fallbackExecutionRegions: ghaConfigured ? ['azure-cloud'] : [], routes: { auto: { primary: DEFAULT_ENGINE, fallback: ghaConfigured ? 'azure-cloud' : null }, france: { available: true, fallback: false }, gha: { available: ghaConfigured, engine: ghaConfigured ? 'azure-cloud' : null } } });
     }
     if (url.pathname === '/v1/sandbox/cleanup-task') {
       if (request.method !== 'POST') return error('METHOD_NOT_ALLOWED', 'method not allowed', 405);

@@ -207,6 +207,51 @@ describe('Cloudflare Runner run coordinator', () => {
     expect(await result.json()).toMatchObject({ outcome: 'succeeded', text: 'done' });
   });
 
+  it('streams replayable lifecycle and OpenCode output events over SSE', async () => {
+    const { coordinator } = setup();
+    const accepted = await coordinator.fetch(call('/v1/runs', body, { 'idempotency-key': 'sse-run' }));
+    const { runId } = await accepted.json() as { runId: string };
+    const response = await coordinator.fetch(call(`/v1/runs/${runId}/events?cursor=0`, undefined, { accept: 'text/event-stream' }));
+    expect(response.status).toBe(200);
+    expect(response.headers.get('content-type')).toContain('text/event-stream');
+    const reader = response.body!.getReader();
+    const decoder = new TextDecoder();
+    const first = await reader.read();
+    expect(decoder.decode(first.value)).toContain('event: run_queued');
+
+    const startingRead = reader.read();
+    await coordinator.alarm();
+    expect(decoder.decode((await startingRead).value)).toContain('event: run_state_changed');
+
+    let outputFrame = '';
+    for (let attempt = 0; attempt < 8 && !outputFrame.includes('event: opencode_output'); attempt += 1) {
+      const outputRead = reader.read();
+      const poll = coordinator.alarm();
+      outputFrame += decoder.decode((await outputRead).value);
+      await poll;
+    }
+    expect(outputFrame).toContain('event: opencode_output');
+    expect(outputFrame).toContain('step 1: inspect');
+    await reader.cancel();
+  });
+
+  it('reports JSON event pagination honestly and flags a cursor older than retained events', async () => {
+    const { coordinator, storage } = setup();
+    const accepted = await coordinator.fetch(call('/v1/runs', body, { 'idempotency-key': 'event-page' }));
+    const { runId } = await accepted.json() as { runId: string };
+    const stored = storage.values.get('runner-v1') as { runs: Record<string, { sequence: number; events: Array<Record<string, unknown>>; eventsDroppedThrough?: number }> };
+    const run = stored.runs[runId]!;
+    run.sequence = 3;
+    run.events = [1, 2, 3].map((sequence) => ({ eventId: `event-${sequence}`, sequence, type: `event_${sequence}` }));
+    run.eventsDroppedThrough = 1;
+    storage.values.set('runner-v1', stored);
+
+    const firstPage = await coordinator.fetch(call(`/v1/runs/${runId}/events?cursor=1&limit=1`));
+    expect(await firstPage.json()).toMatchObject({ cursor: 2, hasMore: true, resetRequired: false });
+    const stalePage = await coordinator.fetch(call(`/v1/runs/${runId}/events?cursor=0&limit=1`));
+    expect(await stalePage.json()).toMatchObject({ cursor: 3, hasMore: false, resetRequired: true, events: [] });
+  });
+
   it('cuts over from France to GHA only on confirmed pre-admission capacity refusal and pins the run there', async () => {
     const { coordinator, env, storage } = setup();
     env.GHA_WORKER_URL = 'https://gha.example';
