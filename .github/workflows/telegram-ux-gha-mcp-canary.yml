@@ -1,0 +1,52 @@
+name: Telegram UX sandbox GHA MCP canary
+
+on:
+  workflow_dispatch:
+    inputs:
+      prior_canary_task_id:
+        description: Optional exact prior canary task ID to clean after terminal status and result verification
+        required: false
+        type: string
+        default: ''
+      prior_canary_run_id:
+        description: Exact run ID belonging to the prior canary task
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: telegram-ux-sandbox-gha-mcp-canary
+  cancel-in-progress: false
+
+jobs:
+  canary:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: sandbox
+    env:
+      RUNNER_API_KEY_AGENT_API: ${{ secrets.RUNNER_API_KEY_AGENT_API }}
+      GITHUB_TOKEN: ${{ github.token }}
+      PRIOR_CANARY_TASK_ID: ${{ inputs.prior_canary_task_id }}
+      PRIOR_CANARY_RUN_ID: ${{ inputs.prior_canary_run_id }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Run the pinned sandbox API GHA MCP canary
+        run: node scripts/telegram-ux-gha-mcp-canary.mjs
+      - name: Upload sanitized canary evidence
+        if: always() && hashFiles('gha-mcp-canary-evidence.json') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: telegram-ux-gha-mcp-canary-${{ github.run_id }}
+          path: gha-mcp-canary-evidence.json
+          if-no-files-found: error
+          retention-days: 30
