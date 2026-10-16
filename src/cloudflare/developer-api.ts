@@ -43,7 +43,8 @@ export function developerCapabilities(env: RunnerWorkerEnv, principal: ApiPrinci
   return Response.json({ contractVersion: 1, execution: 'eu-vm-agent-run', isolation: 'none',
     limits: { maxTimeoutSeconds: 3600, maxPromptCharacters: 100_000 },
     managedAvailable: managed, managedModel: env.RUNNER_DEVELOPER_MANAGED_MODEL ?? null, byokConnections, webhooks,
-    features: { status: true, result: true, events: true, artifacts: true, cancel: true,
+    eventStream: { transports: ['json', 'sse'], replayable: true, cursor: 'sequence', retainedPerRun: 128, heartbeatSeconds: 15 },
+    features: { status: true, result: true, events: true, liveEvents: true, artifacts: true, cancel: true,
       webhooks: env.RUNNER_WEBHOOKS_ENABLED === 'true', billing: false, selfServiceConnections: false } },
   { headers: { 'cache-control': 'no-store' } });
 }
@@ -143,7 +144,11 @@ export async function developerRequest(request: Request, env: RunnerWorkerEnv, p
   if (url.search && action !== 'events' && action !== 'artifacts') return failure('INVALID_REQUEST', 'query parameters are not supported for this action', 400);
   const object = env.RUNNER_RUNS.get(env.RUNNER_RUNS.idFromName(`task-${runId.split('_')[1]}`));
   const headers = new Headers({ 'x-runner-principal': JSON.stringify(principal) });
+  for (const name of ['accept', 'last-event-id', 'x-request-id']) {
+    const value = request.headers.get(name);
+    if (value) headers.set(name, value);
+  }
   if (write) headers.set('content-type', 'application/json');
   const internalUrl = `https://runner-runs.internal/v1/runs/${runId}/${action}${url.search}`;
-  return object.fetch(new Request(internalUrl, { method: request.method, headers, ...(write ? { body: '{}' } : {}) }));
+  return object.fetch(new Request(internalUrl, { method: request.method, headers, signal: request.signal, ...(write ? { body: '{}' } : {}) }));
 }

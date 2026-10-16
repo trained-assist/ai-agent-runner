@@ -267,6 +267,18 @@ describe('opt-in developer API', () => {
     expect(calls[2]!.url).toBe(`https://runner-runs.internal/v1/runs/${runId}/status`);
   });
 
+  it('forwards authenticated SSE negotiation and replay cursor through the developer facade', async () => {
+    const { env, calls } = await setup();
+    const runId = `run_${'a'.repeat(64)}_${'b'.repeat(24)}`;
+    const response = await runnerApi.fetch(new Request(`https://api.example/v1/developer/runs/${runId}/events?cursor=7`, {
+      headers: { authorization: `Bearer ${token}`, accept: 'text/event-stream', 'last-event-id': '7' },
+    }), env);
+    expect(response.status).toBe(200);
+    expect(calls[0]!.url).toBe(`https://runner-runs.internal/v1/runs/${runId}/events?cursor=7`);
+    expect(calls[0]!.headers.get('accept')).toBe('text/event-stream');
+    expect(calls[0]!.headers.get('last-event-id')).toBe('7');
+  });
+
   it('requires explicit key opt-in and refuses raw secrets or unsupported billing fields', async () => {
     const disabled = await setup(false);
     const url = 'https://api.example/v1/developer/runs';

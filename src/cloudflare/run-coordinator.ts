@@ -1,6 +1,7 @@
 import type { ApiPrincipal, DurableObjectStateLike, RunnerWorkerEnv } from './types.js';
 import { DEFAULT_ENGINE, SAFE_ID, error, json } from './runner-api.js';
 import { deliverTerminalWebhook, resolveWebhook, type WebhookConnection, type WebhookDelivery } from './webhooks.js';
+import { redactSecrets } from '../redact.js';
 
 const AGENT_HISTORY_PATH = '__runner/agent-history.json';
 
@@ -18,11 +19,14 @@ interface RunRecord {
   workerStartPhase?: string | null;
   workerStartAttempts?: number | null;
   workerStartedAt?: string | null;
+  workerFinalizingObservedAt?: string | null;
+  logsPending?: boolean;
   launchAttempts: number; result?: Record<string, unknown>; workerReceipt?: Record<string, unknown>;
   launchRejection?: { status: number; code: string; fields: string[] };
   lastError?: string;
   artifacts: Array<Record<string, unknown>>; repo: Record<string, unknown> | null; logUrl: string | null;
   events: Array<Record<string, unknown>>;
+  eventsDroppedThrough?: number;
   webhook?: WebhookDelivery;
   developerGuest?: boolean;
   developerApi?: boolean;
@@ -37,6 +41,9 @@ const ACTIVE = new Set<State>(['queued', 'starting', 'running']);
 const TERMINAL = new Set<State>(['succeeded', 'failed', 'cancelled']);
 const UNKNOWN_RECONCILE_MS = 30 * 60_000;
 const MAX_WEBHOOK_ATTEMPTS = 8;
+const MAX_RUN_EVENTS = 128;
+const MAX_OUTPUT_EVENT_CHARS = 2_000;
+const MAX_LIVE_EVENT_SUBSCRIBERS = 32;
 const GUEST_ARTIFACT_TTL_MS = 24 * 60 * 60_000;
 const now = (): string => new Date().toISOString();
 const stateKey = 'runner-v1';
@@ -151,11 +158,23 @@ function requestedRepositoryAccessToken(requestedToken: unknown): string | undef
 }
 
 function nextEvent(run: RunRecord, type: string, payload: unknown = {}): void {
+  if (type === 'opencode_output' && payload && typeof payload === 'object' && !Array.isArray(payload)) {
+    const value = payload as Record<string, unknown>;
+    if (typeof value['text'] === 'string') {
+      const safeText = redactSecrets(value['text']);
+      value['truncated'] = value['truncated'] === true || safeText.length > MAX_OUTPUT_EVENT_CHARS;
+      value['text'] = safeText.slice(-MAX_OUTPUT_EVENT_CHARS);
+    }
+  }
   run.sequence += 1;
   run.updatedAt = now();
   run.events.push({ eventId: `runner-${run.runId}-${run.sequence}`, runId: run.runId, jobId: run.jobId,
     userTaskId: run.userTaskId, profileId: run.profileId, ownerGeneration: run.ownerGeneration, sequence: run.sequence,
     timestamp: run.updatedAt, type, payload });
+  while (run.events.length > MAX_RUN_EVENTS) {
+    const removed = run.events.shift();
+    if (removed && Number.isSafeInteger(removed['sequence'])) run.eventsDroppedThrough = Number(removed['sequence']);
+  }
 }
 
 function transition(run: RunRecord, next: State, payload?: unknown): void {
@@ -171,6 +190,9 @@ export class RunnerRunCoordinator {
   private readonly state: DurableObjectStateLike;
   private readonly env: RunnerWorkerEnv;
   private readonly ready: Promise<unknown>;
+  private readonly eventVersions = new Map<string, number>();
+  private readonly eventWaiters = new Map<string, Set<() => void>>();
+  private readonly liveSubscribers = new Map<string, number>();
 
   constructor(state: DurableObjectStateLike, env: RunnerWorkerEnv) {
     this.state = state;
@@ -214,14 +236,25 @@ export class RunnerRunCoordinator {
         return error('RESULT_NOT_READY', 'run result is not ready', 409);
       case 'events': {
         if (request.method !== 'GET') return error('METHOD_NOT_ALLOWED', 'events supports GET only', 405);
-        const cursor = Math.max(0, Number(url.searchParams.get('cursor') ?? 0) || 0);
+        const lastEventId = request.headers.get('last-event-id');
+        const rawCursor = lastEventId?.trim() || url.searchParams.get('cursor');
+        const cursor = rawCursor === null ? 0 : Number(rawCursor);
+        if (!Number.isSafeInteger(cursor) || cursor < 0) return error('INVALID_CURSOR', 'event cursor must be a non-negative integer', 400);
         const limit = Math.min(500, Math.max(1, Number(url.searchParams.get('limit') ?? 500) || 500));
-        const events = run.events.filter((event) => Number(event['sequence']) > cursor).slice(0, limit);
-        return json({ runId, events, cursor: events.at(-1)?.['sequence'] ?? cursor, hasMore: false,
+        if (request.headers.get('accept')?.includes('text/event-stream')) {
+          return this.streamEvents(request, run, cursor, rawCursor !== null, principal);
+        }
+        const resetRequired = cursor < (run.eventsDroppedThrough ?? 0);
+        const available = resetRequired ? [] : run.events.filter((event) => Number(event['sequence']) > cursor);
+        const events = available.slice(0, limit);
+        return json({ runId, events, cursor: resetRequired ? run.sequence : events.at(-1)?.['sequence'] ?? cursor,
+          hasMore: available.length > events.length, resetRequired,
+          ...(resetRequired ? { oldestAvailableSequence: run.events[0]?.['sequence'] ?? null } : {}),
           snapshot: { state: run.state, connectionLost: run.state === 'unknown', sequence: run.sequence, ownerGeneration: run.ownerGeneration,
             observedAt: run.updatedAt, lastHeartbeatAt: run.lastHeartbeatAt ?? null,
             statusFreshness: run.lastHeartbeatAt && Date.now() - Date.parse(run.lastHeartbeatAt) > 30_000 ? 'stale' : run.lastHeartbeatAt ? 'fresh' : 'unobserved',
-            output: run.output ?? { stdout: '', stderr: '', updatedAt: null, truncated: false } }, droppedEvents: 0, logUrl: run.logUrl });
+            output: run.output ?? { stdout: '', stderr: '', updatedAt: null, truncated: false } },
+          droppedEvents: run.eventsDroppedThrough ?? 0, logUrl: run.logUrl });
       }
       case 'artifacts':
         if (request.method !== 'GET') return error('METHOD_NOT_ALLOWED', 'artifacts supports GET only', 405);
@@ -553,6 +586,7 @@ export class RunnerRunCoordinator {
       await tx.put(stateKey, stored);
     });
     if (conflict) return error(cancelledBeforeAdmission ? 'CANCELLED_BEFORE_ADMISSION' : record && ACTIVE.has(record.state) ? 'TASK_ATTEMPT_ACTIVE' : 'IDEMPOTENCY_CONFLICT', cancelledBeforeAdmission ? 'the attempt was durably cancelled before admission' : record && ACTIVE.has(record.state) ? `task ${record.userTaskId} already has an active attempt` : 'the same Idempotency-Key was already used with a different request', 409, record && ACTIVE.has(record.state) ? { runId: record.runId, state: record.state } : undefined);
+    if (!deduplicated && record) this.signalRunChanged(record.runId);
     if (!deduplicated) await this.state.storage.setAlarm(Date.now() + 100);
     if (!record!) return error('INTERNAL', 'run could not be admitted', 500);
     if (deduplicated) return json({ requestId: record.requestId, userTaskId: record.userTaskId, runId: record.runId, deduplicated: true }, 200);
@@ -588,6 +622,7 @@ export class RunnerRunCoordinator {
           return;
         }
         run.cancelRequested = true;
+        nextEvent(run, 'run_cancel_requested');
         run.updatedAt = now();
         stored.runs[run.runId] = run;
         await tx.put(stateKey, stored);
@@ -619,6 +654,7 @@ export class RunnerRunCoordinator {
       response = { status: 'cancelled_before_admission', userTaskId: taskId, ownerGeneration, runId: null };
     });
     if (failure) return failure;
+    if (runToCancel) this.signalRunChanged(runToCancel.runId);
     if (runToCancel?.workerReceipt) {
       try { await this.worker(runToCancel.engine, `/v1/runs/${runToCancel.runId}/cancel`, 'POST', {}); }
       catch { /* durable cancelRequested is reconciled by the alarm */ }
@@ -639,16 +675,164 @@ export class RunnerRunCoordinator {
       if (body.ownerGeneration !== undefined && body.ownerGeneration !== run.ownerGeneration) { failure = error('STALE_OWNER_GENERATION', 'cancel names a stale owner generation', 409, { ownerGeneration: run.ownerGeneration }); return; }
       if (TERMINAL.has(run.state)) return;
       run.cancelRequested = true;
+      nextEvent(run, 'run_cancel_requested');
       run.updatedAt = now();
       stored.runs[runId] = run;
       await tx.put(stateKey, stored);
     });
     if (failure) return failure;
     if (!run) return error('NOT_FOUND', `unknown run ${runId}`, 404);
+    this.signalRunChanged(runId);
     if (TERMINAL.has(run.state)) return json({ runId, status: 'already_terminal', state: run.state });
     if (run.workerReceipt) await this.worker(run.engine, `/v1/runs/${runId}/cancel`, 'POST', {});
     await this.state.storage.setAlarm(Date.now() + 100);
     return json({ runId, status: run.workerReceipt ? 'stop_pending' : 'stopped', state: run.state }, run.workerReceipt ? 202 : 200);
+  }
+
+  private async streamEvents(request: Request, initialRun: RunRecord, requestedCursor: number, hasCursor: boolean, principal: ApiPrincipal): Promise<Response> {
+    const runId = initialRun.runId;
+    const subscribers = this.liveSubscribers.get(runId) ?? 0;
+    if (subscribers >= MAX_LIVE_EVENT_SUBSCRIBERS) return error('STREAM_CAPACITY', 'too many event stream subscribers for this run', 429);
+    this.liveSubscribers.set(runId, subscribers + 1);
+    await this.state.storage.setAlarm(Date.now() + 100);
+
+    let cursor = requestedCursor;
+    let initialized = false;
+    let closed = false;
+    let cleaned = false;
+    const abort = new AbortController();
+    const encoder = new TextEncoder();
+    const clear = (): void => {
+      if (cleaned) return;
+      cleaned = true;
+      const count = this.liveSubscribers.get(runId) ?? 1;
+      if (count <= 1) this.liveSubscribers.delete(runId);
+      else this.liveSubscribers.set(runId, count - 1);
+      if (!this.eventWaiters.has(runId)) this.eventVersions.delete(runId);
+      request.signal.removeEventListener('abort', onRequestAbort);
+      abort.abort();
+    };
+    const onRequestAbort = (): void => clear();
+    request.signal.addEventListener('abort', onRequestAbort, { once: true });
+
+    const stream = new ReadableStream<Uint8Array>({
+      pull: async (controller) => {
+        while (!closed) {
+          const observedVersion = this.eventVersions.get(runId) ?? 0;
+          try {
+          const stored = await this.read();
+          const run = stored.runs[runId];
+          if (!run || !owns(run, principal)) {
+            closed = true;
+            clear();
+            controller.close();
+            return;
+          }
+
+          if (!initialized) {
+            initialized = true;
+            const resetRequired = hasCursor && (cursor > run.sequence || cursor < (run.eventsDroppedThrough ?? 0));
+            if (!hasCursor || resetRequired) {
+              cursor = run.sequence;
+              const type = resetRequired ? 'reset' : 'snapshot';
+              controller.enqueue(encoder.encode(`id: ${cursor}\nevent: ${type}\ndata: ${JSON.stringify(view(run))}\n\n`));
+              if (TERMINAL.has(run.state)) {
+                closed = true;
+                clear();
+                controller.close();
+              }
+              return;
+            }
+          }
+
+          if (hasCursor && cursor < (run.eventsDroppedThrough ?? 0)) {
+            cursor = run.sequence;
+            controller.enqueue(encoder.encode(`id: ${cursor}\nevent: reset\ndata: ${JSON.stringify(view(run))}\n\n`));
+            if (TERMINAL.has(run.state)) {
+              closed = true;
+              clear();
+              controller.close();
+            }
+            return;
+          }
+
+          const next = run.events.find((event) => Number(event['sequence']) > cursor);
+          if (next) {
+            cursor = Number(next['sequence']);
+            controller.enqueue(encoder.encode(`id: ${cursor}\nevent: ${String(next['type'] ?? 'message')}\ndata: ${JSON.stringify(next)}\n\n`));
+            return;
+          }
+          if (TERMINAL.has(run.state)) {
+            closed = true;
+            clear();
+            controller.enqueue(encoder.encode(`event: end\ndata: ${JSON.stringify({ runId, sequence: run.sequence })}\n\n`));
+            controller.close();
+            return;
+          }
+
+          const changed = await this.waitForEvent(runId, observedVersion, abort.signal, 15_000);
+          if (closed) return;
+          if (abort.signal.aborted) {
+            closed = true;
+            clear();
+            controller.close();
+            return;
+          }
+          if (!changed) {
+            controller.enqueue(encoder.encode(': keepalive\n\n'));
+            return;
+          }
+          } catch (cause) {
+            closed = true;
+            clear();
+            controller.error(cause);
+          }
+        }
+      },
+      cancel: () => {
+        closed = true;
+        clear();
+      },
+    }, { highWaterMark: 1 });
+
+    return new Response(stream, { status: 200, headers: {
+      'content-type': 'text/event-stream; charset=utf-8',
+      'cache-control': 'no-cache, no-transform',
+      'x-accel-buffering': 'no',
+    } });
+  }
+
+  private async waitForEvent(runId: string, version: number, signal: AbortSignal, timeoutMs: number): Promise<boolean> {
+    if (signal.aborted || (this.eventVersions.get(runId) ?? 0) !== version) return !signal.aborted;
+    return new Promise((resolve) => {
+      let done = false;
+      let timer: ReturnType<typeof setTimeout>;
+      const listeners = this.eventWaiters.get(runId) ?? new Set<() => void>();
+      this.eventWaiters.set(runId, listeners);
+      const finish = (changed: boolean): void => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        listeners.delete(onChange);
+        signal.removeEventListener('abort', onAbort);
+        if (!listeners.size) this.eventWaiters.delete(runId);
+        if (!listeners.size && !this.liveSubscribers.has(runId)) this.eventVersions.delete(runId);
+        resolve(changed);
+      };
+      const onChange = (): void => finish(true);
+      const onAbort = (): void => finish(false);
+      listeners.add(onChange);
+      timer = setTimeout(() => finish(false), timeoutMs);
+      signal.addEventListener('abort', onAbort, { once: true });
+      if ((this.eventVersions.get(runId) ?? 0) !== version) finish(true);
+    });
+  }
+
+  private signalRunChanged(runId: string): void {
+    const waiters = this.eventWaiters.get(runId);
+    if (!this.liveSubscribers.has(runId) && !waiters?.size) return;
+    this.eventVersions.set(runId, (this.eventVersions.get(runId) ?? 0) + 1);
+    for (const wake of waiters ?? []) wake();
   }
 
   private async testRegistryAttachment(server: Record<string, unknown>, context: { runId: string; taskId: string; profileId: string; timeoutMs: number }): Promise<Record<string, unknown>> {
@@ -753,6 +937,8 @@ export class RunnerRunCoordinator {
           for (;;) {
             run.launchAttempts += 1;
             transition(run, 'starting');
+            nextEvent(run, 'run_dispatching', { attempt: run.launchAttempts });
+            await this.writeRun(run);
             const launch = JSON.parse(await decrypt(run.launchCiphertext, this.env.RUN_LAUNCH_ENCRYPTION_KEY)) as Record<string, unknown>;
             const response = await this.worker(run.engine, '/v1/launch', 'POST', launch);
             if (!response.ok) {
@@ -792,26 +978,42 @@ export class RunnerRunCoordinator {
           if (!statusResponse.ok) throw new Error(`worker status HTTP ${statusResponse.status}`);
           const workerStatus = await statusResponse.json() as { status?: string; state?: string; startPhase?: string; startAttempts?: number; startedAt?: string; updatedAt?: string };
           run.lastHeartbeatAt = now();
+          const phaseChanged = typeof workerStatus.startPhase === 'string' && workerStatus.startPhase !== run.workerStartPhase;
+          const attemptsChanged = Number.isSafeInteger(workerStatus.startAttempts) && workerStatus.startAttempts !== run.workerStartAttempts;
           if (typeof workerStatus.startPhase === 'string') run.workerStartPhase = workerStatus.startPhase;
           if (Number.isSafeInteger(workerStatus.startAttempts)) run.workerStartAttempts = workerStatus.startAttempts;
           if (typeof workerStatus.startedAt === 'string') run.workerStartedAt = workerStatus.startedAt;
+          if (phaseChanged || attemptsChanged) nextEvent(run, 'opencode_start_phase', {
+            phase: run.workerStartPhase ?? null, attempts: run.workerStartAttempts ?? null,
+            startedAt: run.workerStartedAt ?? null,
+          });
           if (typeof workerStatus.updatedAt === 'string' && Number.isFinite(Date.parse(workerStatus.updatedAt))) {
-            if (workerStatus.updatedAt !== run.workerReportedUpdatedAt) run.workerProgressObservedAt = now();
+            const progressChanged = workerStatus.updatedAt !== run.workerReportedUpdatedAt;
+            if (progressChanged) {
+              run.workerProgressObservedAt = now();
+              nextEvent(run, 'worker_progress', { workerUpdatedAt: workerStatus.updatedAt, observedAt: run.workerProgressObservedAt });
+            }
             run.workerReportedUpdatedAt = workerStatus.updatedAt;
           }
           const logsResponse = await this.worker(run.engine, `/v1/runs/${run.runId}/logs?after=${run.logCursor ?? 0}&snapshot=1`);
           if (logsResponse.ok) {
-            const batch = await logsResponse.json() as { cursor?: number; logs?: Array<{ stream?: string; message?: string; truncated?: boolean }> };
+            const batch = await logsResponse.json() as { cursor?: number; hasMore?: boolean; logs?: Array<{ sequence?: number; stream?: string; message?: string; truncated?: boolean }> };
             const output = run.output ?? { stdout: '', stderr: '', updatedAt: null, truncated: false };
             let received = false;
             for (const entry of batch.logs ?? []) {
-              if ((entry.stream !== 'stdout' && entry.stream !== 'stderr') || typeof entry.message !== 'string') continue;
+              if ((entry.stream !== 'stdout' && entry.stream !== 'stderr') || typeof entry.message !== 'string'
+                || !Number.isSafeInteger(entry.sequence) || Number(entry.sequence) <= (run.logCursor ?? 0)) continue;
+              const safeMessage = redactSecrets(entry.message);
               const previous = output[entry.stream];
-              output[entry.stream] = `${previous}${previous ? '\n' : ''}${entry.message}`.slice(-24_000);
-              output.truncated ||= entry.truncated === true || previous.length + entry.message.length > 24_000;
+              output[entry.stream] = `${previous}${previous ? '\n' : ''}${safeMessage}`.slice(-24_000);
+              output.truncated ||= entry.truncated === true || previous.length + safeMessage.length > 24_000;
+              nextEvent(run, 'opencode_output', { stream: entry.stream, text: safeMessage,
+                workerSequence: Number(entry.sequence), truncated: entry.truncated === true });
+              run.logCursor = Number(entry.sequence);
               received = true;
             }
-            if (Number.isSafeInteger(batch.cursor) && Number(batch.cursor) >= (run.logCursor ?? 0)) run.logCursor = Number(batch.cursor);
+            run.logsPending = batch.hasMore === true;
+            if (!run.logsPending && Number.isSafeInteger(batch.cursor) && Number(batch.cursor) >= (run.logCursor ?? 0)) run.logCursor = Number(batch.cursor);
             if (received) output.updatedAt = now();
             run.output = output;
           }
@@ -831,6 +1033,10 @@ export class RunnerRunCoordinator {
             if (run.state !== observedState) transition(run, observedState,
               observedState === 'running' ? { evidence: 'worker_process_state' } : { evidence: 'worker_accepted' });
           } else if (['succeeded', 'failed', 'cancelled'].includes(workerStatus?.status ?? '')) {
+            if (!run.workerFinalizingObservedAt) {
+              run.workerFinalizingObservedAt = now();
+              nextEvent(run, 'run_finalizing', { workerState: workerStatus.status, observedAt: run.workerFinalizingObservedAt });
+            }
             const resultResponse = await this.worker(run.engine, `/v1/runs/${run.runId}/result`);
             if (resultResponse.ok) {
               const launchResult = await resultResponse.json() as Record<string, any>;
@@ -941,9 +1147,11 @@ export class RunnerRunCoordinator {
       await this.writeRun(run);
     }
     const latest = await this.read();
-    const activeNext = Object.values(latest.runs).some((run) => ACTIVE.has(run.state)
-      || run.state === 'unknown' && !!run.workerReceipt && Date.now() - Date.parse(run.updatedAt) < UNKNOWN_RECONCILE_MS)
-      ? Date.now() + 5_000 : Infinity;
+    const activeRuns = Object.values(latest.runs).filter((run) => ACTIVE.has(run.state)
+      || run.state === 'unknown' && !!run.workerReceipt && Date.now() - Date.parse(run.updatedAt) < UNKNOWN_RECONCILE_MS);
+    const activeNext = activeRuns.length
+      ? Date.now() + (activeRuns.some((run) => run.logsPending) ? 100 : activeRuns.some((run) => (this.liveSubscribers.get(run.runId) ?? 0) > 0) ? 1_000 : 5_000)
+      : Infinity;
     let webhookNext = Infinity;
     for (const run of Object.values(latest.runs)) {
       if (TERMINAL.has(run.state) && run.webhook && !run.webhook.deliveredAt && !run.webhook.exhaustedAt) {
@@ -987,6 +1195,7 @@ export class RunnerRunCoordinator {
       stored.runs[run.runId] = { ...run, cancelRequested: run.cancelRequested || latest.cancelRequested };
       await tx.put(stateKey, stored);
     });
+    this.signalRunChanged(run.runId);
   }
 }
 
