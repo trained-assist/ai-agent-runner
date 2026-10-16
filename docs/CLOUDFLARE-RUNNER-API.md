@@ -91,6 +91,13 @@ the cutover occurs only after France returns the typed pre-admission refusal
 `503 { accepted: false, code: "WORKER_CAPACITY" }`; the same run and operation identity is then
 persisted against `azure-cloud` before dispatch. Other refusals do not trigger this cutover. An
 accepted or ambiguous France launch is reconciled on France and never started again on GHA.
+If the selected worker (including GHA after cutover) returns a confirmed pre-admission
+`WORKER_CAPACITY`, the API keeps the run `queued` and retries that route with bounded backoff
+(2–30 seconds); it does not return a failed result or require a new submission. Status exposes
+`queueReason: "worker_capacity"` and `retryAt`. The event stream records the queue transition.
+Structured Worker logs include `runner.capacity_queued`, `runner.capacity_fallback`, and
+`runner.capacity_queue_drained` with request/run IDs and measured queue wait, so capacity
+incidents and queue latency can be queried from Cloudflare observability.
 The production fallback remains disabled until its separately reviewed secret provisioning and
 deployment are completed. The isolated `cp-sandbox3` mock-only Worker remains independent and
 never advertises or invokes either real worker. The sandbox-only `mock-test` engine returns

@@ -209,6 +209,8 @@ const POLL_BASE_DELAY_MS = 500;
 const POLL_MAX_DELAY_MS = 10_000;
 /** Запас сверх лимита рана на выгрузку лога и пуш ветки до уничтожения среды. */
 const DEFAULT_RESULT_GRACE_MS = 60_000;
+const CAPACITY_RETRY_BASE_MS = 2_000;
+const CAPACITY_RETRY_MAX_MS = 30_000;
 
 /**
  * Стабильный идентификатор операции: производный от попытки `(userTaskId, generation)`,
@@ -835,7 +837,9 @@ export class AgentApi {
    */
   resumeDispatched(): number {
     let resumed = 0;
-    for (const entry of this.store.dispatchedRuns()) {
+    const dispatched = this.store.dispatchedRuns();
+    const dispatchedIds = new Set(dispatched.map((entry) => entry.runId));
+    for (const entry of dispatched) {
       const record = this.store.getByRun(entry.runId);
       if (!record) continue;
       if (this.resuming.has(record.runId)) continue;
@@ -858,6 +862,19 @@ export class AgentApi {
       this.log({ event: 'poll_resumed', runId: record.runId, engine: entry.engine, operationId: record.spec.operationId });
       this.resuming.add(record.runId);
       void this.restoreAndPoll(record, worker);
+      resumed += 1;
+    }
+    // Admissions with no outstanding launch intent are safely retryable: this includes
+    // jobs queued after a confirmed pre-admission capacity refusal before the API restarted.
+    for (const record of this.store.listAll()) {
+      if (dispatchedIds.has(record.runId) || this.resuming.has(record.runId)) continue;
+      const progress = this.store.progressOf(record.runId);
+      if (progress && isTerminalApiState(progress.state)) continue;
+      const restored = this.store.open(record.runId, record.createdAt, this.chainOf(record)[0] ?? record.spec.engine.name);
+      if (restored.events.length === 0) this.store.append(record.runId, admissionEvents(record.spec, record.createdAt));
+      this.log({ event: 'queued_run_resumed', requestId: record.requestId, runId: record.runId, operationId: record.spec.operationId });
+      this.resuming.add(record.runId);
+      void this.execute(record).finally(() => this.resuming.delete(record.runId));
       resumed += 1;
     }
     return resumed;
@@ -964,97 +981,124 @@ export class AgentApi {
    */
   private async acceptOnChain(record: AdmissionRecord, startedAt: string): Promise<ChainAcceptance | null> {
     const candidates = this.chainOf(record);
-    const attempts: FleetAttempt[] = [];
-    let lastWorker: ExternalWorker | null = null;
-    let lastError: unknown = null;
-    for (let index = 0; index < candidates.length; index += 1) {
-      const engine = candidates[index]!;
-      const worker = this.workerFor(engine);
-      if (!worker) {
-        attempts.push({ engine, code: 'WORKER_NOT_CONFIGURED', summary: 'no worker is configured for this engine' });
+    let capacityRetries = 0;
+    let capacityQueuedAt: number | null = null;
+    for (;;) {
+      const attempts: FleetAttempt[] = [];
+      let lastWorker: ExternalWorker | null = null;
+      let lastError: unknown = null;
+      for (let index = 0; index < candidates.length; index += 1) {
+        const engine = candidates[index]!;
+        const worker = this.workerFor(engine);
+        if (!worker) {
+          attempts.push({ engine, code: 'WORKER_NOT_CONFIGURED', summary: 'no worker is configured for this engine' });
+          continue;
+        }
+        lastWorker = worker;
+        // Движок попытки виден клиенту сразу: цепочка двигается по ранe, а не молча меняет
+        // исполнителя под ногами у того, кто опрашивает статус.
+        this.store.setEngine(record.runId, engine);
+        this.store.appendLaunchIntent(record.runId, engine, this.nowIso());
+        try {
+          const receipt = await worker.launch(this.specForEngine(record, engine));
+          if (capacityQueuedAt !== null) this.log({ event: 'worker_capacity_queue_drained', requestId: record.requestId,
+            runId: record.runId, engine, queueWaitMs: Date.now() - capacityQueuedAt, attempts: capacityRetries,
+            operationId: record.spec.operationId });
+          return { engine, worker, receipt };
+        } catch (err) {
+          lastError = err;
+          if (err instanceof PreflightError && err.code === 'WORKER_CAPACITY') {
+            attempts.push({ engine, code: err.code, summary: err.message });
+            // A measured 60% cutoff preserves 40% of each VM for host services. Send
+            // this new operation directly to GHA; do not consume the next regional VM.
+            const ghaIndex = isRegionalVmEngine(engine)
+              ? candidates.findIndex((candidate, candidateIndex) => candidateIndex > index && isGhaEngine(candidate))
+              : -1;
+            const nextIndex = isRegionalVmEngine(engine) ? (ghaIndex >= 0 ? ghaIndex : candidates.length) : index + 1;
+            for (let skipped = index + 1; skipped < nextIndex; skipped += 1) {
+              attempts.push({ engine: candidates[skipped]!, code: 'CAPACITY_CUTOVER', summary: 'skipped regional VM after capacity refusal' });
+            }
+            const next = candidates[nextIndex];
+            this.log({ event: 'engine_chain_advance', runId: record.runId, engine, code: err.code, next: next ?? null, attempts: attempts.length, operationId: record.spec.operationId });
+            index = nextIndex - 1;
+            continue;
+          }
+          if (err instanceof PreflightError && (err.code === 'WORKER_CAPACITY_UNKNOWN' || err.code === 'WORKER_ADMISSION_UNAVAILABLE')) {
+            attempts.push({ engine, code: err.code, summary: err.message });
+            const next = candidates[index + 1];
+            this.log({ event: 'engine_chain_advance', runId: record.runId, engine, code: err.code, next: next ?? null, attempts: attempts.length, operationId: record.spec.operationId });
+            continue;
+          }
+          if (!isUnacceptedLaunchFailure(err)) {
+            // Отказ на нашей стороне (нет промпта, refs без workspace, не задан resultUrl):
+            // другой движок его не обойдёт, поэтому цепочка не тратит на него бюджеты.
+            if (!this.disposed) {
+              this.log({ event: 'run_failed', runId: record.runId, engine, message: err instanceof Error ? err.message : String(err) });
+              this.finalize(record, workerTransportFailure(record.spec, err, { startedAt, finishedAt: this.nowIso() }, { workerBaseUrl: worker.baseUrl }));
+            }
+            return null;
+          }
+          // Квитанции нет, но ран мог стартовать. Спрашиваем движок, прежде чем звать следующий:
+          // положительный ответ означает, что второй запуск был бы дублем.
+          const known = await this.workerKnowsRun(record, worker);
+          if (known === true) {
+            this.log({ event: 'launch_reconciled', runId: record.runId, engine, operationId: record.spec.operationId });
+            return { engine, worker };
+          }
+          if (known === null) {
+            // Спросить не удалось: доказать, что запуск не состоялся, нельзя, а второй запуск
+            // без доказательства контракт запрещает. Ран остаётся `unknown` — клиент решает сам.
+            this.log({ event: 'launch_uncertain', runId: record.runId, engine, message: err instanceof Error ? err.message : String(err) });
+            this.markUnknown(record, 'launch_uncertain');
+            return null;
+          }
+          attempts.push({ engine, code: launchFailureCode(err), summary: err instanceof Error ? err.message : String(err) });
+          const next = candidates[index + 1];
+          this.log({
+            event: 'engine_chain_advance',
+            runId: record.runId,
+            engine,
+            code: launchFailureCode(err),
+            next: next ?? null,
+            attempts: attempts.length,
+            operationId: record.spec.operationId,
+          });
+        }
+      }
+      if (this.disposed) return null;
+      const confirmedCapacityOnly = attempts.length > 0 && attempts.every((attempt) =>
+        attempt.code === 'WORKER_CAPACITY' || attempt.code === 'CAPACITY_CUTOVER');
+      if (confirmedCapacityOnly) {
+        capacityRetries += 1;
+        capacityQueuedAt ??= Date.now();
+        const delayMs = Math.min(CAPACITY_RETRY_MAX_MS, CAPACITY_RETRY_BASE_MS * 2 ** Math.min(4, capacityRetries - 1));
+        const queuedAt = this.nowIso();
+        this.store.clearLaunchIntent(record.runId, queuedAt, 'WORKER_CAPACITY');
+        this.log({ event: 'worker_capacity_queued', requestId: record.requestId, runId: record.runId,
+          engines: attempts.map((attempt) => attempt.engine), attempts: capacityRetries, retryInMs: delayMs,
+          queuedForMs: Math.max(0, Date.parse(queuedAt) - Date.parse(startedAt)), operationId: record.spec.operationId });
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, delayMs);
+          timer.unref?.();
+        });
+        if (this.disposed || isTerminalApiState(this.store.progressOf(record.runId)?.state ?? 'queued')) return null;
+        this.log({ event: 'worker_capacity_retry', requestId: record.requestId, runId: record.runId,
+          attempts: capacityRetries, operationId: record.spec.operationId });
         continue;
       }
-      lastWorker = worker;
-      // Движок попытки виден клиенту сразу: цепочка двигается по ранe, а не молча меняет
-      // исполнителя под ногами у того, кто опрашивает статус.
-      this.store.setEngine(record.runId, engine);
-      this.store.appendLaunchIntent(record.runId, engine, this.nowIso());
-      try {
-        const receipt = await worker.launch(this.specForEngine(record, engine));
-        return { engine, worker, receipt };
-      } catch (err) {
-        lastError = err;
-        if (err instanceof PreflightError && err.code === 'WORKER_CAPACITY') {
-          attempts.push({ engine, code: err.code, summary: err.message });
-          // A measured 60% cutoff preserves 40% of each VM for host services. Send
-          // this new operation directly to GHA; do not consume the next regional VM.
-          const ghaIndex = isRegionalVmEngine(engine)
-            ? candidates.findIndex((candidate, candidateIndex) => candidateIndex > index && isGhaEngine(candidate))
-            : -1;
-          const nextIndex = isRegionalVmEngine(engine) ? (ghaIndex >= 0 ? ghaIndex : candidates.length) : index + 1;
-          for (let skipped = index + 1; skipped < nextIndex; skipped += 1) {
-            attempts.push({ engine: candidates[skipped]!, code: 'CAPACITY_CUTOVER', summary: 'skipped regional VM after capacity refusal' });
-          }
-          const next = candidates[nextIndex];
-          this.log({ event: 'engine_chain_advance', runId: record.runId, engine, code: err.code, next: next ?? null, attempts: attempts.length, operationId: record.spec.operationId });
-          index = nextIndex - 1;
-          continue;
-        }
-        if (err instanceof PreflightError && (err.code === 'WORKER_CAPACITY_UNKNOWN' || err.code === 'WORKER_ADMISSION_UNAVAILABLE')) {
-          attempts.push({ engine, code: err.code, summary: err.message });
-          const next = candidates[index + 1];
-          this.log({ event: 'engine_chain_advance', runId: record.runId, engine, code: err.code, next: next ?? null, attempts: attempts.length, operationId: record.spec.operationId });
-          continue;
-        }
-        if (!isUnacceptedLaunchFailure(err)) {
-          // Отказ на нашей стороне (нет промпта, refs без workspace, не задан resultUrl):
-          // другой движок его не обойдёт, поэтому цепочка не тратит на него бюджеты.
-          if (!this.disposed) {
-            this.log({ event: 'run_failed', runId: record.runId, engine, message: err instanceof Error ? err.message : String(err) });
-            this.finalize(record, workerTransportFailure(record.spec, err, { startedAt, finishedAt: this.nowIso() }, { workerBaseUrl: worker.baseUrl }));
-          }
-          return null;
-        }
-        // Квитанции нет, но ран мог стартовать. Спрашиваем движок, прежде чем звать следующий:
-        // положительный ответ означает, что второй запуск был бы дублем.
-        const known = await this.workerKnowsRun(record, worker);
-        if (known === true) {
-          this.log({ event: 'launch_reconciled', runId: record.runId, engine, operationId: record.spec.operationId });
-          return { engine, worker };
-        }
-        if (known === null) {
-          // Спросить не удалось: доказать, что запуск не состоялся, нельзя, а второй запуск
-          // без доказательства контракт запрещает. Ран остаётся `unknown` — клиент решает сам.
-          this.log({ event: 'launch_uncertain', runId: record.runId, engine, message: err instanceof Error ? err.message : String(err) });
-          this.markUnknown(record, 'launch_uncertain');
-          return null;
-        }
-        attempts.push({ engine, code: launchFailureCode(err), summary: err instanceof Error ? err.message : String(err) });
-        const next = candidates[index + 1];
-        this.log({
-          event: 'engine_chain_advance',
-          runId: record.runId,
-          engine,
-          code: launchFailureCode(err),
-          next: next ?? null,
-          attempts: attempts.length,
-          operationId: record.spec.operationId,
-        });
+      // Один кандидат — это не цепочка, а закреплённый клиентом движок: отказ остаётся его
+      // собственным кодом, а не общим «цепочка исчерпана».
+      if (candidates.length === 1) {
+        this.log({ event: 'run_failed', runId: record.runId, engine: candidates[0], message: lastError instanceof Error ? lastError.message : String(lastError) });
+        this.finalize(record, workerTransportFailure(record.spec, lastError, { startedAt, finishedAt: this.nowIso() }, { workerBaseUrl: lastWorker?.baseUrl ?? null }));
+        return null;
       }
-    }
-    if (this.disposed) return null;
-    // Один кандидат — это не цепочка, а закреплённый клиентом движок: отказ остаётся его
-    // собственным кодом, а не общим «цепочка исчерпана».
-    if (candidates.length === 1) {
-      this.log({ event: 'run_failed', runId: record.runId, engine: candidates[0], message: lastError instanceof Error ? lastError.message : String(lastError) });
-      this.finalize(record, workerTransportFailure(record.spec, lastError, { startedAt, finishedAt: this.nowIso() }, { workerBaseUrl: lastWorker?.baseUrl ?? null }));
+      // Никто не принял: ран терминален с перечислением попыток. Молчать здесь нельзя — клиент
+      // должен видеть, что задача не выполнена, и новый `Idempotency-Key` даст новую попытку.
+      this.log({ event: 'engine_chain_exhausted', runId: record.runId, attempts });
+      this.finalize(record, fleetExhaustedFailure(record.spec, attempts, { startedAt, finishedAt: this.nowIso() }, { workerBaseUrl: lastWorker?.baseUrl ?? null }));
       return null;
     }
-    // Никто не принял: ран терминален с перечислением попыток. Молчать здесь нельзя — клиент
-    // должен видеть, что задача не выполнена, и новый `Idempotency-Key` даст новую попытку.
-    this.log({ event: 'engine_chain_exhausted', runId: record.runId, attempts });
-    this.finalize(record, fleetExhaustedFailure(record.spec, attempts, { startedAt, finishedAt: this.nowIso() }, { workerBaseUrl: lastWorker?.baseUrl ?? null }));
-    return null;
   }
 
   /**

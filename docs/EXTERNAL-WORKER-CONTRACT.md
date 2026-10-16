@@ -26,7 +26,11 @@
 в рабочую цепочку автоматически, пока отдельный acceptance не подтвердит fallback.
 
 Capacity response `WORKER_CAPACITY` from a regional VM preserves host headroom and can cut
-the new run over to a configured GHA engine, skipping any remaining regional VM.
+an `auto` run over to a configured GHA engine, skipping any remaining regional VM. If the
+selected route also confirms capacity exhaustion (including strict France or GHA routes),
+the Cloudflare coordinator keeps the run queued and retries it with bounded backoff; callers
+continue polling the same `runId`. It emits structured capacity queue/fallback/drain logs with
+run IDs and queue wait time.
 `WORKER_CAPACITY_UNKNOWN` and `WORKER_ADMISSION_UNAVAILABLE` do not prove saturation, so
 they follow the configured regional order. Once any worker accepts, the run is not moved.
 
@@ -47,6 +51,7 @@ they follow the configured regional order. Once any worker accepts, the run is n
 | `WORKER_HTTP_ERROR` (воркер ответил ошибкой) | да, но сначала reconcile |
 | `WORKER_PROTOCOL_INVALID` (ответ вне контракта) | да, но сначала reconcile |
 | `WORKER_CAPACITY` (подтверждённый предел 60%) | для France/Russia — сразу GHA, без промежуточной VM |
+| `WORKER_CAPACITY` на последнем доступном маршруте | оставить тот же ран `queued` и повторять запуск с backoff 2–30 с |
 | `WORKER_CAPACITY_UNKNOWN` / `WORKER_ADMISSION_UNAVAILABLE` | следующий worker по очереди; отказ доказывает, что запуск не принят |
 | квитанция получена | **нет**: ран уже идёт, дальше только reconcile |
 | `unknown` (исход не установился) | **нет**: повод спрашивать принявший движок, а не запускать заново |
@@ -83,10 +88,11 @@ they follow the configured regional order. Once any worker accepts, the run is n
 
 ### Исчерпанная цепочка
 
-Если ни один движок не принял ран, он закрывается `failed` с кодом `ENGINE_FLEET_EXHAUSTED`
-и перечнем попыток (`<движок>: <код>`). Это не `unknown`: выполнять ран некому, и обещать
-reconcile несуществующего запуска было бы враньём. Новый `Idempotency-Key` даёт новую
-попытку.
+Подтверждённый отказ только из-за ёмкости не исчерпывает цепочку: тот же `runId` остаётся
+`queued`, а API повторяет приём с ограниченным backoff. Если все маршруты отклоняют запуск
+по другой подтверждённой причине, ран закрывается `failed` с `ENGINE_FLEET_EXHAUSTED` и
+перечнем попыток (`<движок>: <код>`). Неопределённый исход остаётся `unknown` и никогда не
+перезапускается без reconcile.
 
 ### Региональные ограничения
 

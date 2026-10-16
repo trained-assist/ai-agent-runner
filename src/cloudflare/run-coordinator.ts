@@ -22,6 +22,10 @@ interface RunRecord {
   workerFinalizingObservedAt?: string | null;
   logsPending?: boolean;
   launchAttempts: number; result?: Record<string, unknown>; workerReceipt?: Record<string, unknown>;
+  capacityRetryAttempts?: number;
+  capacityRetryAt?: string;
+  capacityQueuedAt?: string;
+  capacityWaitMs?: number;
   launchRejection?: { status: number; code: string; fields: string[] };
   lastError?: string;
   artifacts: Array<Record<string, unknown>>; repo: Record<string, unknown> | null; logUrl: string | null;
@@ -40,6 +44,8 @@ const INIT: Stored = { runs: {}, idempotency: {}, latestOwnerGeneration: 0 };
 const ACTIVE = new Set<State>(['queued', 'starting', 'running']);
 const TERMINAL = new Set<State>(['succeeded', 'failed', 'cancelled']);
 const UNKNOWN_RECONCILE_MS = 30 * 60_000;
+const CAPACITY_RETRY_BASE_MS = 2_000;
+const CAPACITY_RETRY_MAX_MS = 30_000;
 const MAX_WEBHOOK_ATTEMPTS = 8;
 const MAX_RUN_EVENTS = 128;
 const MAX_OUTPUT_EVENT_CHARS = 2_000;
@@ -100,6 +106,9 @@ function view(run: RunRecord): Record<string, unknown> {
     workerStartAttempts: run.workerStartAttempts ?? null,
     workerStartedAt: run.workerStartedAt ?? null,
     workerProgressFreshness: progressAgeMs === null || !Number.isFinite(progressAgeMs) ? 'unobserved' : progressAgeMs > 30_000 ? 'stale' : 'fresh',
+    ...(run.capacityRetryAt ? { queueReason: 'worker_capacity', retryAt: run.capacityRetryAt } : {}),
+    ...(run.capacityQueuedAt ? { capacityQueuedAt: run.capacityQueuedAt, capacityWaitMs: run.capacityWaitMs ?? Date.now() - Date.parse(run.capacityQueuedAt) }
+      : run.capacityWaitMs !== undefined ? { capacityWaitMs: run.capacityWaitMs } : {}),
     output: run.output ?? { stdout: '', stderr: '', updatedAt: null, truncated: false },
     sequence: run.sequence, fencing: { rejected: 0 }, answer: run.answer };
 }
@@ -912,7 +921,8 @@ export class RunnerRunCoordinator {
     const stored = await this.read();
     let changed = false;
     const pendingRuns = Object.values(stored.runs).filter((run) => ACTIVE.has(run.state)
-      || run.state === 'unknown' && !!run.workerReceipt && Date.now() - Date.parse(run.updatedAt) < UNKNOWN_RECONCILE_MS);
+      || run.state === 'unknown' && !!run.workerReceipt && Date.now() - Date.parse(run.updatedAt) < UNKNOWN_RECONCILE_MS)
+      .filter((run) => !run.capacityRetryAt || Date.parse(run.capacityRetryAt) <= Date.now());
     for (const run of pendingRuns) {
       try {
         if (run.engine === 'mock-test') {
@@ -951,11 +961,27 @@ export class RunnerRunCoordinator {
                 run.engine = GHA_ENGINE;
                 run.launchCiphertext = await encrypt(JSON.stringify(launch), this.env.RUN_LAUNCH_ENCRYPTION_KEY);
                 run.lastError = 'France refused before admission: WORKER_CAPACITY';
+                console.warn(JSON.stringify({ event: 'runner.capacity_fallback', requestId: run.requestId, runId: run.runId,
+                  from: FRANCE_ENGINE, to: GHA_ENGINE, routeMode: run.routeMode ?? 'auto', launchAttempt: run.launchAttempts }));
                 transition(run, 'queued', { reason: 'capacity_cutover', from: FRANCE_ENGINE, to: GHA_ENGINE, code });
                 // Persist route and updated launch before contacting the next worker. A crash
                 // after this write resumes against GHA with the same run/operation identity.
                 await this.writeRun(run);
                 continue;
+              }
+              if (isConfirmedCapacityRefusal(rejection, response.status)) {
+                run.capacityRetryAttempts = (run.capacityRetryAttempts ?? 0) + 1;
+                run.capacityQueuedAt ??= now();
+                const delay = Math.min(CAPACITY_RETRY_MAX_MS, CAPACITY_RETRY_BASE_MS * 2 ** Math.min(4, run.capacityRetryAttempts - 1));
+                run.capacityRetryAt = new Date(Date.now() + delay).toISOString();
+                run.lastError = `Worker capacity is full; retry ${run.capacityRetryAttempts} scheduled`;
+                transition(run, 'queued', { reason: 'capacity_queued', engine: run.engine, retryAt: run.capacityRetryAt, attempt: run.capacityRetryAttempts });
+                console.warn(JSON.stringify({ event: 'runner.capacity_queued', requestId: run.requestId, runId: run.runId,
+                  engine: run.engine, routeMode: run.routeMode ?? 'auto', attempt: run.capacityRetryAttempts,
+                  retryAt: run.capacityRetryAt, status: response.status, code }));
+                changed = true;
+                await this.writeRun(run);
+                break;
               }
               if (response.status < 500 || response.status === 503) {
                 const fields = workerRefusalFields(rejection);
@@ -969,6 +995,14 @@ export class RunnerRunCoordinator {
               throw new Error(`worker launch HTTP ${response.status}`);
             }
             run.workerReceipt = await response.json() as Record<string, unknown>;
+            run.capacityRetryAt = undefined;
+            run.capacityRetryAttempts = 0;
+            if (run.capacityQueuedAt) {
+              run.capacityWaitMs = Date.now() - Date.parse(run.capacityQueuedAt);
+              console.info(JSON.stringify({ event: 'runner.capacity_queue_drained', requestId: run.requestId, runId: run.runId,
+                engine: run.engine, capacityWaitMs: run.capacityWaitMs }));
+              run.capacityQueuedAt = undefined;
+            }
             // A 202 receipt proves durable admission only. The next worker status
             // poll must report process state before the run is marked running.
             break;
@@ -1147,11 +1181,17 @@ export class RunnerRunCoordinator {
       await this.writeRun(run);
     }
     const latest = await this.read();
-    const activeRuns = Object.values(latest.runs).filter((run) => ACTIVE.has(run.state)
-      || run.state === 'unknown' && !!run.workerReceipt && Date.now() - Date.parse(run.updatedAt) < UNKNOWN_RECONCILE_MS);
+    const activeRuns = Object.values(latest.runs).filter((run) => (ACTIVE.has(run.state)
+      || run.state === 'unknown' && !!run.workerReceipt && Date.now() - Date.parse(run.updatedAt) < UNKNOWN_RECONCILE_MS)
+      && (!run.capacityRetryAt || Date.parse(run.capacityRetryAt) <= Date.now()));
     const activeNext = activeRuns.length
       ? Date.now() + (activeRuns.some((run) => run.logsPending) ? 100 : activeRuns.some((run) => (this.liveSubscribers.get(run.runId) ?? 0) > 0) ? 1_000 : 5_000)
       : Infinity;
+    const capacityRetryNext = Object.values(latest.runs).reduce((next, run) => {
+      if (!ACTIVE.has(run.state) || !run.capacityRetryAt) return next;
+      const dueAt = Date.parse(run.capacityRetryAt);
+      return Number.isFinite(dueAt) ? Math.min(next, dueAt) : next;
+    }, Infinity);
     let webhookNext = Infinity;
     for (const run of Object.values(latest.runs)) {
       if (TERMINAL.has(run.state) && run.webhook && !run.webhook.deliveredAt && !run.webhook.exhaustedAt) {
@@ -1159,7 +1199,7 @@ export class RunnerRunCoordinator {
         webhookNext = Math.min(webhookNext, Number.isFinite(dueAt) ? dueAt : Date.now() + 5_000);
       }
     }
-    const nextAlarm = Math.min(activeNext, webhookNext);
+    const nextAlarm = Math.min(activeNext, capacityRetryNext, webhookNext);
     if (Number.isFinite(nextAlarm)) await this.state.storage.setAlarm(Math.max(Date.now() + 100, nextAlarm));
   }
 

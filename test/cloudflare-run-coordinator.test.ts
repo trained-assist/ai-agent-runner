@@ -290,7 +290,7 @@ describe('Cloudflare Runner run coordinator', () => {
     expect(await result.json()).toMatchObject({ outcome: 'succeeded', text: 'done on GHA' });
   });
 
-  it('supports strict France and strict GHA API routes in addition to auto selection', async () => {
+  it('queues strict France capacity refusals and supports strict GHA API routes', async () => {
     const france = setup();
     france.env.GHA_WORKER_URL = 'https://gha.example';
     france.env.GHA_WORKER_TOKEN = 'gha-worker-secret-for-test-only';
@@ -305,7 +305,9 @@ describe('Cloudflare Runner run coordinator', () => {
     const franceReceipt = await franceAccepted.json() as { runId: string };
     await france.coordinator.alarm();
     expect(franceHosts).toEqual(['france.example']);
-    expect(await (await france.coordinator.fetch(call(`/v1/runs/${franceReceipt.runId}/result`))).json()).toMatchObject({ outcome: 'failed', failure: { code: 'WORKER_CAPACITY' } });
+    expect(await (await france.coordinator.fetch(call(`/v1/runs/${franceReceipt.runId}/status`))).json()).toMatchObject({
+      state: 'queued', engine: 'eu-vm-agent-run', queueReason: 'worker_capacity', retryAt: expect.any(String),
+    });
 
     const gha = setup();
     gha.env.GHA_WORKER_URL = 'https://gha.example';
@@ -344,8 +346,8 @@ describe('Cloudflare Runner run coordinator', () => {
     expect(await result.json()).toMatchObject({ outcome: 'failed', failure: { code: 'WORKER_PROFILE_WORKSPACE_UNSUPPORTED' } });
   });
 
-  it('keeps sandbox3 France-only when the optional GHA credential is not provisioned', async () => {
-    const { coordinator, env } = setup();
+  it('keeps a France capacity refusal queued when the optional GHA credential is not provisioned', async () => {
+    const { coordinator, env, storage } = setup();
     env.GHA_WORKER_URL = 'https://gha.example';
     const hosts: string[] = [];
     env.FETCH = async (input) => {
@@ -357,8 +359,53 @@ describe('Cloudflare Runner run coordinator', () => {
     const receipt = await submitted.json() as { runId: string };
     await coordinator.alarm();
     expect(hosts).toEqual(['france.example']);
-    const result = await coordinator.fetch(call(`/v1/runs/${receipt.runId}/result`));
-    expect(await result.json()).toMatchObject({ outcome: 'failed', failure: { code: 'WORKER_CAPACITY' } });
+    const stored = storage.values.get('runner-v1') as { runs: Record<string, { capacityRetryAt?: string }> };
+    expect(stored.runs[receipt.runId]).toMatchObject({ state: 'queued', capacityRetryAttempts: 1, capacityRetryAt: expect.any(String) });
+    expect(await (await coordinator.fetch(call(`/v1/runs/${receipt.runId}/status`))).json()).toMatchObject({
+      state: 'queued', queueReason: 'worker_capacity', retryAt: expect.any(String),
+    });
+
+    // Once capacity is available, the same run and operation are dispatched without a new API request.
+    stored.runs[receipt.runId]!.capacityRetryAt = new Date(Date.now() - 1).toISOString();
+    storage.values.set('runner-v1', stored);
+    env.FETCH = async (input, init) => {
+      const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+      hosts.push(`${url.host}${url.pathname}`);
+      if (url.pathname === '/v1/launch') return Response.json({ status: 'accepted' }, { status: 202 });
+      return Response.json({ status: 'running' });
+    };
+    await coordinator.alarm();
+    expect(hosts).toEqual(['france.example', 'france.example/v1/launch']);
+    expect(storage.values.get('runner-v1')).toMatchObject({ runs: { [receipt.runId]: { state: 'starting', capacityRetryAt: undefined, capacityRetryAttempts: 0 } } });
+  });
+
+  it('accepts five concurrent submissions and drains them after capacity returns', async () => {
+    const { coordinator, env, storage } = setup();
+    let full = true;
+    env.FETCH = async (input, init) => {
+      const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+      if (url.pathname === '/v1/launch' && full) return Response.json({ accepted: false, code: 'WORKER_CAPACITY' }, { status: 503 });
+      if (url.pathname === '/v1/launch') return Response.json({ status: 'accepted' }, { status: 202 });
+      return Response.json({ status: 'running' });
+    };
+    const submissions = await Promise.all(Array.from({ length: 5 }, (_, index) => coordinator.fetch(call('/v1/runs', {
+      ...body, userTaskId: `parallel-${index}`,
+    }, { 'idempotency-key': `parallel-capacity-${index}` }))));
+    expect(submissions.map((response) => response.status)).toEqual([202, 202, 202, 202, 202]);
+    const receipts = await Promise.all(submissions.map(async (response) => await response.json() as { runId: string }));
+
+    await coordinator.alarm();
+    let stored = storage.values.get('runner-v1') as { runs: Record<string, { state: string; capacityRetryAt?: string; capacityWaitMs?: number }> };
+    expect(receipts.every(({ runId }) => stored.runs[runId]?.state === 'queued')).toBe(true);
+    expect(receipts.every(({ runId }) => !!stored.runs[runId]?.capacityRetryAt)).toBe(true);
+
+    full = false;
+    for (const { runId } of receipts) stored.runs[runId]!.capacityRetryAt = new Date(Date.now() - 1).toISOString();
+    storage.values.set('runner-v1', stored);
+    await coordinator.alarm();
+    stored = storage.values.get('runner-v1') as typeof stored;
+    expect(receipts.every(({ runId }) => stored.runs[runId]?.state === 'starting')).toBe(true);
+    expect(receipts.every(({ runId }) => Number.isFinite(stored.runs[runId]?.capacityWaitMs))).toBe(true);
   });
 
   // Regressions from current main: preserve answers, stale-status recovery and process-start visibility.

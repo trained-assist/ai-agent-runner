@@ -29,6 +29,7 @@ export type JournalLine =
   | { kind: 'admission'; record: AdmissionRecord }
   | { kind: 'prepared'; runId: string; repository: { fullName: string; revision?: string }; profileWorkspace?: RunSpec['profileWorkspace'] }
   | { kind: 'launch_intent'; runId: string; engine: string; at: string }
+  | { kind: 'launch_refused'; runId: string; at: string; code: string }
   | { kind: 'dispatched'; runId: string; engine: string; at: string }
   | { kind: 'worker_log_cursor'; runId: string; sourceSequence: number; apiSequence: number }
   | { kind: 'completed'; runId: string; patch: CompletedRunPatch };
@@ -187,11 +188,21 @@ export class StatelessStore {
   appendDispatched(runId: string, engine: string, at: string): void {
     this.write({ kind: 'dispatched', runId, engine, at });
     this.dispatched.set(runId, { runId, engine, at });
+    const run = this.progress.get(runId);
+    if (run) { run.state = 'running'; run.updatedAt = at; }
   }
 
   appendLaunchIntent(runId: string, engine: string, at: string): void {
     this.write({ kind: 'launch_intent', runId, engine, at });
     this.dispatched.set(runId, { runId, engine, at });
+  }
+
+  /** A typed no-admission response is proof that this attempt is safe to retry later. */
+  clearLaunchIntent(runId: string, at: string, code: string): void {
+    this.write({ kind: 'launch_refused', runId, at, code });
+    this.dispatched.delete(runId);
+    const run = this.progress.get(runId);
+    if (run) { run.state = 'queued'; run.updatedAt = at; }
   }
 
   /** Persist the VM log source cursor alongside the central event cursor for restart-safe tailing. */
@@ -246,16 +257,18 @@ export class StatelessStore {
       return; // журнала ещё нет — это первый запуск
     }
     let restored = 0;
-    let resumed = 0;
     for (const line of raw.split('\n')) {
       const trimmed = line.trim();
       if (!trimmed) continue;
       try {
         const entry = JSON.parse(trimmed) as JournalLine;
+        if (entry.kind === 'launch_refused') {
+          if (typeof entry.runId === 'string' && entry.runId.length > 0) this.dispatched.delete(entry.runId);
+          continue;
+        }
         if (entry.kind === 'dispatched' || entry.kind === 'launch_intent') {
           if (typeof entry.runId === 'string' && entry.runId.length > 0) {
             this.dispatched.set(entry.runId, { runId: entry.runId, engine: String(entry.engine ?? ''), at: String(entry.at ?? '') });
-            resumed += 1;
           }
           continue;
         }
@@ -297,6 +310,7 @@ export class StatelessStore {
       }
     }
     if (restored > 0) console.warn(`[stateless-store] restored ${restored} admission records from ${path}`);
+    const resumed = this.dispatched.size;
     if (resumed > 0) console.warn(`[stateless-store] ${resumed} dispatched runs will resume polling`);
   }
 
