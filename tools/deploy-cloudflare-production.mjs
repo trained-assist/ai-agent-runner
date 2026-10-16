@@ -28,15 +28,19 @@ export function productionRunnerPrincipalRecord(apiKey) {
   };
 }
 
-export function hasExpectedProductionCapabilities(body) {
+export function hasExpectedProductionCapabilities(body, expectGha = Boolean(process.env.GHA_WORKER_TOKEN_PRODUCTION_AGENT_API?.trim())) {
   return body?.contract?.name === API_CONTRACT_NAME
     && body?.placement === 'cloudflare-worker'
     && Array.isArray(body?.executionRegions)
     && body.executionRegions.includes('eu-vm-agent-run')
     && Array.isArray(body?.fallbackExecutionRegions)
-    && body.fallbackExecutionRegions.includes('azure-cloud')
-    && body?.routes?.gha?.available === true
-    && body?.routes?.gha?.engine === 'azure-cloud';
+    && (expectGha
+      ? body.fallbackExecutionRegions.includes('azure-cloud')
+        && body?.routes?.gha?.available === true
+        && body?.routes?.gha?.engine === 'azure-cloud'
+      : !body.fallbackExecutionRegions.includes('azure-cloud')
+        && body?.routes?.gha?.available === false
+        && body?.routes?.gha?.engine === null);
 }
 
 function required(name, minimumLength = 1) {
@@ -132,7 +136,8 @@ async function main() {
   const encryptionKey = required('RUN_LAUNCH_ENCRYPTION_KEY', 32);
   const franceToken = required('EU_VM_WORKER_TOKEN', 24);
   const ladderToken = required('LLM_LADDER_TOKEN', 1);
-  const ghaWorkerToken = required('GHA_WORKER_TOKEN_PRODUCTION_AGENT_API', 24);
+  const ghaWorkerToken = process.env.GHA_WORKER_TOKEN_PRODUCTION_AGENT_API?.trim() ?? '';
+  if (ghaWorkerToken && ghaWorkerToken.length < 24) throw new Error('production_runner_secret_invalid:GHA_WORKER_TOKEN_PRODUCTION_AGENT_API');
   const franceUrl = await verifyFranceWorker(required('EU_VM_WORKER_URL'), franceToken);
   const sourceSha = process.env.SOURCE_SHA?.trim() ?? '';
   if (!/^[a-f0-9]{40}$/.test(sourceSha)) throw new Error('production_runner_source_sha_invalid');
@@ -150,7 +155,8 @@ async function main() {
   const registry = JSON.stringify([productionRunnerPrincipalRecord(apiKey)]);
   if (process.argv.includes('--preflight-only')) {
     console.log(JSON.stringify({ ok: true, target: WORKER, sourceSha,
-      franceWorkerReadiness: 'ready', productionConfig: 'valid', secretInputs: 'present' }));
+      franceWorkerReadiness: 'ready', ghaRoute: ghaWorkerToken ? 'configured' : 'unavailable_fail_closed',
+      productionConfig: 'valid', secretInputs: 'present' }));
     return;
   }
 
@@ -160,14 +166,15 @@ async function main() {
     ['RUN_LAUNCH_ENCRYPTION_KEY', encryptionKey],
     ['VM_WORKER_URL', franceUrl],
     ['VM_WORKER_TOKEN', franceToken],
-    ['GHA_WORKER_TOKEN', ghaWorkerToken],
+    ...(ghaWorkerToken ? [['GHA_WORKER_TOKEN', ghaWorkerToken]] : []),
     ['LLM_LADDER_TOKEN', ladderToken],
   ]);
 
   await verifyDeployment(sourceSha, apiKey, delegationSecret);
   console.log(JSON.stringify({ ok: true, worker: WORKER, sourceSha,
     principalId: PRINCIPAL_ID, profileId: PROFILE_ID, executionWorker: 'eu-vm-agent-run',
-    franceWorkerReadiness: 'ready', ghaRouteReadiness: 'passed', authenticatedCapabilities: 'passed', delegatedProfile: 'passed',
+    franceWorkerReadiness: 'ready', ghaRoute: ghaWorkerToken ? 'ready' : 'unavailable_fail_closed',
+    authenticatedCapabilities: 'passed', delegatedProfile: 'passed',
     taskCreated: false }));
 }
 
