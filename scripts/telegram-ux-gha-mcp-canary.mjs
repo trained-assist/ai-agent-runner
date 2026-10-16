@@ -15,6 +15,7 @@ const evidence = {
   taskId,
   runId: null,
   routeMode: 'gha',
+  publicationMode: 'none',
   engine: 'azure-cloud',
   stages: [],
 };
@@ -111,6 +112,7 @@ if (priorTaskId || priorRunId) {
 const payload = {
   userTaskId: taskId,
   routeMode: 'gha',
+  publicationMode: 'none',
   engine: { name: 'azure-cloud', adapterVersion: '1' },
   input: { inlinePrompt: 'Use the available MCP tool named trained-assist-registry-test_registry_fixture_read with empty arguments. Return its result as JSON with marker, taskId, and runId. Do not use bash, curl, webfetch, or repository source to look up the marker. If that MCP tool is unavailable, say so immediately; do not guess values or edit files.' },
   envAllowlist: ['LLM_LADDER_TOKEN'],
@@ -164,7 +166,7 @@ const payload = {
   await stage('api_result', 'verified', {
     state: status.state,
     executionOutcome: result.outcome ?? 'unknown',
-    publicationOutcome: artifactPushFailed ? 'failed' : result.failure ? 'failed' : 'no failure reported',
+    publicationOutcome: result.publicationOutcome ?? (artifactPushFailed ? 'failed' : result.failure ? 'failed' : 'unknown'),
     failureCode: result.failure?.code ?? (artifactPushFailed ? 'ARTIFACTS_PUSH_FAILED' : null),
   });
   if (status.state !== 'succeeded' || result.outcome !== 'succeeded') {

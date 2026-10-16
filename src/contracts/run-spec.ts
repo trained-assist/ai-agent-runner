@@ -203,6 +203,7 @@ export interface RunSpec {
   budget?: BudgetSpec;
   result?: ResultPolicy;
   outputs?: OutputSpec[];
+  publicationMode?: 'git' | 'none';
   traceId?: string;
   repository?: RepositorySpec;
   profileWorkspace?: ProfileWorkspaceSpec;
@@ -231,6 +232,7 @@ const TOP_LEVEL_KEYS = [
   'budget',
   'result',
   'outputs',
+  'publicationMode',
   'traceId',
   'repository',
   'profileWorkspace',
@@ -767,6 +769,14 @@ export function validateRunSpec(input: unknown): ValidationResult<RunSpec> {
   if ('outputs' in input && input['outputs'] !== undefined) {
     outputs = validateOutputs(input['outputs'], 'spec.outputs', collector);
   }
+  let publicationMode: 'git' | 'none' | undefined;
+  if (input['publicationMode'] !== undefined) {
+    if (input['publicationMode'] !== 'git' && input['publicationMode'] !== 'none') collector.push('spec.publicationMode: expected git | none');
+    else publicationMode = input['publicationMode'];
+    if (input['publicationMode'] === 'none' && ((outputs?.length ?? 0) > 0 || input['profileWorkspace'] !== undefined)) {
+      collector.push('spec.publicationMode: none is only valid without outputs or profileWorkspace');
+    }
+  }
 
   let repository: RepositorySpec | undefined;
   if ('repository' in input && input['repository'] !== undefined && input['repository'] !== null) {
@@ -853,6 +863,7 @@ export function validateRunSpec(input: unknown): ValidationResult<RunSpec> {
   if (budget !== undefined) spec.budget = budget;
   if (result !== undefined) spec.result = result;
   if (outputs !== undefined) spec.outputs = outputs;
+  if (publicationMode !== undefined) spec.publicationMode = publicationMode;
   if (input['traceId'] !== undefined) spec.traceId = input['traceId'] as string;
   if (repository !== undefined) spec.repository = repository;
   if (profileWorkspace !== undefined) spec.profileWorkspace = profileWorkspace;

@@ -22,6 +22,13 @@ function validSpec(over: Record<string, unknown> = {}): Record<string, unknown> 
   };
 }
 
+describe('publication mode', () => {
+  it('accepts none for a text-only run and rejects it with declared outputs', () => {
+    expect(validateRunSpec(validSpec({ publicationMode: 'none' })).ok).toBe(true);
+    expect(validateRunSpec(validSpec({ publicationMode: 'none', outputs: [{ path: 'result.txt' }] })).ok).toBe(false);
+  });
+});
+
 const EVENT_PAYLOADS: Record<RunnerEventType, unknown> = {
   claimed: { operationId: 'op-1' },
   materialized: { inputs: 2 },
