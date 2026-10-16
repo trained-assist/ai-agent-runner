@@ -276,26 +276,24 @@ export class RunnerRunCoordinator {
           note: run.artifacts.length ? run.developerGuest ? 'guest downloads expire 24 hours after result collection' : 'artifacts are committed by the VM worker to the run branch' : 'the VM worker reported no artifacts' });
       case 'log': {
         if (request.method !== 'GET') return error('METHOD_NOT_ALLOWED', 'log supports GET only', 405);
-        let refreshed: string | null = null;
-        let failureCode: string | null = null;
         try {
-          const response = await this.worker(run.engine, `/v1/runs/${encodeURIComponent(runId)}/log-url`);
-          if (response.ok) {
-            const value = await response.json() as { logUrl?: unknown; failureCode?: unknown };
-            if (typeof value.logUrl === 'string') refreshed = value.logUrl;
-            if (typeof value.failureCode === 'string') failureCode = value.failureCode;
-          } else {
-            failureCode = `WORKER_HTTP_${response.status}`;
+          const response = await this.worker(run.engine, `/v1/runs/${encodeURIComponent(runId)}/log`);
+          if (response.ok && response.headers.get('content-type')?.includes('application/x-ndjson')) {
+            const headers = new Headers({ 'content-type': 'application/x-ndjson; charset=utf-8', 'cache-control': 'private, no-store', 'x-content-type-options': 'nosniff' });
+            const digest = response.headers.get('x-content-sha256');
+            const length = response.headers.get('content-length');
+            if (digest) headers.set('x-content-sha256', digest);
+            if (length) headers.set('content-length', length);
+            return new Response(response.body, { status: 200, headers });
           }
+          const value = await response.json() as { failureCode?: unknown; retrievable?: unknown };
+          return json({ runId, logUrl: run.logUrl, retrievable: false,
+            ...(typeof value.failureCode === 'string' ? { failureCode: value.failureCode } : !response.ok ? { failureCode: `WORKER_HTTP_${response.status}` } : {}),
+            note: 'the VM could not read the durable session log from Google Storage' });
         } catch {
-          // Report an unavailable log below; never turn a temporary signer failure
-          // into a redirect to an expired URL saved with the original result.
+          return json({ runId, logUrl: run.logUrl, retrievable: false, failureCode: 'WORKER_UNAVAILABLE',
+            note: 'the VM could not be reached to read the durable session log from Google Storage' });
         }
-        const target = retrievableLogUrl(refreshed);
-        if (!target) return json({ runId, logUrl: run.logUrl, retrievable: false,
-          ...(failureCode ? { failureCode } : {}),
-          note: run.logUrl ? 'the worker could not issue a fresh Google Storage download URL' : 'the worker has not published a retrievable session log' });
-        return new Response(null, { status: 302, headers: { location: target, 'cache-control': 'private, no-store' } });
       }
       case 'webhook':
         if (request.method !== 'GET') return error('METHOD_NOT_ALLOWED', 'webhook supports GET only', 405);
@@ -1281,16 +1279,6 @@ function runtimeEnv(env: RunnerWorkerEnv, names: string[]): Record<string, strin
     if (typeof value === 'string') result[name] = value;
   }
   return result;
-}
-
-function retrievableLogUrl(value: string | null): string | null {
-  if (!value) return null;
-  try {
-    const url = new URL(value);
-    return url.protocol === 'https:' && url.hostname === 'storage.googleapis.com' ? url.href : null;
-  } catch {
-    return null;
-  }
 }
 
 function validModelConnection(value: unknown): value is ModelConnection {

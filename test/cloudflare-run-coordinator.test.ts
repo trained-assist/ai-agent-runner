@@ -44,6 +44,7 @@ function setup() {
         const logs = [{ sequence: 1, stream: 'stdout', message: 'step 1: inspect' }, { sequence: 2, stream: 'stderr', message: 'progress warning' }].filter((entry) => entry.sequence > after);
         return Response.json({ runId: url.pathname.split('/').at(-2), cursor: logs.at(-1)?.sequence ?? after, hasMore: false, state: 'running', logs });
       }
+      if (url.pathname.endsWith('/log')) return new Response('{"sequence":1,"type":"log"}\n', { headers: { 'content-type': 'application/x-ndjson', 'x-content-sha256': 'abc' } });
       if (url.pathname.endsWith('/log-url')) return Response.json({ logUrl: 'https://storage.googleapis.com/private-bucket/runs/test/events.jsonl?X-Goog-Signature=fresh' });
       if (url.pathname.endsWith('/result')) return Response.json({ exitReason: 'completed', exitCode: 0, exitSignal: null, answer: 'done', artifacts: [], logUrl: '', repo: null });
       return Response.json({ status: 'cancelled' });
@@ -64,7 +65,7 @@ const testMcp = { servers: [{ serverId: 'trained-assist-registry-test', transpor
 const userMcp = { servers: [{ serverId: 'mem-gpt', transport: 'remote', url: 'https://trained-assist-mcp-user-sandbox.skillset-apply.workers.dev/mcp', bindingRef: 'mem-gpt-user-sandbox', allowedTools: ['identity.whoami', 'google_docs.connect', 'google_docs.get_document'], policyVersion: 'mem-gpt-user-run-v1', catalogueVersion: 'mem-gpt-user-catalogue-v1' }] };
 
 describe('Cloudflare Runner run coordinator', () => {
-  it('mints a fresh Google Storage URL for log requests and rejects untrusted URLs', async () => {
+  it('streams the durable GCS session log through the authenticated Runner API', async () => {
     const { coordinator, storage, env } = setup();
     const submitted = await coordinator.fetch(call('/v1/runs', body, { 'idempotency-key': 'log-redirect' }));
     const { runId } = await submitted.json() as { runId: string };
@@ -73,19 +74,15 @@ describe('Cloudflare Runner run coordinator', () => {
     await storage.put('runner-v1', stored);
 
     const response = await coordinator.fetch(call(`/v1/runs/${runId}/log`));
-    expect(response.status).toBe(302);
-    expect(response.headers.get('location')).toContain('X-Goog-Signature=fresh');
+    expect(response.status).toBe(200);
+    expect(response.headers.get('content-type')).toContain('application/x-ndjson');
     expect(response.headers.get('cache-control')).toBe('private, no-store');
+    expect(response.headers.get('x-content-sha256')).toBe('abc');
+    expect(await response.text()).toContain('"sequence":1');
 
-    env.FETCH = async () => Response.json({ logUrl: 'http://storage.googleapis.com/private-bucket/log.jsonl' });
-    const insecure = await coordinator.fetch(call(`/v1/runs/${runId}/log`));
-    expect(insecure.status).toBe(200);
-    expect(await insecure.json()).toMatchObject({ runId, retrievable: false });
-
-    env.FETCH = async () => Response.json({ logUrl: 'https://attacker.example/steal' });
-    const external = await coordinator.fetch(call(`/v1/runs/${runId}/log`));
-    expect(external.status).toBe(200);
-    expect(await external.json()).toMatchObject({ runId, retrievable: false });
+    env.FETCH = async () => Response.json({ runId, retrievable: false, failureCode: 'BLOB_NOT_FOUND' });
+    const missing = await coordinator.fetch(call(`/v1/runs/${runId}/log`));
+    expect(await missing.json()).toMatchObject({ runId, retrievable: false, failureCode: 'BLOB_NOT_FOUND' });
   });
 
   it('lists only active metadata for one task and enforces principal ownership', async () => {
