@@ -62,7 +62,7 @@ jobs:
             echo 'gateway source SHA must already be merged into GHA gateway main' >&2
             exit 1
           }
-          run="$(gh run view "$SANDBOX_RUN_ID" --repo vovalikessmoothy-png/opencode-gha-runner --json conclusion,workflowName,headBranch)"
+          run="$(gh run view "$SANDBOX_RUN_ID" --repo trained-assist/ai-agent-runner --json conclusion,workflowName,headBranch)"
           RUN_JSON="$run" node --input-type=module <<'NODE'
           const run = JSON.parse(process.env.RUN_JSON);
           if (run.conclusion !== 'success' || run.workflowName !== 'Deploy GHA gateway sandbox' || run.headBranch !== 'main') {
