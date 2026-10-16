@@ -6,6 +6,7 @@ import { isEnvName, isSafeId } from '../contracts/validate.js';
 import type { RunSpec } from '../contracts/run-spec.js';
 import type { LogEvent } from '../contracts/events.js';
 import { Runner } from '../runner/runner.js';
+import type { BlobStore } from '../storage/blob-store.js';
 import { isTerminalState } from '../runner/state-machine.js';
 import type { CapacityAdmission, CapacityEnvelope, CapacityReservationStore, HostUsageSampler } from './capacity-admission.js';
 import { redactSecrets } from '../redact.js';
@@ -50,6 +51,10 @@ export interface VmWorkerServerOptions {
   buildInfo?: VmWorkerBuildInfo;
   bindingsInventory?: VmWorkerBindingsInventory;
   engineAvailable?: () => boolean;
+  /** Optional durable object store used to persist the session event log in Google Storage. */
+  blobStore?: BlobStore;
+  storage?: BlobStore;
+  blob?: BlobStore;
 }
 
 export interface VmWorkerServer extends Server {
@@ -168,7 +173,7 @@ export function createVmWorkerServer(options: VmWorkerServerOptions): VmWorkerSe
     }
     if (!snapshot) { sendJson(res, endpoint === 'result' ? 404 : 200, endpoint === 'result' ? { error: 'NOT_FOUND' } : { runId, status: 'unknown_run' }); return; }
     if (endpoint === 'result' && method === 'GET') {
-      const result = toLaunchResult(options, snapshot);
+      const result = await toLaunchResult(options, snapshot);
       if (!result) { sendJson(res, 409, { error: 'RESULT_NOT_READY' }); return; }
       sendJson(res, 200, result);
       return;
@@ -449,7 +454,7 @@ function stateToWorkerStatus(state: string): WorkerRunStatus {
   return 'unknown';
 }
 
-function toLaunchResult(options: VmWorkerServerOptions, snapshot: NonNullable<ReturnType<Runner['getRun']>>): LaunchResult | null {
+async function toLaunchResult(options: VmWorkerServerOptions, snapshot: NonNullable<ReturnType<Runner['getRun']>>): Promise<LaunchResult | null> {
   const result = snapshot.result;
   if (!result) return null;
   const spec = options.runner.getRunSpec(snapshot.runId);
@@ -486,7 +491,7 @@ function toLaunchResult(options: VmWorkerServerOptions, snapshot: NonNullable<Re
     timedOut: result.exitReason === 'timeout',
     outputTruncated: stdout.length + stderr.length >= (spec?.limits.maxOutputBytes ?? 1_000_000),
     artifacts,
-    logUrl: `local://runs/${encodeURIComponent(snapshot.runId)}/logs`,
+    logUrl: await durableSessionLogUrl(options, snapshot, events),
     repo: { fullName: spec?.repository?.fullName ?? '', branch: `agent-run/${snapshot.runId}`, commit: options.runner.profileWorkspaceCommit?.(snapshot.runId) ?? null },
     ...(result.failure ? { failure: { ...result.failure } } : {}),
     ...(result.profileChanges ? { profileChanges: result.profileChanges } : {}),
@@ -495,6 +500,32 @@ function toLaunchResult(options: VmWorkerServerOptions, snapshot: NonNullable<Re
     } : {}),
   };
   return launch;
+}
+
+async function durableSessionLogUrl(options: VmWorkerServerOptions, snapshot: NonNullable<ReturnType<Runner['getRun']>>, events: readonly unknown[]): Promise<string> {
+  const fallback = `local://runs/${encodeURIComponent(snapshot.runId)}/logs`;
+  const store = (options as { blobStore?: BlobStore; storage?: BlobStore; blob?: BlobStore }).blobStore
+    ?? (options as { storage?: BlobStore }).storage
+    ?? (options as { blob?: BlobStore }).blob;
+  if (!store || typeof store.put !== 'function') return fallback;
+  try {
+    const bytes = Buffer.from((events as unknown[]).map((event) => JSON.stringify(event)).join('\n') + ((events as unknown[]).length ? '\n' : ''));
+    const key = `runs/${encodeURIComponent(snapshot.runId)}/events.jsonl`;
+    await store.put(key, bytes);
+    if (typeof store.shareUrl === 'function') {
+      const shared = await store.shareUrl(key, { expiresAt: new Date(Date.now() + 10 * 60 * 1000) });
+      const candidate = Array.isArray(shared) ? shared[0] : (shared && typeof shared === 'object' ? (shared as { url?: unknown }).url : shared);
+      if (typeof candidate === 'string' && /^https?:\/\//.test(candidate)) return candidate;
+    }
+    const bucketName = typeof (store as unknown as { bucketName?: unknown }).bucketName === 'string'
+      ? (store as unknown as { bucketName: string }).bucketName
+      : (typeof (store as unknown as { name?: unknown }).name === 'string' ? (store as unknown as { name: string }).name : null);
+    if (bucketName) return `https://storage.googleapis.com/${bucketName}/${key}`;
+  } catch {
+    // Keep the run truthful: if durable persistence fails, the caller receives the
+    // non-retrievable local reference instead of a broken GCS URL.
+  }
+  return fallback;
 }
 
 function observeProcessTreeExit(options: VmWorkerServerOptions, operationId: string, runId: string): void {

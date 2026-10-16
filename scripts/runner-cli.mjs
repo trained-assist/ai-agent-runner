@@ -22,6 +22,7 @@ Commands:
   events   <runId> [--cursor <n>] [--limit <n>]
   follow   <runId> [--cursor <n>] [--timeout-ms <n>]   SSE until the run reaches a terminal state
   result   <runId>
+  log      <runId>                                   resolve the session-log URL or non-retrievable state
   cancel   <runId> [--owner-generation <n>] [--reason <text>]
 
 Connection (flags win over environment):
@@ -219,6 +220,23 @@ async function commandResult(conn, runId) {
   print(await request(conn, 'GET', `/v1/runs/${encodeURIComponent(runId)}/result`));
 }
 
+async function commandLog(conn, runId) {
+  const response = await fetch(`${conn.base}/v1/runs/${encodeURIComponent(runId)}/log`, {
+    headers: authHeaders(conn),
+    redirect: 'manual',
+  });
+  const body = await readBody(response);
+  if (response.status === 302) {
+    print({ runId, status: 302, logUrl: response.headers.get('location'), retrievable: true });
+    return;
+  }
+  if (response.ok) {
+    print(body ?? { runId, status: response.status });
+    return;
+  }
+  throw new ApiError(response.status, body);
+}
+
 async function commandCancel(conn, flags, runId) {
   const body = {};
   if (flags['owner-generation'] !== undefined) body.ownerGeneration = intFlag(flags, 'owner-generation', 0);
@@ -350,6 +368,10 @@ async function main() {
     case 'result':
       if (!runId) fail('result: <runId> is required', EXIT_USAGE);
       await commandResult(conn, runId);
+      break;
+    case 'log':
+      if (!runId) fail('log: <runId> is required', EXIT_USAGE);
+      await commandLog(conn, runId);
       break;
     case 'cancel':
       if (!runId) fail('cancel: <runId> is required', EXIT_USAGE);

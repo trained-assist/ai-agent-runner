@@ -183,12 +183,13 @@ export function createAgentApiServer(service: AgentApi, options: AgentApiServerO
         if (req.method !== 'GET') throw new ApiError('METHOD_NOT_ALLOWED', 'log supports GET only');
         requireScope(principal, 'runs:read');
         const view = service.artifacts(principal, runId);
-        if (!view.logUrl) throw new ApiError('RESULT_NOT_READY', 'the worker has not published a session log for this run yet');
-        // Редиректим только на настоящий URL. Воркер может вернуть `local://…` (лог остался
-        // на его машине, бакета ещё нет) — редирект на такую схему клиент не откроет, и врать
-        // «перейдите по ссылке» хуже, чем честно отдать её в теле.
-        if (!isRetrievableLogUrl(view.logUrl)) {
-          sendJson(res, 200, { runId, logUrl: view.logUrl, retrievable: false, note: 'the log is not served over HTTP yet; the worker kept it locally' });
+        // Отсутствие ссылки и локальная ссылка — один и тот же честный ответ: лог не
+        // доступен по HTTP. Не поднимаем RESULT_NOT_READY, потому что для завершённого
+        // рана это означает отказ сохранения, а не «ещё не готов».
+        if (!view.logUrl || !isRetrievableLogUrl(view.logUrl)) {
+          sendJson(res, 200, { runId, logUrl: view.logUrl, retrievable: false, note: view.logUrl
+            ? 'the log is not served over HTTP yet; the worker kept it locally'
+            : 'the worker did not publish a session log; durable persistence failed or never completed' });
           return 200;
         }
         res.writeHead(302, { location: view.logUrl });
