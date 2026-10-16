@@ -158,12 +158,21 @@ export function createVmWorkerServer(options: VmWorkerServerOptions): VmWorkerSe
       return;
     }
 
-    const runPath = /^\/v1\/runs\/([^/]+)(?:\/(status|result|cancel|logs|artifacts|history))?$/.exec(url.pathname);
+    const runPath = /^\/v1\/runs\/([^/]+)(?:\/(status|result|cancel|logs|artifacts|history|log-url))?$/.exec(url.pathname);
     if (!runPath) { sendJson(res, 404, { error: 'NOT_FOUND' }); return; }
     let runId: string;
     try { runId = decodeURIComponent(runPath[1]!); } catch { sendJson(res, 400, { error: 'INVALID_REQUEST' }); return; }
     if (!isSafeId(runId)) { sendJson(res, 400, { error: 'INVALID_REQUEST' }); return; }
     const endpoint = runPath[2] ?? 'status';
+    if (endpoint === 'log-url' && method === 'GET') {
+      const logUrl = await freshSessionLogUrl(options, runId);
+      if (!logUrl) {
+        sendJson(res, 200, { runId, logUrl: null, retrievable: false, note: 'no durable session log is available in Google Storage' });
+        return;
+      }
+      sendJson(res, 200, { runId, logUrl, retrievable: true });
+      return;
+    }
     const snapshot = options.runner.getRun(runId);
     if (endpoint === 'status' && method === 'GET') {
       const status: WorkerRunStatus = snapshot ? stateToWorkerStatus(snapshot.state) : 'unknown';
@@ -504,9 +513,7 @@ async function toLaunchResult(options: VmWorkerServerOptions, snapshot: NonNulla
 
 async function durableSessionLogUrl(options: VmWorkerServerOptions, snapshot: NonNullable<ReturnType<Runner['getRun']>>, events: readonly unknown[]): Promise<string> {
   const fallback = `local://runs/${encodeURIComponent(snapshot.runId)}/logs`;
-  const store = (options as { blobStore?: BlobStore; storage?: BlobStore; blob?: BlobStore }).blobStore
-    ?? (options as { storage?: BlobStore }).storage
-    ?? (options as { blob?: BlobStore }).blob;
+  const store = blobStoreOf(options);
   if (!store || typeof store.put !== 'function') return fallback;
   try {
     const bytes = Buffer.from((events as unknown[]).map((event) => JSON.stringify(event)).join('\n') + ((events as unknown[]).length ? '\n' : ''));
@@ -526,6 +533,23 @@ async function durableSessionLogUrl(options: VmWorkerServerOptions, snapshot: No
     // non-retrievable local reference instead of a broken GCS URL.
   }
   return fallback;
+}
+
+function blobStoreOf(options: VmWorkerServerOptions): BlobStore | null {
+  return options.blobStore ?? options.storage ?? options.blob ?? null;
+}
+
+async function freshSessionLogUrl(options: VmWorkerServerOptions, runId: string): Promise<string | null> {
+  const store = blobStoreOf(options);
+  if (!store?.head || !store.shareUrl) return null;
+  const key = `runs/${encodeURIComponent(runId)}/events.jsonl`;
+  try {
+    await store.head(key);
+    const shared = await store.shareUrl(key, { expiresAt: new Date(Date.now() + 10 * 60 * 1000) });
+    return shared?.url && /^https:\/\//.test(shared.url) ? shared.url : null;
+  } catch {
+    return null;
+  }
 }
 
 function observeProcessTreeExit(options: VmWorkerServerOptions, operationId: string, runId: string): void {

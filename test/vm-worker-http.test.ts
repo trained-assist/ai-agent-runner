@@ -11,6 +11,7 @@ import type { VmWorkerBindingsInventory } from '../src/vm-worker/bindings-invent
 import type { Runner } from '../src/runner/runner.js';
 import type { RunSpec } from '../src/contracts/run-spec.js';
 import { StorageError } from '../src/storage/errors.js';
+import type { BlobStore } from '../src/storage/blob-store.js';
 
 const TOKEN = 'vm-worker-test-secret-that-is-long-enough';
 const API_ORIGIN = 'https://api.example.test';
@@ -84,6 +85,39 @@ describe('installable VM HTTP worker', () => {
     expect(JSON.parse(historyBytes.toString('utf8'))).toMatchObject({ runId: RUN_ID, outcome: 'succeeded',
       entries: [{ type: 'log', text: 'worker says hello' }, { type: 'log', text: 'diagnostic' },
         { type: 'assistant_message', text: 'Checking the repository first.' }], answer: 'worker says hello' });
+  });
+
+  it('uploads the completed Runner event journal to GCS and mints a fresh signed URL on demand', async () => {
+    const uploads = new Map<string, Buffer>();
+    const blobStore: BlobStore = {
+      backend: 'gcs',
+      put: async (key, bytes) => {
+        uploads.set(key, Buffer.from(bytes));
+        return { sha256: 'test-sha256', size: Buffer.byteLength(bytes), generation: '1' };
+      },
+      get: async (key) => uploads.get(key) ?? Buffer.alloc(0),
+      head: async (key) => ({ size: uploads.get(key)?.length ?? 0, generation: '1' }),
+      shareUrl: async (key) => ({ url: `https://storage.googleapis.com/agent-logs/${key}?signature=fresh`, expiresAt: new Date(Date.now() + 600_000).toISOString() }),
+    };
+    const fixture = await startFixture({ blobStore });
+    cleanups.push(fixture.close);
+    const accepted = await launch(fixture.base, launchRequest());
+    expect(accepted.status).toBe(202);
+    await new Promise((resolve) => setTimeout(resolve, 90));
+
+    const resultResponse = await fetch(`${fixture.base}/v1/runs/${RUN_ID}/result`, { headers: authHeaders() });
+    const result = await resultResponse.json() as { logUrl: string };
+    expect(resultResponse.status).toBe(200);
+    expect(result.logUrl).toBe(`https://storage.googleapis.com/agent-logs/runs/${RUN_ID}/events.jsonl?signature=fresh`);
+    const logKey = `runs/${RUN_ID}/events.jsonl`;
+    const saved = uploads.get(logKey);
+    expect(saved).toBeDefined();
+    const events = saved!.toString('utf8').trim().split('\n').map((line) => JSON.parse(line) as { type: string });
+    expect(events.map((event) => event.type)).toEqual(['log', 'log', 'assistant_message']);
+
+    const fresh = await fetch(`${fixture.base}/v1/runs/${RUN_ID}/log-url`, { headers: authHeaders() });
+    expect(fresh.status).toBe(200);
+    expect(await fresh.json()).toMatchObject({ runId: RUN_ID, logUrl: result.logUrl, retrievable: true });
   });
 
   it('refuses a saturated host before Runner.start with the exact capacity code', async () => {
@@ -363,7 +397,7 @@ async function launch(base: string, request: LaunchRequest): Promise<Response> {
   return fetch(`${base}/v1/launch`, { method: 'POST', headers: { ...authHeaders(), 'content-type': 'application/json' }, body: JSON.stringify(request) });
 }
 
-async function startFixture(input: { engineName?: string; cpuPercent?: number; bindingsInventory?: VmWorkerBindingsInventory; profileWorkspaceEnabled?: boolean; profileSavebackEnabled?: boolean; allowedEnvironmentNames?: string[] } = {}): Promise<{
+async function startFixture(input: { engineName?: string; cpuPercent?: number; bindingsInventory?: VmWorkerBindingsInventory; profileWorkspaceEnabled?: boolean; profileSavebackEnabled?: boolean; allowedEnvironmentNames?: string[]; blobStore?: BlobStore } = {}): Promise<{
   base: string;
   dataDir: string;
   runner: FakeRunner;
@@ -390,6 +424,7 @@ async function startFixture(input: { engineName?: string; cpuPercent?: number; b
     allowedRepositories: ['trained-assist/ai-agent-runner'],
     allowedEnvironmentNames: input.allowedEnvironmentNames ?? ['LLM_LADDER_TOKEN'],
     allowedCallbackOrigins: [API_ORIGIN],
+    ...(input.blobStore ? { blobStore: input.blobStore } : {}),
     envelope: { cpuPercent: 10, memoryPercent: 10 },
     buildInfo: { schemaVersion: 1, version: '0.1.0-test', sourceCommit: 'a'.repeat(40), builtAt: new Date().toISOString() },
     ...(input.bindingsInventory ? { bindingsInventory: input.bindingsInventory } : {}),
