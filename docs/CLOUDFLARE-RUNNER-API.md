@@ -181,6 +181,15 @@ Worker secrets:
   any partial or delegated capability is rejected.
 - `VM_WORKER_URL`: HTTPS address of the France execution worker route.
 - `VM_WORKER_TOKEN`: the France worker's current Bearer credential.
+- `VM_WORKER_ENDPOINTS`: optional ordered France endpoint pool as a JSON array of
+  `{workerId, url, token}` objects, stored as one Runner secret (values never appear in
+  vars/source). When set, it takes precedence over `VM_WORKER_URL`/`VM_WORKER_TOKEN`, which
+  remain the single-endpoint fallback. Each endpoint uses a distinct worker token and
+  endpoints are tried in declaration order before a pre-admission refusal forces the run to
+  an unavailable/unknown terminal state or, on confirmed capacity, the configured GHA
+  fallback. Run state pins the accepting endpoint's `workerId`; every later status,
+  result, cancel, and reconcile call goes to that exact endpoint, including after a Durable
+  Object alarm restart.
 - `GHA_WORKER_URL`: non-secret HTTPS address of the GHA/Azure gateway; configured as a Worker var
   for production, sandbox3 and Telegram UX sandbox.
 - `GHA_WORKER_TOKEN`: this Runner environment's GHA gateway client Bearer credential, stored as a Runner
