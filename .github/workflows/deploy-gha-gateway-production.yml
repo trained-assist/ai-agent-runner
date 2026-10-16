@@ -154,6 +154,32 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ vars.CF_ACCOUNT_ID }}
           GATEWAY_SHA: ${{ inputs.gateway_sha }}
         run: npx wrangler deploy --config wrangler.production.generated.toml --var "BUILD_SHA:$GATEWAY_SHA"
+      - name: Provision the production Agent API client credential
+        working-directory: opencode-gha-runner
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          GHA_WORKER_TOKEN_PRODUCTION_AGENT_API: ${{ secrets.GHA_WORKER_TOKEN_PRODUCTION_AGENT_API }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$GHA_WORKER_TOKEN_PRODUCTION_AGENT_API" ]]; then
+            echo 'GHA production client credential is absent; gateway credential sync skipped (route stays fail-closed)' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          printf '%s' "$GHA_WORKER_TOKEN_PRODUCTION_AGENT_API" \
+            | npx wrangler secret put WORKER_CLIENT_TOKEN_PRODUCTION_AGENT_API --config wrangler.production.generated.toml
+          node --input-type=module <<'NODE'
+          const token = process.env.GHA_WORKER_TOKEN_PRODUCTION_AGENT_API;
+          const probeId = 'provisioning-auth-production_agent_api';
+          const response = await fetch(`https://opencode-gha-runner-gateway.skillset-apply.workers.dev/v1/runs/${probeId}/status`, {
+            headers: { authorization: `Bearer ${token}`, 'user-agent': 'trained-assist-runner-provisioner/1.0' },
+            signal: AbortSignal.timeout(10_000),
+          });
+          const body = await response.json().catch(() => null);
+          if (response.status !== 200 || body?.runId !== probeId || body?.status !== 'unknown') {
+            throw new Error('production GHA gateway credential probe failed');
+          }
+          console.log('Production GHA gateway credential probe passed; token value was not displayed.');
+          NODE
       - name: Verify delivered production gateway SHA
         env:
           GATEWAY_SHA: ${{ inputs.gateway_sha }}
