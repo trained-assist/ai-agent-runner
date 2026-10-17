@@ -385,6 +385,11 @@ export class RunnerRunCoordinator {
           return error('MCP_BINDING_UNAVAILABLE', 'pinned test Registry MCP secrets or lease are not configured', 503);
         }
       } else if (server.serverId === MCP_USER.server) {
+        // Fail closed by default: the current Worker configuration has a static profile→user map.
+        // Do not expose it to agent runs until per-run disposable identity provisioning is live.
+        if (this.env.MCP_USER_SANDBOX_ENABLED !== 'true') {
+          return error('MCP_BINDING_UNAVAILABLE', 'sandbox user MCP is disabled until per-run identity provisioning is configured', 503);
+        }
         if (principal.profileId !== MCP_USER.profile || principal.principalId !== MCP_USER.principal ||
             server.transport !== 'remote' || server.url !== MCP_USER.url || server.bindingRef !== MCP_USER.binding ||
             !Array.isArray(server.allowedTools) || server.allowedTools.length !== MCP_USER.tools.length ||
