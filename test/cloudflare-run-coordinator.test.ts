@@ -22,6 +22,8 @@ const principal: ApiPrincipal = { principalId: 'principal-a', profileId: 'profil
 function setup() {
   const storage = new MemoryStorage();
   const launched: Record<string, unknown>[] = [];
+  const provisioned: Array<{ runId: string; userId: string; profileId: string; expiresAt: number }> = [];
+  const revoked: string[] = [];
   let poll = 0;
   const state: DurableObjectStateLike = { storage, blockConcurrencyWhile: async (fn) => fn() };
   const env: RunnerWorkerEnv = {
@@ -31,6 +33,17 @@ function setup() {
     ALLOWED_REPOSITORIES: 'trained-assist/ai-agent-runner,team/profile-one', ALLOWED_ENVIRONMENT_NAMES: '', RUNNER_RUNS: {} as RunnerWorkerEnv['RUNNER_RUNS'],
     FETCH: async (input, init) => {
       const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+      if (url.pathname === '/internal/sandbox/users') {
+        const submitted = JSON.parse(String(init?.body)) as { runId: string; expiresAt: number };
+        const identityHash = createHash('sha256').update(submitted.runId.toLowerCase()).digest('hex').slice(0, 32);
+        provisioned.push({ ...submitted, userId: `sbx-${identityHash}`, profileId: `sbx_${identityHash}` });
+        return Response.json({ ...provisioned.at(-1), created: true }, { status: 201 });
+      }
+      if (url.pathname === '/internal/sandbox/users/revoke') {
+        const submitted = JSON.parse(String(init?.body)) as { runId: string };
+        revoked.push(submitted.runId);
+        return Response.json({ revoked: true });
+      }
       if (url.pathname === '/v1/launch') {
         launched.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
         return Response.json({ runId: launched.at(-1)?.['runId'], operationId: 'op-test', status: 'accepted', statusUrl: 'https://france.example/status', resultUrl: 'https://france.example/result' }, { status: 202 });
@@ -51,7 +64,7 @@ function setup() {
     },
   };
   const coordinator = new RunnerRunCoordinator(state, env);
-  return { coordinator, storage, launched, env };
+  return { coordinator, storage, launched, env, provisioned, revoked };
 }
 
 function call(path: string, body?: unknown, headers: Record<string, string> = {}, actingPrincipal: ApiPrincipal = principal): Request {
@@ -62,7 +75,7 @@ function call(path: string, body?: unknown, headers: Record<string, string> = {}
 
 const body = { userTaskId: 'task-a', input: { inlinePrompt: 'say done' }, envAllowlist: [], limits: { timeoutMs: 300_000 } };
 const testMcp = { servers: [{ serverId: 'trained-assist-registry-test', transport: 'remote', url: 'https://trained-assist-mcp-host-test-160.skillset-apply.workers.dev/mcp', bindingRef: 'registry-mcp-test-160-read', allowedTools: ['registry.fixture_read'], policyVersion: 'registry-fixture-policy-v1', catalogueVersion: 'registry-fixture-catalogue-v1' }] };
-const userMcp = { servers: [{ serverId: 'mem-gpt', transport: 'remote', url: 'https://trained-assist-mcp-user-sandbox.skillset-apply.workers.dev/mcp', bindingRef: 'mem-gpt-user-sandbox', allowedTools: ['identity.whoami', 'google_docs.connect', 'google_docs.get_document'], policyVersion: 'mem-gpt-user-run-v1', catalogueVersion: 'mem-gpt-user-catalogue-v1' }] };
+const userMcp = { servers: [{ serverId: 'mem-gpt', transport: 'remote', url: 'https://trained-assist-mcp-user-sandbox.skillset-apply.workers.dev/mcp', bindingRef: 'mem-gpt-user-sandbox', allowedTools: ['identity.whoami', 'google_docs.connect', 'google_docs.get_document', 'zerocreds_wallet_form_create', 'zerocreds_wallet_form_status', 'zerocreds_wallet_connection_status', 'zerocreds_wallet_connection_revoke'], policyVersion: 'mem-gpt-user-run-v1', catalogueVersion: 'mem-gpt-user-catalogue-v2' }] };
 
 describe('Cloudflare Runner run coordinator', () => {
   it('streams the durable GCS session log through the authenticated Runner API', async () => {
@@ -896,14 +909,14 @@ describe('Cloudflare Runner run coordinator', () => {
   it('attaches a short-lived per-run proof to the pinned product user catalog without persisting secrets', async () => {
     const pair = generateKeyPairSync('ed25519');
     const privateJwk = pair.privateKey.export({ format: 'jwk' });
-    const { coordinator, launched, env } = setup();
+    const { coordinator, launched, env, provisioned, revoked } = setup();
     env.MCP_USER_SANDBOX_ENABLED = 'true';
-    env.MCP_USER_AUTH_TOKEN = 'product-user-mcp-transport-token-123';
+    env.MCP_USER_AUTH_TOKEN = 'sandbox-mcp-transport-token-1234567890';
+    env.MCP_USER_PROVISION_TOKEN = 'sandbox-provision-token-12345678901234567890';
     env.MCP_USER_RUNNER_PRIVATE_JWK = JSON.stringify(privateJwk);
-    env.MCP_USER_PROFILE_USER_IDS = JSON.stringify({ 'integration-telegram-ux-v1': 'sandbox-user-1' });
-    env.MCP_USER_CATALOGUE_VERSION = 'mem-gpt-user-catalogue-v1';
-    env.MCP_USER_CATALOGUE_DIGEST = '8c17e64a0d71123698b139bd5957a10fff71a2b15f12601a95adcde150350e71';
-    const mcpPrincipal: ApiPrincipal = { ...principal, principalId: 'integration-telegram-ux-v1', profileId: 'integration-telegram-ux-v1' };
+    env.MCP_USER_CATALOGUE_VERSION = 'mem-gpt-user-catalogue-v2';
+    env.MCP_USER_CATALOGUE_DIGEST = '483e6d2f949b32c05a70186f4e25aba291b1483eeb0bdc9a7a3bca4b9b7cdf11';
+    const mcpPrincipal: ApiPrincipal = { ...principal, mcpBindings: ['mem-gpt-user-sandbox'] };
     const response = await coordinator.fetch(call('/v1/runs', { ...body, mcp: userMcp }, { 'idempotency-key': 'product-user-mcp-run' }, mcpPrincipal));
     expect(response.status, await response.clone().text()).toBe(202);
     const receipt = await response.json() as { runId: string };
@@ -922,45 +935,76 @@ describe('Cloudflare Runner run coordinator', () => {
     const proof = attachment.mcpSecrets['RUNNER_MCP_USER_PROOF']!;
     const [header, payload, signature] = proof.split('.');
     const claims = JSON.parse(Buffer.from(payload!, 'base64url').toString('utf8')) as Record<string, unknown>;
-    expect(claims).toMatchObject({ userId: 'sandbox-user-1', runId: receipt.runId, userTaskId: 'task-a',
-      profileId: 'integration-telegram-ux-v1', ownerGeneration: 1, serverId: 'mem-gpt',
+    const identityHash = createHash('sha256').update(receipt.runId.toLowerCase()).digest('hex').slice(0, 32);
+    expect(claims).toMatchObject({ userId: `sbx-${identityHash}`, runId: receipt.runId, userTaskId: 'task-a',
+      profileId: `sbx_${identityHash}`, ownerGeneration: 1, serverId: 'mem-gpt',
       bindingRef: 'mem-gpt-user-sandbox', scope: 'mcp:user-agent-run',
-      catalogueVersion: 'mem-gpt-user-catalogue-v1',
-      catalogueDigest: '8c17e64a0d71123698b139bd5957a10fff71a2b15f12601a95adcde150350e71' });
+      catalogueVersion: 'mem-gpt-user-catalogue-v2',
+      catalogueDigest: '483e6d2f949b32c05a70186f4e25aba291b1483eeb0bdc9a7a3bca4b9b7cdf11' });
     expect(verify(null, Buffer.from(`${header}.${payload}`), pair.publicKey, Buffer.from(signature!, 'base64url'))).toBe(true);
-    expect(attachment.mcpSecrets['RUNNER_MCP_USER_TOKEN']).toBe('product-user-mcp-transport-token-123');
-    expect(JSON.stringify((await coordinator['read']()).runs[receipt.runId])).not.toContain('product-user-mcp-transport-token-123');
+    expect(attachment.mcpSecrets['RUNNER_MCP_USER_TOKEN']).toBe('sandbox-mcp-transport-token-1234567890');
+    expect(provisioned).toHaveLength(1);
+    expect(provisioned[0]?.runId).toBe(receipt.runId);
+    expect(JSON.stringify((await coordinator['read']()).runs[receipt.runId])).not.toContain('sandbox-mcp-transport-token-1234567890');
     expect(JSON.stringify((await coordinator['read']()).runs[receipt.runId])).not.toContain(proof);
+    for (let attempt = 0; attempt < 4 && revoked.length === 0; attempt += 1) await coordinator.alarm();
+    expect(revoked).toEqual([receipt.runId]);
+    expect((await coordinator['read']()).runs[receipt.runId]?.mcpUserCleanupDone).toBe(true);
   });
 
   it('refuses a user-catalog descriptor outside the trusted profile or grant lifetime before admission', async () => {
     const { coordinator, storage, env } = setup();
     env.MCP_USER_SANDBOX_ENABLED = 'true';
-    env.MCP_USER_AUTH_TOKEN = 'product-user-mcp-transport-token-123';
+    env.MCP_USER_AUTH_TOKEN = 'sandbox-mcp-transport-token-1234567890';
+    env.MCP_USER_PROVISION_TOKEN = 'sandbox-provision-token-12345678901234567890';
     env.MCP_USER_RUNNER_PRIVATE_JWK = JSON.stringify(generateKeyPairSync('ed25519').privateKey.export({ format: 'jwk' }));
-    env.MCP_USER_PROFILE_USER_IDS = JSON.stringify({ 'integration-telegram-ux-v1': 'sandbox-user-1' });
-    env.MCP_USER_CATALOGUE_VERSION = 'mem-gpt-user-catalogue-v1';
-    env.MCP_USER_CATALOGUE_DIGEST = '8c17e64a0d71123698b139bd5957a10fff71a2b15f12601a95adcde150350e71';
-    const owner: ApiPrincipal = { ...principal, principalId: 'integration-telegram-ux-v1', profileId: 'integration-telegram-ux-v1' };
+    env.MCP_USER_CATALOGUE_VERSION = 'mem-gpt-user-catalogue-v2';
+    env.MCP_USER_CATALOGUE_DIGEST = '483e6d2f949b32c05a70186f4e25aba291b1483eeb0bdc9a7a3bca4b9b7cdf11';
+    const owner: ApiPrincipal = { ...principal, mcpBindings: ['mem-gpt-user-sandbox'] };
     const wrongProfile = await coordinator.fetch(call('/v1/runs', { ...body, mcp: userMcp }, { 'idempotency-key': 'user-mcp-wrong-profile' }, principal));
     expect(wrongProfile.status).toBe(422);
     const longRun = await coordinator.fetch(call('/v1/runs', { ...body, mcp: userMcp, limits: { timeoutMs: 7_200_000 } }, { 'idempotency-key': 'user-mcp-too-long' }, owner));
     expect(longRun.status).toBe(422);
-    expect(JSON.stringify(storage.values.get('runner-v1') ?? {})).not.toContain('sandbox-user-1');
+    expect(JSON.stringify(storage.values.get('runner-v1') ?? {})).not.toContain('trained-assist-product-owner');
   });
 
   it('fails closed for the shared static sandbox user unless per-run identity provisioning is explicitly enabled', async () => {
     const { coordinator, storage, env } = setup();
     env.MCP_USER_AUTH_TOKEN = 'product-user-mcp-transport-token-123';
     env.MCP_USER_RUNNER_PRIVATE_JWK = JSON.stringify(generateKeyPairSync('ed25519').privateKey.export({ format: 'jwk' }));
-    env.MCP_USER_PROFILE_USER_IDS = JSON.stringify({ 'integration-telegram-ux-v1': 'trained-assist-product-owner' });
-    env.MCP_USER_CATALOGUE_VERSION = 'mem-gpt-user-catalogue-v1';
-    env.MCP_USER_CATALOGUE_DIGEST = '8c17e64a0d71123698b139bd5957a10fff71a2b15f12601a95adcde150350e71';
-    const owner: ApiPrincipal = { ...principal, principalId: 'integration-telegram-ux-v1', profileId: 'integration-telegram-ux-v1' };
+    env.MCP_USER_CATALOGUE_VERSION = 'mem-gpt-user-catalogue-v2';
+    env.MCP_USER_CATALOGUE_DIGEST = '483e6d2f949b32c05a70186f4e25aba291b1483eeb0bdc9a7a3bca4b9b7cdf11';
+    const owner: ApiPrincipal = { ...principal, mcpBindings: ['mem-gpt-user-sandbox'] };
     const response = await coordinator.fetch(call('/v1/runs', { ...body, mcp: userMcp }, { 'idempotency-key': 'shared-static-user-denied' }, owner));
     expect(response.status).toBe(503);
     expect(await response.json()).toMatchObject({ error: { code: 'MCP_BINDING_UNAVAILABLE' } });
     expect((storage.values.get('runner-v1') as { runs: Record<string, unknown> }).runs).toEqual({});
+  });
+
+  it('does not launch an agent when fresh MCP identity provisioning fails', async () => {
+    const { coordinator, launched, storage, env } = setup();
+    env.MCP_USER_SANDBOX_ENABLED = 'true';
+    env.MCP_USER_AUTH_TOKEN = 'sandbox-mcp-transport-token-1234567890';
+    env.MCP_USER_PROVISION_TOKEN = 'sandbox-provision-token-12345678901234567890';
+    env.MCP_USER_RUNNER_PRIVATE_JWK = JSON.stringify(generateKeyPairSync('ed25519').privateKey.export({ format: 'jwk' }));
+    env.MCP_USER_CATALOGUE_VERSION = 'mem-gpt-user-catalogue-v2';
+    env.MCP_USER_CATALOGUE_DIGEST = '483e6d2f949b32c05a70186f4e25aba291b1483eeb0bdc9a7a3bca4b9b7cdf11';
+    const baseFetch = env.FETCH!;
+    env.FETCH = async (input, init) => {
+      const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+      if (url.pathname === '/internal/sandbox/users') return new Response('unavailable', { status: 503 });
+      return baseFetch(input, init);
+    };
+    const owner: ApiPrincipal = { ...principal, mcpBindings: ['mem-gpt-user-sandbox'] };
+    const accepted = await coordinator.fetch(call('/v1/runs', { ...body, mcp: userMcp },
+      { 'idempotency-key': 'fresh-user-provision-refused' }, owner));
+    expect(accepted.status).toBe(202);
+    const { runId } = await accepted.json() as { runId: string };
+    await coordinator.alarm();
+    expect(launched).toHaveLength(0);
+    const run = (storage.values.get('runner-v1') as { runs: Record<string, { state: string; lastError?: string }> }).runs[runId]!;
+    expect(run.state).toBe('failed');
+    expect(run.lastError).toBe('sandbox_user_provisioning_failed');
   });
 
   it('rejects unbound or altered MCP descriptors before storing a run', async () => {

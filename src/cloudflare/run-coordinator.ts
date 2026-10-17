@@ -34,6 +34,13 @@ interface RunRecord {
   webhook?: WebhookDelivery;
   developerGuest?: boolean;
   developerApi?: boolean;
+  mcpUserRequested?: boolean;
+  mcpUserProvisioned?: boolean;
+  mcpUserCleanupDone?: boolean;
+  mcpUserId?: string;
+  mcpUserProfileId?: string;
+  mcpUserLeaseExpiresAt?: number;
+  mcpUserCleanupNextAttemptAt?: string;
   artifactExpiresAt?: string;
 }
 interface CancellationFence { userTaskId: string; ownerGeneration: number; principalId: string; profileId: string; tenantId?: string; createdAt: string }
@@ -65,13 +72,14 @@ const MCP_TEST = Object.freeze({
   tokenEnv: 'RUNNER_MCP_REGISTRY_TEST',
 });
 const MCP_USER = Object.freeze({
-  profile: 'integration-telegram-ux-v1', principal: 'integration-telegram-ux-v1',
   server: 'mem-gpt', binding: 'mem-gpt-user-sandbox', scope: 'mcp:user-agent-run',
   policy: 'mem-gpt-user-run-v1', audience: 'trained-assist:mcp:user', issuer: 'trained-assist-agent-runner',
   url: 'https://trained-assist-mcp-user-sandbox.skillset-apply.workers.dev/mcp',
-  digest: '8c17e64a0d71123698b139bd5957a10fff71a2b15f12601a95adcde150350e71',
-  catalogue: 'mem-gpt-user-catalogue-v1', tokenEnv: 'RUNNER_MCP_USER_TOKEN', proofEnv: 'RUNNER_MCP_USER_PROOF',
-  tools: ['identity.whoami', 'google_docs.connect', 'google_docs.get_document'],
+  provisionUrl: 'https://trained-assist-mcp-user-sandbox.skillset-apply.workers.dev/internal/sandbox/users',
+  digest: '483e6d2f949b32c05a70186f4e25aba291b1483eeb0bdc9a7a3bca4b9b7cdf11',
+  catalogue: 'mem-gpt-user-catalogue-v2', tokenEnv: 'RUNNER_MCP_USER_TOKEN', proofEnv: 'RUNNER_MCP_USER_PROOF',
+  tools: ['identity.whoami', 'google_docs.connect', 'google_docs.get_document', 'zerocreds_wallet_form_create',
+    'zerocreds_wallet_form_status', 'zerocreds_wallet_connection_status', 'zerocreds_wallet_connection_revoke'],
 });
 
 function principalOf(request: Request): ApiPrincipal | null {
@@ -455,25 +463,18 @@ export class RunnerRunCoordinator {
         if (this.env.MCP_USER_SANDBOX_ENABLED !== 'true') {
           return error('MCP_BINDING_UNAVAILABLE', 'sandbox user MCP is disabled until per-run identity provisioning is configured', 503);
         }
-        if (principal.profileId !== MCP_USER.profile || principal.principalId !== MCP_USER.principal ||
+        if (!principal.mcpBindings?.includes(MCP_USER.binding) ||
             server.transport !== 'remote' || server.url !== MCP_USER.url || server.bindingRef !== MCP_USER.binding ||
             !Array.isArray(server.allowedTools) || server.allowedTools.length !== MCP_USER.tools.length ||
             MCP_USER.tools.some((tool, index) => server.allowedTools[index] !== tool) ||
             server.policyVersion !== MCP_USER.policy || server.catalogueVersion !== MCP_USER.catalogue) {
           return error('MCP_HOST_POLICY_MISSING', 'MCP descriptor is outside this profile’s pinned user catalog policy', 422);
         }
-        if (!this.env.MCP_USER_AUTH_TOKEN || this.env.MCP_USER_AUTH_TOKEN.length < 32 || !this.env.MCP_USER_RUNNER_PRIVATE_JWK ||
+        if (!this.env.MCP_USER_AUTH_TOKEN || this.env.MCP_USER_AUTH_TOKEN.length < 32 ||
+            !this.env.MCP_USER_PROVISION_TOKEN || this.env.MCP_USER_PROVISION_TOKEN.length < 32 || !this.env.MCP_USER_RUNNER_PRIVATE_JWK ||
             this.env.MCP_USER_CATALOGUE_VERSION !== MCP_USER.catalogue || this.env.MCP_USER_CATALOGUE_DIGEST !== MCP_USER.digest) {
-          return error('MCP_BINDING_UNAVAILABLE', 'pinned sandbox user catalog credentials or digest are not configured', 503);
+          return error('MCP_BINDING_UNAVAILABLE', 'disposable sandbox user provisioning or catalog configuration is unavailable', 503);
         }
-        let profileUsers: Record<string, string>;
-        try {
-          const parsed: unknown = JSON.parse(this.env.MCP_USER_PROFILE_USER_IDS ?? 'null');
-          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || Object.keys(parsed).some(profile => profile !== MCP_USER.profile) ||
-              Object.values(parsed).some(value => typeof value !== 'string' || !/^[A-Za-z0-9._:@-]{1,200}$/.test(value))) throw new Error();
-          profileUsers = parsed as Record<string, string>;
-        } catch { return error('MCP_BINDING_UNAVAILABLE', 'sandbox user catalog profile mapping is invalid', 503); }
-        if (!profileUsers[principal.profileId]) return error('MCP_BINDING_UNAVAILABLE', 'sandbox user catalog has no user mapping for this profile', 503);
         userMcp = true;
       } else return error('MCP_HOST_POLICY_MISSING', 'MCP server is not host approved', 422);
     }
@@ -603,15 +604,15 @@ export class RunnerRunCoordinator {
           repository: { fullName: repository ?? '', branch: `agent-run/${runId}`, ...(body.repository?.revision ? { revision: body.repository.revision } : {}) },
           ...(repositoryToken ? { publicationToken: repositoryToken } : {}),
           resultUrl, isolation: body.isolation ?? { mode: 'none' }, outputs: Array.isArray(body.outputs) ? body.outputs : [], ...(body.publicationMode ? { publicationMode: body.publicationMode } : {}),
-          ...(mcp.length ? userMcp
-            ? await this.userCatalogAttachment({ runId, taskId, profileId: principal.profileId, ownerGeneration, timeoutMs: clampInteger(limits.timeoutMs, 300_000, 1_000, 86_400_000) })
-            : await this.testRegistryAttachment(mcp[0], { runId, taskId, profileId: principal.profileId, timeoutMs: clampInteger(limits.timeoutMs, 300_000, 1_000, 86_400_000) }) : {}) };
+          ...(mcp.length && !userMcp
+            ? await this.testRegistryAttachment(mcp[0], { runId, taskId, profileId: principal.profileId, timeoutMs: clampInteger(limits.timeoutMs, 300_000, 1_000, 86_400_000) }) : {}) };
       record = { requestId, runId, userTaskId: taskId, conversationId, jobId, ownerGeneration, principalId: principal.principalId, profileId: principal.profileId,
         ...(principal.developerApi ? { developerApi: true } : {}),
         ...(principal.developerGuest ? { developerGuest: true } : {}),
         ...(principal.tenantId ? { tenantId: principal.tenantId } : {}), idempotencyKey: idemKey, payloadHash, engine, routeMode, state: 'queued', sequence: 0,
         createdAt: time, updatedAt: time, startedAt: null, finishedAt: null, answer: null, cancelRequested: false, launchAttempts: 0, events: [], artifacts: [], repo: null, logUrl: null,
-        ...(webhook ? { webhook } : {}), launchCiphertext: await encrypt(JSON.stringify(launch), this.env.RUN_LAUNCH_ENCRYPTION_KEY) }
+        ...(webhook ? { webhook } : {}), ...(userMcp ? { mcpUserRequested: true, mcpUserLeaseExpiresAt: Date.parse(time) + 6 * 60 * 60_000 } : {}),
+        launchCiphertext: await encrypt(JSON.stringify(launch), this.env.RUN_LAUNCH_ENCRYPTION_KEY) }
       nextEvent(record, 'run_queued');
       stored.runs[runId] = record;
       stored.idempotency[idemKey] = runId;
@@ -903,25 +904,44 @@ export class RunnerRunCoordinator {
     };
   }
 
-  private async userCatalogAttachment(context: { runId: string; taskId: string; profileId: string; ownerGeneration: number; timeoutMs: number }): Promise<Record<string, unknown>> {
-    let profileUsers: Record<string, string>;
+  private async userCatalogAttachment(context: { runId: string; taskId: string; profileId: string; ownerGeneration: number; timeoutMs: number; leaseExpiresAt: number }): Promise<Record<string, unknown>> {
     let jwk: JsonWebKey;
-    try {
-      profileUsers = JSON.parse(this.env.MCP_USER_PROFILE_USER_IDS ?? 'null') as Record<string, string>;
-      jwk = JSON.parse(this.env.MCP_USER_RUNNER_PRIVATE_JWK ?? 'null') as JsonWebKey;
-    } catch { throw new Error('sandbox user catalog signing configuration is invalid'); }
-    const userId = profileUsers?.[context.profileId];
-    if (typeof userId !== 'string' || !/^[A-Za-z0-9._:@-]{1,200}$/.test(userId) ||
+    try { jwk = JSON.parse(this.env.MCP_USER_RUNNER_PRIVATE_JWK ?? 'null') as JsonWebKey; }
+    catch { throw new Error('sandbox user catalog signing configuration is invalid'); }
+    if (!this.env.MCP_USER_PROVISION_TOKEN || this.env.MCP_USER_PROVISION_TOKEN.length < 32 ||
         jwk?.kty !== 'OKP' || jwk?.crv !== 'Ed25519' || typeof jwk.d !== 'string' || typeof jwk.x !== 'string') {
-      throw new Error('sandbox user catalog subject or Ed25519 key is unavailable');
+      throw new Error('sandbox user provisioning credentials or Ed25519 key are unavailable');
     }
+    const leaseExpiresAt = context.leaseExpiresAt;
+    if (leaseExpiresAt <= Date.now() + context.timeoutMs || leaseExpiresAt > Date.now() + 6 * 60 * 60_000) {
+      throw new Error('sandbox user lease is expired or too short for this run');
+    }
+    const fetchImpl = this.env.FETCH ?? fetch;
+    const provisionResponse = await fetchImpl(MCP_USER.provisionUrl, {
+      method: 'POST', redirect: 'manual',
+      headers: { authorization: `Bearer ${this.env.MCP_USER_PROVISION_TOKEN}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ runId: context.runId, expiresAt: leaseExpiresAt }),
+    });
+    if (!provisionResponse.ok) throw new Error('sandbox user provisioning service refused this run');
+    let provisioned: unknown;
+    try { provisioned = await provisionResponse.json(); } catch { throw new Error('sandbox user provisioning response is invalid'); }
+    const identityHash = await digest(context.runId.toLowerCase());
+    const expectedUserId = `sbx-${identityHash.slice(0, 32)}`;
+    const profileId = `sbx_${identityHash.slice(0, 32)}`;
+    if (!provisioned || typeof provisioned !== 'object' || Array.isArray(provisioned) ||
+        (provisioned as Record<string, unknown>).userId !== expectedUserId ||
+        (provisioned as Record<string, unknown>).profileId !== profileId ||
+        (provisioned as Record<string, unknown>).expiresAt !== leaseExpiresAt) {
+      throw new Error('sandbox user provisioning response failed identity checks');
+    }
+    const userId = expectedUserId;
     const nowSeconds = Math.floor(Date.now() / 1000);
     const exp = nowSeconds + Math.ceil(context.timeoutMs / 1000) + 60;
     if (exp - nowSeconds > 7200) throw new Error('sandbox user catalog grant would exceed its maximum lifetime');
     const key = await crypto.subtle.importKey('jwk', jwk, { name: 'Ed25519' }, false, ['sign']);
     const claims = {
       iss: MCP_USER.issuer, aud: MCP_USER.audience, sub: context.runId,
-      userId, runId: context.runId, userTaskId: context.taskId, profileId: context.profileId,
+      userId, runId: context.runId, userTaskId: context.taskId, profileId,
       ownerGeneration: context.ownerGeneration, serverId: MCP_USER.server,
       bindingRef: MCP_USER.binding, scope: MCP_USER.scope, policyVersion: MCP_USER.policy,
       catalogueVersion: MCP_USER.catalogue, catalogueDigest: MCP_USER.digest,
@@ -932,14 +952,29 @@ export class RunnerRunCoordinator {
     const signature = await crypto.subtle.sign({ name: 'Ed25519' }, key, new TextEncoder().encode(signingInput));
     const proof = `${signingInput}.${base64Url(new Uint8Array(signature))}`;
     return {
+      sandboxIdentity: { userId, profileId },
       mcp: { servers: { [MCP_USER.server]: { type: 'remote', url: MCP_USER.url, enabled: true, headers: {
         Authorization: `Bearer {env:${MCP_USER.tokenEnv}}`,
         'X-MCP-Operation': 'invocation', 'X-MCP-Scope': MCP_USER.scope,
-        'X-MCP-User-Task-Id': context.taskId, 'X-MCP-Profile': context.profileId,
+        'X-MCP-User-Task-Id': context.taskId, 'X-MCP-Profile': profileId,
         'X-MCP-Run-Id': context.runId, 'X-MCP-Run-Binding': `{env:${MCP_USER.proofEnv}}`,
       } } } },
       mcpSecrets: { [MCP_USER.tokenEnv]: this.env.MCP_USER_AUTH_TOKEN, [MCP_USER.proofEnv]: proof },
     };
+  }
+
+  private async revokeUserCatalog(runId: string): Promise<void> {
+    const fetchImpl = this.env.FETCH ?? fetch;
+    const response = await fetchImpl(`${MCP_USER.provisionUrl}/revoke`, {
+      method: 'POST', redirect: 'manual',
+      headers: { authorization: `Bearer ${this.env.MCP_USER_PROVISION_TOKEN}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ runId }),
+    });
+    if (!response.ok) throw new Error('sandbox user revoke service refused cleanup');
+    const body = await response.json() as { revoked?: unknown; reason?: unknown };
+    if (body.revoked !== true && body.reason !== 'already_revoked' && body.reason !== 'not_found') {
+      throw new Error('sandbox user revoke response is invalid');
+    }
   }
 
   async alarm(): Promise<void> {
@@ -976,6 +1011,20 @@ export class RunnerRunCoordinator {
             nextEvent(run, 'run_dispatching', { attempt: run.launchAttempts });
             await this.writeRun(run);
             const launch = JSON.parse(await decrypt(run.launchCiphertext, this.env.RUN_LAUNCH_ENCRYPTION_KEY)) as Record<string, unknown>;
+            if (run.mcpUserRequested && !run.mcpUserProvisioned) {
+              const attachment = await this.userCatalogAttachment({ runId: run.runId, taskId: run.userTaskId,
+                profileId: run.profileId, ownerGeneration: run.ownerGeneration,
+                timeoutMs: Number((launch['limits'] as Record<string, unknown> | undefined)?.['timeoutMs'] ?? 300_000),
+                leaseExpiresAt: run.mcpUserLeaseExpiresAt! });
+              const identity = attachment['sandboxIdentity'] as { userId: string; profileId: string };
+              delete attachment['sandboxIdentity'];
+              Object.assign(launch, attachment);
+              run.mcpUserId = identity.userId;
+              run.mcpUserProfileId = identity.profileId;
+              run.mcpUserProvisioned = true;
+              run.launchCiphertext = await encrypt(JSON.stringify(launch), this.env.RUN_LAUNCH_ENCRYPTION_KEY);
+              await this.writeRun(run);
+            }
             const response = await this.worker(run.engine, '/v1/launch', 'POST', launch);
             if (!response.ok) {
               const rejection = await response.clone().json().catch(() => null);
@@ -1155,7 +1204,10 @@ export class RunnerRunCoordinator {
         }
       } catch (cause) {
         const message = cause instanceof Error ? cause.message : String(cause);
-        if (!run.workerReceipt) {
+        if (!run.workerReceipt && run.mcpUserRequested && !run.mcpUserProvisioned) {
+          run.lastError = 'sandbox_user_provisioning_failed';
+          transition(run, 'failed', { reason: 'sandbox_user_provisioning_failed' });
+        } else if (!run.workerReceipt) {
           try {
             const statusResponse = await this.worker(run.engine, `/v1/runs/${run.runId}/status`);
             const observed = statusResponse.ok ? await statusResponse.json() as { status?: string; state?: string; startPhase?: string; startAttempts?: number; startedAt?: string; updatedAt?: string } : null;
@@ -1180,11 +1232,25 @@ export class RunnerRunCoordinator {
           const lastHeartbeat = run.lastHeartbeatAt ? Date.parse(run.lastHeartbeatAt) : Date.parse(run.startedAt ?? run.updatedAt);
           if (Number.isFinite(lastHeartbeat) && Date.now() - lastHeartbeat > 30_000) transition(run, 'unknown', { reason: 'worker_status_stale' });
         }
-        run['lastError'] = message.slice(0, 200);
+        run['lastError'] = run.mcpUserRequested && !run.workerReceipt && !run.mcpUserProvisioned
+          ? 'sandbox_user_provisioning_failed' : message.slice(0, 200);
       }
       changed = true;
     }
     if (changed) await Promise.all(pendingRuns.map((run) => this.writeRun(run)));
+    const cleanupRuns = Object.values((await this.read()).runs).filter((run) => TERMINAL.has(run.state)
+      && run.mcpUserProvisioned && !run.mcpUserCleanupDone
+      && (!run.mcpUserCleanupNextAttemptAt || Date.parse(run.mcpUserCleanupNextAttemptAt) <= Date.now()));
+    for (const run of cleanupRuns) {
+      run.mcpUserCleanupNextAttemptAt = new Date(Date.now() + 5_000).toISOString();
+      await this.writeRun(run);
+      try {
+        await this.revokeUserCatalog(run.runId);
+        run.mcpUserCleanupDone = true;
+        run.mcpUserCleanupNextAttemptAt = undefined;
+      } catch { /* retain a retry time and rely on the host-side lease as the fallback */ }
+      await this.writeRun(run);
+    }
     const afterPolling = await this.read();
     for (const run of Object.values(afterPolling.runs)) {
       const delivery = run.webhook;
@@ -1219,13 +1285,18 @@ export class RunnerRunCoordinator {
       return Number.isFinite(dueAt) ? Math.min(next, dueAt) : next;
     }, Infinity);
     let webhookNext = Infinity;
+    let mcpCleanupNext = Infinity;
     for (const run of Object.values(latest.runs)) {
       if (TERMINAL.has(run.state) && run.webhook && !run.webhook.deliveredAt && !run.webhook.exhaustedAt) {
         const dueAt = Date.parse(run.webhook.nextAttemptAt);
         webhookNext = Math.min(webhookNext, Number.isFinite(dueAt) ? dueAt : Date.now() + 5_000);
       }
+      if (TERMINAL.has(run.state) && run.mcpUserProvisioned && !run.mcpUserCleanupDone) {
+        const dueAt = Date.parse(run.mcpUserCleanupNextAttemptAt ?? '');
+        mcpCleanupNext = Math.min(mcpCleanupNext, Number.isFinite(dueAt) ? dueAt : Date.now() + 100);
+      }
     }
-    const nextAlarm = Math.min(activeNext, capacityRetryNext, webhookNext);
+    const nextAlarm = Math.min(activeNext, capacityRetryNext, webhookNext, mcpCleanupNext);
     if (Number.isFinite(nextAlarm)) await this.state.storage.setAlarm(Math.max(Date.now() + 100, nextAlarm));
   }
 

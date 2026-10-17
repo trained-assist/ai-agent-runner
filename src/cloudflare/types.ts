@@ -62,8 +62,8 @@ export interface RunnerWorkerEnv {
   MCP_USER_AUTH_TOKEN?: string;
   /** Explicit emergency gate. Static sandbox-user mappings are disabled unless the disposable lifecycle is provisioned. */
   MCP_USER_SANDBOX_ENABLED?: string;
+  MCP_USER_PROVISION_TOKEN?: string;
   MCP_USER_RUNNER_PRIVATE_JWK?: string;
-  MCP_USER_PROFILE_USER_IDS?: string;
   MCP_USER_CATALOGUE_VERSION?: string;
   MCP_USER_CATALOGUE_DIGEST?: string;
   [binding: string]: unknown;
