@@ -100,16 +100,16 @@ Structured Worker logs include `runner.capacity_queued`, `runner.capacity_fallba
 incidents and queue latency can be queried from Cloudflare observability.
 The production fallback remains disabled until its separately reviewed secret provisioning and
 deployment are completed. The isolated `cp-sandbox3` mock-only Worker remains independent and
-never advertises or invokes either real worker. The sandbox-only `mock-test` engine returns
-fixed `pong` without calling a worker or model.
-
-The three real Worker targets are `sandbox3` (GHA sandbox gateway), `telegram-ux-v1` (GHA
-sandbox gateway), and `production` (GHA production gateway). Provision each with a distinct
-client ID: `sandbox3_agent_api` / `wrangler.sandbox3.jsonc` / GitHub environment `sandbox`,
-`telegram_ux_v1_agent_api` / `wrangler.telegram-ux-v1.jsonc` / `sandbox`, and
-`production_agent_api` / `wrangler.production.jsonc` / `production`. The gateway environment is
-`sandbox` for the first two and `production` for the base production gateway. `cp-sandbox3` is
-deliberately excluded because it is an isolated mock contract test.
+never advertises or invokes either real worker. The sandbox-only `mock-test` engine never calls
+the VM or a model. It selects a deterministic scenario from the run's `input.inlinePrompt`
+(prefix `scenario:` or `mock:`) and returns a contract-shaped `LaunchResult`: status, stdout/stderr,
+answer, artifacts, logUrl, duration. Supported scenarios: `ping-pong` (default), `output-artifact`,
+`mother-and-kids:all-good`, `mother-and-kids:mother-dead-before-kids`,
+`mother-and-kids:one-child-dead`, `mother-and-kids:all-dead`,
+`parallel-sessions:all-good`, `parallel-sessions:parent-dead`,
+`parallel-sessions:one-child-dead`, `parallel-sessions:all-dead`,
+`parallel-sessions:session-timeout`. Unknown scenario names fall back to `ping-pong`. The engine
+is disabled unless `AGENT_API_ENABLE_MOCK_TEST=true` in a sandbox environment.
 
 ## Configuration
 
