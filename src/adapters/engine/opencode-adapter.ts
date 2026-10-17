@@ -11,14 +11,17 @@ import { findOnPath, handleForChild, isExecutableFile } from './process-tree.js'
 export interface OpenCodeAdapterOptions {
   binary?: string;
   argv?: string[];
+  /** Модель в формате provider/model; по умолчанию ladder/free, чтобы не уходить на встроенный провайдер OpenCode. */
+  model?: string;
 }
 
-function defaultArgv(spec: RunSpec, sessionId?: string): string[] {
+function defaultArgv(spec: RunSpec, sessionId?: string, model?: string): string[] {
   const prompt = spec.input?.inlinePrompt;
   if (!prompt) {
     throw new EngineStartupError('opencode run requires a host-resolved input.inlinePrompt');
   }
-  if (!spec.ingressManifest) return ['run', prompt, '--format', 'json', ...(sessionId ? ['--session', sessionId] : [])];
+  const modelArgs = model ? ['-m', model] : [];
+  if (!spec.ingressManifest) return ['run', prompt, '--format', 'json', ...modelArgs, ...(sessionId ? ['--session', sessionId] : [])];
   const indexPath = join(spec.cwd, '.inputs', 'ingress', spec.runId, 'input-items.json');
   try {
     if (!lstatSync(indexPath).isFile()) throw new Error('not a regular file');
@@ -30,7 +33,8 @@ function defaultArgv(spec: RunSpec, sessionId?: string): string[] {
     `${JSON.stringify(indexPath)}. Process inputItems in array order and handle each item as a unit; its text is verbatim user input and its artifacts belong with that text.`,
     'Artifact paths are relative to the index directory; read the referenced files as needed. Do not infer order from filenames.',
   ].join(' ');
-  return ['run', `${prompt}\n\n${instruction}`, '--format', 'json', ...(sessionId ? ['--session', sessionId] : [])];
+  const modelArgs2 = model ? ['-m', model] : [];
+  return ['run', `${prompt}\n\n${instruction}`, '--format', 'json', ...modelArgs2, ...(sessionId ? ['--session', sessionId] : [])];
 }
 
 export class OpenCodeAdapter implements EngineAdapter {
@@ -102,7 +106,7 @@ export class OpenCodeAdapter implements EngineAdapter {
       });
       if (imported !== 0) throw new EngineStartupError(`OpenCode rejected the session checkpoint (exit=${String(imported)})`);
     }
-    const argv = shouldExport ? defaultArgv(ctx.spec, sessionId ?? undefined) : this.options.argv!;
+    const argv = shouldExport ? defaultArgv(ctx.spec, sessionId ?? undefined, this.options.model ?? 'ladder/free') : this.options.argv!;
     const launch = launchCommand(ctx, binary, argv);
     const child = spawn(launch.command, launch.args, {
       cwd: ctx.cwd,

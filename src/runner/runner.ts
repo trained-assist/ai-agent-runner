@@ -144,6 +144,8 @@ export interface RunnerOptions {
    * на платный профиль по умолчанию. Секретов в шаблонах нет и быть не может.
    */
   engineConfigTemplates?: EngineConfigTemplate | null;
+  /** Если true, отсутствие посаженного конфига движка валит старт рана (fail-closed). */
+  engineConfigRequired?: boolean;
   /**
    * Резолвер значений credential binding'ов (P13). В песочнице — фикстура, в бою —
    * Credential Broker / Secret Manager. Значение binding'а не попадает в spec/state/events.
@@ -1629,10 +1631,17 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
   private seedEngineConfig(run: InternalRun, st: PersistedRunState): void {
     const room = run.room;
     const target = room ? room : st.spec.cwd;
-    const seeded = materializeEngineConfig(this.opts.engineConfigTemplates ?? null, target, st.spec.engine.name);
-    // Шаблона на хосте нет — поведение прежнее (движок читает свой конфиг сам), и это не
-    // событие рана: в лог попадает только фактически положенная копия.
-    if (!seeded) return;
+    const templates = this.opts.engineConfigTemplates ?? null;
+    if (this.opts.engineConfigRequired && (!templates || !templates.engines.includes(st.spec.engine.name))) {
+      throw new CleanRoomError('ENGINE_CONFIG_MISSING', `engine config template is required for engine "${st.spec.engine.name}" but was not declared by the host`);
+    }
+    const seeded = materializeEngineConfig(templates, target, st.spec.engine.name);
+    if (!seeded) {
+      if (this.opts.engineConfigRequired) {
+        throw new CleanRoomError('ENGINE_CONFIG_MISSING', `engine config for "${st.spec.engine.name}" was not materialized`);
+      }
+      return;
+    }
     const slotSuffix = room ? ` slot=${room.identity.slotId}` : '';
     this.emit(st, 'log', {
       stream: 'runner',
