@@ -27,8 +27,10 @@ export interface RunnerWorkerEnv {
   RUNNER_API_KEYS_DEVELOPER?: string;
   /** HMAC secret for short-lived Control Plane profile capabilities. */
   AGENT_API_PROFILE_DELEGATION_SECRET?: string;
-  VM_WORKER_URL: string;
-  VM_WORKER_TOKEN: string;
+  VM_WORKER_URL?: string;
+  VM_WORKER_TOKEN?: string;
+  /** Ordered France worker endpoints for a France pool (JSON array of {workerId,url,token}). */
+  VM_WORKER_ENDPOINTS?: string;
   /** Optional GHA/Azure route; used only after a confirmed pre-admission capacity refusal in France. */
   GHA_WORKER_URL?: string;
   GHA_WORKER_TOKEN?: string;

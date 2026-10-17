@@ -22,6 +22,7 @@ interface RunRecord {
   workerFinalizingObservedAt?: string | null;
   logsPending?: boolean;
   launchAttempts: number; result?: Record<string, unknown>; workerReceipt?: Record<string, unknown>;
+  workerId?: string;
   capacityRetryAttempts?: number;
   capacityRetryAt?: string;
   capacityQueuedAt?: string;
@@ -335,7 +336,7 @@ export class RunnerRunCoordinator {
     const query = new URLSearchParams({ path: sourcePath });
     const response = await this.worker(run.engine, sourcePath === AGENT_HISTORY_PATH && run.developerApi
       ? `/v1/runs/${encodeURIComponent(run.runId)}/history`
-      : `/v1/runs/${encodeURIComponent(run.runId)}/artifacts?${query.toString()}`, 'GET', undefined, 30_000);
+      : `/v1/runs/${encodeURIComponent(run.runId)}/artifacts?${query.toString()}`, 'GET', undefined, 30_000, run.workerId);
     const headers = new Headers({ 'cache-control': 'private, no-store', 'x-content-type-options': 'nosniff' });
     for (const name of ['content-type', 'content-length', 'content-disposition', 'x-content-sha256']) {
       const value = response.headers.get(name);
@@ -719,7 +720,7 @@ export class RunnerRunCoordinator {
     if (!run) return error('NOT_FOUND', `unknown run ${runId}`, 404);
     this.signalRunChanged(runId);
     if (TERMINAL.has(run.state)) return json({ runId, status: 'already_terminal', state: run.state });
-    if (run.workerReceipt) await this.worker(run.engine, `/v1/runs/${runId}/cancel`, 'POST', {});
+    if (run.workerReceipt) await this.worker(run.engine, `/v1/runs/${runId}/cancel`, 'POST', {}, 8_000, run.workerId);
     await this.state.storage.setAlarm(Date.now() + 100);
     return json({ runId, status: run.workerReceipt ? 'stop_pending' : 'stopped', state: run.state }, run.workerReceipt ? 202 : 200);
   }
@@ -946,11 +947,12 @@ export class RunnerRunCoordinator {
     await this.ready;
     const stored = await this.read();
     let changed = false;
+    console.error('CF_ALARM_READ', Object.keys(stored.runs).length, JSON.stringify(Object.values(stored.runs).map(r=>r.state)));
     const pendingRuns = Object.values(stored.runs).filter((run) => ACTIVE.has(run.state)
       || run.state === 'unknown' && !!run.workerReceipt && Date.now() - Date.parse(run.updatedAt) < UNKNOWN_RECONCILE_MS)
       .filter((run) => !run.capacityRetryAt || Date.parse(run.capacityRetryAt) <= Date.now());
-    for (const run of pendingRuns) {
-      try {
+    for (const run of pendingRuns) { try {
+      console.error('CF_ALARM_ENTRY', run.runId, run.state, 'receipt:', !!run.workerReceipt);
         if (run.engine === 'mock-test') {
           const finishedAt = now();
           run.startedAt = run.createdAt;
@@ -968,15 +970,21 @@ export class RunnerRunCoordinator {
           changed = true;
           continue;
         }
-        if (run.cancelRequested && run.workerReceipt) await this.worker(run.engine, `/v1/runs/${run.runId}/cancel`, 'POST', {});
+        if (run.cancelRequested && run.workerReceipt) await this.worker(run.engine, `/v1/runs/${run.runId}/cancel`, 'POST', {}, undefined, run.workerId);
         if (!run.workerReceipt) {
           for (;;) {
+            if (!run.workerId) {
+              const endpoints = RunnerRunCoordinator.franceWorkerEndpoints(this.env);
+              if (endpoints.length === 0) throw new Error('worker route is not configured for france (no VM_WORKER_URL or VM_WORKER_ENDPOINTS)');
+              run.workerId = endpoints[0]!.workerId;
+              await this.writeRun(run);
+            }
             run.launchAttempts += 1;
             transition(run, 'starting');
             nextEvent(run, 'run_dispatching', { attempt: run.launchAttempts });
             await this.writeRun(run);
             const launch = JSON.parse(await decrypt(run.launchCiphertext, this.env.RUN_LAUNCH_ENCRYPTION_KEY)) as Record<string, unknown>;
-            const response = await this.worker(run.engine, '/v1/launch', 'POST', launch);
+            const response = await this.worker(run.engine, '/v1/launch', 'POST', launch, undefined, run.workerId);
             if (!response.ok) {
               const rejection = await response.clone().json().catch(() => null);
               const code = workerRefusalCode(rejection, response.status);
@@ -1034,7 +1042,7 @@ export class RunnerRunCoordinator {
             break;
           }
         } else {
-          const statusResponse = await this.worker(run.engine, `/v1/runs/${run.runId}/status`);
+          const statusResponse = await this.worker(run.engine, `/v1/runs/${run.runId}/status`, 'GET', undefined, 8_000, run.workerId);
           if (!statusResponse.ok) throw new Error(`worker status HTTP ${statusResponse.status}`);
           const workerStatus = await statusResponse.json() as { status?: string; state?: string; startPhase?: string; startAttempts?: number; startedAt?: string; updatedAt?: string };
           run.lastHeartbeatAt = now();
@@ -1055,7 +1063,7 @@ export class RunnerRunCoordinator {
             }
             run.workerReportedUpdatedAt = workerStatus.updatedAt;
           }
-          const logsResponse = await this.worker(run.engine, `/v1/runs/${run.runId}/logs?after=${run.logCursor ?? 0}&snapshot=1`);
+          const logsResponse = await this.worker(run.engine, `/v1/runs/${run.runId}/logs?after=${run.logCursor ?? 0}&snapshot=1`, 'GET', undefined, 8_000, run.workerId);
           if (logsResponse.ok) {
             const batch = await logsResponse.json() as { cursor?: number; hasMore?: boolean; logs?: Array<{ sequence?: number; stream?: string; message?: string; truncated?: boolean }> };
             const output = run.output ?? { stdout: '', stderr: '', updatedAt: null, truncated: false };
@@ -1097,7 +1105,7 @@ export class RunnerRunCoordinator {
               run.workerFinalizingObservedAt = now();
               nextEvent(run, 'run_finalizing', { workerState: workerStatus.status, observedAt: run.workerFinalizingObservedAt });
             }
-            const resultResponse = await this.worker(run.engine, `/v1/runs/${run.runId}/result`);
+            const resultResponse = await this.worker(run.engine, `/v1/runs/${run.runId}/result`, 'GET', undefined, 8_000, run.workerId);
             if (resultResponse.ok) {
               const launchResult = await resultResponse.json() as Record<string, any>;
               const explicitAnswer = typeof launchResult.answer === 'string' && launchResult.answer.trim().length > 0
@@ -1117,7 +1125,7 @@ export class RunnerRunCoordinator {
               run.artifacts = Array.isArray(launchResult.artifacts) ? launchResult.artifacts.filter((artifact: Record<string, any>) => !run.developerApi || artifact.path !== AGENT_HISTORY_PATH).map((artifact: Record<string, any>) => ({ ...artifact,
                 url: repo && typeof repo['fullName'] === 'string' ? `https://github.com/${repo['fullName']}/${typeof repo['commit'] === 'string' && repo['commit'] ? `blob/${repo['commit']}` : `tree/${String(repo['branch'] ?? '')}`}/${String(artifact.path ?? '').split('/').map(encodeURIComponent).join('/')}` : String(artifact.path ?? '') })) : [];
               if (run.developerApi) {
-                const history = await this.worker(run.engine, `/v1/runs/${run.runId}/history?manifest=1`);
+                const history = await this.worker(run.engine, `/v1/runs/${run.runId}/history?manifest=1`, 'GET', undefined, 8_000, run.workerId);
                 if (history.ok) {
                   const manifest = await history.json() as Record<string, unknown>;
                   if (manifest['path'] === AGENT_HISTORY_PATH && manifest['name'] === 'agent-history.json'
@@ -1157,7 +1165,7 @@ export class RunnerRunCoordinator {
         const message = cause instanceof Error ? cause.message : String(cause);
         if (!run.workerReceipt) {
           try {
-            const statusResponse = await this.worker(run.engine, `/v1/runs/${run.runId}/status`);
+            const statusResponse = await this.worker(run.engine, `/v1/runs/${run.runId}/status`, 'GET', undefined, 8_000, run.workerId);
             const observed = statusResponse.ok ? await statusResponse.json() as { status?: string; state?: string; startPhase?: string; startAttempts?: number; startedAt?: string; updatedAt?: string } : null;
             if (observed?.status && !['unknown', 'unknown_run'].includes(observed.status)) {
               run.workerReceipt = { runId: run.runId, status: 'accepted', operationId: 'reconciled' };
@@ -1237,9 +1245,14 @@ export class RunnerRunCoordinator {
     } catch { return false; }
   }
 
-  private async worker(engine: string, path: string, method = 'GET', body?: unknown, timeoutMs = 8_000): Promise<Response> {
+  private async worker(engine: string, path: string, method = 'GET', body?: unknown, timeoutMs = 8_000, endpointId?: string): Promise<Response> {
     const route = engine === FRANCE_ENGINE
-      ? { base: this.env.VM_WORKER_URL, token: this.env.VM_WORKER_TOKEN }
+      ? (function (endpoints: Array<{ workerId: string; url: string; token: string }>, requested?: string) {
+          if (endpoints.length === 0) throw new Error('worker route is not configured for france (no VM_WORKER_URL or VM_WORKER_ENDPOINTS)');
+          const endpoint = requested ? endpoints.find((item) => item.workerId === requested) ?? endpoints[0] : endpoints[0];
+          if (!endpoint) throw new Error('worker route is not configured for france (no VM_WORKER_URL or VM_WORKER_ENDPOINTS)');
+          return { base: endpoint.url, token: endpoint.token };
+        }(RunnerRunCoordinator.franceWorkerEndpoints(this.env), endpointId))
       : engine === GHA_ENGINE
         ? { base: this.env.GHA_WORKER_URL, token: this.env.GHA_WORKER_TOKEN }
         : null;
@@ -1252,6 +1265,34 @@ export class RunnerRunCoordinator {
     return send(`${base}${path}`, { method, headers: { authorization: `Bearer ${token}`, ...(body === undefined ? {} : { 'content-type': 'application/json' }) }, ...(body === undefined ? {} : { body: JSON.stringify(body) }), signal: AbortSignal.timeout(timeoutMs) });
   }
 
+  static franceWorkerEndpoints(env: RunnerWorkerEnv): Array<{ workerId: string; url: string; token: string }> {
+    const raw = env.VM_WORKER_ENDPOINTS?.trim();
+    if (raw) {
+      let parsed: unknown;
+      try { parsed = JSON.parse(raw); } catch { throw new Error('VM_WORKER_ENDPOINTS must be JSON'); }
+      if (!Array.isArray(parsed) || parsed.length === 0) throw new Error('VM_WORKER_ENDPOINTS must be a non-empty JSON array');
+      const result: Array<{ workerId: string; url: string; token: string }> = [];
+      const seen = new Set<string>();
+      for (const [index, entry] of parsed.entries()) {
+        if (!entry || typeof entry !== 'object' || Array.isArray(entry)) throw new Error(`VM_WORKER_ENDPOINTS[${index}] must be an object`);
+        const record = entry as Record<string, unknown>;
+        const workerId = typeof record['workerId'] === 'string' ? record['workerId'].trim() : '';
+        const url = typeof record['url'] === 'string' ? record['url'].trim() : '';
+        const token = typeof record['token'] === 'string' ? record['token'].trim() : '';
+        if (!workerId) throw new Error(`VM_WORKER_ENDPOINTS[${index}].workerId is required`);
+        if (seen.has(workerId)) throw new Error(`VM_WORKER_ENDPOINTS: workerId "${workerId}" is declared twice`);
+        seen.add(workerId);
+        if (!/^https:\/\//.test(url)) throw new Error(`VM_WORKER_ENDPOINTS[${index}].url must be an https URL`);
+        if (token.length === 0) throw new Error(`VM_WORKER_ENDPOINTS[${index}].token is required`);
+        result.push({ workerId, url, token });
+      }
+      return result;
+    }
+    const url = env.VM_WORKER_URL?.trim();
+    const token = typeof env.VM_WORKER_TOKEN === 'string' ? env.VM_WORKER_TOKEN.trim() : '';
+    if (url && token && /^https:\/\//.test(url)) return [{ workerId: "france-primary", url, token }];
+    return [];
+  }
   private async read(): Promise<Stored> { return await this.state.storage.get<Stored>(stateKey) ?? structuredClone(INIT); }
   private async writeRun(run: RunRecord): Promise<void> {
     await this.state.storage.transaction(async (tx) => {
