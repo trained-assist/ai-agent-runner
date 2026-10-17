@@ -897,6 +897,7 @@ describe('Cloudflare Runner run coordinator', () => {
     const pair = generateKeyPairSync('ed25519');
     const privateJwk = pair.privateKey.export({ format: 'jwk' });
     const { coordinator, launched, env } = setup();
+    env.MCP_USER_SANDBOX_ENABLED = 'true';
     env.MCP_USER_AUTH_TOKEN = 'product-user-mcp-transport-token-123';
     env.MCP_USER_RUNNER_PRIVATE_JWK = JSON.stringify(privateJwk);
     env.MCP_USER_PROFILE_USER_IDS = JSON.stringify({ 'integration-telegram-ux-v1': 'sandbox-user-1' });
@@ -934,6 +935,7 @@ describe('Cloudflare Runner run coordinator', () => {
 
   it('refuses a user-catalog descriptor outside the trusted profile or grant lifetime before admission', async () => {
     const { coordinator, storage, env } = setup();
+    env.MCP_USER_SANDBOX_ENABLED = 'true';
     env.MCP_USER_AUTH_TOKEN = 'product-user-mcp-transport-token-123';
     env.MCP_USER_RUNNER_PRIVATE_JWK = JSON.stringify(generateKeyPairSync('ed25519').privateKey.export({ format: 'jwk' }));
     env.MCP_USER_PROFILE_USER_IDS = JSON.stringify({ 'integration-telegram-ux-v1': 'sandbox-user-1' });
@@ -945,6 +947,20 @@ describe('Cloudflare Runner run coordinator', () => {
     const longRun = await coordinator.fetch(call('/v1/runs', { ...body, mcp: userMcp, limits: { timeoutMs: 7_200_000 } }, { 'idempotency-key': 'user-mcp-too-long' }, owner));
     expect(longRun.status).toBe(422);
     expect(JSON.stringify(storage.values.get('runner-v1') ?? {})).not.toContain('sandbox-user-1');
+  });
+
+  it('fails closed for the shared static sandbox user unless per-run identity provisioning is explicitly enabled', async () => {
+    const { coordinator, storage, env } = setup();
+    env.MCP_USER_AUTH_TOKEN = 'product-user-mcp-transport-token-123';
+    env.MCP_USER_RUNNER_PRIVATE_JWK = JSON.stringify(generateKeyPairSync('ed25519').privateKey.export({ format: 'jwk' }));
+    env.MCP_USER_PROFILE_USER_IDS = JSON.stringify({ 'integration-telegram-ux-v1': 'trained-assist-product-owner' });
+    env.MCP_USER_CATALOGUE_VERSION = 'mem-gpt-user-catalogue-v1';
+    env.MCP_USER_CATALOGUE_DIGEST = '8c17e64a0d71123698b139bd5957a10fff71a2b15f12601a95adcde150350e71';
+    const owner: ApiPrincipal = { ...principal, principalId: 'integration-telegram-ux-v1', profileId: 'integration-telegram-ux-v1' };
+    const response = await coordinator.fetch(call('/v1/runs', { ...body, mcp: userMcp }, { 'idempotency-key': 'shared-static-user-denied' }, owner));
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({ error: { code: 'MCP_BINDING_UNAVAILABLE' } });
+    expect((storage.values.get('runner-v1') as { runs: Record<string, unknown> }).runs).toEqual({});
   });
 
   it('rejects unbound or altered MCP descriptors before storing a run', async () => {
