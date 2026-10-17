@@ -47,7 +47,7 @@ async function main(): Promise<void> {
     throw new Error('worker bindings inventory identity does not match VM_WORKER_ID/VM_WORKER_ENGINE');
   }
   const binary = process.env['OPENCODE_BIN']?.trim() || undefined;
-  const engine = new OpenCodeAdapter(binary ? { binary } : {});
+  const engine = new OpenCodeAdapter(binary ? { binary, model: process.env.OPENCODE_MODEL ?? 'ladder/free' } : { model: process.env.OPENCODE_MODEL ?? 'ladder/free' });
   const token = required('VM_WORKER_TOKEN');
   const allowedRepositories = list('VM_WORKER_ALLOWED_REPOSITORIES');
   const allowedEnvironmentNames = list('VM_WORKER_ALLOWED_ENV');
@@ -78,6 +78,7 @@ async function main(): Promise<void> {
     ingressResolver: createControlPlaneIngressResolverFromEnv(process.env),
     profileWorkspace,
     engineConfigTemplates,
+    engineConfigRequired: true,
     // A durable queued/start-phase run has not crossed the OpenCode spawn
     // boundary. Runner recovery applies its two-retry limit using persisted
     // startAttempts/startPhase evidence; ambiguous spawn is still fail-closed.
