@@ -318,8 +318,14 @@ POST /v1/runs   → 202 receipt              память: AdmissionRecord + с�
   не отправляется никогда;
 - `engines` содержит `mock-test` только при явном sandbox включении; он доступен лишь по
   явному `engine.name`, проходит обычную auth/schema/idempotency обработку и возвращает
-  синтетический `pong`, не запуская модель, внешний worker, profile или repository side effect;
-  в `engineSelection.chain` он запрещён;
+  синтетический результат выбранного сценария (`ping-pong` по умолчанию, либо другой из
+  `ping-pong`, `output-artifact`, `mother-and-kids:all-good`, `mother-and-kids:mother-dead-before-kids`,
+  `mother-and-kids:one-child-dead`, `mother-and-kids:all-dead`,
+  `parallel-sessions:all-good`, `parallel-sessions:parent-dead`,
+  `parallel-sessions:one-child-dead`, `parallel-sessions:all-dead`,
+  `parallel-sessions:session-timeout`, выбирается по префиксу
+  `scenario:`/`mock:` в `input.inlinePrompt`), не запуская модель, внешний worker, profile
+  или repository side effect; в `engineSelection.chain` он запрещён;
 - `isolation.mode: "none"`, `launcher: null` — на хосте API нечего изолировать, агента
   запускает воркер на своей машине и объявляет границу в ответе;
 - `artifacts.export.enabled: false`, `download: false`, `shareLink: false`,

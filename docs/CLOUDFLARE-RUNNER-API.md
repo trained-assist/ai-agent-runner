@@ -76,8 +76,16 @@ verified. See architecture [#208](https://github.com/trained-assist/trained-agen
 
 `eu-vm-agent-run` is the default and only engine in these sandbox configurations. A GHA runner
 is not a fallback. If France cannot accept the job, the task reports an error or unknown
-outcome; the API does not silently move execution elsewhere. The sandbox-only `mock-test`
-engine returns fixed `pong` without calling the VM or a model.
+outcome; the API does not silently move execution elsewhere. The sandbox-only `mock-test` engine never calls the VM or a model. It selects a deterministic
+scenario from the run's `input.inlinePrompt` (prefix `scenario:` or `mock:`) and returns a
+contract-shaped `LaunchResult`: status, stdout/stderr, answer, artifacts, logUrl, duration.
+Supported scenarios: `ping-pong` (default), `output-artifact`, `mother-and-kids:all-good`,
+`mother-and-kids:mother-dead-before-kids`, `mother-and-kids:one-child-dead`,
+`mother-and-kids:all-dead`, `parallel-sessions:all-good`, `parallel-sessions:parent-dead`,
+`parallel-sessions:one-child-dead`, `parallel-sessions:all-dead`,
+  `parallel-sessions:session-timeout`. Unknown scenario names fall
+back to `ping-pong`. The engine is
+disabled unless `AGENT_API_ENABLE_MOCK_TEST=true` in a sandbox environment.
 
 ## Configuration
 
