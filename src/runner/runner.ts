@@ -1232,6 +1232,12 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
           this.completeWithoutEngine(st, 'cancelled', 'cancelled');
           return;
         }
+      } else {
+        // Durable fix: seed engine config into run cwd even without isolation provider,
+        // so OpenCode gets provider/model regardless of isolation mode.
+        phase = 'isolation';
+        this.seedEngineConfig(run, st);
+        if (this.disposed) return;
       }
       const adapter = this.opts.adapters[st.spec.engine.name];
       if (!adapter) throw new PreflightError('ENGINE_UNSUPPORTED', `engine "${st.spec.engine.name}" is not registered on this worker`);
@@ -1622,15 +1628,16 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
    */
   private seedEngineConfig(run: InternalRun, st: PersistedRunState): void {
     const room = run.room;
-    if (!room) return;
-    const seeded = materializeEngineConfig(this.opts.engineConfigTemplates ?? null, room, st.spec.engine.name);
+    const target = room ? room : st.spec.cwd;
+    const seeded = materializeEngineConfig(this.opts.engineConfigTemplates ?? null, target, st.spec.engine.name);
     // Шаблона на хосте нет — поведение прежнее (движок читает свой конфиг сам), и это не
     // событие рана: в лог попадает только фактически положенная копия.
     if (!seeded) return;
+    const slotSuffix = room ? ` slot=${room.identity.slotId}` : '';
     this.emit(st, 'log', {
       stream: 'runner',
       level: 'info',
-      message: `engine_config.seeded engine=${seeded.engine} path=${seeded.path} bytes=${seeded.bytes} sha256=${seeded.sha256} slot=${room.identity.slotId}`,
+      message: `engine_config.seeded engine=${seeded.engine} path=${seeded.path} bytes=${seeded.bytes} sha256=${seeded.sha256}${slotSuffix}`,
     });
   }
 

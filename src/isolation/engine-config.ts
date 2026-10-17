@@ -18,9 +18,9 @@
  * allowlist, который собирает хост.
  */
 import { createHash } from 'node:crypto';
-import { chmodSync, chownSync, existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { chmodSync, chownSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
-import { CleanRoomError, type CleanRoom } from './contract.js';
+import { CleanRoomError, type CleanRoom, type RunIdentity } from './contract.js';
 import { writeFileAtomic } from '../runner/util.js';
 
 /** Максимальный размер шаблона: конфиг движка — это несколько строк, а не данные. */
@@ -95,9 +95,11 @@ export function loadEngineConfigTemplates(dir: string | undefined): EngineConfig
  * не читается, не парсится или некуда положить, — поломка настройки хоста: ран падает
  * ДО спавна, а не стартует с молчаливо неверной (часто платной) моделью.
  */
+export type EngineConfigTarget = CleanRoom | string | { cwd: string; identity?: RunIdentity | null };
+
 export function materializeEngineConfig(
   templates: EngineConfigTemplate | null,
-  room: CleanRoom,
+  target: EngineConfigTarget,
   engineName: string,
 ): MaterializedEngineConfig | null {
   if (!templates) return null;
@@ -136,7 +138,19 @@ export function materializeEngineConfig(
     throw new CleanRoomError('ENGINE_CONFIG_INVALID', `engine config template for "${engineName}" must be a JSON object`);
   }
 
-  const path = join(room.paths.cwd, layout.file);
+  let cwd: string;
+  let identity: RunIdentity | null = null;
+  if (typeof target === 'string') {
+    cwd = target;
+  } else if ('paths' in target) {
+    cwd = target.paths.cwd;
+    identity = target.identity;
+  } else {
+    cwd = target.cwd;
+    identity = target.identity ?? null;
+  }
+  try { mkdirSync(cwd, { recursive: true }); } catch { /* ignore */ }
+  const path = join(cwd, layout.file);
   writeFileAtomic(path, text);
   // Права и владение — независимые шаги: смена владельца требует привилегий, а 0600
   // обязано быть и без них, иначе конфиг рана прочитал бы соседний слот. Порядок тоже
@@ -146,10 +160,12 @@ export function materializeEngineConfig(
   } catch {
     /* файл создан с правами по umask; это увидит проба границы */
   }
-  try {
-    chownSync(path, room.identity.uid, room.identity.gid);
-  } catch {
-    /* chown требует привилегий: файл остаётся 0600 и принадлежит Runner'у */
+  if (identity) {
+    try {
+      chownSync(path, identity.uid, identity.gid);
+    } catch {
+      /* chown требует привилегий: файл остаётся 0600 и принадлежит Runner'у */
+    }
   }
   return { path, engine: engineName, bytes: Buffer.byteLength(text), sha256: createHash('sha256').update(text).digest('hex') };
 }
