@@ -32,8 +32,5 @@
     "SANDBOX_CLEANUP_PROFILES": "integration-telegram-ux-v1",
     "ALLOWED_REPOSITORIES": "trained-assist/ai-agent-runner",
     "ALLOWED_ENVIRONMENT_NAMES": "LLM_LADDER_TOKEN",
-    "MCP_USER_PROFILE_USER_IDS": "{\"integration-telegram-ux-v1\":\"trained-assist-product-owner\"}",
-    "MCP_USER_CATALOGUE_VERSION": "mem-gpt-user-catalogue-v1",
-    "MCP_USER_CATALOGUE_DIGEST": "8c17e64a0d71123698b139bd5957a10fff71a2b15f12601a95adcde150350e71"
   }
 }
