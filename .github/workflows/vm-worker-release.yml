@@ -34,11 +34,11 @@ jobs:
       - name: Download and verify pinned OpenCode fork
         env:
           GH_TOKEN: ${{ github.token }}
-          OPENCODE_RELEASE_TAG: mem-preview-20261015-turn-recovery-91570c76816f
-          OPENCODE_VERSION: 0.0.0-turn-recovery-91570c76816f-202610151149
-          OPENCODE_SOURCE_SHA: 91570c76816fa82244935521c7af4adf9ed81ec7
-          OPENCODE_ARCHIVE_SHA256: ecd22b2414fc626e86b723e4adc780a350bc8fb52d1e102c718c5825c38c5a90
-          OPENCODE_BINARY_SHA256: f0f143113a4c53a334f53a91482503fc362851fadc873ec1fd94ae14fdf92e36
+          OPENCODE_RELEASE_TAG: mem-preview-20261018-trim-web-serve-17355bd
+          OPENCODE_VERSION: 0.0.0-trim-web-serve-202610172230
+          OPENCODE_SOURCE_SHA: 17355bd0dce18126cc73fc76c6d95ca52c0d647b
+          OPENCODE_ARCHIVE_SHA256: c5b08e5feb24a9079a2cf302531a2d10087046f08f3ec5912af817c6afeb962f
+          OPENCODE_BINARY_SHA256: 549fefdc1b4380df1968a2b6143c1d476ed56c72c1dce5f2c93c2b921a96977a
         run: |
           set -euo pipefail
           gh api --paginate --slurp 'repos/gpt-mem/opencode-mem/releases?per_page=100' > "$RUNNER_TEMP/opencode-releases.json"
