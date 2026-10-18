@@ -224,8 +224,12 @@ export class OpenCodeAdapter implements EngineAdapter {
             }
             chunks.push(chunk);
           });
-          exporter.once('error', () => ctx.onExit(code, signal));
-          exporter.once('close', (exportCode) => {
+          let exportFinished = false;
+          let exportExitCode: number | null = null;
+          const finishExport = (exportCode: number | null): void => {
+            if (exportFinished) return;
+            exportFinished = true;
+            clearTimeout(exportTimer);
             if (exportCode === 0 && !failed) {
               try {
                 const text = Buffer.concat(chunks).toString('utf8');
@@ -239,7 +243,23 @@ export class OpenCodeAdapter implements EngineAdapter {
               ctx.onLog('stderr', `opencode session checkpoint export failed (exit=${String(exportCode)}, sizeLimit=${failed})`);
             }
             ctx.onExit(code, signal);
+          };
+          exporter.once('exit', (exitCode) => {
+            exportExitCode = exitCode === null ? null : (exitCode ?? 1);
           });
+          exporter.once('error', () => {
+            try { exporter.kill('SIGKILL'); } catch { /* already gone */ }
+            finishExport(exportExitCode ?? 1);
+          });
+          exporter.once('close', (closeCode) => {
+            finishExport(closeCode === null ? exportExitCode : (closeCode ?? 1));
+          });
+          const exportTimer = setTimeout(() => {
+            ctx.onLog('stderr', 'opencode session checkpoint export timed out; terminating exporter');
+            failed = true;
+            try { exporter.kill('SIGKILL'); } catch { /* already gone */ }
+            finishExport(exportExitCode ?? 1);
+          }, 15000);
         } catch (error) {
           ctx.onLog('stderr', `opencode session checkpoint export failed: ${String(error)}`);
           ctx.onExit(code, signal);
