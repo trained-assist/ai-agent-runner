@@ -50,8 +50,6 @@ async function fetchJson(url, init = {}) {
 }
 
 async function retryProbe(probe) {
-  // Updated Worker secret bindings can take several minutes to reach every
-  // edge. Keep the probe inside the deploy job's 15-minute budget.
   const delays = [0, 1_000, 2_000, 4_000, 8_000, 15_000, 30_000, 60_000, 60_000, 60_000];
   for (const delay of delays) {
     if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
@@ -61,11 +59,17 @@ async function retryProbe(probe) {
 }
 
 async function verifyFranceWorker(url, token) {
-  const { response, body } = await fetchJson(`${url.replace(/\/+$/, '')}/readyz`, {
-    headers: { authorization: `Bearer ${token}` },
-  });
+  let response;
+  let body;
+  try {
+    ({ response, body } = await fetchJson(`${url.replace(/\\/+$/, '')}/readyz`, {
+      headers: { authorization: `Bearer ${token}` },
+    }));
+  } catch {
+    throw new Error('france_worker_probe_network_error');
+  }
   if (!response.ok || !body || typeof body !== 'object' || body.status !== 'ready') {
-    throw new Error('france_worker_not_ready');
+    throw new Error(`france_worker_not_ready_http_${response.status}`);
   }
 }
 
@@ -94,13 +98,11 @@ async function verifyDeployment(sourceSha, apiKey, delegationSecret) {
   })) throw new Error('runner_sandbox_api_key_probe_failed');
 
   const taskId = 'telegram-ux-delegation-health-probe';
-  const digest = createHash('sha256').update(`${PRINCIPAL_ID}\0${PROFILE_ID}\0${taskId}`).digest('hex');
+  const digest = createHash('sha256').update(`${PRINCIPAL_ID}\\0${PROFILE_ID}\\0${taskId}`).digest('hex');
   const runId = `run_${digest}_${'0'.repeat(24)}`;
   if (!await retryProbe(async () => {
-    // Each retry needs a fresh capability. A signature created before the
-    // retry window expires while Cloudflare propagates the updated secret.
     const expiresAt = String(Date.now() + 60_000);
-    const message = `${PRINCIPAL_ID}\0${TENANT_ID}\0${PROFILE_ID}\0${expiresAt}`;
+    const message = `${PRINCIPAL_ID}\\0${TENANT_ID}\\0${PROFILE_ID}\\0${expiresAt}`;
     const signature = createHmac('sha256', delegationSecret).update(message).digest('hex');
     const status = await fetchJson(`${PUBLIC_URL}/v1/runs/${runId}/status`, {
       headers: {
@@ -146,8 +148,6 @@ async function main() {
   const mcpLeaseExpiry = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
   mcpLeaseExpiry.setUTCHours(23, 59, 59, 0);
   const mcpExpiresAt = mcpLeaseExpiry.toISOString();
-  // Non-secret fingerprint lets operators confirm the GitHub sandbox secret is
-  // paired with the separately stored Worker credential without exposing it.
   console.log(JSON.stringify({ apiKeyFingerprint: createHash('sha256').update(apiKey).digest('hex').slice(0, 16) }));
   let workerUrl;
   try {
@@ -184,7 +184,7 @@ async function main() {
     ['RUNNER_API_KEYS', registry],
     ['AGENT_API_PROFILE_DELEGATION_SECRET', delegationSecret],
     ['RUN_LAUNCH_ENCRYPTION_KEY', encryptionKey],
-    ['VM_WORKER_URL', workerUrl.toString().replace(/\/+$/, '')],
+    ['VM_WORKER_URL', workerUrl.toString().replace(/\\/+$/, '')],
     ['VM_WORKER_TOKEN', franceToken],
     ['LLM_LADDER_TOKEN', ladderToken],
     ['MCP_TEST_AUTH_TOKEN', mcpAuthToken],
