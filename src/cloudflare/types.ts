@@ -58,6 +58,16 @@ export interface RunnerWorkerEnv {
   MCP_TEST_RUNNER_PRIVATE_JWK?: string;
   MCP_TEST_CATALOGUE_VERSION?: string;
   MCP_TEST_EXPIRES_AT?: string;
+  /** Base URL of the ZeroCreds wallet API used for standalone credential intake. */
+  ZEROCREDS_WALLET_API_URL?: string;
+  /** Issuer id of the Runner host assertion, as registered with the wallet API. */
+  ZEROCREDS_WALLET_ASSERTION_ISSUER?: string;
+  /** Key id of the Runner host assertion key inside that issuer. */
+  ZEROCREDS_WALLET_ASSERTION_KID?: string;
+  /** Ed25519 private JWK of the Runner host assertion key. */
+  ZEROCREDS_WALLET_ASSERTION_PRIVATE_JWK?: string;
+  /** Map of Runner profile id to the ZeroCreds wallet owner and profile of that user. */
+  ZEROCREDS_WALLET_PROFILES?: string;
   /** Sandbox-only service grant to the authenticated MCP Host user catalog. */
   MCP_USER_AUTH_TOKEN?: string;
   /** Explicit emergency gate. Static sandbox-user mappings are disabled unless the disposable lifecycle is provisioned. */

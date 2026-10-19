@@ -203,6 +203,68 @@ Worker secrets:
 - `MCP_TEST_CATALOGUE_VERSION` and `MCP_TEST_EXPIRES_AT`: pinned catalogue version and
   bounded test lease matching the Host Worker.
 - `LLM_LADDER_TOKEN`: only if the lane's `envAllowlist` permits it.
+- `ZEROCREDS_WALLET_API_URL`: base URL of the ZeroCreds wallet API that owns the
+  credential values. HTTPS only, except a loopback address for a local sandbox.
+- `ZEROCREDS_WALLET_ASSERTION_ISSUER`: issuer id of the Runner host assertion. The
+  wallet API maps this issuer to a public key and to the owner/profile pairs it may
+  act for; the Runner cannot widen that mapping.
+- `ZEROCREDS_WALLET_ASSERTION_KID`: key id of the Runner host assertion key inside
+  that issuer.
+- `ZEROCREDS_WALLET_ASSERTION_PRIVATE_JWK`: Ed25519 private JWK of the Runner host
+  assertion key. It belongs only in this Worker secret store. Never in `vars`,
+  source, a request body or a log.
+- `ZEROCREDS_WALLET_PROFILES`: JSON map from a Runner profile id to the ZeroCreds
+  wallet owner and profile of that user, for example
+  `{"profile-one": {"owner_id": "owner-1", "profile_id": "wallet-profile-1"}}`. An
+  optional `tenant_id` must match the authenticated principal's tenant. A request
+  body can never select an owner, a profile, a destination or a caller class.
+
+## Credential intake
+
+The Runner API accepts credentials from a user without a Control Plane. The user
+places the credential first, in a ZeroCreds form; a later run references the
+resulting connection by an opaque id.
+
+- `POST /v1/credentials` needs the `credentials:write` scope. The body accepts
+  `provider`, `kind`, `title`, `description` and `ttl_minutes`; any other field is
+  rejected. The answer is `{connection_id, form_id, form_url, status_url,
+  expires_at, state}` — an opaque connection reference and value-free metadata. The
+  user opens `form_url` and types the value on the ZeroCreds side.
+- `GET /v1/credentials/{connection_id}` needs the `credentials:read` scope and
+  answers `{connection_id, provider, state, kv_version, updated_at}`.
+
+The credential value never enters the Runner API: it is written straight to the
+wallet's OpenBao path, and the Runner API only ever sees the connection reference.
+`connection_id` is a reference, not a bearer token, and it is bound by the wallet
+API to the owner and profile that created it.
+
+Trust boundary:
+
+- The caller authenticates with a normal API key. `credentials:read` and
+  `credentials:write` are separate scopes: a key that may start runs may not
+  create credential forms, and a key that may create forms may not read them.
+- The Runner API resolves the authenticated profile to a wallet owner and profile
+  from `ZEROCREDS_WALLET_PROFILES`. An unmapped profile is refused before any
+  wallet call.
+- The Runner API proves itself to the wallet API with a short-lived Ed25519 host
+  assertion (`caller_class: human`, at most five minutes, a fresh `jti` per call,
+  because the wallet API rejects a replayed assertion).
+- The wallet API remains the only party that talks to OpenBao, and it verifies the
+  owner, profile, destination and operation against its own issuer configuration.
+
+Failures are closed and typed: `403` without the scope or without a profile
+binding, `503` when the wallet configuration or the wallet service is unavailable,
+`502` when the wallet API rejects the Runner identity, `400` for a malformed form
+request, `404` for an unknown connection, `409` for a reused idempotency key. An
+upstream body is never echoed back.
+
+Local E2E (2026-10-19) ran the real chain under `wrangler dev`: Runner API Worker
+→ ZeroCreds Node server → D1 metadata Worker on local D1 → OpenBao KV v2. The
+Runner API created a form, the user opened the form page, submitted a synthetic
+value, and read back `state: active` with `kv_version: 1`; the value was read from
+OpenBao with a separate reader identity and never appeared in an API response; a
+key without the credential scopes, an unmapped profile and a body that tried to
+choose the owner were refused.
 
 The manual `Deploy and pair isolated sandbox3 live profile auth` workflow runs only from
 protected `main` after an explicit confirmation input. It deploys the reviewed Worker source,
@@ -340,6 +402,10 @@ the complete trusted `RUNNER_CONTROL_PLANE_*` resolver configuration to fetch an
 the manifest; without it, the run fails closed before OpenCode starts. `/readyz` does not
 currently report this optional capability, so a healthy response alone does not prove that
 file-intake runs are ready. The live sandbox file scenario remains the proof gate for this path.
+
+Credential intake stores a credential and reports its status, but no run may consume it yet:
+`POST /v1/runs` still refuses `credentialBindings` with `422 FEATURE_UNSUPPORTED`. Using a
+stored credential from a run needs the credential-use broker and is tracked separately.
 
 A live Host fixture call through CP, this Worker, France VM2, OpenCode and Ladder has succeeded
 and persisted the expected answer. That run did not send a Telegram message and does not establish
