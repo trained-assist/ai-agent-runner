@@ -177,8 +177,11 @@ export class WalletClient {
     if (response.ok) return record;
     if (response.status === 400) throw new WalletError('invalid_request', 'the credential service rejected the requested credential form');
     if (response.status === 401 || response.status === 403) throw new WalletError('rejected', 'the credential service rejected the Runner identity');
-    if (response.status === 404) throw new WalletError('not_found', 'no credential connection exists for this reference');
-    if (response.status === 409) throw new WalletError('conflict', 'a credential request with the same idempotency key already exists');
+    // A typed wallet error is always JSON. Anything else is an infrastructure
+    // failure in front of the wallet (a Cloudflare error page, a proxy answer),
+    // so it must not be reported as a missing credential.
+    if (response.status === 404 && Object.keys(record).length > 0) throw new WalletError('not_found', 'no credential connection exists for this reference');
+    if (response.status === 409 && Object.keys(record).length > 0) throw new WalletError('conflict', 'a credential request with the same idempotency key already exists');
     throw new WalletError('unavailable', 'the credential service is not available');
   }
 

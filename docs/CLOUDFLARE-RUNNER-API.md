@@ -271,6 +271,15 @@ OpenBao with a separate reader identity and never appeared in an API response; a
 key without the credential scopes, an unmapped profile and a body that tried to
 choose the owner were refused.
 
+The Worker configuration of a lane that talks to a ZeroCreds wallet API on the
+same Cloudflare account must set the `global_fetch_strictly_public` compatibility
+flag. Without it Cloudflare answers a Worker-to-Worker request on the same account
+with error 1042 instead of routing it, and the wallet call fails before it leaves
+the platform — the credential intake then reports `503 CREDENTIALS_UNAVAILABLE`.
+The flag routes every outbound request of that Worker through the public path; the
+sandbox3 configuration carries it and `test/cloudflare-sandbox3-config.test.ts`
+fails if it is removed.
+
 The manual `Deploy and pair isolated sandbox3 live profile auth` workflow runs only from
 protected `main` after an explicit confirmation input. It deploys the reviewed Worker source,
 updates only `RUNNER_API_KEYS_SANDBOX3` and `AGENT_API_PROFILE_DELEGATION_SECRET`, then sends

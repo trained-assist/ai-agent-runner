@@ -141,6 +141,17 @@ describe('Cloudflare Runner API credential intake', () => {
     expect(JSON.stringify(await response.json())).not.toContain('socket closed');
   });
 
+  it('reports an infrastructure error in front of the wallet as unavailable, not as a missing credential', async () => {
+    // Cloudflare answers a Worker-to-Worker request on the same account with a
+    // plain error page instead of the wallet's JSON. Reporting that as a
+    // missing credential would hide the real failure.
+    const fetchImpl = vi.fn(async () => new Response('error code: 1042', { status: 404 })) as unknown as typeof fetch;
+    const env = await environment(['credentials:write'], fetchImpl);
+    const response = await runnerApi.fetch(post({ provider: 'github' }), env);
+    expect(response.status).toBe(503);
+    expect(JSON.stringify(await response.json())).not.toContain('1042');
+  });
+
   it('keeps unsupported methods and unknown credential routes closed', async () => {
     const fetchImpl = vi.fn(async () => Response.json({})) as unknown as typeof fetch;
     const env = await environment(['credentials:write', 'credentials:read'], fetchImpl);
