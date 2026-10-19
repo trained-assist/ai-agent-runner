@@ -67,6 +67,16 @@ async function authenticate(request: Request, env: RunnerWorkerEnv): Promise<Api
         configured = [...configured, ...(raw as KeyConfig[])];
       } catch { throw new Error('RUNNER_API_KEYS_DEVELOPER must be a valid JSON array of developer key hash records'); }
     }
+    // The credential registry is additive and independent: it holds only the
+    // principals allowed to open a credential form, so provisioning it never
+    // rewrites the base, sandbox3, developer or additional registries.
+    if (env.RUNNER_API_KEYS_CREDENTIALS !== undefined) {
+      try {
+        const raw: unknown = JSON.parse(env.RUNNER_API_KEYS_CREDENTIALS);
+        if (!Array.isArray(raw) || raw.some((item) => !validKeyConfig(item))) throw new Error('invalid credential key records');
+        configured = [...configured, ...(raw as KeyConfig[])];
+      } catch { throw new Error('RUNNER_API_KEYS_CREDENTIALS must be a valid JSON array of key hash records'); }
+    }
   }
   const digest = await sha256(match[1]);
   const record = configured.find((entry) => entry.keyHash === digest);

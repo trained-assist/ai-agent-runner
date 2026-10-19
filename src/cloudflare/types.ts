@@ -25,6 +25,8 @@ export interface RunnerWorkerEnv {
   RUNNER_API_KEYS_SANDBOX3?: string;
   /** Separate sandbox developer principals; ignored by production authentication. */
   RUNNER_API_KEYS_DEVELOPER?: string;
+  /** Additive principals that may only use the credential intake routes. */
+  RUNNER_API_KEYS_CREDENTIALS?: string;
   /** HMAC secret for short-lived Control Plane profile capabilities. */
   AGENT_API_PROFILE_DELEGATION_SECRET?: string;
   VM_WORKER_URL: string;

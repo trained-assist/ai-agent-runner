@@ -149,4 +149,37 @@ describe('Cloudflare Runner API credential intake', () => {
     expect((await runnerApi.fetch(new Request('https://api.example/v1/credentials/conn-1/secret', { headers: { authorization: `Bearer ${KEY}` } }), env)).status).toBe(404);
     expect(fetchImpl).not.toHaveBeenCalled();
   });
+
+  it('authenticates a credential principal from the dedicated credential registry alone', async () => {
+    const fetchImpl = vi.fn(async () => Response.json({ form_id: 'c'.repeat(32), connection_id: 'conn-3',
+      url: 'https://wallet.example/f/form-3', state: 'pending' })) as unknown as typeof fetch;
+    const base = await environment(['runs:read'], fetchImpl);
+    const env = {
+      ...base,
+      RUNNER_API_KEYS_CREDENTIALS: JSON.stringify([{ keyHash: await sha256('credential-key'),
+        principalId: 'credential-principal', profileId: 'credential-profile', repository: 'team/repo',
+        scopes: ['credentials:read', 'credentials:write'] }]),
+      ZEROCREDS_WALLET_PROFILES: JSON.stringify({ 'credential-profile': { owner_id: 'owner-1', profile_id: 'wallet-profile-1' } }),
+    } as RunnerWorkerEnv;
+    const request = new Request('https://api.example/v1/credentials', { method: 'POST',
+      headers: { authorization: 'Bearer credential-key', 'content-type': 'application/json' }, body: JSON.stringify({ provider: 'github' }) });
+    const response = await runnerApi.fetch(request, env);
+    expect(response.status).toBe(201);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses a credential registry principal that has no credential scope', async () => {
+    const fetchImpl = vi.fn(async () => Response.json({})) as unknown as typeof fetch;
+    const base = await environment(['runs:read'], fetchImpl);
+    const env = {
+      ...base,
+      RUNNER_API_KEYS_CREDENTIALS: JSON.stringify([{ keyHash: await sha256('credential-key'),
+        principalId: 'credential-principal', profileId: 'credential-profile', repository: 'team/repo',
+        scopes: ['runs:read'] }]),
+    } as RunnerWorkerEnv;
+    const request = new Request('https://api.example/v1/credentials', { method: 'POST',
+      headers: { authorization: 'Bearer credential-key', 'content-type': 'application/json' }, body: JSON.stringify({ provider: 'github' }) });
+    expect((await runnerApi.fetch(request, env)).status).toBe(403);
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
 });
