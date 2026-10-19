@@ -23,7 +23,7 @@ duplicated here.
 - [VM worker operations](docs/VM-WORKER-OPERATIONS.md) — install, update, rollback, health.
 - [VM worker secret inventory](docs/VM-WORKER-SECRET-INVENTORY.md) — which secret lives where.
 - [Multi-worker region](docs/MULTI-WORKER-REGION.md) — placement, failover, and the
-  France/Russia sandbox workers.
+  France sandbox worker.
 - [VM worker compatibility boundaries](docs/VM-WORKER-LEGACY-COMPATIBILITY.md) — what this
   worker is and is not.
 - [Promotion](docs/PROMOTION.md) — the promotion journal and fleet acceptance.

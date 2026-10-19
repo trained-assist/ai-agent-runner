@@ -24,7 +24,7 @@ const warn = (label, message) => {
   process.stdout.write(`::warning title=${label}::${message}\n`);
 };
 
-for (const [region, prefix] of [['France', 'EU'], ['Russia', 'RU']]) {
+for (const [region, prefix] of [['France', 'EU']]) {
   const baseUrl = process.env[`${prefix}_VM_WORKER_URL`]?.trim();
   const token = process.env[`${prefix}_VM_WORKER_TOKEN`];
   if (!baseUrl || !token) {
@@ -87,5 +87,5 @@ for (const [region, prefix] of [['France', 'EU'], ['Russia', 'RU']]) {
     warn(`${region} worker check failed`, safe.slice(0, 400));
   }
 }
-if (warnings === 0) process.stdout.write('Both configured VM worker deployment checks passed.\n');
+if (warnings === 0) process.stdout.write('The configured VM worker deployment check passed.\n');
 process.exitCode = warnings > 0 ? 1 : 0;

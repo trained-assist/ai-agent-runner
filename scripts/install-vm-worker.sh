@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [[ "${EUID}" -ne 0 ]]; then
-  echo "Usage: sudo scripts/install-vm-worker.sh <vm-worker-tag> <france|russia>" >&2
+  echo "Usage: sudo scripts/install-vm-worker.sh <vm-worker-tag> <france>" >&2
   exit 1
 fi
 
@@ -12,8 +12,8 @@ if [[ ! "${release_tag}" =~ ^vm-worker-v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   echo "Provide an immutable release tag, for example vm-worker-v0.1.0" >&2
   exit 1
 fi
-if [[ "${region}" != "france" && "${region}" != "russia" ]]; then
-  echo "Region must be france or russia" >&2
+if [[ "${region}" != "france" ]]; then
+  echo "Region must be france" >&2
   exit 1
 fi
 script_dir="$(cd "$(dirname "$0")" && pwd)"
@@ -28,9 +28,7 @@ fi
 command -v gh >/dev/null || { echo "Install GitHub CLI (gh) before verifying signed releases" >&2; exit 1; }
 command -v systemctl >/dev/null || { echo "systemd is required" >&2; exit 1; }
 
-if [[ "${region}" == "france" ]]; then
-  "${script_dir}/install-playwright-runtime.sh"
-fi
+"${script_dir}/install-playwright-runtime.sh"
 
 if ! id ai-agent >/dev/null 2>&1; then
   useradd --system --home-dir /var/lib/ai-agent-runner --create-home --shell /usr/sbin/nologin ai-agent

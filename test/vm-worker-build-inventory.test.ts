@@ -46,7 +46,7 @@ describe('VM worker build and binding inventory', () => {
       'VM_WORKER_CPU_RESERVATION_PCT', 'VM_WORKER_MEMORY_RESERVATION_PCT', 'STORAGE_BACKEND',
       'OPENCODE_BIN', 'AGENT_API_ENGINE_CONFIG_DIR',
     ];
-    for (const name of ['france.json', 'russia.json']) {
+    for (const name of ['france.json']) {
       const path = new URL(`../deploy/vm-worker/inventory/${name}`, import.meta.url);
       const inventory = readVmWorkerBindingsInventory(path.pathname);
       const bindings = new Map(inventory.bindings.map((binding) => [binding.name, binding]));
