@@ -173,6 +173,11 @@ Worker secrets:
   `trained-assist-runner-api-sandbox3` Worker. It is separate from both the base registry and
   the canary registry and contains only the sandbox3 CP principal, with its own API-key hash,
   tenant, repository, scopes, and `eu-vm-agent-run` engine grant.
+- `RUNNER_API_KEYS_CREDENTIALS`: dedicated additional registry for the credential intake
+  principals. It is separate from the base, additional, sandbox3 and developer registries and
+  holds only the principals allowed to open a credential form, so provisioning it never rewrites
+  another registry. `scripts/provision-sandbox3-credential-intake.mjs` writes this registry and
+  the ZeroCreds wallet secrets of the sandbox3 Worker without redeploying it.
 - `AGENT_API_PROFILE_DELEGATION_SECRET`: HMAC secret used only when the trusted Control Plane
   sends the complete `x-agent-profile-*` capability header set. The Worker checks the signature,
   configured API-key tenant, profile ID and short expiry before changing the effective profile.
