@@ -16,7 +16,7 @@ const MCP_CATALOGUE_VERSION = 'registry-fixture-catalogue-v1';
 const API_CONTRACT_NAME = 'ai-agent-runner/serverless-agent-api';
 
 export function parseJsoncWithTrailingCommas(source) {
-  return JSON.parse(source.replace(/,\\s*([}\\]])/g, '$1'));
+  return JSON.parse(source.replace(/,\s*([}\]])/g, '$1'));
 }
 
 export function hasExpectedApiCapabilities(body) {
