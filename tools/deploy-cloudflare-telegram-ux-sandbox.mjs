@@ -15,6 +15,10 @@ const PROFILE_REPOSITORY = 'trained-assist/ai-agent-runner';
 const MCP_CATALOGUE_VERSION = 'registry-fixture-catalogue-v1';
 const API_CONTRACT_NAME = 'ai-agent-runner/serverless-agent-api';
 
+export function parseJsoncWithTrailingCommas(source) {
+  return JSON.parse(source.replace(/,\s*([}\]])/g, '$1'));
+}
+
 export function hasExpectedApiCapabilities(body) {
   return body?.contract?.name === API_CONTRACT_NAME
     && Array.isArray(body?.executionRegions)
@@ -154,7 +158,7 @@ async function main() {
     workerUrl = new URL(franceUrl);
     if (workerUrl.protocol !== 'https:' || workerUrl.username || workerUrl.password || workerUrl.hash) throw new Error();
   } catch { throw new Error('france_worker_url_invalid'); }
-  const config = JSON.parse(await readFile(CONFIG, 'utf8'));
+  const config = parseJsoncWithTrailingCommas(await readFile(CONFIG, 'utf8'));
   validateConfig(config);
 
   const sourceSha = run('git', ['rev-parse', 'HEAD']).trim();
