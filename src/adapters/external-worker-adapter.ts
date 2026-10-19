@@ -1,3 +1,4 @@
+import { OPENCODE_SESSION_ID } from '../contracts/opencode-session-id.js';
 import { randomUUID, timingSafeEqual } from 'node:crypto';
 import { RUNNER_EVENT_SCHEMA_VERSION, type RunnerEvent } from '../contracts/events.js';
 import { RUN_RESULT_SCHEMA_VERSION, type ExitReason, type FailureClass, type RunFailure, type RunOutcome, type RunResult } from '../contracts/result.js';
@@ -669,7 +670,7 @@ export function validateLaunchResult(input: unknown, expectedRunId: string): Val
     if (checkObject(checkpoint, 'launch.sessionCheckpoint', collector)) {
       checkKeys(checkpoint, ['sourceRunId', 'sessionId', 'path', 'sha256', 'size'], ['sourceRunId', 'sessionId', 'path', 'sha256', 'size'], 'launch.sessionCheckpoint', collector);
       if (!isSafeId(checkpoint['sourceRunId'])) collector.push('launch.sessionCheckpoint.sourceRunId: expected a safe run id');
-      if (typeof checkpoint['sessionId'] !== 'string' || !/^ses_[0-7][0-9A-HJKMNP-TV-Z]{25}$/.test(checkpoint['sessionId'])) collector.push('launch.sessionCheckpoint.sessionId: expected an OpenCode session id');
+      if (typeof checkpoint['sessionId'] !== 'string' || !OPENCODE_SESSION_ID.test(checkpoint['sessionId'])) collector.push('launch.sessionCheckpoint.sessionId: expected an OpenCode session id');
       if (typeof checkpoint['path'] !== 'string' || checkpoint['path'] !== `.session-traces/${String(checkpoint['sessionId'])}.json`) collector.push('launch.sessionCheckpoint.path: expected the session archive path');
       if (typeof checkpoint['sha256'] !== 'string' || !/^[0-9a-f]{64}$/.test(checkpoint['sha256'])) collector.push('launch.sessionCheckpoint.sha256: expected sha256');
       if (typeof checkpoint['size'] !== 'number' || !Number.isSafeInteger(checkpoint['size']) || checkpoint['size'] < 0) collector.push('launch.sessionCheckpoint.size: expected non-negative integer');

@@ -106,10 +106,9 @@ describe('OpenCodeAdapter', () => {
     }
   });
 
-  it('forwards a typed native question without exposing it as an unstructured log', async () => {
+  it.each(['ses_01J9A3J9Y7V8W2K4M6N0PQRSTZ', 'ses_eabdad9efffecDKCL3aEAtfJdY'])('forwards a typed question for %s without exposing it as an unstructured log', async (sessionId) => {
     const cwd = mkdtempSync(join(tmpdir(), 'opencode-question-'));
     try {
-      const sessionId = 'ses_01J9A3J9Y7V8W2K4M6N0PQRSTZ';
       const fakeOpenCode = join(cwd, 'opencode-stub.sh');
       writeFileSync(fakeOpenCode, [
         '#!/bin/sh',

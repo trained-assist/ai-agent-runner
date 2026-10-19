@@ -1,3 +1,4 @@
+import { OPENCODE_SESSION_ID, OPENCODE_CHECKPOINT_PATH } from '../contracts/opencode-session-id.js';
 import { chmodSync, chownSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
@@ -1459,7 +1460,7 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
         throw new PreflightError('MATERIALIZE_REF_INVALID', 'OpenCode session checkpoint is not valid exported session JSON');
       }
       if (bytes.length !== resume.size || createHash('sha256').update(bytes).digest('hex') !== resume.sha256
-        || typeof sessionId !== 'string' || sessionId !== resume.sessionId || !/^ses_[0-7][0-9A-HJKMNP-TV-Z]{25}$/.test(sessionId)) {
+        || typeof sessionId !== 'string' || sessionId !== resume.sessionId || !OPENCODE_SESSION_ID.test(sessionId)) {
         throw new PreflightError('MATERIALIZE_REF_INVALID', 'OpenCode session checkpoint failed profile archive integrity validation');
       }
       this.emit(st, 'log', { stream: 'runner', level: 'info', message: `opencode.session_checkpoint_restored sessionId=${sessionId} bytes=${bytes.length} sourceRunId=${resume.sourceRunId}` });
@@ -2050,7 +2051,7 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
   private onEngineAssistantMessage(runId: string, message: { sessionId: string; messageId: string; text: string }): void {
     const run = this.runs.get(runId);
     if (!run || this.disposed || isTerminalState(run.state.state)) return;
-    if (!/^ses_[0-7][0-9A-HJKMNP-TV-Z]{25}$/.test(message.sessionId) || !message.messageId.trim()) return;
+    if (!OPENCODE_SESSION_ID.test(message.sessionId) || !message.messageId.trim()) return;
     // These are user-visible message bodies, so preserve normal paragraph/newline
     // formatting while redacting credentials and non-printable controls.
     const safeText = redactRunSecrets(redactSecrets(message.text), run.runtimeSecrets)
@@ -2068,7 +2069,7 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
   }): void {
     const run = this.runs.get(runId);
     if (!run || this.disposed || isTerminalState(run.state.state)) return;
-    if (!/^ses_[0-7][0-9A-HJKMNP-TV-Z]{25}$/.test(question.sessionId) || !question.requestId.trim()) return;
+    if (!OPENCODE_SESSION_ID.test(question.sessionId) || !question.requestId.trim()) return;
     const safe = (value: string, limit: number): string => redactRunSecrets(redactSecrets(value), run.runtimeSecrets)
       .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, ' ').slice(0, limit);
     this.emit(run.state, 'assistant_question', {
@@ -2664,7 +2665,7 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
     if (!existsSync(sessionDir)) return;
     try {
       const changed = st.result?.profileChanges?.files ?? [];
-      const names = changed.map((file) => file.path.match(/^\.session-traces\/(ses_[0-7][0-9A-HJKMNP-TV-Z]{25})\.json$/)?.[1]).filter((id): id is string => !!id);
+      const names = changed.map((file) => file.path.match(OPENCODE_CHECKPOINT_PATH)?.[1]).filter((id): id is string => !!id);
       const resumed = st.spec.input?.resumeSessionFrom;
       const candidateIds = [...new Set([...names, ...(resumed ? [resumed.sessionId] : [])])];
       let selected: { sessionId: string; path: string; bytes: Buffer } | undefined;
@@ -2683,7 +2684,7 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
       if (!selected) return;
       const { sessionId, path: relativePath, bytes } = selected;
       const parsed = JSON.parse(bytes.toString('utf8')) as { info?: { id?: unknown } };
-      if (parsed.info?.id !== sessionId || !/^ses_[0-7][0-9A-HJKMNP-TV-Z]{25}$/.test(sessionId)) {
+      if (parsed.info?.id !== sessionId || !OPENCODE_SESSION_ID.test(sessionId)) {
         throw new Error('exported session has an invalid id');
       }
       const sha256 = createHash('sha256').update(bytes).digest('hex');
