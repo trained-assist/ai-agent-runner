@@ -1,5 +1,6 @@
 import type { ApiPrincipal, RunnerWorkerEnv } from './types.js';
 import { developerCapabilities, developerRequest, developerWebhooks } from './developer-api.js';
+import { WalletClient, WalletError } from './wallet-client.js';
 
 const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const DEFAULT_ENGINE = 'eu-vm-agent-run';
@@ -116,7 +117,7 @@ function validKeyConfig(value: unknown): value is KeyConfig {
     && typeof record['principalId'] === 'string' && !!record['principalId']
     && typeof record['profileId'] === 'string' && !!record['profileId']
     && (record['tenantId'] === undefined || typeof record['tenantId'] === 'string' && !!record['tenantId'])
-    && Array.isArray(record['scopes']) && record['scopes'].length > 0 && record['scopes'].every((scope) => ['runs:read', 'runs:write'].includes(String(scope)))
+    && Array.isArray(record['scopes']) && record['scopes'].length > 0 && record['scopes'].every((scope) => ['runs:read', 'runs:write', 'credentials:read', 'credentials:write'].includes(String(scope)))
     && (engines === undefined || Array.isArray(engines) && engines.every((engine) => typeof engine === 'string'))
     && (validRepository || mockOnly || pinnedMcpOnly)
     && (record['mcpBindings'] === undefined || Array.isArray(record['mcpBindings']) && record['mcpBindings'].every((binding) => typeof binding === 'string' && binding.length > 0 && binding.length <= 300))
@@ -125,6 +126,30 @@ function validKeyConfig(value: unknown): value is KeyConfig {
 }
 
 function requireScope(principal: ApiPrincipal, scope: string): boolean { return principal.scopes.includes(scope); }
+
+const WALLET_CONNECTION_ID = /^[A-Za-z0-9_-]{1,100}$/;
+
+/**
+ * Credential intake is a separate capability from run admission: a key that may
+ * start runs is not automatically allowed to create credential forms, and a key
+ * that may create credential forms is not automatically allowed to read them.
+ */
+function walletResolutionError(reason: 'not_configured' | 'invalid_config' | 'profile_unmapped'): Response {
+  if (reason === 'profile_unmapped') return error('CREDENTIALS_FORBIDDEN', 'credential intake is not enabled for this profile', 403);
+  return error('CREDENTIALS_UNAVAILABLE', 'credential intake is not configured on this Runner API', 503);
+}
+
+function walletFailure(failure: unknown): Response {
+  const code = failure instanceof WalletError ? failure.code : 'unknown';
+  console.error('[credential-intake] request failed', code);
+  if (failure instanceof WalletError) {
+    if (failure.code === 'invalid_request') return error('INVALID_CREDENTIAL_REQUEST', failure.message, 400);
+    if (failure.code === 'not_found') return error('CREDENTIAL_NOT_FOUND', failure.message, 404);
+    if (failure.code === 'conflict') return error('CREDENTIAL_CONFLICT', failure.message, 409);
+    if (failure.code === 'rejected') return error('CREDENTIALS_REJECTED', failure.message, 502);
+  }
+  return error('CREDENTIALS_UNAVAILABLE', 'credential intake is not available', 503);
+}
 
 export default {
   async fetch(request: Request, env: RunnerWorkerEnv): Promise<Response> {
@@ -197,6 +222,68 @@ export default {
       return object.fetch(new Request(forwarded, { headers }));
     }
     const path = url.pathname.split('/').filter(Boolean);
+    if (path[0] === 'v1' && path[1] === 'credentials') {
+      if (path.length === 2 && request.method === 'POST') {
+        if (!requireScope(principal, 'credentials:write')) return error('FORBIDDEN', 'API key does not have the required scope', 403);
+        let submitted: Record<string, unknown>;
+        try { submitted = await request.clone().json() as Record<string, unknown>; } catch { return error('INVALID_REQUEST', 'request body must be JSON', 400); }
+        if (!submitted || typeof submitted !== 'object' || Array.isArray(submitted)) return error('INVALID_REQUEST', 'request body must be an object', 400);
+        const allowedFields = new Set(['provider', 'kind', 'title', 'description', 'ttl_minutes']);
+        const unknownFields = Object.keys(submitted).filter((name) => !allowedFields.has(name));
+        if (unknownFields.length) return error('INVALID_REQUEST', 'request contains unsupported fields', 400, { errors: unknownFields.map((name) => `request.${name}: unknown field`) });
+        const provider = typeof submitted['provider'] === 'string' ? submitted['provider'].trim() : '';
+        if (!provider) return error('INVALID_REQUEST', 'provider is required', 400);
+        const kind = submitted['kind'] === undefined ? undefined : typeof submitted['kind'] === 'string' ? submitted['kind'] : null;
+        const title = submitted['title'] === undefined ? undefined : typeof submitted['title'] === 'string' ? submitted['title'] : null;
+        const description = submitted['description'] === undefined ? undefined : typeof submitted['description'] === 'string' ? submitted['description'] : null;
+        const ttlMinutes = submitted['ttl_minutes'] === undefined ? undefined : typeof submitted['ttl_minutes'] === 'number' ? submitted['ttl_minutes'] : null;
+        if (kind === null || title === null || description === null || ttlMinutes === null) return error('INVALID_REQUEST', 'kind, title, description and ttl_minutes must have their documented types', 400);
+        if (kind !== undefined && !/^[a-z0-9][a-z0-9_-]{0,63}$/.test(kind)) return error('INVALID_REQUEST', 'kind is invalid', 400);
+        if (title !== undefined && (!title.trim() || title.length > 200)) return error('INVALID_REQUEST', 'title is invalid', 400);
+        if (description !== undefined && description.length > 2000) return error('INVALID_REQUEST', 'description is invalid', 400);
+        if (ttlMinutes !== undefined && (!Number.isInteger(ttlMinutes) || ttlMinutes < 1 || ttlMinutes > 1440)) return error('INVALID_REQUEST', 'ttl_minutes must be an integer between 1 and 1440', 400);
+        const resolution = WalletClient.resolve(principal, env);
+        if (!resolution.ok) return walletResolutionError(resolution.reason);
+        const idempotencyHeader = request.headers.get('idempotency-key')?.trim() ?? '';
+        try {
+          const form = await resolution.client.createForm({
+            provider,
+            ...(kind === undefined ? {} : { kind }),
+            ...(title === undefined ? {} : { title }),
+            ...(description === undefined ? {} : { description }),
+            ...(ttlMinutes === undefined ? {} : { ttlMinutes }),
+            ...(idempotencyHeader ? { idempotencyKey: await sha256(idempotencyHeader) } : {}),
+          });
+          return json({
+            connection_id: form.connectionId,
+            form_id: form.formId,
+            form_url: form.url,
+            status_url: form.statusUrl,
+            expires_at: form.expiresAt,
+            state: form.state,
+          }, 201);
+        } catch (failure) { return walletFailure(failure); }
+      }
+      if (path.length === 3 && request.method === 'GET') {
+        if (!requireScope(principal, 'credentials:read')) return error('FORBIDDEN', 'API key does not have the required scope', 403);
+        const connectionId = path[2] ?? '';
+        if (!WALLET_CONNECTION_ID.test(connectionId)) return error('INVALID_REQUEST', 'connection id is invalid', 400);
+        const resolution = WalletClient.resolve(principal, env);
+        if (!resolution.ok) return walletResolutionError(resolution.reason);
+        try {
+          const connection = await resolution.client.getConnection(connectionId);
+          return json({
+            connection_id: connection.connectionId,
+            provider: connection.provider,
+            state: connection.state,
+            kv_version: connection.kvVersion,
+            updated_at: connection.updatedAt,
+          });
+        } catch (failure) { return walletFailure(failure); }
+      }
+      if (path.length === 2 || path.length === 3) return error('METHOD_NOT_ALLOWED', 'method not allowed', 405);
+      return error('ROUTE_NOT_FOUND', `no route for ${url.pathname}`, 404);
+    }
     if (path[0] !== 'v1' || path[1] !== 'runs') return error('ROUTE_NOT_FOUND', `no route for ${url.pathname}`, 404);
     if ((path.length === 2 && !['GET', 'POST'].includes(request.method)) || (path.length > 2 && !['GET', 'POST'].includes(request.method))) return error('METHOD_NOT_ALLOWED', 'method not allowed', 405);
     if (!requireScope(principal, path.length === 2 && request.method === 'POST' || path[3] === 'cancel' ? 'runs:write' : 'runs:read')) return error('FORBIDDEN', 'API key does not have the required scope', 403);
