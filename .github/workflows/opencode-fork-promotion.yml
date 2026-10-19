@@ -5,7 +5,7 @@ name: OpenCode fork promotion
 # Расписание только замечает кандидата: если последний опубликованный
 # mem-preview релиз форка указывает на другой коммит, чем пин в
 # `vm-worker-release.yml`, запускается гейт. Промоушен (смена пина и, дальше,
-# подписанный релиз воркера на france+russia) происходит ТОЛЬКО после зелёного
+# подписанный релиз воркера на france) происходит ТОЛЬКО после зелёного
 # гейта. Красный гейт оставляет всё как есть и публикует решение артефактом.
 #
 # Почему не автоматом: подмена бинаря на воркере — это то, что реально
@@ -173,7 +173,7 @@ jobs:
           git add .github/workflows/vm-worker-release.yml
           git commit -m "chore(vm-worker): pin verified OpenCode fork $TAG"
           git push --force-with-lease origin "$branch"
-          body="$(printf 'The promotion gate passed for `%s` (`%s`).\n\nThis pins the verified fork build so the next signed `vm-worker-v*` release bundles it, and the France and Russia deploy jobs install that release.\n\nEvidence: the `promotion-decision` artifact of run %s.\n' "$TAG" "$SOURCE" "$GITHUB_RUN_ID")"
+          body="$(printf 'The promotion gate passed for `%s` (`%s`).\n\nThis pins the verified fork build so the next signed `vm-worker-v*` release bundles it, and the France deploy job installs that release.\n\nEvidence: the `promotion-decision` artifact of run %s.\n' "$TAG" "$SOURCE" "$GITHUB_RUN_ID")"
           if gh pr view "$branch" >/dev/null 2>&1; then
             gh pr comment "$branch" --body "$body"
           else

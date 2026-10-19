@@ -69,9 +69,8 @@ install -o root -g root -m 0644 "${release_dir}/scripts/assert-vm-worker-update-
 install -o root -g root -m 0644 "${release_dir}/scripts/select-vm-worker-inventory.mjs" "$(dirname -- "${updater_path}")/select-vm-worker-inventory.mjs"
 install -o root -g root -m 0755 "${release_dir}/scripts/ai-agent-vm-worker-gha-update" "$(dirname -- "${updater_path}")/ai-agent-vm-worker-gha-update"
 install -o root -g root -m 0755 "${release_dir}/scripts/ai-agent-vm-worker-configure-production-ingress" "$(dirname -- "${updater_path}")/ai-agent-vm-worker-configure-production-ingress"
-# Инвентарь выбирается по VM_WORKER_ID, а не по имени файла: один и тот же
-# подписанный релиз ставится и на france, и на russia, и воркер не должен
-# получить чужой инвентарь биндингов.
+# Инвентарь выбирается по VM_WORKER_ID, а не по имени файла: подписанный релиз
+# ставится на воркер, и воркер не должен получить чужой инвентарь биндингов.
 inventory_dir="${release_dir}/deploy/vm-worker/inventory"
 inventory_target="$(sed -n 's/^VM_WORKER_BINDINGS_INVENTORY=//p' "$config_file" | tail -n 1 | sed 's/^"//;s/"$//')"
 worker_id="$(sed -n 's/^VM_WORKER_ID=//p' "$config_file" | tail -n 1 | sed 's/^"//;s/"$//')"

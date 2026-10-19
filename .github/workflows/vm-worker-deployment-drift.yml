@@ -17,7 +17,7 @@ permissions:
 
 jobs:
   check-workers:
-    name: Check France and Russia deployments (warning gate)
+    name: Check France deployment (warning gate)
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
@@ -58,6 +58,4 @@ jobs:
           VM_WORKER_OPENCODE_BINARY_SHA256: ${{ steps.release.outputs.opencode_binary_sha256 }}
           EU_VM_WORKER_URL: ${{ secrets.EU_VM_WORKER_URL }}
           EU_VM_WORKER_TOKEN: ${{ secrets.EU_VM_WORKER_TOKEN }}
-          RU_VM_WORKER_URL: ${{ secrets.RU_VM_WORKER_URL }}
-          RU_VM_WORKER_TOKEN: ${{ secrets.RU_VM_WORKER_TOKEN }}
         run: node scripts/check-vm-worker-deployments.mjs

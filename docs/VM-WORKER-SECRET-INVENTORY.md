@@ -5,7 +5,7 @@
 > [CLOUDFLARE-RUNNER-API.md](CLOUDFLARE-RUNNER-API.md). The France VM owns only execution
 > worker credentials and runtime secrets.
 
-The checked-in France and Russia inventories under `deploy/vm-worker/inventory/` record
+The checked-in France inventory under `deploy/vm-worker/inventory/` records
 binding names and metadata only. They must never contain values. `/version` reports
 whether required process-environment bindings are present, their configured source,
 owner, rotation date, and whether the binding is secret; it never returns a value.
@@ -127,6 +127,10 @@ both stores and an authenticated canary have been verified. The model ladder tok
 workaround for this missing setup.
 
 ## Historical France/Russia deployment check (2026-10-07; superseded for VM2)
+
+The Russia sandbox deployment path (CI deploy job, its secrets, the Russia binding
+inventory and the Russia drift check) was removed on 2026-10-20. The note below is kept
+as the record of what that check established while it was live.
 
 At that time the GitHub Actions deployment-drift workflow could reach both configured endpoints using
 `EU_VM_WORKER_URL` / `EU_VM_WORKER_TOKEN` and `RU_VM_WORKER_URL` / `RU_VM_WORKER_TOKEN`.

@@ -159,10 +159,10 @@ unset GH_TOKEN
 sudo systemctl enable --now ai-agent-vm-worker
 ```
 
-Use `russia` for the Russia host. The bootstrap creates separate France/Russia templates,
-installs the systemd unit and updater, and stops before deployment while placeholders
-remain. `GH_TOKEN` is needed only for an update command; keep it in an operator secret
-store or short-lived shell environment, not the worker service env file.
+The bootstrap targets the France host: it installs the systemd unit and updater,
+and stops before deployment while placeholders remain. `GH_TOKEN` is needed only
+for an update command; keep it in an operator secret store or short-lived shell
+environment, not the worker service env file.
 
 Each release is built from a tag that must already be reachable from `main`. GitHub
 Actions publishes a Linux bundle and SHA-256 checksum, then creates a keyless SLSA
@@ -253,8 +253,8 @@ Before changing versions, the updater waits for `/readyz` to report zero active 
 reservations. The cloud workflow retries only this busy state, then checks `/healthz`,
 `/version` and `/readyz` after restart and rolls back on failure. Re-running a release
 already installed with matching worker and OpenCode hashes is a no-op. This automation
-targets only the France sandbox, not Russia or production, and does not require a
-workstation scheduler.
+targets the France sandbox only — it reaches no other region and not production — and does
+not require a workstation scheduler.
 
 This drift check is deliberately narrower than product migration acceptance. See
 [VM-WORKER-LEGACY-COMPATIBILITY.md](VM-WORKER-LEGACY-COMPATIBILITY.md) and

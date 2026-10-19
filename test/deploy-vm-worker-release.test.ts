@@ -10,9 +10,11 @@ describe('VM worker release updater safety contract', () => {
   it('installs the binding inventory of the worker it is deployed to, not a fixed region', async () => {
     const updater = await readFile(updaterPath, 'utf8');
     const workflow = await readFile(releaseWorkflowPath, 'utf8');
-    // One signed release serves both regions: the updater picks the inventory by
-    // the host's own VM_WORKER_ID, so a russia host cannot receive france.json.
-    expect(workflow).toContain('cp deploy/vm-worker/inventory/france.json deploy/vm-worker/inventory/russia.json "$STAGE/deploy/vm-worker/inventory/"');
+    // One signed release serves the France sandbox: the updater picks the
+    // inventory by the host's own VM_WORKER_ID, so a host can never receive
+    // another worker's inventory.
+    expect(workflow).toContain('cp deploy/vm-worker/inventory/france.json "$STAGE/deploy/vm-worker/inventory/"');
+    expect(workflow).not.toContain('inventory/russia.json');
     expect(updater).toContain('inventory_source="$(node "$(dirname -- "${updater_path}")/select-vm-worker-inventory.mjs" "${inventory_dir}" "${worker_id}")"');
     expect(updater).not.toContain('inventory_source="${release_dir}/deploy/vm-worker/inventory/france.json"');
     expect(updater).toContain("sed -n 's/^VM_WORKER_ID=//p' \"$config_file\"");
@@ -21,14 +23,17 @@ describe('VM worker release updater safety contract', () => {
     expect(updater).toContain('scripts/select-vm-worker-inventory.mjs');
   });
 
-  it('deploys the same signed release to both sandbox regions', async () => {
+  it('deploys the signed release to the France sandbox only', async () => {
     const workflow = await readFile(releaseWorkflowPath, 'utf8');
     expect(workflow).toContain('Deploy signed release to France sandbox');
-    expect(workflow).toContain('Deploy signed release to Russia sandbox');
     expect(workflow).toContain('deploy/vm-worker/france-deploy-known-hosts');
-    expect(workflow).toContain('deploy/vm-worker/russia-deploy-known-hosts');
-    expect(workflow).toContain('root@45.94.209.122');
-    expect(workflow).toContain('RUSSIA_VM_RELEASE_DEPLOY_KEY');
+    // The Russia sandbox deployment path is removed: no job, no secrets, no host.
+    expect(workflow).not.toContain('Deploy signed release to Russia sandbox');
+    expect(workflow).not.toContain('russia-deploy-known-hosts');
+    expect(workflow).not.toContain('root@45.94.209.122');
+    expect(workflow).not.toContain('RUSSIA_VM_RELEASE_DEPLOY_KEY');
+    expect(workflow).not.toContain('RUSSIA_VM_RELEASE_READ_TOKEN');
+    expect(workflow).not.toContain('environment: russia-sandbox');
   });
   it('resolves its colocated readiness helper independently of the caller cwd', async () => {
     const updater = await readFile(updaterPath, 'utf8');
