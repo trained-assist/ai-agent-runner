@@ -184,7 +184,7 @@ async function main() {
     ['RUNNER_API_KEYS', registry],
     ['AGENT_API_PROFILE_DELEGATION_SECRET', delegationSecret],
     ['RUN_LAUNCH_ENCRYPTION_KEY', encryptionKey],
-    ['VM_WORKER_URL', workerUrl.toString().replace(/\\/+$/, '')],
+    ['VM_WORKER_URL', workerUrl.toString().replace(/\/+$/, '')],
     ['VM_WORKER_TOKEN', franceToken],
     ['LLM_LADDER_TOKEN', ladderToken],
     ['MCP_TEST_AUTH_TOKEN', mcpAuthToken],
