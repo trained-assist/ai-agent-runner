@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 
 const base = 'https://trained-assist-runner-api-telegram-ux-v1-sandbox.skillset-apply.workers.dev';
 const apiKey = process.env.RUNNER_API_KEY_AGENT_API;
@@ -71,6 +71,51 @@ function assertIdentity(value, label, runId) {
   if (value?.runId !== runId || value?.userTaskId !== taskId) throw new Error(`${label} task/run identity mismatch`);
 }
 
+function safeAnswerPreview(value) {
+  return String(value ?? '')
+    .replace(/Bearer\s+\S+/gi, 'Bearer [redacted]')
+    .replace(/\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})\b/g, '[redacted]')
+    .slice(0, 500);
+}
+
+function mcpEvidenceFromEvents(events) {
+  const names = new Set(['server_ready', 'tool_invoked', 'tool_result', 'tool_failed', 'server_tool_missing', 'server_start_failed']);
+  const lines = [];
+  const visit = (value, depth = 0) => {
+    if (depth > 5 || value == null) return;
+    if (typeof value === 'string') {
+      for (const line of value.split(/\r?\n/)) {
+        if (/\bmcp\.(?:server_ready|tool_invoked|tool_result|tool_failed|server_tool_missing|server_start_failed)\b/.test(line)) lines.push(line);
+      }
+      return;
+    }
+    if (Array.isArray(value)) { for (const item of value) visit(item, depth + 1); return; }
+    if (typeof value === 'object') {
+      for (const key of ['message', 'text', 'line', 'payload', 'events', 'output', 'stdout', 'stderr', 'logs']) visit(value[key], depth + 1);
+    }
+  };
+  visit(events);
+
+  const unique = [...new Set(lines)];
+  return unique.map((line) => {
+    const match = line.match(/\bmcp\.([a-z_]+)/);
+    const event = match?.[1] ?? 'unknown';
+    const fields = Object.fromEntries([...line.matchAll(/(?:^|\s)(serverId|tool|tools|outcome|reason|bindingRef|scopedTools)=([^\s]+)/g)]
+      .map((entry) => [entry[1], entry[2]]));
+    return { event, ...Object.fromEntries(['serverId', 'tool', 'tools', 'outcome', 'reason', 'bindingRef', 'scopedTools']
+      .filter((key) => fields[key] !== undefined).map((key) => [key, fields[key]])) };
+  }).filter((entry) => names.has(entry.event));
+}
+
+async function collectMcpEvidence(runId) {
+  try {
+    const page = await read(`/v1/runs/${encodeURIComponent(runId)}/events?limit=500`);
+    return { available: true, count: (page.events ?? []).length, events: mcpEvidenceFromEvents(page.events ?? []) };
+  } catch (error) {
+    return { available: false, reason: error instanceof Error ? error.message.slice(0, 180) : 'events_unavailable', events: [] };
+  }
+}
+
 let ghaAvailable = false;
 let receipt;
 let status;
@@ -114,7 +159,7 @@ const payload = {
   routeMode: 'gha',
   publicationMode: 'none',
   engine: { name: 'azure-cloud', adapterVersion: '1' },
-  input: { inlinePrompt: 'Use the available MCP tool named trained-assist-registry-test_registry_fixture_read with empty arguments. Return its result as JSON with marker, taskId, and runId. Do not use bash, curl, webfetch, or repository source to look up the marker. If that MCP tool is unavailable, say so immediately; do not guess values or edit files.' },
+  input: { inlinePrompt: 'Call the available MCP tool named registry.fixture_read with empty arguments. Return the tool result as JSON with marker, taskId, and runId. Do not use bash, curl, webfetch, or repository source to look up the marker. If registry.fixture_read is unavailable, say so immediately; do not guess values or edit files.' },
   envAllowlist: ['LLM_LADDER_TOKEN'],
   limits: { timeoutMs: 300_000, maxOutputBytes: 100_000, maxLogBytes: 200_000 },
   repository: { fullName: 'trained-assist/ai-agent-runner', token: repositoryToken },
@@ -154,13 +199,49 @@ const payload = {
   result = await read(`/v1/runs/${encodeURIComponent(receipt.runId)}/result`);
   assertIdentity(result, 'result', receipt.runId);
   const answer = String(result.text ?? '');
+  const mcpEvidence = await collectMcpEvidence(receipt.runId);
+  const answerProof = (() => {
+    try {
+      const parsed = JSON.parse(answer);
+      return { marker: parsed?.marker ?? null, taskId: parsed?.taskId ?? null, runId: parsed?.runId ?? null };
+    } catch {
+      return {
+        marker: answer.includes('registry-fixture-marker-160-v1') ? 'registry-fixture-marker-160-v1' : null,
+        taskId: answer.includes(taskId) ? taskId : null,
+        runId: answer.includes(receipt.runId) ? receipt.runId : null,
+      };
+    }
+  })();
+  evidence.agentResult = {
+    state: status.state,
+    outcome: result.outcome ?? 'unknown',
+    failureCode: result.failure?.code ?? null,
+    answerLength: answer.length,
+    answerSha256: createHash('sha256').update(answer).digest('hex'),
+    answerPreview: safeAnswerPreview(answer),
+    returnedFields: answerProof,
+  };
+  evidence.mcpEvidence = mcpEvidence;
+  await saveEvidence();
   const hasFixtureProof = answer.includes('registry-fixture-marker-160-v1') && answer.includes(taskId) && answer.includes(receipt.runId);
-  if (hasFixtureProof) {
-    await stage('mcp_connection', 'verified', { evidence: 'run-bound fixture result returned by the pinned MCP server' });
-    await stage('tools_list', 'verified', { evidence: 'the successful call used the only tool in the pinned allowlist' });
+  const ready = mcpEvidence.events.some((event) => event.event === 'server_ready' && event.serverId === 'trained-assist-registry-test'
+    && (event.tools === 'registry.fixture_read' || event.tools?.split(',').includes('registry.fixture_read')));
+  const invoked = mcpEvidence.events.some((event) => event.event === 'tool_invoked' && event.serverId === 'trained-assist-registry-test' && event.tool === 'registry.fixture_read');
+  const completed = mcpEvidence.events.some((event) => event.event === 'tool_result' && event.serverId === 'trained-assist-registry-test'
+    && event.tool === 'registry.fixture_read' && event.outcome === 'completed');
+  if (ready) {
+    await stage('mcp_connection', 'verified', { evidence: 'Runner event records the pinned MCP server as ready' });
+    await stage('tools_list', 'verified', { evidence: 'Runner event lists registry.fixture_read as a scoped tool' });
+  } else {
+    await stage('mcp_connection', 'failed', { reason: 'run evidence does not show the pinned fixture tool ready' });
+  }
+  if (invoked && completed && hasFixtureProof) {
     await stage('tools_call', 'verified', { marker: 'registry-fixture-marker-160-v1', taskId, runId: receipt.runId });
   } else {
-    await stage('mcp_proof', 'failed', { reason: 'fixture marker or task/run identity is missing from the API result' });
+    await stage('mcp_proof', 'failed', {
+      reason: 'requires a matching MCP tool_invoked/tool_result pair and fixture marker plus task/run IDs in the Agent result',
+      ready, invoked, completed, returnedMarker: Boolean(answerProof.marker), returnedTaskId: Boolean(answerProof.taskId), returnedRunId: Boolean(answerProof.runId),
+    });
   }
   const artifactPushFailed = JSON.stringify(result).includes('ARTIFACTS_PUSH_FAILED');
   await stage('api_result', 'verified', {
@@ -175,8 +256,8 @@ const payload = {
   if (result.failure || artifactPushFailed) {
     throw new Error(`MCP canary result has a contradictory finalization failure: ${result.failure?.code ?? 'ARTIFACTS_PUSH_FAILED'}`);
   }
-  if (!hasFixtureProof) {
-    throw new Error('MCP fixture invocation is unproven: result lacks the fixture marker and this run’s IDs');
+  if (!ready || !invoked || !completed || !hasFixtureProof) {
+    throw new Error(`MCP fixture invocation is unproven: ready=${ready} invoked=${invoked} completed=${completed} markerAndIds=${hasFixtureProof}`);
   }
   console.log(`MCP fixture call verified: marker=registry-fixture-marker-160-v1 taskId=${taskId} runId=${receipt.runId}`);
   } finally {
