@@ -868,7 +868,7 @@ describe('Cloudflare Runner run coordinator', () => {
     const [header, payload, signature] = proof.split('.');
     const claims = JSON.parse(Buffer.from(payload!, 'base64url').toString('utf8')) as Record<string, unknown>;
     expect(JSON.parse(Buffer.from(header!, 'base64url').toString('utf8'))).toEqual({ alg: 'EdDSA', typ: 'JWT' });
-    expect(claims).toMatchObject({ runId: receipt.runId, sub: receipt.runId, userTaskId: 'task-a', profileId: 'integration-telegram-ux-v1', principalId: 'integration-telegram-ux-v1', scope: 'registry:fixture-read', serverId: 'trained-assist-registry-test', bindingRef: 'registry-mcp-test-160-read', catalogueVersion: 'registry-fixture-catalogue-v1', registryDigest: '129ab5033964c3ed5be47414711026cc2469b3d9af90ce83ee071cba7f005ea9' });
+    expect(claims).toMatchObject({ runId: receipt.runId, sub: receipt.runId, userTaskId: 'task-a', profileId: 'integration-telegram-ux-v1', principalId: 'integration-telegram-ux-v1', scope: 'registry:fixture-read', serverId: 'trained-assist-registry-test', bindingRef: 'registry-mcp-test-160-read', catalogueVersion: 'registry-fixture-catalogue-v1', registryDigest: 'fcfc1bda07f5ba348a97002489fbb621c495394ca84b3d2aeb0a1ec71cb55c7b' });
     expect(Number(claims.exp) - Number(claims.iat)).toBe(900);
     expect(Object.keys(claims).sort()).toEqual(['allowedTools', 'aud', 'bindingRef', 'catalogueVersion', 'exp', 'iat', 'iss', 'policyVersion', 'principalId', 'profileId', 'registryDigest', 'runId', 'scope', 'serverId', 'sub', 'userTaskId'].sort());
     const contractPath = process.env['MCP_RUN_PROOF_CONTRACT'];
