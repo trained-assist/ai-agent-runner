@@ -66,12 +66,26 @@ if [[ ! -d "${release_dir}" ]]; then
 fi
 install -o root -g root -m 0755 "${release_dir}/scripts/deploy-vm-worker-release.sh" "${updater_path}"
 install -o root -g root -m 0644 "${release_dir}/scripts/assert-vm-worker-update-ready.mjs" "$(dirname -- "${updater_path}")/assert-vm-worker-update-ready.mjs"
+install -o root -g root -m 0644 "${release_dir}/scripts/select-vm-worker-inventory.mjs" "$(dirname -- "${updater_path}")/select-vm-worker-inventory.mjs"
 install -o root -g root -m 0755 "${release_dir}/scripts/ai-agent-vm-worker-gha-update" "$(dirname -- "${updater_path}")/ai-agent-vm-worker-gha-update"
 install -o root -g root -m 0755 "${release_dir}/scripts/ai-agent-vm-worker-configure-production-ingress" "$(dirname -- "${updater_path}")/ai-agent-vm-worker-configure-production-ingress"
-inventory_source="${release_dir}/deploy/vm-worker/inventory/france.json"
+# Инвентарь выбирается по VM_WORKER_ID, а не по имени файла: один и тот же
+# подписанный релиз ставится и на france, и на russia, и воркер не должен
+# получить чужой инвентарь биндингов.
+inventory_dir="${release_dir}/deploy/vm-worker/inventory"
 inventory_target="$(sed -n 's/^VM_WORKER_BINDINGS_INVENTORY=//p' "$config_file" | tail -n 1 | sed 's/^"//;s/"$//')"
+worker_id="$(sed -n 's/^VM_WORKER_ID=//p' "$config_file" | tail -n 1 | sed 's/^"//;s/"$//')"
+if [[ ! "${worker_id}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+  echo 'VM_WORKER_ID is missing or invalid in the service configuration' >&2
+  exit 1
+fi
+if [[ ! -d "${inventory_dir}" ]]; then
+  echo 'Signed VM worker release is missing its binding inventories' >&2
+  exit 1
+fi
+inventory_source="$(node "$(dirname -- "${updater_path}")/select-vm-worker-inventory.mjs" "${inventory_dir}" "${worker_id}")"
 if [[ ! -f "$inventory_source" ]]; then
-  echo 'Signed France VM release is missing its binding inventory' >&2
+  echo 'Signed VM worker release is missing its binding inventory' >&2
   exit 1
 fi
 if [[ ! "$inventory_target" =~ ^/[A-Za-z0-9._/-]+$ || "$inventory_target" == *'..'* || ! -f "$inventory_target" ]]; then
@@ -79,7 +93,7 @@ if [[ ! "$inventory_target" =~ ^/[A-Za-z0-9._/-]+$ || "$inventory_target" == *'.
   exit 1
 fi
 install -o root -g root -m 0644 "$inventory_source" "$inventory_target"
-echo "Installed signed VM worker binding inventory at $inventory_target"
+echo "Installed signed VM worker binding inventory for ${worker_id} at $inventory_target"
 old_target="$(readlink -f "${root}/current" 2>/dev/null || true)"
 old_opencode_target="$(readlink -f "${opencode_path}" 2>/dev/null || true)"
 public_url="$(sed -n 's/^VM_WORKER_PUBLIC_URL=//p' "${config_file}" | tail -n 1 | sed 's/^"//;s/"$//')"

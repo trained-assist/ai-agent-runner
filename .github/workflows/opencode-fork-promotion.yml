@@ -1,0 +1,188 @@
+name: OpenCode fork promotion
+
+# Хук продвижения сборки форка OpenCode MEM.
+#
+# Расписание только замечает кандидата: если последний опубликованный
+# mem-preview релиз форка указывает на другой коммит, чем пин в
+# `vm-worker-release.yml`, запускается гейт. Промоушен (смена пина и, дальше,
+# подписанный релиз воркера на france+russia) происходит ТОЛЬКО после зелёного
+# гейта. Красный гейт оставляет всё как есть и публикует решение артефактом.
+#
+# Почему не автоматом: подмена бинаря на воркере — это то, что реально
+# обслуживает задачи. Пока гейт не прошёл, кандидат не должен никуда попадать.
+
+on:
+  schedule:
+    - cron: '41 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      candidate_tag:
+        description: Fork release tag to gate instead of the detected latest
+        required: false
+        type: string
+      candidate_source:
+        description: Source commit SHA that the tag must pin
+        required: false
+        type: string
+      candidate_archive_sha256:
+        description: sha256 of opencode-linux-x64.tar.gz in that release
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: opencode-fork-promotion
+  cancel-in-progress: false
+
+jobs:
+  detect:
+    name: Detect a fork release that is not the active build
+    runs-on: ubuntu-latest
+    outputs:
+      status: ${{ steps.decide.outputs.status }}
+      tag: ${{ steps.decide.outputs.candidate_tag }}
+      source_commit: ${{ steps.decide.outputs.candidate_source_commit }}
+      archive_sha256: ${{ steps.decide.outputs.candidate_archive_sha256 }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Resolve the pinned OpenCode build from the worker release workflow
+        id: active
+        run: |
+          set -euo pipefail
+          node --input-type=module -e '
+            import { readFileSync, appendFileSync } from "node:fs";
+            import { readOpenCodePin } from "./scripts/update-opencode-release-pin.mjs";
+            const pin = readOpenCodePin(readFileSync(".github/workflows/vm-worker-release.yml", "utf8"));
+            appendFileSync(process.env.GITHUB_OUTPUT, `source_commit=${pin.OPENCODE_SOURCE_SHA}\ntag=${pin.OPENCODE_RELEASE_TAG}\n`);
+          '
+      - name: Fetch published fork releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api --paginate --slurp 'repos/gpt-mem/opencode-mem/releases?per_page=100' > "$RUNNER_TEMP/opencode-releases.json"
+      - name: Decide whether the latest release is a promotion candidate
+        id: decide
+        env:
+          ACTIVE_SOURCE: ${{ steps.active.outputs.source_commit }}
+          ACTIVE_TAG: ${{ steps.active.outputs.tag }}
+          OVERRIDE_TAG: ${{ inputs.candidate_tag }}
+          OVERRIDE_SOURCE: ${{ inputs.candidate_source }}
+          OVERRIDE_ARCHIVE: ${{ inputs.candidate_archive_sha256 }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$OVERRIDE_TAG" ]]; then
+            {
+              echo "status=candidate"
+              echo "candidate_tag=$OVERRIDE_TAG"
+              echo "candidate_source_commit=$OVERRIDE_SOURCE"
+              echo "candidate_archive_sha256=$OVERRIDE_ARCHIVE"
+            } >> "$GITHUB_OUTPUT"
+            echo "Gating the manually requested candidate $OVERRIDE_TAG" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          node scripts/opencode-promotion-candidate.mjs "$RUNNER_TEMP/opencode-releases.json" "$ACTIVE_SOURCE" "$ACTIVE_TAG"
+
+  gate:
+    name: Gate the candidate before anything is promoted
+    needs: detect
+    if: needs.detect.outputs.status == 'candidate'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - name: Download the candidate archive from the fork release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/promotion"
+          gh release download "${{ needs.detect.outputs.tag }}" \
+            --repo gpt-mem/opencode-mem \
+            --pattern opencode-linux-x64.tar.gz \
+            --pattern opencode-linux-x64.tar.gz.sha256 \
+            --dir "$RUNNER_TEMP/promotion"
+      - name: Verify provenance, then run the runner e2e against the candidate binary
+        run: |
+          set -euo pipefail
+          node scripts/opencode-promotion-gate.mjs \
+            --candidate-tag "${{ needs.detect.outputs.tag }}" \
+            --candidate-source "${{ needs.detect.outputs.source_commit }}" \
+            --archive-sha256 "${{ needs.detect.outputs.archive_sha256 }}" \
+            --archive-path "$RUNNER_TEMP/promotion/opencode-linux-x64.tar.gz" \
+            --work-dir "$RUNNER_TEMP/promotion" \
+            --repo-root "$GITHUB_WORKSPACE"
+      - name: Keep the promotion decision as evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: promotion-decision
+          path: ${{ runner.temp }}/promotion/promotion-decision.json
+          if-no-files-found: warn
+
+  promote:
+    name: Pin the verified candidate and open the release PR
+    needs: [detect, gate]
+    if: needs.gate.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: actions/download-artifact@v4
+        with:
+          name: promotion-decision
+          path: ${{ runner.temp }}/promotion
+      - name: Re-pin the fork build to the gated candidate
+        id: pin
+        run: |
+          set -euo pipefail
+          node scripts/update-opencode-release-pin.mjs \
+            "$RUNNER_TEMP/promotion/promotion-decision.json" \
+            .github/workflows/vm-worker-release.yml
+          if git diff --quiet -- .github/workflows/vm-worker-release.yml; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "The worker release workflow already pins ${{ needs.detect.outputs.tag }}." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+      - name: Open a pull request that carries the verified pin
+        if: steps.pin.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.detect.outputs.tag }}
+          SOURCE: ${{ needs.detect.outputs.source_commit }}
+        run: |
+          set -euo pipefail
+          branch="opencode-promotion/$TAG"
+          git config user.name "opencode-promotion"
+          git config user.email "opencode-promotion@users.noreply.github.com"
+          git checkout -b "$branch"
+          git add .github/workflows/vm-worker-release.yml
+          git commit -m "chore(vm-worker): pin verified OpenCode fork $TAG"
+          git push --force-with-lease origin "$branch"
+          body="$(printf 'The promotion gate passed for `%s` (`%s`).\n\nThis pins the verified fork build so the next signed `vm-worker-v*` release bundles it, and the France and Russia deploy jobs install that release.\n\nEvidence: the `promotion-decision` artifact of run %s.\n' "$TAG" "$SOURCE" "$GITHUB_RUN_ID")"
+          if gh pr view "$branch" >/dev/null 2>&1; then
+            gh pr comment "$branch" --body "$body"
+          else
+            gh pr create --title "chore(vm-worker): pin verified OpenCode fork $TAG" --body "$body" --head "$branch" --base main
+          fi
+      - name: Summarise the promotion
+        run: |
+          {
+            echo "### OpenCode fork promotion"
+            echo "- candidate: \`${{ needs.detect.outputs.tag }}\` (\`${{ needs.detect.outputs.source_commit }}\`)"
+            echo "- pin updated: \`${{ steps.pin.outputs.changed }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
