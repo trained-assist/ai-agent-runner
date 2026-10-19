@@ -110,7 +110,14 @@ function mcpEvidenceFromEvents(events) {
 async function collectMcpEvidence(runId) {
   try {
     const page = await read(`/v1/runs/${encodeURIComponent(runId)}/events?limit=500`);
-    return { available: true, count: (page.events ?? []).length, events: mcpEvidenceFromEvents(page.events ?? []) };
+    const events = page.events ?? [];
+    const output = page.snapshot?.output ?? {};
+    return {
+      available: true,
+      eventCount: events.length,
+      outputAvailable: Boolean(output.stdout || output.stderr),
+      events: mcpEvidenceFromEvents({ events, output }),
+    };
   } catch (error) {
     return { available: false, reason: error instanceof Error ? error.message.slice(0, 180) : 'events_unavailable', events: [] };
   }
@@ -223,6 +230,7 @@ const payload = {
   };
   evidence.mcpEvidence = mcpEvidence;
   await saveEvidence();
+  console.log(`MCP canary diagnostics=${JSON.stringify({ agentResult: evidence.agentResult, mcpEvidence })}`);
   const hasFixtureProof = answer.includes('registry-fixture-marker-160-v1') && answer.includes(taskId) && answer.includes(receipt.runId);
   const ready = mcpEvidence.events.some((event) => event.event === 'server_ready' && event.serverId === 'trained-assist-registry-test'
     && (event.tools === 'registry.fixture_read' || event.tools?.split(',').includes('registry.fixture_read')));
