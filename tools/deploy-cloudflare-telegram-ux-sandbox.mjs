@@ -62,7 +62,7 @@ async function verifyFranceWorker(url, token) {
   let response;
   let body;
   try {
-    ({ response, body } = await fetchJson(`${url.replace(/\\/+$/, '')}/readyz`, {
+    ({ response, body } = await fetchJson(`${url.replace(/\/+$/, '')}/readyz`, {
       headers: { authorization: `Bearer ${token}` },
     }));
   } catch {
@@ -98,11 +98,11 @@ async function verifyDeployment(sourceSha, apiKey, delegationSecret) {
   })) throw new Error('runner_sandbox_api_key_probe_failed');
 
   const taskId = 'telegram-ux-delegation-health-probe';
-  const digest = createHash('sha256').update(`${PRINCIPAL_ID}\\0${PROFILE_ID}\\0${taskId}`).digest('hex');
+  const digest = createHash('sha256').update(`${PRINCIPAL_ID}\0${PROFILE_ID}\0${taskId}`).digest('hex');
   const runId = `run_${digest}_${'0'.repeat(24)}`;
   if (!await retryProbe(async () => {
     const expiresAt = String(Date.now() + 60_000);
-    const message = `${PRINCIPAL_ID}\\0${TENANT_ID}\\0${PROFILE_ID}\\0${expiresAt}`;
+    const message = `${PRINCIPAL_ID}\0${TENANT_ID}\0${PROFILE_ID}\0${expiresAt}`;
     const signature = createHmac('sha256', delegationSecret).update(message).digest('hex');
     const status = await fetchJson(`${PUBLIC_URL}/v1/runs/${runId}/status`, {
       headers: {
