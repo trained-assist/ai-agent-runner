@@ -4,6 +4,10 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
+    paths-ignore:
+      - .github/workflows/telegram-ux-gha-mcp-canary.yml
+      - .github/workflows/vm-worker-deployment-drift.yml
+      - scripts/telegram-ux-gha-mcp-canary.mjs
   schedule:
     - cron: '17 */2 * * *'
 
