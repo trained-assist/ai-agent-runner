@@ -24,10 +24,17 @@ const SHA256 = /^[0-9a-f]{64}$/;
 const LINUX_ARCHIVE = 'opencode-linux-x64.tar.gz';
 const LINUX_CHECKSUM = `${LINUX_ARCHIVE}.sha256`;
 
-/** Опубликованные mem-preview релизы, старые первыми. Черновики и prerelease не рассматриваются. */
+/**
+ * Опубликованные mem-preview релизы, старые первыми. Черновики не рассматриваются.
+ *
+ * Флаг GitHub `prerelease` здесь НЕ фильтруется: форк помечает свои preview-релизы
+ * как prerelease, и отбрасывая их, детектор не видит ровно те релизы, которые пиннит
+ * `vm-worker-release.yml`. Тег и так говорит «preview», а проверяемость релиза
+ * (SHA источника, дайджест архива) проверяется ниже по отдельности.
+ */
 export function publishedForkReleases(releases) {
   return releases.flat(Infinity)
-    .filter((release) => release && !release.draft && !release.prerelease
+    .filter((release) => release && !release.draft
       && PREVIEW_TAG.test(release.tag_name ?? '')
       && Number.isFinite(Date.parse(release.published_at ?? '')))
     .sort((a, b) => Date.parse(a.published_at) - Date.parse(b.published_at));

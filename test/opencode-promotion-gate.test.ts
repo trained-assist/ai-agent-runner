@@ -54,6 +54,23 @@ describe('OpenCode promotion gate', () => {
     expect(readCandidateIdentity(binary).embeddedSourceCommit).toBeNull();
   });
 
+  it('does not pretend a Linux binary ran on a host that cannot run it', () => {
+    const stage = mkdtempSync(join(workDir, 'elf-'));
+    const binary = join(stage, 'opencode');
+    // ELF magic of a Linux x64 executable; the file itself is not a real program.
+    writeFileSync(binary, Buffer.concat([Buffer.from([0x7f, 0x45, 0x4c, 0x46]), Buffer.alloc(64)]));
+    if (process.platform === 'linux') {
+      // A Linux host could run a real ELF, but this file is not executable.
+      expect(() => readCandidateIdentity(binary)).toThrow('does not run');
+      return;
+    }
+    const identity = readCandidateIdentity(binary);
+    expect(identity.executableHere).toBe(false);
+    expect(identity.version).toBeNull();
+    expect(identity.reason).toContain('cannot run on');
+    expect(identity.binarySha256).toMatch(/^[0-9a-f]{64}$/);
+  });
+
   it('rejects an archive that does not contain an opencode binary', () => {
     const stage = mkdtempSync(join(workDir, 'empty-'));
     writeFileSync(join(stage, 'README'), 'nothing here');
