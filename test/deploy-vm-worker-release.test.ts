@@ -7,13 +7,28 @@ const releaseWorkflowPath = new URL('../.github/workflows/vm-worker-release.yml'
 const ghaUpdatePath = new URL('../scripts/ai-agent-vm-worker-gha-update', import.meta.url);
 
 describe('VM worker release updater safety contract', () => {
-  it('installs the reviewed France binding inventory from the signed bundle', async () => {
+  it('installs the binding inventory of the worker it is deployed to, not a fixed region', async () => {
     const updater = await readFile(updaterPath, 'utf8');
     const workflow = await readFile(releaseWorkflowPath, 'utf8');
-    expect(workflow).toContain('cp deploy/vm-worker/inventory/france.json "$STAGE/deploy/vm-worker/inventory/"');
-    expect(updater).toContain('inventory_source="${release_dir}/deploy/vm-worker/inventory/france.json"');
+    // One signed release serves both regions: the updater picks the inventory by
+    // the host's own VM_WORKER_ID, so a russia host cannot receive france.json.
+    expect(workflow).toContain('cp deploy/vm-worker/inventory/france.json deploy/vm-worker/inventory/russia.json "$STAGE/deploy/vm-worker/inventory/"');
+    expect(updater).toContain('inventory_source="$(node "$(dirname -- "${updater_path}")/select-vm-worker-inventory.mjs" "${inventory_dir}" "${worker_id}")"');
+    expect(updater).not.toContain('inventory_source="${release_dir}/deploy/vm-worker/inventory/france.json"');
+    expect(updater).toContain("sed -n 's/^VM_WORKER_ID=//p' \"$config_file\"");
     expect(updater).toContain("sed -n 's/^VM_WORKER_BINDINGS_INVENTORY=//p' \"$config_file\"");
     expect(updater).toContain('install -o root -g root -m 0644 "$inventory_source" "$inventory_target"');
+    expect(updater).toContain('scripts/select-vm-worker-inventory.mjs');
+  });
+
+  it('deploys the same signed release to both sandbox regions', async () => {
+    const workflow = await readFile(releaseWorkflowPath, 'utf8');
+    expect(workflow).toContain('Deploy signed release to France sandbox');
+    expect(workflow).toContain('Deploy signed release to Russia sandbox');
+    expect(workflow).toContain('deploy/vm-worker/france-deploy-known-hosts');
+    expect(workflow).toContain('deploy/vm-worker/russia-deploy-known-hosts');
+    expect(workflow).toContain('root@45.94.209.122');
+    expect(workflow).toContain('RUSSIA_VM_RELEASE_DEPLOY_KEY');
   });
   it('resolves its colocated readiness helper independently of the caller cwd', async () => {
     const updater = await readFile(updaterPath, 'utf8');
