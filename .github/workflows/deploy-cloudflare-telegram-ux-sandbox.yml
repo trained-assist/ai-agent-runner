@@ -1,6 +1,12 @@
 name: Deploy Telegram UX Cloudflare Runner sandbox
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/deploy-cloudflare-telegram-ux-sandbox.yml
+      - scripts/telegram-ux-gha-mcp-canary.mjs
+      - src/cloudflare/run-coordinator.ts
   workflow_dispatch:
     inputs:
       run_gha_mcp_canary:
@@ -54,7 +60,7 @@ jobs:
       - run: npm run worker:dry-run:telegram-ux
       - run: node tools/deploy-cloudflare-telegram-ux-sandbox.mjs
       - name: Verify a GHA Registry MCP tool call
-        if: inputs.run_gha_mcp_canary == true
+        if: github.event_name == 'push' || inputs.run_gha_mcp_canary == true
         env:
           GITHUB_TOKEN: ${{ github.token }}
           PRIOR_CANARY_TASK_ID: ${{ inputs.prior_canary_task_id }}
