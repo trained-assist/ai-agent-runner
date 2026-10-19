@@ -4,6 +4,7 @@
   "account_id": "d740a05e9442c1d0feacae2dfc673e93",
   "main": "src/cloudflare/index.ts",
   "compatibility_date": "2026-10-09",
+  "compatibility_flags": ["global_fetch_strictly_public"],
   "workers_dev": true,
   "observability": { "enabled": true },
   "durable_objects": {
