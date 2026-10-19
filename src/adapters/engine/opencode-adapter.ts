@@ -1,3 +1,4 @@
+import { OPENCODE_SESSION_ID } from '../../contracts/opencode-session-id.js';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdirSync, lstatSync, readFileSync, writeFileSync } from 'node:fs';
@@ -81,7 +82,7 @@ export class OpenCodeAdapter implements EngineAdapter {
       catch { throw new EngineStartupError('restored OpenCode session checkpoint is invalid JSON'); }
       if (bytes.length !== resume.size || createHash('sha256').update(bytes).digest('hex') !== resume.sha256
         || parsed.info?.id !== resume.sessionId || typeof parsed.info.id !== 'string'
-        || !/^ses_[0-7][0-9A-HJKMNP-TV-Z]{25}$/.test(parsed.info.id)) {
+        || !OPENCODE_SESSION_ID.test(parsed.info.id)) {
         throw new EngineStartupError('restored OpenCode session checkpoint failed archive integrity validation');
       }
       sessionId = resume.sessionId;
@@ -129,7 +130,7 @@ export class OpenCodeAdapter implements EngineAdapter {
               request?: { id?: unknown; sessionID?: unknown; questions?: unknown; tool?: { callID?: unknown } };
               part?: { type?: unknown; id?: unknown; messageID?: unknown; text?: unknown; reason?: unknown; time?: { end?: unknown } };
             };
-            if (typeof event.sessionID === 'string' && /^ses_[0-7][0-9A-HJKMNP-TV-Z]{25}$/.test(event.sessionID)) sessionId = event.sessionID;
+            if (typeof event.sessionID === 'string' && OPENCODE_SESSION_ID.test(event.sessionID)) sessionId = event.sessionID;
             if (event.type === 'text' && event.part?.type === 'text' && typeof event.part.text === 'string') {
               if (event.part.time?.end) {
                 if (typeof event.sessionID === 'string' && typeof event.part.messageID === 'string') {
@@ -171,7 +172,7 @@ export class OpenCodeAdapter implements EngineAdapter {
                 }).slice(0, 20) : [];
                 return [{ header: typeof item.header === 'string' ? item.header.slice(0, 200) : '', question: item.question.slice(0, 5000), multiple: item.multiple === true, options }];
               }).slice(0, 20);
-              if (typeof event.sessionID === 'string' && /^ses_[0-7][0-9A-HJKMNP-TV-Z]{25}$/.test(event.sessionID)
+              if (typeof event.sessionID === 'string' && OPENCODE_SESSION_ID.test(event.sessionID)
                 && typeof request?.id === 'string' && request.id.length > 0 && questions.length > 0) {
                 ctx.onAssistantQuestion?.({ sessionId: event.sessionID, requestId: request.id.slice(0, 200), questions,
                   toolCallId: typeof request.tool?.callID === 'string' ? request.tool.callID.slice(0, 200) : null });

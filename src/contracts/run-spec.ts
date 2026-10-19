@@ -1,3 +1,4 @@
+import { OPENCODE_SESSION_ID } from './opencode-session-id.js';
 import {
   ErrorCollector,
   checkArray,
@@ -324,12 +325,12 @@ function validateInput(value: unknown, path: string, collector: ErrorCollector):
     if (checkObject(source, `${path}.resumeSessionFrom`, collector)) {
       checkKeys(source, ['sourceRunId', 'sessionId', 'path', 'sha256', 'size'], ['sourceRunId', 'sessionId', 'path', 'sha256', 'size'], `${path}.resumeSessionFrom`, collector);
       if (!isSafeId(source['sourceRunId'])) collector.push(`${path}.resumeSessionFrom.sourceRunId: expected a safe run id`);
-      if (typeof source['sessionId'] !== 'string' || !/^ses_[0-7][0-9A-HJKMNP-TV-Z]{25}$/.test(source['sessionId'])) collector.push(`${path}.resumeSessionFrom.sessionId: expected an OpenCode session id`);
+      if (typeof source['sessionId'] !== 'string' || !OPENCODE_SESSION_ID.test(source['sessionId'])) collector.push(`${path}.resumeSessionFrom.sessionId: expected an OpenCode session id`);
       if (typeof source['path'] !== 'string' || source['path'] !== `.session-traces/${String(source['sessionId'])}.json`) collector.push(`${path}.resumeSessionFrom.path: expected the session archive path`);
       if (typeof source['sha256'] !== 'string' || !/^[0-9a-f]{64}$/.test(source['sha256'])) collector.push(`${path}.resumeSessionFrom.sha256: expected sha256`);
       if (typeof source['size'] !== 'number' || !Number.isSafeInteger(source['size']) || source['size'] < 0) collector.push(`${path}.resumeSessionFrom.size: expected non-negative integer`);
       if (isSafeId(source['sourceRunId']) && typeof source['sessionId'] === 'string'
-        && /^ses_[0-7][0-9A-HJKMNP-TV-Z]{25}$/.test(source['sessionId'])
+        && OPENCODE_SESSION_ID.test(source['sessionId'])
         && source['path'] === `.session-traces/${source['sessionId']}.json`
         && typeof source['sha256'] === 'string' && /^[0-9a-f]{64}$/.test(source['sha256'])
         && typeof source['size'] === 'number' && Number.isSafeInteger(source['size']) && source['size'] >= 0) {

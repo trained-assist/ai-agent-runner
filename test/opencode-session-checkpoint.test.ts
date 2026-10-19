@@ -9,7 +9,7 @@ import type { RunBranchWorker } from '../src/workspace/run-branch-worker.js';
 import { createHarness } from './helpers.js';
 
 describe('durable OpenCode session checkpoint', () => {
-  it('round-trips through the existing profile archive and resumes the same session', async () => {
+  it.each(['ses_01J9A3J9Y7V8W2K4M6N0PQRSTZ', 'ses_eabdad9efffecDKCL3aEAtfJdY'])('round-trips %s through the existing profile archive and resumes the same session', async (sessionId) => {
     const root = mkdtempSync(join(tmpdir(), 'opencode-session-checkpoint-'));
     const archiveRoot = join(root, 'profile-archive');
     mkdirSync(archiveRoot, { recursive: true });
@@ -56,7 +56,7 @@ describe('durable OpenCode session checkpoint', () => {
         'if [ "$1" = "import" ]; then touch "$PWD/.runner-imported"; exit 0; fi',
         'if [ "$1" = "export" ]; then printf \'{"info":{"id":"%s"},"messages":[{"role":"assistant"}]}\\n\' "$2"; exit 0; fi',
         '[ "$1" = "run" ] || exit 20',
-        'session_id="ses_01J9A3J9Y7V8W2K4M6N0PQRSTZ"; previous=""',
+        `session_id="${sessionId}"; previous=""`,
         'for arg in "$@"; do if [ "$previous" = "--session" ]; then session_id="$arg"; fi; previous="$arg"; done',
         'if [ -f "$EXPECTED_SESSION" ]; then [ "$(cat "$EXPECTED_SESSION")" = "$session_id" ] || exit 22; else printf "%s" "$session_id" > "$EXPECTED_SESSION"; fi',
         'if [ -f "$PWD/.runner-imported" ]; then echo "resumed" > "$PWD/.runner-resume-proof"; fi',
@@ -85,15 +85,15 @@ describe('durable OpenCode session checkpoint', () => {
       const first = h.start({ ...common, input: { inlinePrompt: 'Perform the first step.' }, envAllowlist: ['EXPECTED_SESSION'] });
       const firstResult = await h.runner.waitFor(first.receipt.runId);
       expect(h.runner.events(first.receipt.runId).filter((event) => event.type === 'assistant_message')).toMatchObject([
-        { payload: { sessionId: 'ses_01J9A3J9Y7V8W2K4M6N0PQRSTZ', messageId: 'msg_01J9A3J9Y7V8W2K4M6N0PQRSTZ', text: 'Checking the repository first.' } },
+        { payload: { sessionId, messageId: 'msg_01J9A3J9Y7V8W2K4M6N0PQRSTZ', text: 'Checking the repository first.' } },
       ]);
       const checkpoint = firstResult.sessionCheckpoint;
       expect(checkpoint).toMatchObject({
         sourceRunId: first.receipt.runId,
-        sessionId: 'ses_01J9A3J9Y7V8W2K4M6N0PQRSTZ',
-        path: '.session-traces/ses_01J9A3J9Y7V8W2K4M6N0PQRSTZ.json',
+        sessionId,
+        path: `.session-traces/${sessionId}.json`,
       });
-      const archivedPath = join(archiveRoot, '.session-traces', 'ses_01J9A3J9Y7V8W2K4M6N0PQRSTZ.json');
+      const archivedPath = join(archiveRoot, '.session-traces', `${sessionId}.json`);
       const archivedBytes = readFileSync(archivedPath);
       expect(createHash('sha256').update(archivedBytes).digest('hex')).toBe(checkpoint?.sha256);
       expect(JSON.parse(archivedBytes.toString('utf8')).info.id).toBe(checkpoint?.sessionId);
