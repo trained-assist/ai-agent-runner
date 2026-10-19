@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { hasExpectedApiCapabilities } from '../tools/deploy-cloudflare-telegram-ux-sandbox.mjs';
+import { hasExpectedApiCapabilities, parseJsoncWithTrailingCommas } from '../tools/deploy-cloudflare-telegram-ux-sandbox.mjs';
 
-describe('Telegram UX Runner deploy acceptance', () => {
+describe('Telegram UX Runner deploy acceptance', () => {\n  it('parses Wrangler JSONC with trailing commas', () => {\n    expect(parseJsoncWithTrailingCommas('{\"vars\": {\"enabled\": true,},}')).toEqual({ vars: { enabled: true } });\n  });\n
   it('accepts the actual serverless Runner API contract and EU engine', () => {
     expect(hasExpectedApiCapabilities({
       contract: { name: 'ai-agent-runner/serverless-agent-api', version: 1 },
