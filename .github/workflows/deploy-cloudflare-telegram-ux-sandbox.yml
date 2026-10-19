@@ -68,3 +68,11 @@ jobs:
           PRIOR_CANARY_TASK_ID: ${{ inputs.prior_canary_task_id }}
           PRIOR_CANARY_RUN_ID: ${{ inputs.prior_canary_run_id }}
         run: node scripts/telegram-ux-gha-mcp-canary.mjs
+      - name: Upload sanitized GHA MCP canary evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: telegram-ux-gha-mcp-canary-${{ github.run_id }}
+          path: gha-mcp-canary-evidence.json
+          if-no-files-found: ignore
+          retention-days: 30
