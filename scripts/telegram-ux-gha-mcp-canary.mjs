@@ -166,7 +166,7 @@ const payload = {
   routeMode: 'gha',
   publicationMode: 'none',
   engine: { name: 'azure-cloud', adapterVersion: '1' },
-  input: { inlinePrompt: 'Call the available MCP tool named registry.fixture_read with empty arguments. Return the tool result as JSON with marker, taskId, and runId. Do not use bash, curl, webfetch, or repository source to look up the marker. If registry.fixture_read is unavailable, say so immediately; do not guess values or edit files.' },
+  input: { inlinePrompt: 'Call the available MCP tool named trained-assist-registry-test_registry_fixture_read with empty arguments. Return the tool result as JSON with marker, taskId, and runId. Do not use bash, curl, webfetch, or repository source to look up the marker. If trained-assist-registry-test_registry_fixture_read is unavailable, say so immediately; do not guess values or edit files.' },
   envAllowlist: ['LLM_LADDER_TOKEN'],
   limits: { timeoutMs: 300_000, maxOutputBytes: 100_000, maxLogBytes: 200_000 },
   repository: { fullName: 'trained-assist/ai-agent-runner', token: repositoryToken },
