@@ -237,6 +237,11 @@ resulting connection by an opaque id.
   user opens `form_url` and types the value on the ZeroCreds side.
 - `GET /v1/credentials/{connection_id}` needs the `credentials:read` scope and
   answers `{connection_id, provider, state, kv_version, updated_at}`.
+- `DELETE /v1/credentials/{connection_id}` needs the `credentials:write` scope
+  and revokes the credential: the wallet closes the connection and deletes the
+  stored value, and the answer is `{connection_id, state}`. A revoked
+  connection stays known — it is never quietly removed — so a later run can
+  tell "revoked" from "never existed".
 
 The credential value never enters the Runner API: it is written straight to the
 wallet's OpenBao path, and the Runner API only ever sees the connection reference.

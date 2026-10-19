@@ -39,6 +39,10 @@ function get(connectionId: string): Request {
   return new Request(`https://api.example/v1/credentials/${connectionId}`, { headers: { authorization: `Bearer ${KEY}` } });
 }
 
+function revoke(connectionId: string): Request {
+  return new Request(`https://api.example/v1/credentials/${connectionId}`, { method: 'DELETE', headers: { authorization: `Bearer ${KEY}` } });
+}
+
 describe('Cloudflare Runner API credential intake', () => {
   it('creates a credential form for the authenticated profile and returns no secret material', async () => {
     const calls: { url: string; authorization: string | null; body: string | null }[] = [];
@@ -191,6 +195,45 @@ describe('Cloudflare Runner API credential intake', () => {
     const request = new Request('https://api.example/v1/credentials', { method: 'POST',
       headers: { authorization: 'Bearer credential-key', 'content-type': 'application/json' }, body: JSON.stringify({ provider: 'github' }) });
     expect((await runnerApi.fetch(request, env)).status).toBe(403);
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('revokes a credential connection and asks the wallet to close it', async () => {
+    const calls: { url: string; authorization: string | null }[] = [];
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ url: String(input), authorization: new Headers(init?.headers).get('authorization') });
+      return Response.json({ connection_id: 'conn-1', state: 'revoked' });
+    }) as unknown as typeof fetch;
+    const env = await environment(['credentials:write'], fetchImpl);
+    const response = await runnerApi.fetch(revoke('conn-1'), env);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ connection_id: 'conn-1', state: 'revoked' });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.url).toBe('https://wallet.example/api/wallet/connections/conn-1/revoke');
+    const claims = claimsOf(calls[0]!.authorization);
+    expect(claims['operations']).toContain('wallet.connections.revoke');
+    expect(claims).toMatchObject({ owner_id: 'owner-1', profile_id: 'wallet-profile-1', caller_class: 'human' });
+  });
+
+  it('refuses a revocation without the credential write scope', async () => {
+    const fetchImpl = vi.fn(async () => Response.json({})) as unknown as typeof fetch;
+    const env = await environment(['credentials:read'], fetchImpl);
+    expect((await runnerApi.fetch(revoke('conn-1'), env)).status).toBe(403);
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('answers a revocation of an unknown connection with a typed error and no upstream body', async () => {
+    const fetchImpl = vi.fn(async () => Response.json({ error: 'connection_unavailable' }, { status: 404 })) as unknown as typeof fetch;
+    const env = await environment(['credentials:write'], fetchImpl);
+    const response = await runnerApi.fetch(revoke('conn-1'), env);
+    expect(response.status).toBe(404);
+    expect(JSON.stringify(await response.json())).not.toContain('connection_unavailable');
+  });
+
+  it('rejects a connection reference that is not a safe id before it reaches the wallet', async () => {
+    const fetchImpl = vi.fn(async () => Response.json({})) as unknown as typeof fetch;
+    const env = await environment(['credentials:write'], fetchImpl);
+    expect((await runnerApi.fetch(revoke('bad$id'), env)).status).toBe(400);
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 });
