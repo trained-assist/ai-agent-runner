@@ -68,7 +68,7 @@ const MCP_TEST = Object.freeze({
   tool: 'registry.fixture_read', scope: 'registry:fixture-read', policy: 'registry-fixture-policy-v1',
   audience: 'trained-assist:registry-mcp:test', issuer: 'trained-assist-agent-runner',
   url: 'https://trained-assist-mcp-host-test-160.skillset-apply.workers.dev/mcp',
-  digest: '129ab5033964c3ed5be47414711026cc2469b3d9af90ce83ee071cba7f005ea9',
+  digest: 'fcfc1bda07f5ba348a97002489fbb621c495394ca84b3d2aeb0a1ec71cb55c7b',
   tokenEnv: 'RUNNER_MCP_REGISTRY_TEST',
 });
 const MCP_USER = Object.freeze({
