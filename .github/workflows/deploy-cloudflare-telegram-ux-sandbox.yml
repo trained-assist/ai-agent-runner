@@ -7,6 +7,8 @@ on:
       - .github/workflows/deploy-cloudflare-telegram-ux-sandbox.yml
       - scripts/telegram-ux-gha-mcp-canary.mjs
       - src/cloudflare/run-coordinator.ts
+      - tools/deploy-cloudflare-telegram-ux-sandbox.mjs
+      - test/cloudflare-sandbox-deploy.test.ts
   workflow_dispatch:
     inputs:
       run_gha_mcp_canary:
