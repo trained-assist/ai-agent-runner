@@ -45,9 +45,9 @@ jobs:
       LLM_LADDER_TOKEN: ${{ secrets.LLM_LADDER_TOKEN }}
       MCP_TEST_AUTH_TOKEN: ${{ secrets.MCP_TEST_AUTH_TOKEN }}
       MCP_TEST_RUNNER_PRIVATE_JWK: ${{ secrets.MCP_TEST_RUNNER_PRIVATE_JWK }}
-      MCP_USER_AUTH_TOKEN: ${{ secrets.MCP_USER_AUTH_TOKEN }}
-      MCP_USER_PROVISION_TOKEN: ${{ secrets.MCP_SANDBOX_PROVISION_TOKEN }}
-      MCP_USER_RUNNER_PRIVATE_JWK: ${{ secrets.MCP_USER_RUNNER_PRIVATE_JWK }}
+      MCP_USER_AUTH_TOKEN: ${{ secrets.MCP_SANDBOX_PROVISION_TOKEN != '' && secrets.MCP_USER_AUTH_TOKEN != '' && secrets.MCP_USER_RUNNER_PRIVATE_JWK != '' && secrets.MCP_USER_AUTH_TOKEN || '' }}
+      MCP_USER_PROVISION_TOKEN: ${{ secrets.MCP_SANDBOX_PROVISION_TOKEN != '' && secrets.MCP_USER_AUTH_TOKEN != '' && secrets.MCP_USER_RUNNER_PRIVATE_JWK != '' && secrets.MCP_SANDBOX_PROVISION_TOKEN || '' }}
+      MCP_USER_RUNNER_PRIVATE_JWK: ${{ secrets.MCP_SANDBOX_PROVISION_TOKEN != '' && secrets.MCP_USER_AUTH_TOKEN != '' && secrets.MCP_USER_RUNNER_PRIVATE_JWK != '' && secrets.MCP_USER_RUNNER_PRIVATE_JWK || '' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
