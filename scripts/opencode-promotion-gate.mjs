@@ -70,8 +70,25 @@ export function extractCandidateBinary(archivePath, workDir, expectedArchiveSha2
  * Идентичность бинаря. `--version` — единственный способ узнать, что внутри:
  * сборки форка печатают либо `opencode v0.0.0-fork-at-<sha>` (сборка из исходников,
  * SHA вшит через OPENCODE_VERSION), либо `opencode v0.0.0-<slug>-<ts>` (релиз).
+ *
+ * Архив релиза — это Linux x64, поэтому на хосте без Linux бинарь не запустится.
+ * Тогда шаг не «красный», а «здесь не выполнимо»: гейт решает, можно ли
+ * продвигать, и решать это на хосте, который не может запустить кандидата,
+ * нельзя. sha256 при этом считается на любом хосте — это байты файла.
  */
 export function readCandidateIdentity(binaryPath) {
+  const binarySha256 = sha256OfFile(binaryPath);
+  const isElf = readFileSync(binaryPath).subarray(0, 4).equals(Buffer.from([0x7f, 0x45, 0x4c, 0x46]));
+  if (isElf && process.platform !== 'linux') {
+    return {
+      version: null,
+      raw: null,
+      embeddedSourceCommit: null,
+      binarySha256,
+      executableHere: false,
+      reason: `candidate binary is a Linux ELF and cannot run on ${process.platform}; the promotion gate must run on Linux`,
+    };
+  }
   let raw;
   try {
     raw = execFileSync(binaryPath, ['--version'], { encoding: 'utf8', timeout: 30_000 }).trim();
@@ -81,7 +98,7 @@ export function readCandidateIdentity(binaryPath) {
   const version = raw.split('\n')[0]?.replace(/^opencode\s+v?/, '').trim() ?? '';
   if (!version) throw new Error('Candidate binary reported an empty version');
   const embedded = /fork-at-([0-9a-f]{7,40})/.exec(raw)?.[1] ?? null;
-  return { version, raw, embeddedSourceCommit: embedded, binarySha256: sha256OfFile(binaryPath) };
+  return { version, raw, embeddedSourceCommit: embedded, binarySha256, executableHere: true, reason: null };
 }
 
 /** Прогон e2e раннера с подменённым OPENCODE_BIN. Возвращает результат, не бросает. */
@@ -105,8 +122,14 @@ if (invokedDirectly) {
     const archivePath = args.archivePath ?? join(args.workDir, LINUX_ARCHIVE);
     const binaryPath = args.binaryPath ?? extractCandidateBinary(archivePath, args.workDir, args.archiveSha256);
     const identity = readCandidateIdentity(binaryPath);
-    steps.push({ label: 'candidate_identity', status: 'pass', output: JSON.stringify(identity) });
-    if (identity.embeddedSourceCommit && !args.candidateSource.startsWith(identity.embeddedSourceCommit)) {
+    steps.push({
+      label: 'candidate_identity',
+      status: identity.executableHere ? 'pass' : 'skip',
+      output: JSON.stringify(identity),
+    });
+    if (!identity.executableHere) {
+      steps.push({ label: 'candidate_source_matches_version', status: 'skip', output: identity.reason });
+    } else if (identity.embeddedSourceCommit && !args.candidateSource.startsWith(identity.embeddedSourceCommit)) {
       steps.push({ label: 'candidate_source_matches_version', status: 'fail', output: `binary embeds ${identity.embeddedSourceCommit}, release pins ${args.candidateSource}` });
     } else {
       steps.push({ label: 'candidate_source_matches_version', status: identity.embeddedSourceCommit ? 'pass' : 'skip', output: identity.embeddedSourceCommit ? 'version string carries the source commit' : 'release build does not embed a source commit' });
@@ -121,19 +144,25 @@ if (invokedDirectly) {
       }));
     }
     const failed = steps.filter((step) => step.status === 'fail');
+    const cannotVerify = !identity.executableHere;
+    const outcome = failed.length > 0 ? 'hold' : cannotVerify ? 'cannot-verify' : 'promote';
     const decision = {
       schemaVersion: 1,
       candidate: { tag: args.candidateTag, sourceCommit: args.candidateSource, archiveSha256: args.archiveSha256, ...identity },
       binaryPath,
       steps,
-      outcome: failed.length === 0 ? 'promote' : 'hold',
-      reason: failed.length === 0 ? 'All promotion gate steps passed' : `Gate steps failed: ${failed.map((step) => step.label).join(', ')}`,
+      outcome,
+      reason: failed.length > 0
+        ? `Gate steps failed: ${failed.map((step) => step.label).join(', ')}`
+        : cannotVerify
+          ? identity.reason
+          : 'All promotion gate steps passed',
     };
     const out = join(args.workDir, 'promotion-decision.json');
     writeFileSync(out, `${JSON.stringify(decision, null, 2)}\n`);
     for (const step of steps) process.stdout.write(`[${step.status}] ${step.label}\n${step.output}\n`);
     process.stdout.write(`outcome=${decision.outcome} reason=${decision.reason}\ndecision=${out}\n`);
-    process.exit(failed.length === 0 ? 0 : 1);
+    process.exit(outcome === 'promote' ? 0 : outcome === 'hold' ? 1 : 2);
   } catch (error) {
     process.stderr.write(`promotion gate did not run: ${error instanceof Error ? error.message : String(error)}\n`);
     process.exit(2);

@@ -14,10 +14,12 @@ export type PromotionGateArgs = {
 };
 
 export type CandidateIdentity = {
-  version: string;
-  raw: string;
+  version: string | null;
+  raw: string | null;
   embeddedSourceCommit: string | null;
   binarySha256: string;
+  executableHere: boolean;
+  reason: string | null;
 };
 
 export const FORK_REPO: string;
