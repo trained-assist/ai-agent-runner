@@ -29,12 +29,13 @@ describe('OpenCode fork promotion candidate', () => {
     });
   });
 
-  it('ignores drafts, prereleases, foreign tags and undated releases', () => {
+  it('ignores drafts, foreign tags and undated releases, but keeps GitHub prereleases', () => {
+    // The fork marks its mem-preview releases as GitHub prereleases, so that flag
+    // cannot be used to filter them: the pinned build is itself a prerelease.
     const kept = release();
     const releases = [
       kept,
       release({ draft: true }),
-      release({ prerelease: true }),
       release({ tag_name: 'mem-v20261018-17355bd' }),
       release({ tag_name: 'v1.0.0' }),
       release({ published_at: 'not-a-date' }),
