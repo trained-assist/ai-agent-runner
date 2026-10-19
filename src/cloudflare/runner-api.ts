@@ -291,6 +291,17 @@ export default {
           });
         } catch (failure) { return walletFailure(failure); }
       }
+      if (path.length === 3 && request.method === 'DELETE') {
+        if (!requireScope(principal, 'credentials:write')) return error('FORBIDDEN', 'API key does not have the required scope', 403);
+        const connectionId = path[2] ?? '';
+        if (!WALLET_CONNECTION_ID.test(connectionId)) return error('INVALID_REQUEST', 'connection id is invalid', 400);
+        const resolution = WalletClient.resolve(principal, env);
+        if (!resolution.ok) return walletResolutionError(resolution.reason);
+        try {
+          const revoked = await resolution.client.revokeConnection(connectionId);
+          return json({ connection_id: revoked.connectionId, state: revoked.state });
+        } catch (failure) { return walletFailure(failure); }
+      }
       if (path.length === 2 || path.length === 3) return error('METHOD_NOT_ALLOWED', 'method not allowed', 405);
       return error('ROUTE_NOT_FOUND', `no route for ${url.pathname}`, 404);
     }

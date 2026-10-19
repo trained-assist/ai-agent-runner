@@ -15,6 +15,7 @@ import type { ApiPrincipal, RunnerWorkerEnv } from './types.js';
  */
 
 const WALLET_OPERATIONS = ['wallet.forms.create', 'wallet.connections.status'];
+const WALLET_REVOKE_OPERATIONS = [...WALLET_OPERATIONS, 'wallet.connections.revoke'];
 const ASSERTION_TTL_SECONDS = 120;
 const WALLET_TIMEOUT_MS = 10_000;
 const PROVIDER = /^[a-z0-9][a-z0-9_-]{0,63}$/;
@@ -150,6 +151,20 @@ export class WalletClient {
       state,
       kvVersion: typeof kvVersion === 'number' ? kvVersion : null,
       updatedAt: text(body['updated_at']),
+    };
+  }
+
+  /**
+   * Revokes one credential connection. The wallet deletes the stored value and
+   * closes the connection, so the credential stops being usable even though the
+   * reference itself stays known.
+   */
+  async revokeConnection(connectionId: string): Promise<{ connectionId: string; state: string }> {
+    if (!WALLET_ID.test(connectionId)) throw new WalletError('invalid_request', 'connection id is not a valid reference');
+    const body = await this.call('wallet.connections.revoke', WALLET_REVOKE_OPERATIONS, `/api/wallet/connections/${encodeURIComponent(connectionId)}/revoke`, 'POST', {});
+    return {
+      connectionId: text(body['connection_id']) ?? connectionId,
+      state: text(body['state']) ?? 'revoked',
     };
   }
 
