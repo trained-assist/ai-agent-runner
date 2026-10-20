@@ -146,20 +146,31 @@ the report never contains the value.
   Runner API lane publishes through its own profile workspace, where the
   published bytes are edited by value before they leave the host.
 
-## The measured run (2026-10-20, worker 0.3.46, France sandbox worker)
+## The measured run (2026-10-20, worker 0.3.47, France sandbox worker, Runner API f91b7509)
 
 ```
+ok   A: the Runner API accepts a run that binds the credential — run_32faff21bdb659a12fa9627ce31b84d3cf17432f8f72f37dc37ccbc6fd81faf0_2b87898dd8634374acc63873
 ok   A: the credential reaches the agent in its environment, and only there — value=sha256:8b6715b585cd536f
 ok   A: the run finishes — state=succeeded
 ok   A: the value does not reach the run record, the status or the events — value-free
+ok   A: the host counts the hosts that received the value — deliveries=1 repeats=0
 ok   A: the value does not reach the runner log, the run state or the session transcript — value-free
 ok   A: the copy does not survive the run on the host — the workspace was swept
-ok   A: the published profile carries the file without the value — skipped: the lane publishes no profile
+ok   A: the published profile carries the file without the value — published without the value (10 bytes, sha256 017ad73325fcf108)
+ok   B: the Runner API accepts the second run that will be killed — run_8224c45b839f9f6bbdccc250491474bc0f43c6066fb7403b29122d62f9545429_4de008e02f704a0180af29c5
+ok   B: the credential is in the engine environment and the copy is on the disk — value=sha256:8b6715b585cd536f
 ok   B: the host dies mid-flight: the worker is SIGKILLed — the worker control group is dead
 ok   B: the copy on the dead host is swept by the recovery, not by the kill — the workspace copy is gone
 ok   B: the outcome of the run whose host died — state=failed
 ok   B: the custody store is independent of the host — the custody outlived the host
 ```
+
+The published file was read back from the lane after the run
+(`GET /v1/runs/{runId}/profile-changes?path=blast/leak.txt`): 10 bytes, sha256
+`017ad73325fcf108a972edac618f9edfc957c5b1de10f8b371b0a8bfa4f59e2d` — the same
+digest the manifest and the response header carry. The bytes hold
+`[redacted]` and no token-shaped string. The agent wrote the value; the profile
+that landed holds the marker.
 
 On the host, the killed run ended as `workerCrashed: true`, `exit observed:
 false`, and its checkpoint as `cleanup: completed` — the recovery removed the
@@ -184,9 +195,10 @@ grant for that run.
   grant per run, and the host counts the deliveries, so the growth of the
   radius is a number rather than an inference from the journal
   ([#478](https://github.com/trained-assist/ai-agent-runner/issues/478)).
-- **A stored value never expires.** The custody keeps the value until it is
-  explicitly revoked; there is no lease
-  ([#477](https://github.com/trained-assist/ai-agent-runner/issues/477)).
+- **A stored value never expires by itself.** The custody keeps the value until
+  it is explicitly revoked; a lease is the exception, and it is the custody
+  that owns it — once the lease has ended the custody refuses to hand the
+  value out again ([#477](https://github.com/trained-assist/ai-agent-runner/issues/477)).
 
 The drill's own defects were fixed as they appeared; the history is in
 [#472](https://github.com/trained-assist/ai-agent-runner/pull/472),
