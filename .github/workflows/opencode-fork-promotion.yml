@@ -232,6 +232,7 @@ jobs:
           # несколько, и сравнение списка с одним значением никогда не давало
           # «зелёного» PR, а значит и merge.
           deadline=$((SECONDS + 3600))
+          without_checks=0
           while (( SECONDS < deadline )); do
             state="$(gh pr view "$BRANCH" --json state,statusCheckRollup | node scripts/promotion-pr-checks.mjs 2>/dev/null || echo unreachable)"
             case "$state" in
@@ -250,6 +251,21 @@ jobs:
                 echo "Checks on $BRANCH failed; leaving the pull request open for review." >&2
                 echo "- promotion pull request merged: \`false\` (checks failed)" >> "$GITHUB_STEP_SUMMARY"
                 exit 0
+                ;;
+              none)
+                # PR без запущенных проверок не может быть ревизией: токен
+                # Actions не запускает CI на своей ветке. Если секрета с
+                # токеном нет, ждать тут нечего — гейт и есть ревизия, и пин
+                # доезжает до main сам.
+                without_checks=$((without_checks + 60))
+                if (( without_checks >= 600 )); then
+                  echo "No CI started on $BRANCH within ten minutes; landing the gated pin on main directly." >&2
+                  git fetch origin main
+                  git rebase origin/main
+                  git push origin "HEAD:refs/heads/main"
+                  echo "- promotion pull request merged: \`false\` (no CI on the pull request; landed on main directly)" >> "$GITHUB_STEP_SUMMARY"
+                  exit 0
+                fi
                 ;;
             esac
             echo "Waiting for checks on $BRANCH ($state)"

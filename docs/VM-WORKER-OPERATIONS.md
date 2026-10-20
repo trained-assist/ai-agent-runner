@@ -115,8 +115,9 @@ GitHub Actions to create and approve pull requests
 `PROMOTION_GITHUB_TOKEN` repository secret must hold a token that can open and merge
 pull requests and push to `main` — contents, pull requests, and workflows read/write.
 Without the secret the hook still runs, but the pull request is opened with the workflow
-token, whose pull requests do not trigger CI, and the hook then falls back to landing
-the gated pin directly on `main`.
+token, whose pull requests do not trigger CI; after ten minutes of a pull request with no
+checks at all the hook concludes that the pull request cannot serve as the review and
+lands the gated pin directly on `main`, because the gate is then the only review.
 The deployment job first refreshes the host updater from the tagged release itself.
 The updater installs itself only after a successful installation, so an updater that
 predates a release can refuse a bundle the newer updater would accept — for example
