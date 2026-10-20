@@ -122,8 +122,9 @@ a host that serves anything else.
 The deterministic part lives in CI:
 `test/sandbox3-credential-blast-radius.test.ts` runs the same drill against a
 fake host and a fake API, and pins the parts that must not rot — the shell
-quoting, the cgroup kill command, the environment parsing, and the rule that
-the report never contains the value.
+quoting, pausing the credential-bearing engine before the kill, killing its
+PID and worker cgroup, the environment parsing, and the rule that the report
+never contains the value.
 
 ## What the drill does not prove
 
@@ -150,17 +151,16 @@ the report never contains the value.
   whose committed blob is read back. The drill does not measure it: no live
   lane publishes through git, so that claim rests on the tests, not on a live
   measurement.
-- **It does not cover the outputs of a run whose host died.** When the worker
-  restarts, the run's secret values are gone — they lived only in its memory —
-  so the export cannot make its bytes value-free either. Such an output is
-  reported as not published, and its local copy stays on the host: it is the
-  only copy, and nothing collects it yet
-  ([#486](https://github.com/trained-assist/ai-agent-runner/issues/486)).
+- **It does not measure artifact-export bytes after a host death.** The code
+  refuses an export when the run no longer knows its secret values. Phase B
+  below measures the profile-publication refusal and workspace cleanup; the
+  janitor for other workspace leftovers remains tracked in
+  [#486](https://github.com/trained-assist/ai-agent-runner/issues/486).
 
-## The measured run (2026-10-20, worker 0.3.47, France sandbox worker, Runner API f91b7509)
+## The measured run (2026-10-20, worker 0.3.49, France sandbox worker, Runner API e985dcb4)
 
 ```
-ok   A: the Runner API accepts a run that binds the credential — run_32faff21bdb659a12fa9627ce31b84d3cf17432f8f72f37dc37ccbc6fd81faf0_2b87898dd8634374acc63873
+ok   A: the Runner API accepts a run that binds the credential — run_6a807e7430f5a0244793f4b5acc8408fba1a921fb30de76ca711d6f064b82629_328eeb107706420d8ccbe7dd
 ok   A: the credential reaches the agent in its environment, and only there — value=sha256:8b6715b585cd536f
 ok   A: the run finishes — state=succeeded
 ok   A: the value does not reach the run record, the status or the events — value-free
@@ -168,25 +168,28 @@ ok   A: the host counts the hosts that received the value — deliveries=1 repea
 ok   A: the value does not reach the runner log, the run state or the session transcript — value-free
 ok   A: the copy does not survive the run on the host — the workspace was swept
 ok   A: the published profile carries the file without the value — published without the value (10 bytes, sha256 017ad73325fcf108)
-ok   B: the Runner API accepts the second run that will be killed — run_8224c45b839f9f6bbdccc250491474bc0f43c6066fb7403b29122d62f9545429_4de008e02f704a0180af29c5
+ok   B: the Runner API accepts the second run that will be killed — run_d416007d7e121627662c7e899f09da7fbb8628a8dc0ab8d4e792e568a713edaf_f16e7f3b855442bf8c33018b
 ok   B: the credential is in the engine environment and the copy is on the disk — value=sha256:8b6715b585cd536f
 ok   B: the host dies mid-flight: the worker is SIGKILLed — the worker control group is dead
 ok   B: the copy on the dead host is swept by the recovery, not by the kill — the workspace copy is gone
 ok   B: the outcome of the run whose host died — state=failed
+ok   B: the profile published by the dead run carries no value — the publication was refused: nothing left the host
 ok   B: the custody store is independent of the host — the custody outlived the host
 ```
 
-The published file was read back from the lane after the run
+The profile file was read back from the lane after run A
 (`GET /v1/runs/{runId}/profile-changes?path=blast/leak.txt`): 10 bytes, sha256
-`017ad73325fcf108a972edac618f9edfc957c5b1de10f8b371b0a8bfa4f59e2d` — the same
-digest the manifest and the response header carry. The bytes hold
-`[redacted]` and no token-shaped string. The agent wrote the value; the profile
-that landed holds the marker.
+`017ad73325fcf108…` — matching the manifest and response header. It holds
+`[redacted]` and no credential value. The France worker reported version
+`0.3.49` with source commit `e985dcb49a4ce1d4a284c94cfdbb268239620512`; its
+`/healthz` returned `ok` after the drill.
 
-On the host, the killed run ended as `workerCrashed: true`, `exit observed:
-false`, and its checkpoint as `cleanup: completed` — the recovery removed the
-workspace, engine and MCP socket, and the custody journal kept exactly one
-grant for that run.
+Run B was frozen as soon as its credential-bearing engine process was found,
+then that PID and the worker cgroup were killed. The run ended `failed`; recovery
+removed the workspace, engine and MCP socket. Its result reported
+`publicationOutcome: refused`, the profile manifest had no leak file, and the
+custody journal kept exactly one grant for run B. The host counted one delivery
+and no repeat.
 
 ## What the drill found
 
@@ -210,13 +213,10 @@ grant for that run.
   it is explicitly revoked; a lease is the exception, and it is the custody
   that owns it — once the lease has ended the custody refuses to hand the
   value out again ([#477](https://github.com/trained-assist/ai-agent-runner/issues/477)).
-- **A host death left the publication unedited.** The recovery finalizes the
-  run whose worker died, and by then the run's secret values are gone: they
-  lived only in the worker's memory. The publication had nothing to edit by,
-  so the bytes left the host as they were. The drill did not measure that path
-  before it was closed — the publication is now refused when the run cannot
-  clear what it does not know, the refused workspace is swept instead of kept,
-  and the drill reads the published profile of the dead run back
+- **A host death used to leave the publication unedited.** The recovery now
+  refuses publication when the run cannot clear values it no longer knows,
+  reports `publicationOutcome: refused`, and sweeps the workspace. Phase B
+  measured that refusal on the live France worker
   ([#471](https://github.com/trained-assist/ai-agent-runner/issues/471)).
 
 The drill's own defects were fixed as they appeared; the history is in
