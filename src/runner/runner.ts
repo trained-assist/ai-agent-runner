@@ -3012,6 +3012,9 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
       ...(sessionCheckpoint ? { sessionCheckpoint } : {}),
       persistence: persistence.status,
       persistenceReason: persistence.reason,
+      // Отказ публикации — не отказ загрузки: ран сам не смог очистить байты.
+      // Полоса читает это поле и не переотдаёт такой ран другому хосту.
+      ...(publishState?.workspacePublishRefused ? { publicationOutcome: 'refused' as const } : {}),
       cleanup: cleanupStatus.status,
       cleanupReason: cleanupStatus.reason,
       logPath: this.store.relLogPath(st.runId),

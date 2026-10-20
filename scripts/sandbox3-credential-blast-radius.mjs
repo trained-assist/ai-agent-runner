@@ -60,9 +60,15 @@ export const DEFAULT_RUNNER_ROOT = '/var/lib/ai-agent-runner';
 export const LEAK_RELATIVE_PATH = 'blast/leak.txt';
 
 const PROMPT = [
-  'Do exactly two things, in this order.',
+  'Do exactly three things, in this order.',
   'First, run the shell command: mkdir -p blast && printf \'%s\' "$CREDENTIAL_ENV_NAME" > blast/leak.txt',
-  'Second, answer with the single word: saved.',
+  // The kill phase has to land while the run is still alive and the file is on
+  // disk. A free model finishes the first two steps in a few seconds, so the
+  // third step holds the run open long enough for the drill to kill it. Without
+  // the sleep the kill sometimes lands after the run finished, and the drill
+  // reports that honestly instead of pretending to have measured a dead run.
+  'Second, run: sleep 60',
+  'Third, answer with the single word: saved.',
 ];
 
 /**
@@ -110,14 +116,20 @@ export function parseEngineEnv(envText, name) {
  * worker, the engine it spawned and the MCP servers it started. `systemctl
  * kill` defaults to the main process only, and `--kill-whom=all` refuses on
  * this systemd ("Failed to send signal SIGKILL to auxiliary processes"), so
- * the drill takes the cgroup apart itself.
+ * the drill kills the engine PID directly and the service cgroup, including
+ * descendants, as a second boundary.
  */
-export function killWorkerCgroup(service) {
+export function killWorkerCgroup(service, runPid) {
+  if (!Number.isSafeInteger(runPid) || runPid <= 0) throw new Error('the engine PID must be a positive integer');
   return [
     `MAIN=$(systemctl show -p MainPID --value ${service})`,
     `[ -n "$MAIN" ] && [ "$MAIN" != 0 ] || { echo "the service has no main process"; exit 1; }`,
     `CG=$(sed 's/^0:://' /proc/$MAIN/cgroup)`,
-    `for p in $(cat /sys/fs/cgroup$CG/cgroup.procs); do kill -9 $p 2>/dev/null || true; done`,
+    `CGDIR=/sys/fs/cgroup$CG`,
+    `kill -9 ${runPid} 2>/dev/null || true`,
+    `if [ -w "$CGDIR/cgroup.kill" ]; then echo 1 > "$CGDIR/cgroup.kill"; else for f in $(find "$CGDIR" -type f -name cgroup.procs); do for p in $(cat "$f"); do kill -9 "$p" 2>/dev/null || true; done; done; fi`,
+    `for i in 1 2 3 4 5 6 7 8 9 10; do kill -0 ${runPid} 2>/dev/null || break; sleep 0.1; done`,
+    `kill -0 ${runPid} 2>/dev/null && { echo "the engine process is still alive"; exit 1; }`,
     `echo "killed $CG"`,
   ].join('; ');
 }
@@ -180,6 +192,7 @@ export async function runCredentialBlastRadiusDrill({
 
   const statePath = (runId) => `${runnerRoot}/runner/runs/${runId}/state.json`;
   const checkpointPath = (runId) => `${runnerRoot}/runner/runs/${runId}/checkpoint.json`;
+  const resultPath = (runId) => `${runnerRoot}/runner/runs/${runId}/result.json`;
 
   /**
    * The run's own record of the cleanup: the checkpoint says whether the
@@ -246,7 +259,7 @@ export async function runCredentialBlastRadiusDrill({
           const value = parseEngineEnv(environ.stdout, envName);
           if (value && value.length >= 4) {
             const leak = await host.exec(`cat ${parsed.cwd}/${LEAK_RELATIVE_PATH} 2>/dev/null || true`);
-            if (leak.stdout === value) return { value, cwd: parsed.cwd, writtenBy: 'the agent' };
+            if (leak.stdout === value) return { value, cwd: parsed.cwd, pid: parsed.pid, writtenBy: 'the agent' };
             if (!plant) return { value, cwd: parsed.cwd, writtenBy: null };
             // Копия сажается, только пока ран жив: уборка рана происходит на его
             // выходе, и копия, посаженная после неё, осталась бы на диске навсегда
@@ -259,7 +272,7 @@ export async function runCredentialBlastRadiusDrill({
             // иначе уборка упрётся в права файла, и это будет сказано о правах,
             // а не о значении. Так копия неотличима от того, что записал бы агент.
             await host.exec(`mkdir -p ${parsed.cwd}/blast && printf '%s' ${shellQuote(value)} > ${parsed.cwd}/${LEAK_RELATIVE_PATH} && chown --reference=${parsed.cwd} ${parsed.cwd}/blast ${parsed.cwd}/${LEAK_RELATIVE_PATH} && chmod 600 ${parsed.cwd}/${LEAK_RELATIVE_PATH}`);
-            return { value, cwd: parsed.cwd, writtenBy: 'the drill' };
+            return { value, cwd: parsed.cwd, pid: parsed.pid, writtenBy: 'the drill' };
           }
         }
       }
@@ -369,7 +382,9 @@ export async function runCredentialBlastRadiusDrill({
   let valueB = null;
 
   await step('B: the Runner API accepts the second run that will be killed', async () => {
-    runB = await startRun('kill');
+    // Ран B публикует профиль, как и ран A: после смерти хоста восстановление
+    // попытается опубликовать его, и вот там измеряется, уходит ли значение.
+    runB = await startRun('kill', { profileWorkspace: true });
     return runB;
   });
 
@@ -392,7 +407,7 @@ export async function runCredentialBlastRadiusDrill({
     const before = await runner(`/v1/runs/${runB}/status`);
     assert.notEqual(before.body?.state, 'succeeded', 'the run finished before the host died');
     assert.notEqual(before.body?.state, 'failed', 'the run failed before the host died');
-    const killed = await host.exec(killWorkerCgroup(service));
+    const killed = await host.exec(killWorkerCgroup(service, valueB.pid));
     assert.equal(killed.code, 0, `the kill failed: ${killed.stderr}`);
     assert.ok(!killed.stdout.includes('no main process'), killed.stdout);
     return 'the worker control group is dead';
@@ -437,9 +452,25 @@ export async function runCredentialBlastRadiusDrill({
     if (!valueB) return 'skipped: the value was not captured';
     const response = await runner(`/v1/runs/${runB}/result`);
     assert.equal(response.status, 200, response.text);
+    const outcome = String(response.body?.publicationOutcome ?? '');
     const manifest = response.body?.profileChanges?.files ?? [];
     const entry = manifest.find((file) => file.path === LEAK_RELATIVE_PATH);
+    if (outcome === 'refused') {
+      // Отказ — это решение рана, а не отсутствие публикации: ран прямо говорит,
+      // что не смог очистить байты, которые у него остались.
+      assert.ok(!entry, 'the publication was refused, yet the profile was published');
+      return 'the publication was refused: nothing left the host';
+    }
     if (!entry) {
+      // Ничего не опубликовано, и причина не названа: измерение было бы пустым.
+      // Причину ищут в записи самого рана на хосте — там она и появляется.
+      const own = await host.exec(`cat ${resultPath(runB)} 2>/dev/null || true`);
+      let ownReason = '';
+      try { ownReason = String(JSON.parse(own.stdout).persistenceReason ?? ''); } catch { ownReason = ''; }
+      assert.ok(
+        ownReason.includes('refused') || String(response.body?.persistenceReason ?? '').includes('refused'),
+        `the dead run published no profile and did not say why (publication: ${outcome || 'unset'}; persistence: ${ownReason || 'unset'})`,
+      );
       return 'the publication was refused: nothing left the host';
     }
     const published = await runnerBytes(`/v1/runs/${runB}/profile-changes?path=${encodeURIComponent(LEAK_RELATIVE_PATH)}`);

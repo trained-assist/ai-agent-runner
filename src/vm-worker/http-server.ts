@@ -518,8 +518,13 @@ async function toLaunchResult(options: VmWorkerServerOptions, snapshot: NonNulla
     repo: { fullName: spec?.repository?.fullName ?? '', branch: `agent-run/${snapshot.runId}`, commit: options.runner.profileWorkspaceCommit?.(snapshot.runId) ?? null },
     ...(result.failure ? { failure: { ...result.failure } } : {}),
     ...(result.profileChanges ? { profileChanges: result.profileChanges } : {}),
+    ...(result.publicationOutcome ? { publicationOutcome: result.publicationOutcome } : {}),
     ...(!result.profileChanges && result.persistence === 'failed' && spec?.profileWorkspace?.savebackUrl ? {
-      failure: { code: 'ARTIFACTS_PUSH_FAILED', failureClass: 'finalization' as const, safeSummary: 'profile saveback upload failed; the VM retained the run workspace', retryable: true },
+      // Отказ публикации и сбой загрузки — разные вещи: отказ не повторяется
+      // (значения секретов ран уже не знает) и рабочий каталог убран, а не удержан.
+      failure: result.publicationOutcome === 'refused'
+        ? { code: 'PROFILE_PUBLICATION_REFUSED', failureClass: 'finalization' as const, safeSummary: 'the profile publication was refused: the run cannot clear the secret values it no longer knows', retryable: false }
+        : { code: 'ARTIFACTS_PUSH_FAILED', failureClass: 'finalization' as const, safeSummary: 'profile saveback upload failed; the VM retained the run workspace', retryable: true },
     } : {}),
   };
   return launch;
