@@ -308,6 +308,16 @@ run starts:
   same grant. A worker that refused the launch has already received the value in
   the request body, so a delivery is counted when the launch is sent, not when
   it is accepted.
+- A credential may carry a **lease**. The custody owns it: the value is only
+  handed out while the lease is valid, and once it has ended the custody
+  refuses with its own code (`CREDENTIAL_LEASE_EXPIRED`, HTTP 403 from the
+  wallet API). The refusal is a fact about the credential, not about the
+  service, so the run fails closed with that code in its `run_failed` event and
+  in its result (`failure.code`), and no worker is asked at all. A value
+  without a lease is unaffected: it lives in the custody until it is revoked.
+  The lease end rides along with the grant, so the run status reports it as
+  `credentialLeaseExpiresAt` and an operator can see when the credential ages
+  out.
 - The environment name must also be approved on the worker host
   (`VM_WORKER_ALLOWED_ENV`). The worker refuses a launch whose allowlist names a
   variable the host has not approved, so a lane that enables credential bindings

@@ -25,7 +25,7 @@ const PROFILE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/;
 const ASSERTION_ISSUER = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,99}$/;
 const RUN_ID = /^run_[0-9a-f]{64}_[0-9a-f]{24}$/;
 
-export type WalletErrorCode = 'invalid_request' | 'rejected' | 'not_found' | 'conflict' | 'unavailable';
+export type WalletErrorCode = 'invalid_request' | 'rejected' | 'not_found' | 'conflict' | 'lease_expired' | 'unavailable';
 
 export class WalletError extends Error {
   constructor(readonly code: WalletErrorCode, message: string) {
@@ -62,6 +62,11 @@ export interface WalletGrant {
    * here, so the host can count how many workers received the value.
    */
   replay: boolean;
+  /**
+   * The instant the custody's lease on this value ends, when it has one. Null
+   * means the value has no lease and lives in the custody until it is revoked.
+   */
+  leaseExpiresAt: string | null;
 }
 
 export interface WalletFormRequest {
@@ -215,7 +220,8 @@ export class WalletClient {
     if (!Object.keys(fields).length) throw new WalletError('unavailable', 'the credential service returned an empty value');
     const version = body['version'];
     return { fields, version: typeof version === 'number' ? version : null,
-      expiresAt: text(body['expires_at']), replay: body['replay'] === true };
+      expiresAt: text(body['expires_at']), replay: body['replay'] === true,
+      leaseExpiresAt: text(body['lease_expires_at']) };
   }
 
   /** Signs a one-call host assertion and forwards the request to the wallet API. */
@@ -242,6 +248,13 @@ export class WalletClient {
     const record = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {};
     if (response.ok) return record;
     if (response.status === 400) throw new WalletError('invalid_request', 'the credential service rejected the requested credential form');
+    // A lease that has ended is a typed refusal, not a rejected identity. The
+    // caller has to be able to tell "this credential aged out" from "this
+    // Runner may not ask", because only the first one is worth retrying later
+    // with a new value.
+    if (response.status === 403 && record['error'] === 'CREDENTIAL_LEASE_EXPIRED') {
+      throw new WalletError('lease_expired', 'the credential lease has expired');
+    }
     if (response.status === 401 || response.status === 403) throw new WalletError('rejected', 'the credential service rejected the Runner identity');
     // A typed wallet error is always JSON. Anything else is an infrastructure
     // failure in front of the wallet (a Cloudflare error page, a proxy answer),

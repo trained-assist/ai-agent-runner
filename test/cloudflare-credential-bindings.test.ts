@@ -166,6 +166,45 @@ describe('Cloudflare Runner credential bindings', () => {
     expect(await status.json()).toMatchObject({ state: 'failed' });
   });
 
+  it('fails the run closed when the credential lease has ended', async () => {
+    const { coordinator, launched, walletCalls } = setup({
+      grant: () => Response.json({ error: 'CREDENTIAL_LEASE_EXPIRED', lease_expires_at: '2026-01-01T00:00:00.000Z' }, { status: 403 }),
+    });
+    const submitted = await coordinator.fetch(call('/v1/runs', { ...body, credentialBindings: [{ ref: 'github', scope: 'repo' }] }, { 'idempotency-key': 'leased-out' }));
+    const { runId } = await submitted.json() as { runId: string };
+    await coordinator.alarm();
+    expect(walletCalls).toHaveLength(1);
+    expect(launched).toHaveLength(0);
+
+    // The refusal is visible to the caller and it is its own fact: the
+    // credential aged out, which is not the same as a revoked credential and not
+    // the same as an unavailable custody.
+    const status = await coordinator.fetch(call(`/v1/runs/${runId}/status`));
+    const statusBody = await status.json() as { state: string };
+    expect(statusBody.state).toBe('failed');
+    const events = await coordinator.fetch(call(`/v1/runs/${runId}/events?cursor=0`));
+    const failed = (await events.json() as { events: Array<{ type: string; payload?: { code?: string } }> }).events
+      .find((event) => event.type === 'run_failed');
+    expect(failed?.payload?.code).toBe('CREDENTIAL_LEASE_EXPIRED');
+    const result = await coordinator.fetch(call(`/v1/runs/${runId}/result`));
+    const resultBody = await result.json() as { failure: { code: string; safeSummary: string } };
+    expect(resultBody.failure.code).toBe('CREDENTIAL_LEASE_EXPIRED');
+    expect(resultBody.failure.safeSummary).not.toContain(SECRET);
+  });
+
+  it('reports the lease end of the credential the run holds', async () => {
+    const { coordinator } = setup({
+      grant: () => Response.json({ connection_id: 'conn-1', value: { token: SECRET }, version: 3,
+        expires_at: '2026-10-20T12:05:00.000Z', lease_expires_at: '2026-10-21T00:00:00.000Z' }),
+    });
+    const submitted = await coordinator.fetch(call('/v1/runs', { ...body, credentialBindings: [{ ref: 'github', scope: 'repo' }] }, { 'idempotency-key': 'leased' }));
+    const { runId } = await submitted.json() as { runId: string };
+    await coordinator.alarm();
+    const status = await coordinator.fetch(call(`/v1/runs/${runId}/status`));
+    const statusBody = await status.json() as { credentialLeaseExpiresAt?: string | null };
+    expect(statusBody.credentialLeaseExpiresAt).toBe('2026-10-21T00:00:00.000Z');
+  });
+
   it('parses a host credential registry and refuses a malformed one', () => {
     const registry = parseSandboxCredentials(REGISTRY);
     expect(registry['github']).toMatchObject({ connectionId: 'conn-1', env: 'GITHUB_TOKEN', field: 'token', scope: 'repo' });
