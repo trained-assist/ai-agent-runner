@@ -56,11 +56,14 @@ function makeHost({ agentWroteTheFile = true, sweepAfterKill = true, engineHasNo
   };
 }
 
-function makeApi({ state = 'succeeded', publishedBytes = 'token=[redacted]\n' } = {}, host?: { killed: boolean }, journal: Array<Record<string, unknown>> = []) {
+function makeApi({ state = 'succeeded', publishedBytes = 'token=[redacted]\n', deadRunPublishes = true } = {}, host?: { killed: boolean }, journal: Array<Record<string, unknown>> = []) {
   const requests: Array<{ url: string; method: string }> = [];
   const bytes = Buffer.from(publishedBytes);
   const publishedDigest = createHash('sha256').update(bytes).digest('hex');
   const manifest = { profileChanges: { files: [{ path: LEAK_RELATIVE_PATH, sha256: publishedDigest, size: bytes.length }], deletes: [] } };
+  // Ран, чей хост умер, публикует профиль только если хост успел это сделать. Когда
+  // публикация отказана (значения секретов ран уже не знает), профиля нет вовсе.
+  const deadManifest = { profileChanges: { files: [], deletes: [] } };
   const reply = (status: number, body: unknown) => ({ status, headers: new Headers(), text: async () => JSON.stringify(body), json: async () => body,
     arrayBuffer: async () => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) });
   // Пока хост жив, ран, который будет убит, идёт; после убийства — терминальный.
@@ -82,7 +85,7 @@ function makeApi({ state = 'succeeded', publishedBytes = 'token=[redacted]\n' } 
         response.headers = new Headers({ 'x-content-sha256': publishedDigest });
         return response;
       }
-      if (text.includes('/result')) return reply(200, manifest);
+      if (text.includes('/result')) return reply(200, host?.killed && !deadRunPublishes ? deadManifest : manifest);
       if (text.endsWith('/status')) {
         // Счётчик доставок — факт хоста: сколько воркеров получили значение.
         const counted = { credentialDeliveries: 1, credentialGrantRepeats: 0 };
@@ -240,6 +243,33 @@ describe('sandbox3 credential blast-radius drill', () => {
       expect(host.calls.some((command) => command.includes('cgroup.procs') && command.includes('kill -9'))).toBe(true);
       // Исход рана — измерение: координатор вправе переотдать ран после смерти хоста.
       expect(steps.some((line) => line.includes('the outcome of the run whose host died'))).toBe(true);
+      // Профиль мёртвого рана тоже читается назад: значение не уходит с хоста.
+      expect(steps.some((line) => line.includes('the profile published by the dead run carries no value'))).toBe(true);
+      expect(steps.join('\n')).not.toContain(SECRET);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('reports the refused publication of the run whose host died', async () => {
+    // Хост умер до публикации: ран больше не знает значений своих секретов, поэтому
+    // профиль не публикуется вовсе. Это тоже результат: наружу не ушло ничего.
+    const host = makeHost();
+    const api = makeApi({ deadRunPublishes: false }, host);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = api.fetch as unknown as typeof fetch;
+    try {
+      const steps = await runCredentialBlastRadiusDrill({
+        apiUrl: 'https://runner.example',
+        apiKey: 'key',
+        registry: REGISTRY,
+        host,
+        kill: true,
+        captureWaitMs: 2_000,
+        sweepWaitMs: 2_000,
+      });
+      expect(steps.filter((line) => line.startsWith('FAIL'))).toEqual([]);
+      expect(steps.join('\n')).toContain('the publication was refused: nothing left the host');
       expect(steps.join('\n')).not.toContain(SECRET);
     } finally {
       globalThis.fetch = originalFetch;

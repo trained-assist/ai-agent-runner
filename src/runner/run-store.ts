@@ -53,6 +53,13 @@ export interface PersistedRunState {
   result: RunResult | null;
   /** Commit pushed to the profile run branch, checkpointed before later finalization work. */
   profileWorkspaceCommit?: string;
+  /**
+   * Сколько значений секретов ран получил (только количество, без значений). Значения не
+   * переживают рестарт воркера по построению — поэтому после рестарта ран знает, что
+   * значения были, но не знает их: публикация и экспорт в таком случае закрываются
+   * (fail closed), а не публикуют байты, которые ран не может очистить.
+   */
+  secretValues?: number;
   fencing: { rejected: number };
   mcp: PersistedMcpState | null;
   /**

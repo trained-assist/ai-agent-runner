@@ -37,4 +37,34 @@ describe('VM profile workspace wrapper', () => {
     expect(legacy.prepare).not.toHaveBeenCalled();
     expect(legacy.publish).not.toHaveBeenCalled();
   });
+
+  it('forwards the run secret values to the legacy git publication as well', async () => {
+    const prepare = vi.fn(async () => undefined);
+    const publish = vi.fn(async () => 'no-commit');
+    const changes = vi.fn(() => ({ files: [], deletes: [] }));
+    const apiSaveback: RunBranchWorker & { supportsSaveback(): boolean; changes: typeof changes } = {
+      supportsSaveback: () => true,
+      prepare,
+      publish,
+      changes,
+    };
+    const legacy: RunBranchWorker = {
+      prepare: vi.fn(async () => undefined),
+      publish: vi.fn(async () => 'legacy-commit'),
+    };
+    const worker = createVmProfileWorkspaceWorker('/tmp/unused-saveback-test', legacy, apiSaveback);
+    // Ран без saveback-адреса публикуется через git-ветку: секреты рана должны дойти и туда.
+    const spec = makeRunSpec({
+      runId: 'run_vm_profile_legacy',
+      profileWorkspace: {
+        bindingId: 'binding-a', snapshotUrl: 'https://api.example/snapshot', snapshotSha256: 'a'.repeat(64), snapshotSize: 1,
+        artifacts: [], excludedPatterns: [],
+      },
+    });
+
+    await worker.publish(spec, '/tmp/profile', 'run-scoped-git-token-0123456789', ['ghp_secretvalue0123456789']);
+
+    expect(legacy.publish).toHaveBeenCalledWith(spec, '/tmp/profile', 'run-scoped-git-token-0123456789', ['ghp_secretvalue0123456789']);
+    expect(publish).not.toHaveBeenCalled();
+  });
 });
