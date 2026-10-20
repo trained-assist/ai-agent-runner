@@ -17,12 +17,12 @@ export function createVmProfileWorkspaceWorker(
     prepare: (spec, cwd, token) => spec.profileWorkspace?.savebackUrl
       ? apiSaveback.prepare(spec, cwd, token)
       : legacy.prepare(spec, cwd, token),
-    // Значения секретов рана доходят только до API-публикации: там файл агента
-    // редактируется по значению перед загрузкой. Git-публикация (ветка GHA) этой
-    // редакции пока не делает — см. issue #471.
+    // Значения секретов рана доходят до обоих путей публикации: и до API-публикации,
+    // и до git-публикации. В обоих случаях файл агента редактируется по значению перед
+    // тем, как покинуть хост.
     publish: (spec, cwd, token, secrets) => spec.profileWorkspace?.savebackUrl
       ? apiSaveback.publish(spec, cwd, token, secrets)
-      : legacy.publish(spec, cwd, token),
+      : legacy.publish(spec, cwd, token, secrets),
     ...(apiSaveback.changes ? { changes: (spec) => apiSaveback.changes!(spec) } : {}),
   };
 }

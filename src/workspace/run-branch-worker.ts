@@ -1,6 +1,7 @@
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { spawn } from 'node:child_process';
+import { redactSecretBytes } from '../redact.js';
 import type { ProfileWorkspaceSpec, RunSpec } from '../contracts/run-spec.js';
 import type { BlobStore } from '../storage/blob-store.js';
 import { sha256Hex } from '../storage/blob-store.js';
@@ -56,7 +57,7 @@ export function createRunBranchWorker(objects: BlobStore, options: { repositoryU
         rmSync(resolveInsideRoot(cwd, entry.path, 'excluded profile path'), { recursive: true, force: true });
       }
     },
-    async publish(spec, cwd, token = '') {
+    async publish(spec, cwd, token = '', secrets: readonly string[] = []) {
       requiredWorkspace(spec);
       const branch = runBranchName(spec.runId);
       if ((await gitText(cwd, ['rev-parse', 'HEAD'], token)).trim() !== spec.repository!.revision) throw new Error('agent changed the pinned profile base commit; refusing publication');
@@ -67,13 +68,19 @@ export function createRunBranchWorker(objects: BlobStore, options: { repositoryU
       const artifacts: Array<{ path: string; key: string; sha256: string; size: number; mime: string }> = [];
       for (const file of scanned.files) {
         if (file.action !== 'heavy') continue;
-        const bytes = readFileSync(resolveInsideRoot(cwd, file.path, 'profile artifact path'));
-        if (sha256Hex(bytes) !== file.sha256) throw new Error(`profile artifact changed during publication: ${file.path}`);
-        const key = `profiles/${spec.profileId}/workspace/${spec.runId}/${file.sha256}`;
+        const onDisk = readFileSync(resolveInsideRoot(cwd, file.path, 'profile artifact path'));
+        if (sha256Hex(onDisk) !== file.sha256) throw new Error(`profile artifact changed during publication: ${file.path}`);
+        // The bytes that leave the host are edited by value: a file the agent wrote with a
+        // secret inside must not carry that secret into the blob store. The manifest
+        // describes what was published, so its digest is the digest of the edited bytes.
+        const safe = redactSecretBytes(onDisk, secrets);
+        const bytes = safe === onDisk ? onDisk : Buffer.from(safe);
+        const digest = sha256Hex(bytes);
+        const key = `profiles/${spec.profileId}/workspace/${spec.runId}/${digest}`;
         const uploaded = await objects.put(key, bytes);
         const verified = await objects.get(key);
-        if (uploaded.sha256 !== file.sha256 || verified.length !== file.size || sha256Hex(verified) !== file.sha256) throw new Error(`profile artifact upload verification failed: ${file.path}`);
-        artifacts.push({ path: file.path, key, sha256: file.sha256, size: file.size, mime: mimeForName(file.path) });
+        if (uploaded.sha256 !== digest || verified.length !== bytes.length || sha256Hex(verified) !== digest) throw new Error(`profile artifact upload verification failed: ${file.path}`);
+        artifacts.push({ path: file.path, key, sha256: digest, size: bytes.length, mime: mimeForName(file.path) });
       }
       // Use a private index so excluded/runtime files can never be staged by broad `git add -A`.
       const indexPath = join(cwd, '.git', `runner-index-${spec.runId}`);
@@ -81,10 +88,19 @@ export function createRunBranchWorker(objects: BlobStore, options: { repositoryU
       await git(cwd, ['read-tree', spec.repository!.revision!], token, env);
       const allowed = new Set<string>();
       for (const file of scanned.files) {
-        if (file.action === 'publish') {
-          allowed.add(file.path);
+        if (file.action !== 'publish') continue;
+        allowed.add(file.path);
+        const onDisk = readFileSync(resolveInsideRoot(cwd, file.path, 'profile artifact path'));
+        const safe = redactSecretBytes(onDisk, secrets);
+        if (safe === onDisk) {
           await git(cwd, ['add', '-f', '--', file.path], token, env);
+          continue;
         }
+        // The workspace keeps what the agent wrote; the index gets the edited bytes. Staging
+        // the edited content this way leaves the disk untouched, so the run's own export
+        // still compares against the file the agent produced.
+        const blob = await gitBlob(cwd, Buffer.from(safe), file.path, token, env);
+        await git(cwd, ['update-index', '--add', '--cacheinfo', fileMode(cwd, file.path), blob, file.path], token, env);
       }
       const tracked = (await gitText(cwd, ['ls-tree', '-r', '--name-only', spec.repository!.revision!], token)).split('\n').filter(Boolean);
       for (const path of tracked) {
@@ -118,7 +134,28 @@ async function gitText(cwd: string, args: string[], token: string): Promise<stri
   return runGit(cwd, args, token, {}, false, true);
 }
 
-function runGit(cwd: string, args: string[], token: string, extraEnv: NodeJS.ProcessEnv, allowFailure: boolean, capture: boolean): Promise<string> {
+/**
+ * The blob of edited content, written into the repository's object store.
+ *
+ * `git hash-object` is the only way to put bytes into the index that never touched the
+ * disk: the workspace keeps what the agent wrote, and the commit carries the edited
+ * bytes. The path is passed so the same filters apply as for `git add` — the committed
+ * content of a redacted file must differ from the original only by the redaction.
+ */
+async function gitBlob(cwd: string, bytes: Buffer, path: string, token: string, extraEnv: NodeJS.ProcessEnv): Promise<string> {
+  const printed = await runGit(cwd, ['hash-object', '-w', '--stdin', '--path', path], token, extraEnv, false, true, bytes);
+  const blob = printed.trim();
+  if (!/^[0-9a-f]{40}$/.test(blob)) throw new Error(`git hash-object did not return a blob id for ${path}`);
+  return blob;
+}
+
+/** The mode git records for a regular file: executable or not. */
+function fileMode(cwd: string, path: string): string {
+  const absolute = resolveInsideRoot(cwd, path, 'profile artifact path');
+  return statSync(absolute).mode & 0o111 ? '100755' : '100644';
+}
+
+function runGit(cwd: string, args: string[], token: string, extraEnv: NodeJS.ProcessEnv, allowFailure: boolean, capture: boolean, input?: Buffer): Promise<string> {
   const env: NodeJS.ProcessEnv = { ...process.env, ...extraEnv, RUNNER_GIT_TOKEN: token, GIT_TERMINAL_PROMPT: '0' };
   const askpassDir = join(cwd, '.git', 'runner-askpass');
   mkdirSync(askpassDir, { recursive: true, mode: 0o700 });
@@ -126,7 +163,7 @@ function runGit(cwd: string, args: string[], token: string, extraEnv: NodeJS.Pro
   writeFileSync(askpassPath, ASKPASS, { mode: 0o700 });
   env.GIT_ASKPASS = askpassPath;
   return new Promise((resolve, reject) => {
-    const child = spawn('git', args, { cwd, env, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn('git', args, { cwd, env, detached: true, stdio: [input ? 'pipe' : 'ignore', 'pipe', 'pipe'] });
     let stdout = '';
     let stderr = '';
     let timedOut = false;
@@ -135,6 +172,7 @@ function runGit(cwd: string, args: string[], token: string, extraEnv: NodeJS.Pro
       killProcessTree(child.pid, child.pid, 'SIGKILL');
     }, 60_000);
     timer.unref?.();
+    if (input) child.stdin?.end(input);
     child.stdout?.on('data', (chunk: Buffer) => { if (capture && stdout.length < 1_000_000) stdout += chunk.toString('utf8'); });
     child.stderr?.on('data', (chunk: Buffer) => { if (stderr.length < 1000) stderr += chunk.toString('utf8'); });
     child.on('error', (error) => { clearTimeout(timer); reject(error); });

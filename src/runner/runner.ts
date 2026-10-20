@@ -32,7 +32,7 @@ import { artifactNameFor, mimeForName } from '../storage/export-manifest.js';
 import type { RunExportManifest } from '../storage/export-manifest.js';
 import { isRegularFile, resolveExistingInsideRoot, resolveInsideRoot } from '../storage/local-paths.js';
 import { profileKey } from '../storage/keys.js';
-import { redactSecretValues, redactSecrets, specHash, truncateLine, writeFileAtomic } from './util.js';
+import { redactSecretBytes, redactSecretValues, redactSecrets, specHash, truncateLine, writeFileAtomic } from './util.js';
 import {
   AGENT_MANIFEST_PATH,
   mergeOutputPlan,
@@ -293,12 +293,19 @@ interface InternalRun {
   /**
    * Значения секретов, которые не должны уйти с хоста в артефактах рана: транскрипт
    * сессии и опубликованные файлы профиля. Живут дольше `runtimeSecrets`: движок уже
-   * умер, а публикация профиля ещё впереди. Стираются сразу после публикации.
+   * умер, а публикация профиля ещё впереди. Стираются после экспорта — до этого момента
+   * они нужны повторной финализации, которая тоже обязана их вычистить.
    */
   publicationSecrets: string[];
   workspaceToken: string | null;
   repositoryCommit: string | null;
   workspacePublishFailed: boolean;
+  /**
+   * Публикация отказана по правилу: байты рана нельзя очистить от значения секрета,
+   * потому что значения уже неизвестны (рестарт воркера). Такой отказ не оставляет
+   * рабочий каталог на хосте: в нём может лежать копия значения.
+   */
+  workspacePublishRefused: boolean;
   sessionCheckpoint: SessionCheckpointRef | null;
 }
 
@@ -420,6 +427,18 @@ function redactRunSecrets(text: string, secrets: readonly string[]): string {
   return redactSecretValues(text, secrets);
 }
 
+/**
+ * Отказ публикации по правилу, а не по сбою: байты рана нельзя очистить от значения
+ * секрета, потому что значения уже неизвестны (рестарт воркера). Такой отказ не оставляет
+ * рабочий каталог рана на хосте: в нём может лежать копия значения.
+ */
+class PublicationRefusedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'PublicationRefusedError';
+  }
+}
+
 export class Runner {
   private readonly opts: RunnerOptions;
   private readonly store: RunStore;
@@ -473,6 +492,7 @@ export class Runner {
         workspaceToken: null,
         repositoryCommit: state.profileWorkspaceCommit ?? state.result?.repositoryCommit ?? null,
         workspacePublishFailed: false,
+        workspacePublishRefused: false,
         sessionCheckpoint: state.result?.sessionCheckpoint ?? null,
       });
     }
@@ -679,6 +699,7 @@ export class Runner {
         : spec.profileWorkspace ? spec.repository?.token ?? null : null,
       repositoryCommit: null,
       workspacePublishFailed: false,
+      workspacePublishRefused: false,
       sessionCheckpoint: null,
       publicationSecrets: [],
     });
@@ -987,7 +1008,7 @@ export class Runner {
 
   dispose(): void {
     this.disposed = true;
-    for (const run of this.runs.values()) { run.runtimeEnv = {}; run.runtimeSecrets = []; }
+    for (const run of this.runs.values()) { run.runtimeEnv = {}; run.runtimeSecrets = []; run.publicationSecrets = []; }
     for (const controller of this.cloneControllers.values()) controller.abort();
     this.cloneControllers.clear();
     for (const run of this.runs.values()) {
@@ -1790,6 +1811,13 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
     }
     run.runtimeSecrets = spec.envAllowlist.map((name) => env[name]).filter((value): value is string => typeof value === 'string' && value.length >= 4);
     run.publicationSecrets = [...run.runtimeSecrets];
+    // Количество значений секретов уходит в состояние рана (без самих значений): после
+    // рестарта воркера ран знает, что значения были, и закрывает публикацию вместо того,
+    // чтобы отправить наружу байты, которые он не может очистить.
+    if (run.state.secretValues !== run.runtimeSecrets.length) {
+      run.state.secretValues = run.runtimeSecrets.length;
+      this.store.saveState(run.state);
+    }
     const room = run.room;
     if (room) {
       // run-scoped HOME/config/cache/tmp: движок не видит и не пишет пользовательский
@@ -2162,7 +2190,7 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
   ): void {
     const internalRun = this.runs.get(st.runId);
     if (internalRun) this.clearStartTimer(internalRun);
-    if (internalRun) { internalRun.runtimeEnv = {}; internalRun.runtimeSecrets = []; }
+    if (internalRun) { internalRun.runtimeEnv = {}; internalRun.runtimeSecrets = []; internalRun.publicationSecrets = []; }
     const result: RunResult = {
       schemaVersion: 1,
       runId: st.runId,
@@ -2252,11 +2280,16 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
         } else {
           if (!run && !st.spec.profileWorkspace.savebackUrl) throw new Error('profile workspace runtime state is unavailable');
           if (!run?.workspaceToken && !st.spec.profileWorkspace.savebackUrl) throw new Error('profile workspace publication credential is unavailable');
+          // Fail closed: если ран получил значения секретов, а значения уже неизвестны
+          // (рестарт воркера), публиковать нечего — очистить байты ран не может.
+          if ((st.secretValues ?? 0) > 0 && (run?.publicationSecrets.length ?? 0) === 0) {
+            throw new PublicationRefusedError('the run secret values are unknown after a worker restart');
+          }
           const publishedCommit = await this.opts.profileWorkspace.publish(st.spec, st.spec.cwd, run?.workspaceToken ?? undefined, run?.publicationSecrets);
           if (run) run.repositoryCommit = publishedCommit;
           st.profileWorkspaceCommit = publishedCommit;
           this.store.saveState(st);
-          if (run) { run.workspaceToken = null; run.publicationSecrets = []; }
+          if (run) run.workspaceToken = null;
         }
         if (st.spec.profileWorkspace.savebackUrl && !st.result?.profileChanges) {
           const changes = this.opts.profileWorkspace.changes?.(st.spec);
@@ -2265,9 +2298,20 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
           this.store.saveResult(st.runId, st.result);
         }
       } catch (error) {
-        if (run) { run.workspacePublishFailed = true; run.workspaceToken = null; }
+        const refused = error instanceof PublicationRefusedError;
+        if (run) {
+          run.workspaceToken = null;
+          if (refused) run.workspacePublishRefused = true;
+          else run.workspacePublishFailed = true;
+        }
         const detail = truncateLine(redactSecrets(error instanceof Error ? error.message : String(error)), 300);
-        this.emit(st, 'log', { stream: 'runner', level: 'error', message: `profile_workspace.publish_failed runId=${st.runId} detail=${detail}; workspace retained` });
+        this.emit(st, 'log', {
+          stream: 'runner',
+          level: 'error',
+          message: refused
+            ? `profile_workspace.publish_refused runId=${st.runId} detail=${detail}; the run workspace is swept`
+            : `profile_workspace.publish_failed runId=${st.runId} detail=${detail}; workspace retained`,
+        });
       }
     }
     const exit = run ? this.resolveExit(run, st) : null;
@@ -2297,8 +2341,11 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
     this.store.saveResult(st.runId, durableCaptured);
     // The captured answer is already durable in result.json + checkpoint. Its small
     // object-store copy can be retried without delaying delivery of that result.
-    const answerArtifactId = await this.saveAnswerArtifact(st, exit?.answer ?? { present: false, source: null, chars: 0, text: '' });
+    const answerArtifactId = await this.saveAnswerArtifact(st, exit?.answer ?? { present: false, source: null, chars: 0, text: '' }, run?.publicationSecrets ?? []);
     const exportManifest = await this.runExport(st, exit ? { plan: exit.plan } : {});
+    // Экспорт закончен: значения секретов рана больше не нужны. Если экспорт не удался,
+    // значения остаются в памяти — повтор финализации должен уметь их вычистить.
+    if (run) run.publicationSecrets = [];
     const soleCopies = this.soleCopiesOnDisk(st, exportManifest);
     // Намерение уборки фиксируется на диске ДО самой уборки: сбой в момент sweep не
     // должен оставить каталоги рана без записанного намерения их вычистить.
@@ -2317,7 +2364,7 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
     // Единственная копия выхода остаётся на диске: слот не отдаём, переиспользование
     // открыло бы прежние данные рана.
     const cleanup = await this.sweepRunEnvironment(run, soleCopies.length > 0 ? 'sole_copy_retained' : `finalized_${st.exit ? 'engine_exit' : 'startup_failure'}`, {
-      keepWorkspace: soleCopies.length > 0 || run?.workspacePublishFailed === true,
+      keepWorkspace: soleCopies.length > 0 || (run?.workspacePublishFailed === true && run?.workspacePublishRefused !== true),
     });
 
     const result: RunResult = {
@@ -2714,9 +2761,12 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
   private async saveAnswerArtifact(
     st: PersistedRunState,
     answer: { present: boolean; source: 'agent_file' | 'engine_stdout' | null; chars: number; text: string },
+    secrets: readonly string[],
   ): Promise<string | null> {
     if (!answer.present || !this.opts.exports) return null;
-    const text = answer.text;
+    // Ответ агента уходит с хоста в хранилище артефактов — значит, он редактируется по
+    // значению: ответ может процитировать секрет рана.
+    const text = redactSecretValues(answer.text, secrets);
     if (text.length === 0) return null;
     try {
       const manifest = await this.opts.exports.artifacts.put({
@@ -2778,7 +2828,21 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
         this.emitExportFailed(ctx, output.path, reason, progress.version);
         return;
       }
-      const bytes = await readFile(absolute);
+      const onDisk = await readFile(absolute);
+      // Выход рана уходит с хоста в хранилище артефактов — а значит, он редактируется по
+      // значению, как и публикация профиля. Манифест экспорта описывает опубликованное:
+      // хэш в нём — хэш отредактированных байтов, а не того, что лежало на диске.
+      const secrets = this.runs.get(ctx.runId)?.publicationSecrets ?? [];
+      if (secrets.length === 0 && (st?.secretValues ?? 0) > 0) {
+        // Fail closed: значения секретов рана неизвестны (рестарт воркера), поэтому ран не
+        // может очистить байты от значения креды. Выход объявляется неопубликованным.
+        const reason = 'the run secret values are unknown after a worker restart';
+        const progress = exports.recordFailure(ctx, output.path, reason);
+        this.emitExportFailed(ctx, output.path, reason, progress.version);
+        return;
+      }
+      const safe = redactSecretBytes(onDisk, secrets);
+      const bytes = safe === onDisk ? onDisk : Buffer.from(safe);
       const name = output.name ?? artifactNameFor(output.path);
       const manifest = await exports.artifacts.put({
         runId: ctx.runId,
@@ -2919,9 +2983,12 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
     const outputRefs = (exportManifest?.entries ?? [])
       .filter((entry) => entry.status === 'exported' && entry.artifactId !== null)
       .map((entry) => entry.artifactId as string);
-    const persistence = this.runs.get(st.runId)?.workspacePublishFailed && st.spec.profileWorkspace?.savebackUrl
-      ? { status: 'failed' as const, reason: 'profile saveback upload failed; the VM retained the run workspace' }
-      : this.persistenceStatus(exportManifest);
+    const publishState = this.runs.get(st.runId);
+    const persistence = publishState?.workspacePublishRefused && st.spec.profileWorkspace?.savebackUrl
+      ? { status: 'failed' as const, reason: 'profile saveback upload was refused: the run secret values are unknown, so the bytes could not be cleared' }
+      : publishState?.workspacePublishFailed && st.spec.profileWorkspace?.savebackUrl
+        ? { status: 'failed' as const, reason: 'profile saveback upload failed; the VM retained the run workspace' }
+        : this.persistenceStatus(exportManifest);
     const cleanupStatus = this.cleanupStatus(this.soleCopiesOnDisk(st, exportManifest), cleanup);
     const sessionCheckpoint = this.runs.get(st.runId)?.sessionCheckpoint ?? st.result?.sessionCheckpoint;
 
