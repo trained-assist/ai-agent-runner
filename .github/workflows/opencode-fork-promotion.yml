@@ -323,6 +323,10 @@ jobs:
           # Релиз неизменяемый, тег vm-worker-vX.Y.Z; сборка и деплой
           # проверяют подпись, дайджесты и метаданные бандла, а недовый
           # процесс откатывается на прежний релиз.
+          # Идентичность коммита и тега задаём явно: на раннере воркера её
+          # нет, и коммит падал с "empty ident name".
+          git config user.name "opencode-promotion"
+          git config user.email "opencode-promotion@users.noreply.github.com"
           git fetch origin main
           git checkout -B release/promotion origin/main
           TAG="$(node -p "require('./deploy/vm-worker/opencode-release-pin.json').OPENCODE_RELEASE_TAG")"
@@ -335,7 +339,13 @@ jobs:
           npm version --no-git-tag-version --allow-same-version "$next" >/dev/null
           git add package.json package-lock.json
           git commit -m "chore: bump VM worker to v$next with the gated OpenCode fork build"
-          git push origin "HEAD:refs/heads/main"
+          # main мог уехать вперёд, пока резался релиз: тогда коммит бомпа
+          # переносим на свежий main и пушим ещё раз.
+          if ! git push origin "HEAD:refs/heads/main"; then
+            git fetch origin main
+            git rebase origin/main
+            git push origin "HEAD:refs/heads/main"
+          fi
           git tag -a "vm-worker-v$next" -m "vm-worker v$next: OpenCode fork $TAG" HEAD
           git push origin "vm-worker-v$next"
           # GITHUB_TOKEN push of a tag does not trigger workflows; dispatch explicitly.
