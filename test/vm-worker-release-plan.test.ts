@@ -92,6 +92,16 @@ describe('worker release plan', () => {
     expect(workflow).toContain('vm-worker-v$next');
   });
 
+  it('commits the release as a bot, so the release job does not die on an empty git identity', () => {
+    const workflow = readFileSync(new URL('../.github/workflows/opencode-fork-promotion.yml', import.meta.url), 'utf8');
+    // Раннер Actions не настроен на committer по умолчанию: без явной
+    // идентичности git отказывается коммитить ("empty ident name"), и релиз
+    // не режется — гейт промоушена падал на ровно этом шаге.
+    const releaseStep = workflow.slice(workflow.indexOf('name: Release the worker with the pinned build'));
+    expect(releaseStep).toContain('git config user.email');
+    expect(releaseStep.indexOf('git config user.email')).toBeLessThan(releaseStep.indexOf('git commit'));
+  });
+
   it('opens and merges the promotion pull request with the repository token', () => {
     const workflow = readFileSync(new URL('../.github/workflows/opencode-fork-promotion.yml', import.meta.url), 'utf8');
     // Токен Actions не запускает CI на ветке PR, поэтому PR и merge делаются

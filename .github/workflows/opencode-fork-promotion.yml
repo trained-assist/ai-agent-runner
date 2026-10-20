@@ -325,6 +325,10 @@ jobs:
           # процесс откатывается на прежний релиз.
           git fetch origin main
           git checkout -B release/promotion origin/main
+          # Коммит релиза идёт от бота: без явной идентичности git на раннере
+          # отказывается коммитить ("empty ident name"), и релиз не режется.
+          git config user.name "opencode-promotion"
+          git config user.email "opencode-promotion@users.noreply.github.com"
           TAG="$(node -p "require('./deploy/vm-worker/opencode-release-pin.json').OPENCODE_RELEASE_TAG")"
           current="$(node -p "require('./package.json').version")"
           next="$(node -e 'const [a,b,c]=process.argv[1].split(".").map(Number); process.stdout.write(`${a}.${b}.${c+1}`)' "$current")"
