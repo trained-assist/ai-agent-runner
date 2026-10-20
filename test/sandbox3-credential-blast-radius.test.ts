@@ -125,6 +125,32 @@ describe('sandbox3 credential blast-radius drill', () => {
     }
   });
 
+  it('kills the whole worker control group, and reports the run outcome instead of judging it', async () => {
+    const host = makeHost();
+    const api = makeApi();
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = api.fetch as unknown as typeof fetch;
+    try {
+      const steps = await runCredentialBlastRadiusDrill({
+        apiUrl: 'https://runner.example',
+        apiKey: 'key',
+        registry: REGISTRY,
+        host,
+        kill: true,
+        captureWaitMs: 2_000,
+        sweepWaitMs: 2_000,
+      });
+      expect(steps.filter((line) => line.startsWith('FAIL'))).toEqual([]);
+      // Гибнет вся контрольная группа: «хост умер», а не «умер один процесс».
+      expect(host.calls.some((command) => command.includes('--kill-whom=all'))).toBe(true);
+      // Исход рана — измерение: координатор вправе переотдать ран после смерти хоста.
+      expect(steps.some((line) => line.includes('the outcome of the run whose host died'))).toBe(true);
+      expect(steps.join('\n')).not.toContain(SECRET);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   it('fails the drill when a copy survives the recovery', async () => {
     const host = makeHost({ sweepAfterKill: false });
     const api = makeApi();
