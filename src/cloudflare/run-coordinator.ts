@@ -67,6 +67,13 @@ interface RunRecord {
    */
   credentialDeliveries?: number;
   credentialGrantRepeats?: number;
+  /**
+   * When the lease of the credential this run holds ends. The custody owns the
+   * lease; the run only carries the instant so an operator can see when the
+   * credential ages out. Null means the value has no lease and lives in the
+   * custody until it is revoked.
+   */
+  credentialLeaseExpiresAt?: string | null;
   capacityRetryAttempts?: number;
   capacityRetryAt?: string;
   capacityQueuedAt?: string;
@@ -167,6 +174,8 @@ function view(run: RunRecord): Record<string, unknown> {
     // reported with the run instead of being reconstructed afterwards.
     ...(run.credentialDeliveries ? { credentialDeliveries: run.credentialDeliveries,
       credentialGrantRepeats: run.credentialGrantRepeats ?? 0 } : {}),
+    // When the credential this run holds ages out. The custody owns the lease.
+    ...(run.credentialLeaseExpiresAt !== undefined ? { credentialLeaseExpiresAt: run.credentialLeaseExpiresAt } : {}),
     output: run.output ?? { stdout: '', stderr: '', updatedAt: null, truncated: false },
     sequence: run.sequence, fencing: { rejected: 0 }, answer: run.answer };
 }
@@ -217,6 +226,27 @@ function refusedLaunchResult(run: RunRecord): Record<string, unknown> {
     persistenceReason: 'The execution worker did not accept the run; there is nothing to persist.',
     cleanup: 'completed', cleanupReason: 'No execution receipt was issued by the worker.',
     logPath: `runner-api://worker-launch-refusal/${run.runId}`,
+  };
+}
+
+// A credential that the custody refused is not a worker refusal: the worker was
+// never asked. The run says which refusal it was — the credential is gone, its
+// lease ended, or the custody could not answer — and never says what the value
+// was. The exit reason stays inside the contract: the run was refused before
+// it started.
+function refusedCredentialResult(run: RunRecord, code: string): Record<string, unknown> {
+  return {
+    schemaVersion: 1, runId: run.runId, jobId: run.jobId, userTaskId: run.userTaskId,
+    profileId: run.profileId, ownerGeneration: run.ownerGeneration, outcome: 'failed',
+    exitReason: 'preflight_refused', exitCode: null, exitSignal: null, exitObserved: false, engineStart: 'not_started',
+    startedAt: run.startedAt ?? run.createdAt, finishedAt: run.finishedAt ?? now(),
+    failure: { code, failureClass: 'preflight',
+      safeSummary: `The credential for this run was refused by the custody (${code}). No execution worker received a credential value.`,
+      retryable: false },
+    usage: { status: 'unknown' }, outputRefs: [], persistence: 'not_required',
+    persistenceReason: 'The run never started, so there is nothing to persist.',
+    cleanup: 'completed', cleanupReason: 'No execution receipt was issued by the worker.',
+    logPath: `runner-api://credential-refusal/${run.runId}`,
   };
 }
 
@@ -1063,7 +1093,7 @@ export class RunnerRunCoordinator {
    */
   private async resolveRunCredentials(run: RunRecord, launch: Record<string, unknown>,
     refs: Array<{ ref: string; scope: string }>): Promise<
-      { ok: true; env: Record<string, string>; envAllowlist: string[]; replays: number }
+      { ok: true; env: Record<string, string>; envAllowlist: string[]; replays: number; leaseExpiresAt: string | null }
       | { ok: false; code: string; message: string }> {
     let registry: Record<string, SandboxCredential>;
     try { registry = parseSandboxCredentials(this.env.ZEROCREDS_WALLET_CREDENTIALS); }
@@ -1075,6 +1105,7 @@ export class RunnerRunCoordinator {
     const env: Record<string, string> = {};
     const envAllowlist: string[] = [];
     let replays = 0;
+    let leaseExpiresAt: string | null = null;
     const runtimeEnv = launch['env'] as Record<string, string> | undefined ?? {};
     const runtimeNames = new Set(Array.isArray(launch['envAllowlist']) ? launch['envAllowlist'] as string[] : []);
     for (const reference of refs) {
@@ -1088,11 +1119,19 @@ export class RunnerRunCoordinator {
       let granted;
       try { granted = await resolution.client.grantValue(configured.connectionId, run.runId); }
       catch (failure) {
-        const missing = failure instanceof WalletError && failure.code === 'not_found';
+        const code = failure instanceof WalletError ? failure.code : 'unavailable';
         console.warn(JSON.stringify({ event: 'runner.credential_grant_failed', requestId: run.requestId, runId: run.runId,
-          ref: reference.ref, code: failure instanceof WalletError ? failure.code : 'unavailable' }));
-        return { ok: false, code: missing ? 'CREDENTIAL_REVOKED' : 'CREDENTIAL_UNAVAILABLE',
-          message: missing ? 'the credential is no longer stored' : 'the credential service is not available' };
+          ref: reference.ref, code }));
+        // The three refusals are different facts and the caller has to be able
+        // to tell them apart: the credential is gone, its lease ended, or the
+        // custody could not answer.
+        if (code === 'not_found') {
+          return { ok: false, code: 'CREDENTIAL_REVOKED', message: 'the credential is no longer stored' };
+        }
+        if (code === 'lease_expired') {
+          return { ok: false, code: 'CREDENTIAL_LEASE_EXPIRED', message: 'the credential lease has expired' };
+        }
+        return { ok: false, code: 'CREDENTIAL_UNAVAILABLE', message: 'the credential service is not available' };
       }
       const value = configured.field ? granted.fields[configured.field] : Object.values(granted.fields)[0];
       if (typeof value !== 'string' || !value) {
@@ -1101,11 +1140,12 @@ export class RunnerRunCoordinator {
       env[configured.env] = value;
       envAllowlist.push(configured.env);
       if (granted.replay) replays += 1;
+      if (granted.leaseExpiresAt) leaseExpiresAt = granted.leaseExpiresAt;
     }
     // The custody says whether this run already held the grant. It is the
     // custody's own fact, and it is what lets the host count the deliveries
     // instead of guessing them.
-    return { ok: true, env, envAllowlist, replays };
+    return { ok: true, env, envAllowlist, replays, leaseExpiresAt };
   }
 
   private async revokeUserCatalog(runId: string): Promise<void> {
@@ -1161,18 +1201,18 @@ export class RunnerRunCoordinator {
             // goes to the worker and nowhere else.
             const credentialRefs = Array.isArray(launch['credentialRefs'])
               ? launch['credentialRefs'] as Array<{ ref: string; scope: string }> : [];
-            let credentialEnv: { env: Record<string, string>; envAllowlist: string[] } | undefined;
+            let credentialEnv: { env: Record<string, string>; envAllowlist: string[]; leaseExpiresAt: string | null } | undefined;
             let credentialReplays = 0;
             if (credentialRefs.length) {
               const resolved = await this.resolveRunCredentials(run, launch, credentialRefs);
               if (!resolved.ok) {
                 run.lastError = resolved.message;
-                run.result = refusedLaunchResult(run);
+                run.result = refusedCredentialResult(run, resolved.code);
                 transition(run, 'failed', { reason: 'credential_unavailable', code: resolved.code });
                 changed = true;
                 break;
               }
-              credentialEnv = { env: resolved.env, envAllowlist: resolved.envAllowlist };
+              credentialEnv = { env: resolved.env, envAllowlist: resolved.envAllowlist, leaseExpiresAt: resolved.leaseExpiresAt };
               credentialReplays = resolved.replays;
             }
             if (run.mcpUserRequested && !run.mcpUserProvisioned) {
@@ -1203,6 +1243,9 @@ export class RunnerRunCoordinator {
             if (credentialEnv) {
               run.credentialDeliveries = (run.credentialDeliveries ?? 0) + 1;
               run.credentialGrantRepeats = (run.credentialGrantRepeats ?? 0) + credentialReplays;
+              // The custody's lease end rides along with the run, so the age of
+              // the credential is visible without asking the custody again.
+              run.credentialLeaseExpiresAt = credentialEnv.leaseExpiresAt;
             }
             const response = await this.worker(run.engine, '/v1/launch', 'POST', workerLaunch);
             if (!response.ok) {

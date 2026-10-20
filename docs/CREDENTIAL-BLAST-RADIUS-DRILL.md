@@ -70,6 +70,13 @@ count different things, and the drill reports both:
   their launch, and how many of those the custody recognised as the same
   grant. That is the radius.
 
+The radius also has an end in time. A credential may carry a lease, and the
+custody owns it: once the lease has ended the custody refuses to hand the
+value out again, so a re-dispatch after that point delivers nothing. The
+refusal is `CREDENTIAL_LEASE_EXPIRED` and the run fails closed with it. A
+credential without a lease has no such end — it lives in the custody until it
+is revoked.
+
 ## Running it
 
 The drill needs the API of the lane, the host it runs on, and (optionally) the

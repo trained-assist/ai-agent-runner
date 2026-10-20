@@ -156,6 +156,7 @@ function walletFailure(failure: unknown): Response {
     if (failure.code === 'invalid_request') return error('INVALID_CREDENTIAL_REQUEST', failure.message, 400);
     if (failure.code === 'not_found') return error('CREDENTIAL_NOT_FOUND', failure.message, 404);
     if (failure.code === 'conflict') return error('CREDENTIAL_CONFLICT', failure.message, 409);
+    if (failure.code === 'lease_expired') return error('CREDENTIAL_LEASE_EXPIRED', failure.message, 403);
     if (failure.code === 'rejected') return error('CREDENTIALS_REJECTED', failure.message, 502);
   }
   return error('CREDENTIALS_UNAVAILABLE', 'credential intake is not available', 503);
