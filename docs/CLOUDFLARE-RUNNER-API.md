@@ -342,11 +342,21 @@ from the places that carry it by design:
 | Runner log, assistant messages, questions | redacted by value before the event is emitted |
 | Session transcript (`.session-traces/<id>.json`) | written already redacted; both the raw and the JSON-escaped form of the value are replaced, and the file stays valid JSON |
 | Published profile (the API saveback) | the bytes are redacted before the upload; the "the file changed while saving" check still compares the on-disk bytes, so the TOCTOU guarantee is unchanged |
+| Published profile (the git branch, the GitHub Actions lane) | the bytes are redacted by value before they are written into the repository: the heavy artifacts are edited before the upload, and the published files are staged as edited blobs, so the agent's own copy on disk stays as it is |
+| Run outputs (the artifact export) | the bytes are redacted by value before the upload, and the export manifest describes the published bytes: its digest is the digest of what left the host |
+| Answer artifact | redacted by value before the upload |
 
 The values that reach the publication path are the run's own secret values, and
-they are erased right after the publication. The git publication path (the
-GitHub Actions lane) does not redact yet —
-[#471](https://github.com/trained-assist/ai-agent-runner/issues/471).
+they are erased once the export is done — a repeated finalization still has to be
+able to clear what it publishes.
+
+**When the values are unknown, nothing is published.** The values live in the
+worker's memory: they are not written to disk, so a worker restart loses them. A
+run that restarts with secret values it can no longer clear refuses to publish its
+profile and refuses to export its outputs, and says so in the run result — the
+alternative would be sending bytes nobody can edit. The refused workspace is swept
+rather than kept, because it may hold a copy of the value
+([#471](https://github.com/trained-assist/ai-agent-runner/issues/471)).
 
 These claims are measured, not asserted: the
 [credential blast-radius drill](CREDENTIAL-BLAST-RADIUS-DRILL.md) binds a

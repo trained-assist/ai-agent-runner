@@ -63,6 +63,7 @@ died" means — a power cut, not one process exiting.
 | The kill landed on a run that was still alive | the measurement is of a death, not of a normal exit |
 | The copy on the dead host is swept by the recovery | the recovery removes the run's leftovers; the kill itself removes nothing |
 | The outcome of the run whose host died | measured, not judged — see below |
+| The profile published by the dead run carries no value | the publication after a host death is refused or edited by value: the value does not leave the host |
 | The custody store is independent of the host | the value outlived the host, and the journal kept one grant for the run |
 
 The outcome of a killed run is a **measurement**, not an assertion. The
@@ -141,10 +142,20 @@ the report never contains the value.
   ([#485](https://github.com/trained-assist/ai-agent-runner/issues/485)). The
   transcript is checked on the host, where it is written already redacted.
 - **It does not cover the git publication path.** The GitHub Actions lane
-  publishes the agent's files without redaction
-  ([#471](https://github.com/trained-assist/ai-agent-runner/issues/471)). The
-  Runner API lane publishes through its own profile workspace, where the
-  published bytes are edited by value before they leave the host.
+  publishes the agent's files to a git branch. That path now edits the run's
+  secret values by value before the bytes leave the host — the same rule the
+  lane's own profile workspace follows
+  ([#471](https://github.com/trained-assist/ai-agent-runner/issues/471)) — and
+  the rule is pinned by deterministic tests, including a real git repository
+  whose committed blob is read back. The drill does not measure it: no live
+  lane publishes through git, so that claim rests on the tests, not on a live
+  measurement.
+- **It does not cover the outputs of a run whose host died.** When the worker
+  restarts, the run's secret values are gone — they lived only in its memory —
+  so the export cannot make its bytes value-free either. Such an output is
+  reported as not published, and its local copy stays on the host: it is the
+  only copy, and nothing collects it yet
+  ([#486](https://github.com/trained-assist/ai-agent-runner/issues/486)).
 
 ## The measured run (2026-10-20, worker 0.3.47, France sandbox worker, Runner API f91b7509)
 
@@ -199,6 +210,14 @@ grant for that run.
   it is explicitly revoked; a lease is the exception, and it is the custody
   that owns it — once the lease has ended the custody refuses to hand the
   value out again ([#477](https://github.com/trained-assist/ai-agent-runner/issues/477)).
+- **A host death left the publication unedited.** The recovery finalizes the
+  run whose worker died, and by then the run's secret values are gone: they
+  lived only in the worker's memory. The publication had nothing to edit by,
+  so the bytes left the host as they were. The drill did not measure that path
+  before it was closed — the publication is now refused when the run cannot
+  clear what it does not know, the refused workspace is swept instead of kept,
+  and the drill reads the published profile of the dead run back
+  ([#471](https://github.com/trained-assist/ai-agent-runner/issues/471)).
 
 The drill's own defects were fixed as they appeared; the history is in
 [#472](https://github.com/trained-assist/ai-agent-runner/pull/472),

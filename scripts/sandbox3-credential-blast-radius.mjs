@@ -271,6 +271,7 @@ export async function runCredentialBlastRadiusDrill({
   // ---------------------------------------------------------------- run A
   let runA = null;
   let valueA = null;
+  let capturedA = null;
 
   await step('A: the Runner API accepts a run that binds the credential', async () => {
     runA = await startRun('leak', { profileWorkspace: true });
@@ -279,6 +280,7 @@ export async function runCredentialBlastRadiusDrill({
 
   await step('A: the credential reaches the agent in its environment, and only there', async () => {
     const captured = await captureValue(runA);
+    capturedA = captured;
     valueA = captured.value;
     steps.push(`note the copy in the workspace was written by ${captured.writtenBy}`);
     return `value=${fingerprint(valueA)}`;
@@ -318,7 +320,7 @@ export async function runCredentialBlastRadiusDrill({
     assert.ok(!log.stdout.includes(valueA), 'the value must not appear in the runner log');
     const state = await host.exec(`cat ${statePath(runA)}`);
     assert.ok(!state.stdout.includes(valueA), 'the value must not appear in the run state');
-    const traces = await host.exec(`cat ${valueA.cwd}/.session-traces/*.json 2>/dev/null || true`);
+    const traces = await host.exec(`cat ${capturedA.cwd}/.session-traces/*.json 2>/dev/null || true`);
     assert.ok(!traces.stdout.includes(valueA), 'the value must not appear in the session transcript');
     return 'value-free';
   });
@@ -426,6 +428,26 @@ export async function runCredentialBlastRadiusDrill({
       await new Promise((resolve) => setTimeout(resolve, 5_000));
     }
     return `state=${state ?? 'unknown'}`;
+  });
+
+  await step('B: the profile published by the dead run carries no value', async () => {
+    // Хост умер до публикации, значения секретов рана остались в его памяти и не
+    // пережили рестарт. Публиковать такие байты нельзя: ран не может их очистить.
+    // Значит, наружу не уходит либо ничего, либо очищенная копия.
+    if (!valueB) return 'skipped: the value was not captured';
+    const response = await runner(`/v1/runs/${runB}/result`);
+    assert.equal(response.status, 200, response.text);
+    const manifest = response.body?.profileChanges?.files ?? [];
+    const entry = manifest.find((file) => file.path === LEAK_RELATIVE_PATH);
+    if (!entry) {
+      return 'the publication was refused: nothing left the host';
+    }
+    const published = await runnerBytes(`/v1/runs/${runB}/profile-changes?path=${encodeURIComponent(LEAK_RELATIVE_PATH)}`);
+    assert.equal(published.status, 200, `the published bytes are not readable: HTTP ${published.status}`);
+    assert.ok(!published.text.includes(valueB.value), 'the published file of the dead run carries the value');
+    const raw = createHash('sha256').update(valueB.value).digest('hex');
+    assert.notEqual(entry.sha256, raw, 'the published file of the dead run carries the value');
+    return 'published without the value';
   });
 
   await step('B: the custody store is independent of the host', async () => {
