@@ -357,6 +357,9 @@ profile and refuses to export its outputs, and says so in the run result — the
 alternative would be sending bytes nobody can edit. The refused workspace is swept
 rather than kept, because it may hold a copy of the value
 ([#471](https://github.com/trained-assist/ai-agent-runner/issues/471)).
+The run result reports this policy refusal as `publicationOutcome: refused`,
+separate from a transient upload failure; the live France drill verifies the
+refusal after a worker restart.
 
 These claims are measured, not asserted: the
 [credential blast-radius drill](CREDENTIAL-BLAST-RADIUS-DRILL.md) binds a
