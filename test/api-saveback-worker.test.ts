@@ -62,7 +62,7 @@ describe('France VM API-owned profile saveback', () => {
     const binary = join(root, 'opencode-stub.sh');
     writeFileSync(binary, [
       '#!/bin/sh',
-      'if [ "$1" = "export" ]; then printf \'{"info":{"id":"%s"},"messages":[]}\\n\' "$2"; exit 0; fi',
+      'if [ "$1" = "session" ] && [ "$2" = "export" ]; then printf \'{"info":{"id":"%s"},"messages":[]}\\n\' "$3"; exit 0; fi',
       "printf 'after\\n' > state.md; rm -f remove.md; printf 'new file\\n' > new.md",
       `printf '{"type":"text","sessionID":"${sessionId}","part":{"type":"text","text":"saveback fixture complete","time":{"start":1,"end":2}}}\\n'`,
     ].join('\n'));
