@@ -21,6 +21,7 @@ const PRIVATE_JWK = (() => {
   return JSON.stringify(privateKey.export({ format: 'jwk' }));
 })();
 const SECRET = 'ghp_live_value_never_in_the_record';
+const LAUNCH_KEY = 'encryption-key-long-enough-for-test-only';
 const REGISTRY = JSON.stringify({ github: { connection_id: 'conn-1', env: 'GITHUB_TOKEN', field: 'token', scope: 'repo' } });
 
 function claimsOf(authorization: string | null): Record<string, unknown> {
@@ -28,7 +29,7 @@ function claimsOf(authorization: string | null): Record<string, unknown> {
   return JSON.parse(Buffer.from(token.split('.')[1]!, 'base64url').toString('utf8')) as Record<string, unknown>;
 }
 
-function setup(options: { bindingsEnabled?: string; registry?: string; grant?: () => Response } = {}) {
+function setup(options: { bindingsEnabled?: string; registry?: string; allowedEnv?: string; grant?: () => Response } = {}) {
   const storage = new MemoryStorage();
   const launched: Record<string, unknown>[] = [];
   const walletCalls: { url: string; authorization: string | null }[] = [];
@@ -36,9 +37,9 @@ function setup(options: { bindingsEnabled?: string; registry?: string; grant?: (
   const state: DurableObjectStateLike = { storage, blockConcurrencyWhile: async (fn) => fn() };
   const env: RunnerWorkerEnv = {
     RUNNER_API_KEYS: '[]', VM_WORKER_URL: 'https://france.example', VM_WORKER_TOKEN: 'worker-secret',
-    RUNNER_API_PUBLIC_URL: 'https://runner-api.example', RUN_LAUNCH_ENCRYPTION_KEY: 'encryption-key-long-enough-for-test-only',
+    RUNNER_API_PUBLIC_URL: 'https://runner-api.example', RUN_LAUNCH_ENCRYPTION_KEY: LAUNCH_KEY,
     RUNNER_ENGINE: 'eu-vm-agent-run',
-    ALLOWED_REPOSITORIES: 'trained-assist/ai-agent-runner', ALLOWED_ENVIRONMENT_NAMES: '', RUNNER_RUNS: {} as RunnerWorkerEnv['RUNNER_RUNS'],
+    ALLOWED_REPOSITORIES: 'trained-assist/ai-agent-runner', ALLOWED_ENVIRONMENT_NAMES: options.allowedEnv ?? 'GITHUB_TOKEN', RUNNER_RUNS: {} as RunnerWorkerEnv['RUNNER_RUNS'],
     RUNNER_CREDENTIAL_BINDINGS_ENABLED: options.bindingsEnabled ?? 'true',
     ZEROCREDS_WALLET_CREDENTIALS: options.registry ?? REGISTRY,
     ZEROCREDS_WALLET_API_URL: 'https://wallet.example',
@@ -67,6 +68,14 @@ function setup(options: { bindingsEnabled?: string; registry?: string; grant?: (
   };
   const coordinator = new RunnerRunCoordinator(state, env);
   return { coordinator, storage, launched, walletCalls, env };
+}
+
+async function decryptLaunch(ciphertext: string): Promise<Record<string, unknown>> {
+  const [iv, cipher] = ciphertext.split('.');
+  const key = await crypto.subtle.importKey('raw', new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(LAUNCH_KEY))),
+    { name: 'AES-GCM' }, false, ['decrypt']);
+  const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: Buffer.from(iv!, 'base64url') }, key, Buffer.from(cipher!, 'base64url'));
+  return JSON.parse(new TextDecoder().decode(plain)) as Record<string, unknown>;
 }
 
 function call(path: string, body?: unknown, headers: Record<string, string> = {}): Request {
@@ -130,6 +139,14 @@ describe('Cloudflare Runner credential bindings', () => {
     expect(await response.json()).toMatchObject({ error: { code: 'FEATURE_UNSUPPORTED' } });
   });
 
+  it('refuses a credential whose environment name the lane does not approve', async () => {
+    const { coordinator, launched } = setup({ allowedEnv: '' });
+    const response = await coordinator.fetch(call('/v1/runs', { ...body, credentialBindings: [{ ref: 'github', scope: 'repo' }] }, { 'idempotency-key': 'unapproved-env' }));
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({ error: { code: 'SERVER_MISCONFIGURED' } });
+    expect(launched).toHaveLength(0);
+  });
+
   it('fails the run closed when the credential was revoked after intake', async () => {
     const { coordinator, launched, walletCalls } = setup({
       grant: () => Response.json({ error: 'value_unavailable' }, { status: 404 }),
@@ -150,5 +167,55 @@ describe('Cloudflare Runner credential bindings', () => {
     expect(() => parseSandboxCredentials('not json')).toThrow();
     expect(() => parseSandboxCredentials(JSON.stringify({ github: { connection_id: 'c', env: 'lowercase', scope: 'repo' } }))).toThrow();
     expect(() => parseSandboxCredentials(JSON.stringify({ github: { connection_id: 'c', env: 'GITHUB_TOKEN', scope: 'repo', extra: 1 } }))).toThrow();
+  });
+
+  it('keeps the value out of the stored launch payload, not only out of the record', async () => {
+    const { coordinator, storage } = setup();
+    const submitted = await coordinator.fetch(call('/v1/runs', { ...body, credentialBindings: [{ ref: 'github', scope: 'repo' }] }, { 'idempotency-key': 'stored-launch' }));
+    const { runId } = await submitted.json() as { runId: string };
+    await coordinator.alarm();
+
+    // The launch payload that is kept with the run is the encrypted one. It must
+    // carry the reference and never the value, because it is decrypted again on
+    // every dispatch attempt and on the paths that re-encrypt it.
+    const stored = storage.values.get('runner-v1') as { runs: Record<string, { launchCiphertext: string }> };
+    const payload = await decryptLaunch(stored.runs[runId]!.launchCiphertext);
+    expect(payload['credentialRefs']).toEqual([{ ref: 'github', scope: 'repo' }]);
+    expect(JSON.stringify(payload)).not.toContain(SECRET);
+    expect((payload['env'] as Record<string, unknown> | undefined)?.['GITHUB_TOKEN']).toBeUndefined();
+  });
+
+  it('keeps the value out of the launch payload that a capacity cutover re-encrypts', async () => {
+    const { coordinator, storage, launched, env } = setup();
+    env.GHA_WORKER_URL = 'https://gha.example';
+    env.GHA_WORKER_TOKEN = 'gha-worker-secret-for-test-only';
+    env.FETCH = async (input, init) => {
+      const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+      if (url.hostname === 'wallet.example') {
+        return Response.json({ connection_id: 'conn-1', value: { token: SECRET }, version: 3 });
+      }
+      if (url.hostname === 'france.example') return Response.json({ accepted: false, code: 'WORKER_CAPACITY', cpuPercent: 60.1 }, { status: 503 });
+      if (url.pathname === '/v1/launch') {
+        launched.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        return Response.json({ runId: launched.at(-1)?.['runId'], operationId: 'op-test', status: 'accepted' }, { status: 202 });
+      }
+      return Response.json({ status: 'cancelled' });
+    };
+
+    const submitted = await coordinator.fetch(call('/v1/runs', { ...body, credentialBindings: [{ ref: 'github', scope: 'repo' }] }, { 'idempotency-key': 'cutover' }));
+    const { runId } = await submitted.json() as { runId: string };
+    await coordinator.alarm();
+
+    // The cutover re-encrypts the launch payload with the new engine, so this is
+    // the path that would have persisted the value with the run. It also re-enters
+    // the dispatch loop, so the credential is resolved a second time.
+    expect(launched).toHaveLength(1);
+    expect(launched[0]!['engine']).toMatchObject({ name: 'azure-cloud' });
+    expect(launched[0]!['env']).toMatchObject({ GITHUB_TOKEN: SECRET });
+    const stored = storage.values.get('runner-v1') as { runs: Record<string, { launchCiphertext: string }> };
+    const payload = await decryptLaunch(stored.runs[runId]!.launchCiphertext);
+    expect(payload['engine']).toMatchObject({ name: 'azure-cloud' });
+    expect(JSON.stringify(payload)).not.toContain(SECRET);
+    expect((payload['env'] as Record<string, unknown> | undefined)?.['GITHUB_TOKEN']).toBeUndefined();
   });
 });

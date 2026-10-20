@@ -280,8 +280,9 @@ run starts:
   `RUNNER_CREDENTIAL_BINDINGS_ENABLED` is `true`. The binding is validated
   against host policy at admission: the shape must be exactly `{ref, scope}`, the
   `ref` must be in the credential registry, the `scope` must be the one the
-  registry grants, and the environment name must not collide with a runtime
-  secret. A binding cannot be mixed with a model connection.
+  registry grants, and the environment name must be listed in
+  `ALLOWED_ENVIRONMENT_NAMES` and must not collide with a runtime secret. A
+  binding cannot be mixed with a model connection.
 - The registry (`ZEROCREDS_WALLET_CREDENTIALS`) is host configuration:
   `{"github": {"connection_id": "...", "env": "GITHUB_TOKEN", "field": "token",
   "scope": "repo"}}`. The environment name and the connection come from it, so a
@@ -289,9 +290,14 @@ run starts:
 - The value is resolved at dispatch, not at admission: the Runner API asks the
   wallet for a run-scoped grant with a machine assertion that names the run. The
   stored launch payload and the run record carry the reference only; the value
-  exists in the launch that goes to the worker and nowhere else. A connection
-  that was revoked after intake fails the run closed instead of starting without
-  the credential.
+  exists in the launch that goes to the worker and nowhere else. The worker
+  holds the value in its process environment and keeps it out of its run spec.
+  A connection that was revoked after intake fails the run closed instead of
+  starting without the credential.
+- The environment name must also be approved on the worker host
+  (`VM_WORKER_ALLOWED_ENV`). The worker refuses a launch whose allowlist names a
+  variable the host has not approved, so a lane that enables credential bindings
+  has to approve the same name on both sides.
 
 This is the "trusted runtime" mode of
 [ai-agent-runner#438](https://github.com/trained-assist/ai-agent-runner/issues/438):
