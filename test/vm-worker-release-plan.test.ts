@@ -90,6 +90,10 @@ describe('worker release plan', () => {
     expect(workflow).toContain('node scripts/vm-worker-release-plan.mjs');
     expect(workflow).toContain('git show origin/main:deploy/vm-worker/opencode-release-pin.json');
     expect(workflow).toContain('vm-worker-v$next');
+    // На раннере воркера нет git identity: без неё коммит падал с
+    // "empty ident name", и релиз не резался вовсе.
+    expect(workflow).toContain('git config user.name "opencode-promotion"');
+    expect(workflow).toContain('git config user.email "opencode-promotion@users.noreply.github.com"');
   });
 
   it('opens and merges the promotion pull request with the repository token', () => {
