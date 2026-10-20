@@ -267,7 +267,10 @@ jobs:
     # прошлого цикла, или ручная правка. Решение принимает скрипт по двум
     # файлам пина, так что человек в цикл не входит ни на одном шаге.
     needs: [detect, promote]
-    if: ${{ always() && (needs.promote.result == 'success' || needs.promote.result == 'skipped') }}
+    # Релиз режется по сверке пина, а не по исходу промоушена: даже если
+    # промоушен упал, пин в main может уже обслуживаться не той сборкой,
+    # и починка не должна ждать следующего тика расписания.
+    if: ${{ always() && needs.detect.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
