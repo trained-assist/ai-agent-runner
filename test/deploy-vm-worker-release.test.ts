@@ -149,4 +149,21 @@ describe('VM worker release updater safety contract', () => {
     expect(operations).toContain('A restart, liveness, readiness,');
     expect(operations).toContain('`/readyz` is healthy');
   });
+
+  it('pins the release tag in the bundle, not in the build signature', async () => {
+    const workflow = await readFile(releaseWorkflowPath, 'utf8');
+    const updater = await readFile(updaterPath, 'utf8');
+    const drift = await readFile(new URL('../.github/workflows/vm-worker-deployment-drift.yml', import.meta.url), 'utf8');
+    const buildInfo = await readFile(new URL('../scripts/write-vm-worker-build-info.mjs', import.meta.url), 'utf8');
+    // Dispatch-сборка запущена событием ветки по умолчанию, а не тегом, и
+    // GitHub Actions подпись для неё называет источником ветку: теговое
+    // происхождение теперь несёт сам бандл.
+    expect(workflow).toContain('VM_WORKER_SOURCE_COMMIT=');
+    expect(workflow).toContain('VM_WORKER_SOURCE_REF=refs/tags/');
+    expect(buildInfo).toContain('VM_WORKER_SOURCE_REF');
+    expect(updater).not.toContain('--source-ref');
+    expect(updater).toContain('"${source_ref}" != "refs/tags/${release_tag}"');
+    expect(drift).not.toContain('--source-ref');
+    expect(drift).toContain('refs/tags/');
+  });
 });

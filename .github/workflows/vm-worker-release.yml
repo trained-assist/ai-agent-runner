@@ -74,6 +74,14 @@ jobs:
           echo "OPENCODE_SOURCE_SHA=$OPENCODE_SOURCE_SHA" >> "$GITHUB_ENV"
           echo "OPENCODE_BINARY_SHA256=$OPENCODE_BINARY_SHA256" >> "$GITHUB_ENV"
       - run: npm ci
+      - name: Record the source this bundle is built from
+        run: |
+          set -euo pipefail
+          # Сборка по dispatch запущена событием ветки по умолчанию, а не
+          # тегом: коммит тега и сам тег фиксируем явно, чтобы бандл нес
+          # свои собственные реквизиты происхождения.
+          echo "VM_WORKER_SOURCE_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "VM_WORKER_SOURCE_REF=refs/tags/${{ env.RELEASE_TAG }}" >> "$GITHUB_ENV"
       - run: npm run build
       - name: Assemble immutable Linux VM worker bundle
         id: bundle

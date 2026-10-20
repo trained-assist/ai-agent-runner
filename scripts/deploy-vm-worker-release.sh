@@ -31,10 +31,13 @@ gh release download "${release_tag}" --repo "${repo}" --pattern "${archive}" --p
   cd "${tmp}"
   sha256sum --check "${archive}.sha256"
 )
+# Подпись подтверждает, что бандл собрал этот workflow; сам тег фиксирует
+# бандл, а не подпись: dispatch-сборку запускает событие ветки по умолчанию,
+# не тег, и подпись такого билда называет источником ветку. Поэтому теговое
+# происхождение проверяется по build-info.json ниже.
 gh attestation verify "${tmp}/${archive}" \
   --repo "${repo}" \
-  --signer-workflow "${workflow}" \
-  --source-ref "refs/tags/${release_tag}" >/dev/null
+  --signer-workflow "${workflow}" >/dev/null
 
 mkdir -p "${root}/releases"
 mkdir "${tmp}/unpack"
@@ -42,12 +45,14 @@ tar -xzf "${tmp}/${archive}" -C "${tmp}/unpack"
 metadata="${tmp}/unpack/dist/vm-worker/build-info.json"
 if [[ ! -f "${metadata}" ]]; then echo "Signed bundle is missing build metadata" >&2; exit 1; fi
 source_commit="$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).sourceCommit)' "${metadata}")"
+source_ref="$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).sourceRef || "")' "${metadata}")"
 version="$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).version)' "${metadata}")"
 opencode_version="$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).opencode?.version || "")' "${metadata}")"
 opencode_source="$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).opencode?.sourceCommit || "")' "${metadata}")"
 opencode_sha="$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(process.argv[1], "utf8")).opencode?.binarySha256 || "")' "${metadata}")"
 opencode_file="${tmp}/unpack/opencode"
 if [[ ! "${source_commit}" =~ ^[0-9a-f]{40}$ || "${release_tag}" != "vm-worker-v${version}" \
+  || "${source_ref}" != "refs/tags/${release_tag}" \
   || ! "${opencode_source}" =~ ^[0-9a-f]{40}$ || ! "${opencode_sha}" =~ ^[0-9a-f]{64}$ \
   || ! -x "${opencode_file}" ]]; then
   echo "Signed release tag, version, or bundled OpenCode metadata is invalid" >&2

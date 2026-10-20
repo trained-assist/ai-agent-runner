@@ -42,10 +42,18 @@ jobs:
             --pattern ai-agent-vm-worker-linux-x64.tar.gz \
             --pattern ai-agent-vm-worker-linux-x64.tar.gz.sha256 --dir "$tmp"
           (cd "$tmp" && sha256sum --check ai-agent-vm-worker-linux-x64.tar.gz.sha256)
+          # Подпись сборки подтверждает, что бандл собрал этот workflow; сам
+          # тег фиксирует бандл (build-info.json), а не подпись: сборка по
+          # dispatch пришла событием ветки по умолчанию, а не тегом.
           gh attestation verify "$tmp/ai-agent-vm-worker-linux-x64.tar.gz" --repo "$GITHUB_REPOSITORY" \
-            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/vm-worker-release.yml" \
-            --source-ref "refs/tags/$release_tag" >/dev/null
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/vm-worker-release.yml" >/dev/null
           tar -xOf "$tmp/ai-agent-vm-worker-linux-x64.tar.gz" ./dist/vm-worker/build-info.json > "$tmp/build-info.json"
+          node -e '
+            const { readFileSync } = require("node:fs");
+            const info = JSON.parse(readFileSync(process.argv[1], "utf8"));
+            const expected = `refs/tags/${process.argv[2]}`;
+            if (info.sourceRef !== expected) throw new Error(`bundle is from ${info.sourceRef}, not ${expected}`);
+          ' "$tmp/build-info.json" "$release_tag"
           node scripts/write-worker-release-identity.mjs "$tmp/build-info.json" "$release_tag" >> "$GITHUB_OUTPUT"
       - name: Check deployed source, health and bindings
         env:

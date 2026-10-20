@@ -64,6 +64,11 @@ bundle also carries the pinned OpenCode Linux x64
 binary; the updater verifies its version and SHA-256 and points `/usr/local/bin/opencode`
 through the same `current` symlink, so rollback restores the matching binary. `/version`
 reports the Runner source commit and the OpenCode version, source commit, and binary SHA.
+The bundle also records the immutable tag it was built from (`sourceRef` in
+`build-info.json`), and the updater refuses a bundle whose tag is not the one being
+installed. The tag is carried by the bundle rather than read from the build signature on
+purpose: GitHub signs a workflow run with the ref that started it, and a run started by a
+dispatch names the default branch, not the tag, even when it built exactly that tag.
 `ai-agent-vm-worker.service` owns the long-running worker.
 `install-vm-worker.sh` is only a one-time bootstrap for the service account, unit,
 configuration templates, and updater. Each worker release pins a specific OpenCode
