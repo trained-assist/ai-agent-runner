@@ -3,6 +3,15 @@ import { DEFAULT_ENGINE, SAFE_ID, error, json } from './runner-api.js';
 import { deliverTerminalWebhook, resolveWebhook, type WebhookConnection, type WebhookDelivery } from './webhooks.js';
 import { WalletClient, WalletError } from './wallet-client.js';
 import { redactSecrets } from '../redact.js';
+import {
+  MAX_PROFILE_FILE_BYTES,
+  MAX_PROFILE_RUN_BYTES,
+  buildProfileWorkspaceSpec,
+  isSafeProfilePath,
+  mintSavebackToken,
+  profileBaseRevision,
+  profileBytesKey,
+} from './profile-workspace.js';
 
 const AGENT_HISTORY_PATH = '__runner/agent-history.json';
 
@@ -74,6 +83,18 @@ interface RunRecord {
    * custody until it is revoked.
    */
   credentialLeaseExpiresAt?: string | null;
+  /**
+   * The profile changes the worker published for this run: the manifest of what
+   * landed in the profile. The published bytes live beside it in the lane's
+   * storage, so an operator can read back what actually landed rather than a
+   * hash of it.
+   */
+  profileChanges?: { files: Array<{ path: string; sha256: string; size: number }>; deletes: string[] };
+  /**
+   * The files the lane actually received for this run: the published bytes it
+   * holds. The manifest above is what the worker reported; this is what landed.
+   */
+  profileReceived?: Array<{ path: string; sha256: string; size: number }>;
   capacityRetryAttempts?: number;
   capacityRetryAt?: string;
   capacityQueuedAt?: string;
@@ -304,6 +325,14 @@ export class RunnerRunCoordinator {
     if (segments.length === 4 && segments[0] === 'v1' && segments[1] === 'runs' && segments[3] === 'download') {
       return this.guestDownload(request, segments[2]!);
     }
+    // The saveback upload is not a caller of the API: the worker publishes the
+    // profile with the run-scoped capability the host minted for it. The
+    // capability is checked against the encrypted launch, not against an API key.
+    if (segments.length === 5 && segments[0] === 'v1' && segments[1] === 'worker' && segments[2] === 'launches' && segments[4] === 'profile-changes') {
+      let targetRunId: string;
+      try { targetRunId = decodeURIComponent(segments[3]!); } catch { return error('INVALID_REQUEST', 'invalid run id', 400); }
+      return this.profileChange(request, targetRunId);
+    }
     const principal = principalOf(request);
     if (!principal) return error('UNAUTHENTICATED', 'authenticated principal missing', 401);
     if (url.pathname === '/v1/sandbox/cleanup-task') return request.method === 'POST' ? this.cleanupTask(request, principal) : error('METHOD_NOT_ALLOWED', 'method not allowed', 405);
@@ -391,6 +420,7 @@ export class RunnerRunCoordinator {
           deliveredAt: run.webhook.deliveredAt ?? null, lastStatus: run.webhook.lastStatus ?? null,
           lastError: run.webhook.lastError ?? null });
       case 'cancel': return request.method === 'POST' ? this.cancel(request, runId, principal) : error('METHOD_NOT_ALLOWED', 'cancel supports POST only', 405);
+      case 'profile-changes': return request.method === 'GET' ? this.profileChanges(run, url) : error('METHOD_NOT_ALLOWED', 'profile changes support GET only', 405);
       default: return error('ROUTE_NOT_FOUND', `no route for ${url.pathname}`, 404);
     }
   }
@@ -432,8 +462,74 @@ export class RunnerRunCoordinator {
     return new Response(response.body, { status: response.status, headers });
   }
 
-  private async listTaskRuns(url: URL, principal: ApiPrincipal): Promise<Response> {
-    const taskId = url.searchParams.get('userTaskId');
+  /**
+   * Receives one published profile file.
+   *
+   * The worker publishes with the run-scoped capability the host minted for
+   * this run. The capability lives inside the encrypted launch, so it is never
+   * at rest in the clear, and the upload is refused unless it matches.
+   */
+  private async profileChange(request: Request, runId: string): Promise<Response> {
+    if (request.method !== 'POST') return error('METHOD_NOT_ALLOWED', 'profile changes support POST only', 405);
+    if (!SAFE_ID.test(runId)) return error('INVALID_REQUEST', 'invalid run id', 400);
+    const stored = await this.read();
+    const run = stored.runs[runId];
+    if (!run) return error('NOT_FOUND', 'unknown run', 404);
+    let expected = '';
+    try {
+      const launch = JSON.parse(await decrypt(run.launchCiphertext, this.env.RUN_LAUNCH_ENCRYPTION_KEY)) as Record<string, unknown>;
+      const workspace = launch['profileWorkspace'] as { savebackToken?: unknown } | undefined;
+      expected = typeof workspace?.savebackToken === 'string' ? workspace.savebackToken : '';
+    } catch { return error('SERVER_MISCONFIGURED', 'the launch record of this run could not be read', 503); }
+    if (!expected) return error('FORBIDDEN', 'this run has no profile saveback', 403);
+    const presented = (request.headers.get('authorization') ?? '').replace(/^Bearer\s+/i, '').trim();
+    if (!presented || !(await sameSecret(presented, expected))) return error('FORBIDDEN', 'the profile saveback capability is not valid for this run', 403);
+    const path = new URL(request.url).searchParams.get('path') ?? '';
+    if (!isSafeProfilePath(path)) return error('INVALID_REQUEST', 'the published path is not a safe relative path', 400);
+    const declared = request.headers.get('x-content-sha256') ?? '';
+    if (!/^[0-9a-f]{64}$/.test(declared)) return error('INVALID_REQUEST', 'x-content-sha256 must be a lowercase sha256', 400);
+    const declaredLength = Number(request.headers.get('content-length') ?? 0);
+    if (Number.isFinite(declaredLength) && declaredLength > MAX_PROFILE_FILE_BYTES) return error('PROFILE_CHANGE_TOO_LARGE', 'the published file is larger than this lane accepts', 413);
+    const bytes = new Uint8Array(await request.arrayBuffer());
+    if (bytes.length > MAX_PROFILE_FILE_BYTES) return error('PROFILE_CHANGE_TOO_LARGE', 'the published file is larger than this lane accepts', 413);
+    const digest = await sha256Hex(bytes);
+    if (digest !== declared) return error('UPLOAD_HASH_MISMATCH', 'the uploaded bytes do not match x-content-sha256', 400);
+    const received = (run.profileReceived ?? []).filter((file) => file.path !== path);
+    const totalBytes = received.reduce((sum, file) => sum + file.size, 0) + bytes.length;
+    if (totalBytes > MAX_PROFILE_RUN_BYTES) return error('PROFILE_CHANGE_TOO_LARGE', 'the published profile is larger than this lane accepts', 413);
+    await this.state.storage.put(profileBytesKey(run.runId, path), bytes.buffer);
+    run.profileReceived = [...received, { path, sha256: digest, size: bytes.length }].sort((left, right) => left.path.localeCompare(right.path));
+    await this.writeRun(run);
+    return json({ accepted: true, path, size: bytes.length, sha256: digest }, 201);
+  }
+
+  /**
+   * Reads back what landed in the profile: the manifest the worker reported and,
+   * for one path, the published bytes. A hash says what should have landed; the
+   * bytes say what did.
+   */
+  private async profileChanges(run: RunRecord, url: URL): Promise<Response> {
+    const received = run.profileReceived ?? [];
+    const changes = run.profileChanges;
+    if (!changes && !received.length) return error('NOT_FOUND', 'this run published no profile changes', 404);
+    const path = url.searchParams.get('path');
+    if (path === null) {
+      return json({ runId: run.runId, manifest: changes ?? { files: received, deletes: [] }, received,
+        count: received.length,
+        note: 'the published bytes are served per path: /v1/runs/{runId}/profile-changes?path=<relative path>' });
+    }
+    if (!isSafeProfilePath(path)) return error('INVALID_REQUEST', 'the published path is not a safe relative path', 400);
+    if (!received.some((file) => file.path === path)) return error('NOT_FOUND', 'path is not part of the published profile', 404);
+    const file = received.find((entry) => entry.path === path)!;
+    const stored = await this.state.storage.get<ArrayBuffer>(profileBytesKey(run.runId, path));
+    if (!stored) return error('NOT_FOUND', 'the published bytes are no longer stored', 404);
+    const bytes = new Uint8Array(stored);
+    const headers = new Headers({ 'content-type': 'application/octet-stream', 'cache-control': 'private, no-store',
+      'x-content-type-options': 'nosniff', 'x-content-sha256': file.sha256, 'content-length': String(bytes.length) });
+    return new Response(bytes, { status: 200, headers });
+  }
+
+  private async listTaskRuns(url: URL, principal: ApiPrincipal): Promise<Response> {    const taskId = url.searchParams.get('userTaskId');
     if (!taskId || !SAFE_ID.test(taskId)) return error('INVALID_REQUEST', 'userTaskId query parameter is required and must be a safe id', 400);
     const stateFilter = url.searchParams.get('state');
     if (stateFilter !== null && !['active', 'all'].includes(stateFilter)) return error('INVALID_REQUEST', 'state supports active or all', 400);
@@ -494,7 +590,7 @@ export class RunnerRunCoordinator {
       body = JSON.parse(text) as Record<string, any>;
     } catch { return error('INVALID_REQUEST', 'request body must be JSON', 400); }
     if (!body || typeof body !== 'object' || Array.isArray(body)) return error('INVALID_REQUEST', 'request body must be an object', 400);
-    const allowedFields = new Set(['userTaskId', 'conversationId', 'engine', 'routeMode', 'input', 'ingressManifest', 'envAllowlist', 'limits', 'deadline', 'regionConstraints', 'credentialBindings', 'mcp', 'budget', 'result', 'outputs', 'publicationMode', 'traceId', 'instructions', 'repository', 'isolation', 'webhookId']);
+    const allowedFields = new Set(['userTaskId', 'conversationId', 'engine', 'routeMode', 'input', 'ingressManifest', 'envAllowlist', 'limits', 'deadline', 'regionConstraints', 'credentialBindings', 'mcp', 'budget', 'result', 'outputs', 'publicationMode', 'traceId', 'instructions', 'repository', 'isolation', 'webhookId', 'profileWorkspace']);
     if (body.publicationMode !== undefined && body.publicationMode !== 'git' && body.publicationMode !== 'none') return error('INVALID_REQUEST', 'publicationMode must be git or none', 400);
     if (body.publicationMode === 'none' && ((Array.isArray(body.outputs) && body.outputs.length > 0) || body.profileWorkspace !== undefined)) return error('INVALID_REQUEST', 'publicationMode none cannot be combined with outputs or profileWorkspace', 400);
     const unknownFields = Object.keys(body).filter((name) => !allowedFields.has(name));
@@ -559,7 +655,16 @@ export class RunnerRunCoordinator {
       } else return error('MCP_HOST_POLICY_MISSING', 'MCP server is not host approved', 422);
     }
     if (userMcp && body.limits.timeoutMs > 7_140_000) return error('MCP_GRANT_MAX_LIFETIME', 'sandbox user catalog runs are limited to a grant lifetime of two hours', 422);
-    if (body.profileWorkspace) return error('FEATURE_UNSUPPORTED', 'profile workspace is not supported by this Worker API yet', 422);
+    // The profile workspace of this lane is the lane's own: the request may ask
+    // for it, but it chooses neither the base nor the destination. The host mints
+    // the capability and pins the base by digest.
+    if (body.profileWorkspace !== undefined) {
+      if (!body.profileWorkspace || typeof body.profileWorkspace !== 'object' || Array.isArray(body.profileWorkspace)) {
+        return error('INVALID_REQUEST', 'profileWorkspace must be an object', 400);
+      }
+      const requested = Object.keys(body.profileWorkspace as Record<string, unknown>);
+      if (requested.length) return error('INVALID_REQUEST', 'the host decides the profile workspace; it takes no request fields', 400, { errors: requested.map((name) => `request.profileWorkspace.${name}: unknown field`) });
+    }
     if (body.isolation !== undefined && body.isolation?.mode !== 'none') return error('ISOLATION_UNSUPPORTED', 'the France VM worker currently supports isolation.mode=none only', 422);
     const routeMode = body.routeMode === undefined ? 'auto' : body.routeMode;
     if (routeMode !== 'auto' && routeMode !== 'france' && routeMode !== 'gha') return error('INVALID_REQUEST', 'routeMode must be auto, france, or gha', 400);
@@ -713,12 +818,18 @@ export class RunnerRunCoordinator {
       const time = now();
       const jobId = prior?.jobId ?? stored.jobId ?? `job_${crypto.randomUUID().replaceAll('-', '').slice(0, 24)}`;
       const resultUrl = `${this.env.RUNNER_API_PUBLIC_URL.replace(/\/+$/, '')}/v1/runs/${runId}/result`;
+      // The lane's profile workspace: the host pins the base, mints the
+      // capability and names the destination. Nothing of it comes from the request.
+      const profileWorkspace = body.profileWorkspace !== undefined
+        ? buildProfileWorkspaceSpec({ runId, publicUrl: this.env.RUNNER_API_PUBLIC_URL, token: mintSavebackToken() })
+        : undefined;
       const limits = body.limits;
       const launch = { runId, jobId, userTaskId: taskId, profileId: principal.profileId, conversationId, operationId: `op_${await digest(`${taskId}:${ownerGeneration}`).then((h) => h.slice(0, 24))}`,
           ownerGeneration, engine: { name: engine, adapterVersion: body.engine?.adapterVersion ?? '1', ...(boundModel || body.engine?.modelSettings?.model ? { modelSettings: { model: boundModel ?? body.engine.modelSettings.model } } : {}) },
           input: { inlinePrompt: `${typeof inputPrompt === 'string' ? inputPrompt : ''}${instructions ? `${inputPrompt ? '\n\nAdditional instructions: ' : ''}${instructions}` : ''}` }, cwd: `/tmp/runner/${runId}`, envAllowlist, env: launchEnv, ...(credentialRefs.length ? { credentialRefs } : {}), limits: { timeoutMs: clampInteger(limits.timeoutMs, 300_000, 1_000, 86_400_000), maxOutputBytes: clampInteger(limits.maxOutputBytes, 5_000_000, 1, 100_000_000), maxLogBytes: clampInteger(limits.maxLogBytes, 5_000_000, 1, 100_000_000) },
           ...(ingressManifest ? { ingressManifest: { ...ingressManifest, userTaskId: taskId, profileId: principal.profileId, runId, ownerGeneration } } : {}),
-          repository: { fullName: repository ?? '', branch: `agent-run/${runId}`, ...(body.repository?.revision ? { revision: body.repository.revision } : {}) },
+          repository: { fullName: repository ?? '', branch: `agent-run/${runId}`, ...(body.repository?.revision ? { revision: body.repository.revision } : profileWorkspace ? { revision: profileBaseRevision() } : {}) },
+          ...(profileWorkspace ? { profileWorkspace } : {}),
           ...(repositoryToken ? { publicationToken: repositoryToken } : {}),
           resultUrl, isolation: body.isolation ?? { mode: 'none' }, outputs: Array.isArray(body.outputs) ? body.outputs : [], ...(body.publicationMode ? { publicationMode: body.publicationMode } : {}),
           ...(mcp.length && !userMcp
@@ -1409,6 +1520,18 @@ export class RunnerRunCoordinator {
                 }));
               }
               const outcome = launchResult.exitReason === 'completed' ? 'succeeded' : launchResult.exitReason === 'cancelled' ? 'cancelled' : 'failed';
+              // The manifest the worker reported: what it published into the profile.
+              const reported = launchResult.profileChanges as { files?: unknown; deletes?: unknown } | undefined;
+              if (reported && Array.isArray(reported.files)) {
+                const files = reported.files
+                  .filter((file): file is Record<string, unknown> => Boolean(file) && typeof file === 'object')
+                  .filter((file) => typeof file['path'] === 'string' && isSafeProfilePath(file['path'])
+                    && typeof file['sha256'] === 'string' && /^[0-9a-f]{64}$/.test(file['sha256'] as string)
+                    && Number.isSafeInteger(file['size']) && Number(file['size']) >= 0)
+                  .map((file) => ({ path: file['path'] as string, sha256: file['sha256'] as string, size: Number(file['size']) }));
+                const deletes = Array.isArray(reported.deletes) ? reported.deletes.filter((entry): entry is string => typeof entry === 'string') : [];
+                run.profileChanges = { files, deletes };
+              }
               run.result = { schemaVersion: 1, runId: run.runId, jobId: run.jobId, userTaskId: run.userTaskId, profileId: run.profileId, ownerGeneration: run.ownerGeneration,
                 outcome, exitReason: launchResult.exitReason ?? 'worker_crash', exitCode: launchResult.exitCode ?? null, exitSignal: launchResult.exitSignal ?? null,
                 engineStart: launchResult.engineStart === 'not_started' || launchResult.engineStart === 'started' ? launchResult.engineStart : 'unknown',
@@ -1416,10 +1539,11 @@ export class RunnerRunCoordinator {
                   : launchResult.exitCode != null || launchResult.exitSignal != null,
                 startedAt: run.startedAt ?? run.createdAt, finishedAt: now(),
                 ...(run.answer !== null ? { text: run.answer } : {}), ...(launchResult.failure ? { failure: launchResult.failure } : {}), usage: { status: 'unknown' },
+                ...(run.profileChanges ? { profileChanges: run.profileChanges } : {}),
                 outputRefs: run.artifacts.map((artifact) => String(run.developerGuest ? artifact['downloadUrl'] : artifact['url'])),
                 ...(run.developerApi ? { artifacts: run.artifacts } : {}),
                 ...(run.developerGuest ? { artifactExpiresAt: run.artifactExpiresAt } : {}),
-                persistence: run.artifacts.length ? 'persisted' : 'not_required', publicationOutcome: launchResult.publicationOutcome ?? (launchResult.failure?.code === 'ARTIFACTS_PUSH_FAILED' ? 'failed' : run.artifacts.length ? 'published' : 'not_requested'), persistenceReason: run.artifacts.length ? run.developerGuest ? 'artifacts were exported by the execution worker' : `artifacts are committed to ${String(repo?.['fullName'] ?? 'the repository')}` : 'the worker reported no artifacts', cleanup: 'completed', cleanupReason: 'execution workspace is owned by the selected worker', logPath: run.logUrl ?? `worker-run:${run.runId}` };
+                persistence: run.artifacts.length || run.profileChanges ? 'persisted' : 'not_required', publicationOutcome: launchResult.publicationOutcome ?? (launchResult.failure?.code === 'ARTIFACTS_PUSH_FAILED' ? 'failed' : run.artifacts.length || run.profileChanges ? 'published' : 'not_requested'), persistenceReason: run.artifacts.length ? run.developerGuest ? 'artifacts were exported by the execution worker' : `artifacts are committed to ${String(repo?.['fullName'] ?? 'the repository')}` : run.profileChanges ? 'the profile changes were published to the lane profile workspace' : 'the worker reported no artifacts', cleanup: 'completed', cleanupReason: 'execution workspace is owned by the selected worker', logPath: run.logUrl ?? `worker-run:${run.runId}` };
               transition(run, outcome, { exitReason: launchResult.exitReason });
             }
           }
@@ -1614,4 +1738,27 @@ async function decrypt(value: string, rawKey: string): Promise<string> {
 function base64(bytes: Uint8Array): string { let binary = ''; for (const byte of bytes) binary += String.fromCharCode(byte); return btoa(binary); }
 function fromBase64(value: string): Uint8Array { return Uint8Array.from(atob(value), (char) => char.charCodeAt(0)); }
 function base64Url(bytes: Uint8Array): string { return base64(bytes).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, ''); }
+
+/** The digest of the bytes, as the lane names them in a manifest or a header. */
+async function sha256Hex(bytes: Uint8Array): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', bytes as BufferSource);
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+/**
+ * Compares two secrets without leaking how much of them matched. The digests
+ * are compared byte by byte and the loop does not stop at the first difference,
+ * so the answer does not depend on where the strings diverge.
+ */
+async function sameSecret(presented: string, expected: string): Promise<boolean> {
+  const [left, right] = await Promise.all([
+    crypto.subtle.digest('SHA-256', new TextEncoder().encode(presented)),
+    crypto.subtle.digest('SHA-256', new TextEncoder().encode(expected)),
+  ]);
+  const leftBytes = new Uint8Array(left);
+  const rightBytes = new Uint8Array(right);
+  let difference = 0;
+  for (let index = 0; index < leftBytes.length; index += 1) difference |= leftBytes[index]! ^ rightBytes[index]!;
+  return difference === 0;
+}
 

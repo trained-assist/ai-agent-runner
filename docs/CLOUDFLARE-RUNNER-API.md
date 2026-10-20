@@ -434,6 +434,49 @@ enables only `sandbox3-vm2-live-canary`; the canary script cleans up only after 
 Production and the mock-only Runner Worker leave cleanup disabled. The CP E2E cleanup script
 calls this route before deleting corresponding CP rows.
 
+## The lane's profile workspace
+
+A run may ask the lane to own its profile: the lane serves the base the run
+starts from, and it receives the bytes the run publishes. The request says only
+*that* it wants it — it chooses neither the base nor the destination:
+
+- `POST /v1/runs` accepts `profileWorkspace: {}`. An object with any field is
+  refused (`400 INVALID_REQUEST`): a caller that could name a snapshot URL or a
+  saveback URL would turn the lane into a fetcher for the caller's own host.
+- The host builds the workspace: the base is the lane's own snapshot, pinned by
+  digest and size, and the destination is a URL on the lane's own origin
+  (`RUNNER_API_PUBLIC_URL`). The saveback capability is minted per run (32
+  random bytes) and lives only inside the encrypted launch payload, so it is
+  never at rest in the clear and never appears in a status, a result or a log.
+- The saveback path clones nothing. The base of a run is therefore the
+  snapshot, and the snapshot is pinned by its digest — a stronger pin than a git
+  commit would be. The runner still asks every profile workspace for a pinned
+  base, so the launch carries the snapshot's digest in `repository.revision`.
+  That field names the content pin of the base that actually exists; it is not
+  a commit the lane ever checked out.
+- `GET /v1/worker/launches/{runId}/profile-snapshot` serves the base. The
+  content is a constant empty archive, so the route is not an oracle: it
+  reveals nothing about any run, and the run pins the bytes by digest before it
+  extracts them.
+- `POST /v1/worker/launches/{runId}/profile-changes?path=<relative path>`
+  receives one published file. The worker presents the run-scoped capability in
+  the `Authorization` header; the Durable Object compares it with the one in
+  the encrypted launch, and the digest of the body must match
+  `x-content-sha256`. The lane keeps the bytes, so the published file can be
+  read back — a hash says what should have landed, the bytes say what did.
+- `GET /v1/runs/{runId}/profile-changes` returns the manifest the worker
+  reported and the list of the files the lane received;
+  `GET /v1/runs/{runId}/profile-changes?path=<relative path>` returns the
+  published bytes themselves.
+- The lane is a proof lane, not an archive: a published file may not exceed
+  1 MiB (a Durable Object value may not exceed 2 MB, key and value together)
+  and a run may not exceed 8 MiB in total. A larger publication is refused
+  (`413 PROFILE_CHANGE_TOO_LARGE`), not silently truncated.
+- The published bytes are edited **by value** before they leave the host, so a
+  credential the agent wrote into a file does not reach the profile. The drill
+  measures that end to end: see
+  [credential blast-radius drill](CREDENTIAL-BLAST-RADIUS-DRILL.md).
+
 ## Verification
 
 ```bash
@@ -508,9 +551,11 @@ Telegram UX principal/profile with its exact API-key `mcpBindings` grant. It cre
 proof after allocating `runId`, bounds it by `MCP_TEST_EXPIRES_AT`, and keeps the Host Bearer
 inside the encrypted launch and `mcpSecrets`. Other MCP descriptors fail closed.
 
-Profile workspace provisioning/saveback, generic input refs, binary artifact download,
-GCS log publication, the complete `/v1/capabilities` document, and multi-engine fallback
-remain unsupported. Task-scoped `ingressManifest` pins are accepted only in the exact
+Generic input refs, binary artifact download, GCS log publication, the complete
+`/v1/capabilities` document, and multi-engine fallback remain unsupported. The
+lane's own profile workspace is supported for a run that asks for it (see
+above); the profile provisioning of the API service is a different lane and is
+not part of this Worker. Task-scoped `ingressManifest` pins are accepted only in the exact
 `cp-input-manifest:<userTaskId>` form with a lowercase SHA-256 version, then enriched with the
 admitted profile/run/generation and forwarded to the France VM launch request. The VM must have
 the complete trusted `RUNNER_CONTROL_PLANE_*` resolver configuration to fetch and materialize
@@ -518,9 +563,10 @@ the manifest; without it, the run fails closed before OpenCode starts. `/readyz`
 currently report this optional capability, so a healthy response alone does not prove that
 file-intake runs are ready. The live sandbox file scenario remains the proof gate for this path.
 
-Credential intake stores a credential and reports its status, but no run may consume it yet:
-`POST /v1/runs` still refuses `credentialBindings` with `422 FEATURE_UNSUPPORTED`. Using a
-stored credential from a run needs the credential-use broker and is tracked separately.
+Credential intake stores a credential and reports its status, and a run may consume
+a stored credential through a binding (see above). What is still missing is the
+broker mode: the value reaches the agent's process environment, so a run that
+needs the value to stay out of the agent process needs the credential-use broker.
 
 A live Host fixture call through CP, this Worker, France VM2, OpenCode and Ladder has succeeded
 and persisted the expected answer. That run did not send a Telegram message and does not establish

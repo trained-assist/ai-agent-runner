@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import {
   BLAST_RADIUS_REF,
   LEAK_RELATIVE_PATH,
@@ -55,10 +56,13 @@ function makeHost({ agentWroteTheFile = true, sweepAfterKill = true, engineHasNo
   };
 }
 
-function makeApi({ state = 'succeeded' } = {}, host?: { killed: boolean }, journal: Array<Record<string, unknown>> = []) {
+function makeApi({ state = 'succeeded', publishedBytes = 'token=[redacted]\n' } = {}, host?: { killed: boolean }, journal: Array<Record<string, unknown>> = []) {
   const requests: Array<{ url: string; method: string }> = [];
-  const manifest = { profileChanges: { files: [{ path: LEAK_RELATIVE_PATH, sha256: 'a'.repeat(64), size: 10 }], deletes: [] } };
-  const reply = (status: number, body: unknown) => ({ status, text: async () => JSON.stringify(body), json: async () => body });
+  const bytes = Buffer.from(publishedBytes);
+  const publishedDigest = createHash('sha256').update(bytes).digest('hex');
+  const manifest = { profileChanges: { files: [{ path: LEAK_RELATIVE_PATH, sha256: publishedDigest, size: bytes.length }], deletes: [] } };
+  const reply = (status: number, body: unknown) => ({ status, headers: new Headers(), text: async () => JSON.stringify(body), json: async () => body,
+    arrayBuffer: async () => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) });
   // Пока хост жив, ран, который будет убит, идёт; после убийства — терминальный.
   // Так проверка «убийство попало по активному рану» не проходит вхолостую.
   let phaseASeen = false;
@@ -71,6 +75,13 @@ function makeApi({ state = 'succeeded' } = {}, host?: { killed: boolean }, journ
         return reply(200, { result: [{ results: journal }] });
       }
       if (text.endsWith('/v1/runs') && (init?.method ?? 'GET') === 'POST') return reply(202, { runId: 'run_x' });
+      if (text.includes('/profile-changes')) {
+        // Опубликованные байты, а не только манифест: drill читает их назад.
+        const response = reply(200, {});
+        response.text = async () => bytes.toString();
+        response.headers = new Headers({ 'x-content-sha256': publishedDigest });
+        return response;
+      }
       if (text.includes('/result')) return reply(200, manifest);
       if (text.endsWith('/status')) {
         // Счётчик доставок — факт хоста: сколько воркеров получили значение.
@@ -152,6 +163,31 @@ describe('sandbox3 credential blast-radius drill', () => {
       expect(report).toContain('value-free');
       // The drill asked the agent to persist the value, and read the copy back.
       expect(host.calls.some((command) => command.includes(LEAK_RELATIVE_PATH))).toBe(true);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('fails when the published bytes carry the value, even when the manifest matches them', async () => {
+    const host = makeHost();
+    // Опубликованные байты несут значение, и манифест честно их хеширует.
+    // Хеш совпадает — а публикация всё равно утечка: проверять надо байты.
+    const api = makeApi({ publishedBytes: SECRET }, host);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = api.fetch as unknown as typeof fetch;
+    try {
+      const steps = await runCredentialBlastRadiusDrill({
+        apiUrl: 'https://runner.example',
+        apiKey: 'key',
+        registry: REGISTRY,
+        host,
+        kill: false,
+        captureWaitMs: 2_000,
+        sweepWaitMs: 2_000,
+      });
+      const failed = steps.filter((line) => line.startsWith('FAIL'));
+      expect(failed.some((line) => line.includes('the published file carries the value'))).toBe(true);
+      expect(steps.join('\n')).not.toContain(SECRET);
     } finally {
       globalThis.fetch = originalFetch;
     }

@@ -1,4 +1,5 @@
 import type { ApiPrincipal, RunnerWorkerEnv } from './types.js';
+import { EMPTY_PROFILE_SNAPSHOT_SHA256, emptyProfileSnapshotBytes } from './profile-workspace.js';
 import { developerCapabilities, developerRequest, developerWebhooks } from './developer-api.js';
 import { WalletClient, WalletError } from './wallet-client.js';
 
@@ -173,6 +174,24 @@ export default {
       if (env.DEPLOYMENT_ENV === 'production' || env.RUNNER_DEVELOPER_API_ENABLED !== 'true') return error('DEVELOPER_API_UNAVAILABLE', 'developer API is disabled on this lane', 503);
       const object = env.RUNNER_RUNS.get(env.RUNNER_RUNS.idFromName(`task-${guestDownload[1]!.split('_')[1]}`));
       return object.fetch(new Request(`https://runner-runs.internal/v1/runs/${guestDownload[1]}/download${url.search}`));
+    }
+    // The worker of a profile-workspace run fetches the base it starts from and
+    // publishes the bytes it produced. Neither call carries an API key: the base
+    // is a constant empty archive (the lane's profile has no content to restore
+    // yet, and the run pins it by digest), and the upload carries the run-scoped
+    // capability the host minted, which the Durable Object checks.
+    const profileWorkspaceCall = /^\/v1\/worker\/launches\/(run_[0-9a-f]{64}_[0-9a-f]{24})\/(profile-snapshot|profile-changes)$/.exec(url.pathname);
+    if (profileWorkspaceCall) {
+      const runId = profileWorkspaceCall[1]!;
+      if (profileWorkspaceCall[2] === 'profile-snapshot') {
+        if (request.method !== 'GET') return error('METHOD_NOT_ALLOWED', 'profile snapshots support GET only', 405);
+        const bytes = emptyProfileSnapshotBytes();
+        return new Response(bytes.buffer as ArrayBuffer, { status: 200, headers: { 'content-type': 'application/gzip', 'cache-control': 'private, no-store',
+          'x-content-type-options': 'nosniff', 'x-content-sha256': EMPTY_PROFILE_SNAPSHOT_SHA256, 'content-length': String(bytes.length) } });
+      }
+      if (request.method !== 'POST') return error('METHOD_NOT_ALLOWED', 'profile changes support POST only', 405);
+      const object = env.RUNNER_RUNS.get(env.RUNNER_RUNS.idFromName(`task-${runId.split('_')[1]}`));
+      return object.fetch(new Request(`https://runner-runs.internal${url.pathname}${url.search}`, request));
     }
     let authenticated: ApiPrincipal | null;
     try { authenticated = await authenticate(request, env); } catch { return error('SERVER_MISCONFIGURED', 'Runner API authentication is not configured', 503); }
