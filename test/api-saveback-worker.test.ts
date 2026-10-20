@@ -107,4 +107,99 @@ describe('France VM API-owned profile saveback', () => {
     expect(state).not.toContain('scoped-saveback-capability');
     expect(state).toContain('profileChanges');
   });
+
+  it('does not publish the run secret values: the transcript and the agent file are redacted by value', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'vm-api-profile-saveback-secret-'));
+    const profile = join(root, 'profile');
+    mkdirSync(profile, { recursive: true });
+    writeFileSync(join(profile, 'state.md'), 'before\n');
+    const archive = join(root, 'snapshot.tar.gz');
+    execFileSync('tar', ['--format', 'ustar', '-czf', archive, '-C', profile, '.']);
+    const archiveBytes = readFileSync(archive);
+    const snapshotSha256 = createHash('sha256').update(archiveBytes).digest('hex');
+    const uploads: Array<{ path: string; text: string; sha256: string }> = [];
+    const server = createServer((req, res) => {
+      if (req.method === 'GET' && req.url === '/snapshot') {
+        res.writeHead(200, { 'content-length': archiveBytes.length });
+        res.end(archiveBytes);
+        return;
+      }
+      if (req.method === 'POST' && req.url?.startsWith('/v1/worker/launches/')) {
+        const chunks: Buffer[] = [];
+        req.on('data', (chunk: Buffer) => chunks.push(chunk));
+        req.on('end', () => {
+          const bytes = Buffer.concat(chunks);
+          if (req.headers.authorization !== 'Bearer scoped-saveback-capability-1234567890') { res.writeHead(401).end(); return; }
+          uploads.push({
+            path: new URL(req.url!, 'http://localhost').searchParams.get('path') ?? '',
+            text: bytes.toString('utf8'),
+            sha256: String(req.headers['x-content-sha256'] ?? ''),
+          });
+          res.writeHead(201).end();
+        });
+        return;
+      }
+      res.writeHead(404).end();
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('saveback test server did not bind');
+    const base = `http://127.0.0.1:${address.port}`;
+    closers.push(async () => { await new Promise<void>((resolve) => server.close(() => resolve())); rmSync(root, { recursive: true, force: true }); });
+
+    // Значение креды ран получает агент из окружения и может записать его куда угодно:
+    // в файл рабочего каталога или в свой ответ. Ни то, ни другое не должно уйти с хоста.
+    const secret = 'ghp_livevalue0123456789ABCDEFGH';
+    process.env['RUNNER_TEST_SECRET'] = secret;
+    try {
+      const dataDir = join(root, 'worker-data');
+      const workspace = join(dataDir, 'workspaces', 'run_vm_secret');
+      const sessionId = 'ses_01J5Y5H0AH4Q4NXJ6P4C3P5V2K';
+      const binary = join(root, 'opencode-stub.sh');
+      writeFileSync(binary, [
+        '#!/bin/sh',
+        'if [ "$1" = "session" ] && [ "$2" = "export" ]; then printf \'{"info":{"id":"%s"},"messages":[{"content":"leaked %s"}]}\\n\' "$3" "$RUNNER_TEST_SECRET"; exit 0; fi',
+        'printf \'token=%s\\n\' "$RUNNER_TEST_SECRET" > notes.md',
+        `printf '{"type":"text","sessionID":"${sessionId}","part":{"type":"text","text":"secret fixture complete","time":{"start":1,"end":2}}}\\n'`,
+      ].join('\n'));
+      chmodSync(binary, 0o700);
+      const runner = new Runner({ rootDir: join(root, 'runner'), adapters: { opencode: new OpenCodeAdapter({ binary }) }, profileWorkspace: createApiSavebackWorker(dataDir) });
+      closers.push(async () => runner.dispose());
+      const spec = makeRunSpec({
+        runId: 'run_vm_secret', cwd: workspace,
+        engine: { name: 'opencode', adapterVersion: '1' },
+        envAllowlist: ['RUNNER_TEST_SECRET'],
+        input: { inlinePrompt: 'Save the secret into notes.md.' },
+        repository: { fullName: 'owner/profile', revision: 'a'.repeat(40) },
+        profileWorkspace: {
+          bindingId: 'binding-a', snapshotUrl: `${base}/snapshot`, snapshotSha256, snapshotSize: archiveBytes.length,
+          savebackToken: 'scoped-saveback-capability-1234567890', savebackUrl: `${base}/v1/worker/launches/run_vm_secret/profile-changes`,
+          artifacts: [], excludedPatterns: [],
+        },
+      });
+      runner.start(spec);
+      const result = await runner.waitFor(spec.runId, 15_000);
+
+      expect(result.outcome, JSON.stringify(result)).toBe('succeeded');
+      expect(uploads.length).toBeGreaterThan(0);
+      for (const upload of uploads) {
+        expect(upload.text, upload.path).not.toContain(secret);
+        expect(upload.sha256).toBe(createHash('sha256').update(upload.text).digest('hex'));
+      }
+      // Файл агента опубликован с отредактированным значением, а не с исходным байтом.
+      expect(uploads.find((upload) => upload.path === 'notes.md')?.text).toBe('token=[redacted]\n');
+      // Транскрипт остаётся валидным JSON и не содержит значения.
+      const transcript = uploads.find((upload) => upload.path === `.session-traces/${sessionId}.json`);
+      expect(transcript).toBeDefined();
+      expect(JSON.parse(transcript!.text).info.id).toBe(sessionId);
+      expect(transcript!.text).toContain('[redacted]');
+      // Манифест описывает опубликованное содержимое, а не то, что лежит на диске.
+      const notes = result.profileChanges?.files.find((file) => file.path === 'notes.md');
+      expect(notes?.sha256).toBe(createHash('sha256').update('token=[redacted]\n').digest('hex'));
+      const state = readFileSync(join(root, 'runner', 'runs', spec.runId, 'state.json'), 'utf8');
+      expect(state).not.toContain(secret);
+    } finally {
+      delete process.env['RUNNER_TEST_SECRET'];
+    }
+  });
 });

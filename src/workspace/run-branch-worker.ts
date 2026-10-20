@@ -18,7 +18,11 @@ const ASKPASS = ['#!/bin/sh', 'case "$1" in', "  *sername*) printf '%s\\n' 'x-ac
 export interface RunBranchWorker {
   supportsSaveback?(): boolean;
   prepare(spec: RunSpec, cwd: string, token?: string): Promise<void>;
-  publish(spec: RunSpec, cwd: string, token?: string): Promise<string>;
+  /**
+   * Публикация изменений профиля. `secrets` — значения, которые не должны уйти с хоста
+   * в опубликованном содержимом: опубликованный файл агента может содержать секрет рана.
+   */
+  publish(spec: RunSpec, cwd: string, token?: string, secrets?: readonly string[]): Promise<string>;
   changes?(spec: RunSpec): { files: Array<{ path: string; sha256: string; size: number }>; deletes: string[] } | undefined;
 }
 

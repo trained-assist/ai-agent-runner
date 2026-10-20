@@ -7,6 +7,7 @@ import type { ProfileWorkspaceSpec, RunSpec } from '../contracts/run-spec.js';
 import type { RunBranchWorker } from './run-branch-worker.js';
 import { resolveInsideRoot, isSafeRelativePath } from '../storage/local-paths.js';
 import { DEFAULT_EXPORT_POLICY, compilePolicy, matchRule, scanWorkspace } from './policy.js';
+import { redactSecretBytes } from '../redact.js';
 import { writeFileAtomic } from '../runner/util.js';
 
 const POLICY = compilePolicy(DEFAULT_EXPORT_POLICY);
@@ -71,7 +72,7 @@ export function createApiSavebackWorker(dataDir: string): RunBranchWorker & {
       mkdirSync(receipts, { recursive: true, mode: 0o700 });
       writeReceipt(receiptPath(receipts, spec.runId), { baseline });
     },
-    async publish(spec, cwd, token) {
+    async publish(spec, cwd, token, secrets = []) {
       const profile = requiredSavebackWorkspace(spec);
       if (!token) throw new Error('run-scoped profile saveback capability is unavailable');
       const path = receiptPath(receipts, spec.runId);
@@ -97,9 +98,15 @@ export function createApiSavebackWorker(dataDir: string): RunBranchWorker & {
         }
         if (entry.size > MAX_FILE_BYTES || totalBytes + entry.size > MAX_RUN_BYTES) throw new Error('profile changes exceed the VM saveback size limits');
         const absolute = resolveInsideRoot(runRoot, relative, 'profile saveback path');
-        const bytes = readFileSync(absolute);
+        const onDisk = readFileSync(absolute);
+        // Сверка идёт по байтам на диске: опубликованное содержимое может отличаться от
+        // них (редакция секретов), но измениться между сканом и публикацией не должно.
+        if (createHash('sha256').update(onDisk).digest('hex') !== entry.sha256 || onDisk.length !== entry.size) throw new Error(`profile change changed while saving: ${relative}`);
+        // Файл, написанный агентом, может содержать значение креды. Публикуемое
+        // содержимое редактируется по значению: секрет не должен покидать хост.
+        const safe = redactSecretBytes(onDisk, secrets);
+        const bytes = safe === onDisk ? onDisk : Buffer.from(safe);
         const sha256 = createHash('sha256').update(bytes).digest('hex');
-        if (sha256 !== entry.sha256 || bytes.length !== entry.size) throw new Error(`profile change changed while saving: ${relative}`);
         await uploadFile(profile, token, relative, bytes, sha256);
         files.push({ path: relative, sha256, size: bytes.length });
         totalBytes += bytes.length;

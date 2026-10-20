@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import { mkdirSync, lstatSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { EngineStartupError } from '../../contracts/validate.js';
+import { redactSecretValues } from '../../redact.js';
 import type { RunSpec } from '../../contracts/run-spec.js';
 import type { EngineAdapter, EngineHandle, EngineStartContext } from './engine-adapter.js';
 import { launchCommand } from './launch.js';
@@ -254,7 +255,10 @@ export class OpenCodeAdapter implements EngineAdapter {
                 const text = Buffer.concat(chunks).toString('utf8');
                 const parsed = JSON.parse(text) as { info?: { id?: string } };
                 if (parsed.info?.id !== sessionId) throw new Error('OpenCode exported a different session id');
-                writeFileSync(checkpointPath!, text, { mode: 0o600 });
+                // Транскрипт уезжает в архив профиля, а ответы агента (аргументы
+                // инструментов, напечатанные значения) могут содержать секрет рана.
+                // Редакция по значению — единственная, которая знает сам секрет.
+                writeFileSync(checkpointPath!, redactSecretValues(text, ctx.secrets ?? []), { mode: 0o600 });
               } catch (error) {
                 ctx.onLog('stderr', `opencode session checkpoint export failed: ${String(error)}`);
               }

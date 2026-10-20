@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { mkdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { canonicalJson, redactRepositoryToken } from '../contracts/run-spec.js';
-import { redactSecrets, truncateLine } from '../redact.js';
+import { redactSecretValues, redactSecrets, truncateLine } from '../redact.js';
 
 let atomicCounter = 0;
 
@@ -33,4 +33,4 @@ export function writeFileAtomic(path: string, content: string | Uint8Array): voi
   }
 }
 
-export { redactSecrets, truncateLine };
+export { redactSecretValues, redactSecrets, truncateLine };
