@@ -567,6 +567,10 @@ export class RunnerRunCoordinator {
       const configured = registry[record['ref']];
       if (!configured) return error('CREDENTIAL_NOT_FOUND', 'the credential is not available to this Runner API', 404);
       if (configured.scope !== record['scope']) return error('FORBIDDEN', 'the credential does not grant that scope', 403);
+      // The environment name must be approved for this lane, the same way a hosted
+      // model connection is: the worker refuses an env name it does not allow, and
+      // a run must not read a credential it cannot deliver.
+      if (!allowedEnv.has(configured.env)) return error('SERVER_MISCONFIGURED', 'the credential environment name is not approved for this Runner API', 503);
       if (launchEnv[configured.env] !== undefined || envAllowlist.includes(configured.env)) {
         return error('SERVER_MISCONFIGURED', 'the credential environment name collides with a runtime secret', 503);
       }
@@ -1038,10 +1042,15 @@ export class RunnerRunCoordinator {
    * request and the stored launch payload carry references only; the values exist
    * in the launch that goes to the worker and nowhere else. A connection that was
    * revoked after intake fails the run closed instead of starting without it.
+   *
+   * The resolved values are returned separately from the launch payload on
+   * purpose: the payload is re-encrypted into the run record on later paths (the
+   * MCP attachment and the capacity cutover), and a value that had been merged
+   * into it would be persisted with the run.
    */
   private async resolveRunCredentials(run: RunRecord, launch: Record<string, unknown>,
     refs: Array<{ ref: string; scope: string }>): Promise<
-      { ok: true; launch: { env: Record<string, string>; envAllowlist: string[] } }
+      { ok: true; env: Record<string, string>; envAllowlist: string[] }
       | { ok: false; code: string; message: string }> {
     let registry: Record<string, SandboxCredential>;
     try { registry = parseSandboxCredentials(this.env.ZEROCREDS_WALLET_CREDENTIALS); }
@@ -1050,14 +1059,16 @@ export class RunnerRunCoordinator {
     if (!resolution.ok) {
       return { ok: false, code: 'CREDENTIAL_UNAVAILABLE', message: `the credential profile is not mapped (${resolution.reason})` };
     }
-    const env: Record<string, string> = { ...(launch['env'] as Record<string, string> | undefined ?? {}) };
-    const envAllowlist = Array.isArray(launch['envAllowlist']) ? [...launch['envAllowlist'] as string[]] : [];
+    const env: Record<string, string> = {};
+    const envAllowlist: string[] = [];
+    const runtimeEnv = launch['env'] as Record<string, string> | undefined ?? {};
+    const runtimeNames = new Set(Array.isArray(launch['envAllowlist']) ? launch['envAllowlist'] as string[] : []);
     for (const reference of refs) {
       const configured = registry[reference.ref];
       if (!configured || configured.scope !== reference.scope) {
         return { ok: false, code: 'SERVER_MISCONFIGURED', message: 'the credential registry changed after admission' };
       }
-      if (env[configured.env] !== undefined) {
+      if (env[configured.env] !== undefined || runtimeEnv[configured.env] !== undefined || runtimeNames.has(configured.env)) {
         return { ok: false, code: 'SERVER_MISCONFIGURED', message: 'the credential environment name is already in use' };
       }
       let granted;
@@ -1076,7 +1087,7 @@ export class RunnerRunCoordinator {
       env[configured.env] = value;
       envAllowlist.push(configured.env);
     }
-    return { ok: true, launch: { env, envAllowlist } };
+    return { ok: true, env, envAllowlist };
   }
 
   private async revokeUserCatalog(runId: string): Promise<void> {
@@ -1132,6 +1143,7 @@ export class RunnerRunCoordinator {
             // goes to the worker and nowhere else.
             const credentialRefs = Array.isArray(launch['credentialRefs'])
               ? launch['credentialRefs'] as Array<{ ref: string; scope: string }> : [];
+            let credentialEnv: { env: Record<string, string>; envAllowlist: string[] } | undefined;
             if (credentialRefs.length) {
               const resolved = await this.resolveRunCredentials(run, launch, credentialRefs);
               if (!resolved.ok) {
@@ -1141,7 +1153,7 @@ export class RunnerRunCoordinator {
                 changed = true;
                 break;
               }
-              Object.assign(launch, resolved.launch);
+              credentialEnv = { env: resolved.env, envAllowlist: resolved.envAllowlist };
             }
             if (run.mcpUserRequested && !run.mcpUserProvisioned) {
               const attachment = await this.userCatalogAttachment({ runId: run.runId, taskId: run.userTaskId,
@@ -1157,7 +1169,13 @@ export class RunnerRunCoordinator {
               run.launchCiphertext = await encrypt(JSON.stringify(launch), this.env.RUN_LAUNCH_ENCRYPTION_KEY);
               await this.writeRun(run);
             }
-            const response = await this.worker(run.engine, '/v1/launch', 'POST', launch);
+            // The values travel to the worker in this body only. The launch payload
+            // that is kept with the run carries the reference, never the value.
+            const workerLaunch = credentialEnv
+              ? { ...launch, env: { ...(launch['env'] as Record<string, string> | undefined ?? {}), ...credentialEnv.env },
+                envAllowlist: [...(launch['envAllowlist'] as string[] | undefined ?? []), ...credentialEnv.envAllowlist] }
+              : launch;
+            const response = await this.worker(run.engine, '/v1/launch', 'POST', workerLaunch);
             if (!response.ok) {
               const rejection = await response.clone().json().catch(() => null);
               const code = workerRefusalCode(rejection, response.status);
