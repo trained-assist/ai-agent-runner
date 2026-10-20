@@ -16,12 +16,14 @@ import type { ApiPrincipal, RunnerWorkerEnv } from './types.js';
 
 const WALLET_OPERATIONS = ['wallet.forms.create', 'wallet.connections.status'];
 const WALLET_REVOKE_OPERATIONS = [...WALLET_OPERATIONS, 'wallet.connections.revoke'];
+const WALLET_GRANT_OPERATIONS = [...WALLET_OPERATIONS, 'wallet.connections.grant'];
 const ASSERTION_TTL_SECONDS = 120;
 const WALLET_TIMEOUT_MS = 10_000;
 const PROVIDER = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 const WALLET_ID = /^[A-Za-z0-9_-]{1,100}$/;
 const PROFILE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/;
 const ASSERTION_ISSUER = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,99}$/;
+const RUN_ID = /^run_[0-9a-f]{64}_[0-9a-f]{24}$/;
 
 export type WalletErrorCode = 'invalid_request' | 'rejected' | 'not_found' | 'conflict' | 'unavailable';
 
@@ -46,6 +48,13 @@ export interface WalletConnection {
   state: string;
   kvVersion: number | null;
   updatedAt: string | null;
+}
+
+export interface WalletGrant {
+  /** The stored value as the field map the form collected. */
+  fields: Record<string, string>;
+  version: number | null;
+  expiresAt: string | null;
 }
 
 export interface WalletFormRequest {
@@ -93,6 +102,14 @@ export class WalletClient {
    * call resolves to the end user's profile rather than to the service profile.
    */
   static resolve(principal: ApiPrincipal, env: RunnerWorkerEnv): WalletResolution {
+    return WalletClient.resolveFor(principal.profileId, principal.tenantId, env);
+  }
+
+  /**
+   * The same lookup for a stored run, where only the profile and tenant survive:
+   * the wallet profile mapping is what matters, not the key that started the run.
+   */
+  static resolveFor(profileId: string, tenantId: string | undefined, env: RunnerWorkerEnv): WalletResolution {
     const apiUrl = (env.ZEROCREDS_WALLET_API_URL ?? '').trim();
     const issuer = (env.ZEROCREDS_WALLET_ASSERTION_ISSUER ?? '').trim();
     const kid = (env.ZEROCREDS_WALLET_ASSERTION_KID ?? '').trim();
@@ -112,9 +129,9 @@ export class WalletClient {
     }
     const profiles = parseProfiles(profilesRaw);
     if (!profiles) return { ok: false, reason: 'invalid_config' };
-    const binding = profiles[principal.profileId];
+    const binding = profiles[profileId];
     if (!binding) return { ok: false, reason: 'profile_unmapped' };
-    if (binding.tenantId && principal.tenantId && binding.tenantId !== principal.tenantId) return { ok: false, reason: 'profile_unmapped' };
+    if (binding.tenantId && tenantId && binding.tenantId !== tenantId) return { ok: false, reason: 'profile_unmapped' };
     return { ok: true, client: new WalletClient((env.FETCH ?? fetch).bind(globalThis), base.origin + base.pathname.replace(/\/$/, ''), issuer, kid, privateJwk, binding) };
   }
 
@@ -168,9 +185,36 @@ export class WalletClient {
     };
   }
 
+  /**
+   * Resolves a stored value for one run. Only a machine assertion may ask: the
+   * caller class is `machine` and the run id is part of the signed claims, so the
+   * wallet attributes the read to that run and the store records it. The value is
+   * answered once — a revoked connection fails closed here.
+   */
+  async grantValue(connectionId: string, runId: string): Promise<WalletGrant> {
+    if (!WALLET_ID.test(connectionId)) throw new WalletError('invalid_request', 'connection id is not a valid reference');
+    if (!RUN_ID.test(runId)) throw new WalletError('invalid_request', 'run id is not a valid reference');
+    const body = await this.call('wallet.connections.grant', WALLET_GRANT_OPERATIONS,
+      `/api/wallet/connections/${encodeURIComponent(connectionId)}/grants`, 'POST', {},
+      { callerClass: 'machine', runId });
+    const raw = body['value'];
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      throw new WalletError('unavailable', 'the credential service returned an unexpected response');
+    }
+    const fields: Record<string, string> = {};
+    for (const [name, value] of Object.entries(raw as Record<string, unknown>)) {
+      if (typeof value === 'string') fields[name] = value;
+    }
+    if (!Object.keys(fields).length) throw new WalletError('unavailable', 'the credential service returned an empty value');
+    const version = body['version'];
+    return { fields, version: typeof version === 'number' ? version : null,
+      expiresAt: text(body['expires_at']) };
+  }
+
   /** Signs a one-call host assertion and forwards the request to the wallet API. */
-  private async call(operation: string, operations: string[], route: string, method: 'GET' | 'POST', body?: Record<string, unknown>): Promise<Record<string, unknown>> {
-    const assertion = await this.assertion(operation, operations);
+  private async call(operation: string, operations: string[], route: string, method: 'GET' | 'POST', body?: Record<string, unknown>,
+    caller: { callerClass: 'human' | 'machine'; runId?: string } = { callerClass: 'human' }): Promise<Record<string, unknown>> {
+    const assertion = await this.assertion(operation, operations, caller);
     // Detached on purpose: the Workers runtime rejects a fetch invoked with a
     // receiver that is not the global object.
     const fetchImpl = this.fetchImpl;
@@ -200,18 +244,21 @@ export class WalletClient {
     throw new WalletError('unavailable', 'the credential service is not available');
   }
 
-  private async assertion(operation: string, operations: string[]): Promise<string> {
+  private async assertion(operation: string, operations: string[],
+    caller: { callerClass: 'human' | 'machine'; runId?: string }): Promise<string> {
     const now = Math.floor(Date.now() / 1000);
     const claims = {
       iss: this.issuer,
-      aud: 'zerocreds-wallet:human',
+      aud: `zerocreds-wallet:${caller.callerClass}`,
       owner_id: this.profile.ownerId,
       profile_id: this.profile.profileId,
-      caller_class: 'human',
+      caller_class: caller.callerClass,
       operations,
       iat: now,
       exp: now + ASSERTION_TTL_SECONDS,
       jti: randomToken(24),
+      // A machine assertion has to name the run it acts for; a human one must not.
+      ...(caller.callerClass === 'machine' ? { run_id: caller.runId } : {}),
     };
     const encode = (value: unknown): string => base64Url(new TextEncoder().encode(JSON.stringify(value)));
     const signingInput = `${encode({ alg: 'EdDSA', typ: 'JWT', kid: this.kid })}.${encode(claims)}`;

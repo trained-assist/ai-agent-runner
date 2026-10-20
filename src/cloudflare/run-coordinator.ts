@@ -1,9 +1,46 @@
 import type { ApiPrincipal, DurableObjectStateLike, RunnerWorkerEnv } from './types.js';
 import { DEFAULT_ENGINE, SAFE_ID, error, json } from './runner-api.js';
 import { deliverTerminalWebhook, resolveWebhook, type WebhookConnection, type WebhookDelivery } from './webhooks.js';
+import { WalletClient, WalletError } from './wallet-client.js';
 import { redactSecrets } from '../redact.js';
 
 const AGENT_HISTORY_PATH = '__runner/agent-history.json';
+
+/**
+ * One credential a run may bind. The environment name and the connection come
+ * from host configuration, so a request can never choose where a value lands or
+ * which connection it comes from.
+ */
+export interface SandboxCredential {
+  connectionId: string;
+  env: string;
+  field?: string;
+  scope: string;
+}
+
+/** Parses the host credential registry. A malformed registry is refused, never ignored. */
+export function parseSandboxCredentials(raw: string | undefined): Record<string, SandboxCredential> {
+  if (!raw) return {};
+  let parsed: unknown;
+  try { parsed = JSON.parse(raw); } catch { throw new Error('credential registry is not JSON'); }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('credential registry is not an object');
+  const out: Record<string, SandboxCredential> = {};
+  for (const [ref, value] of Object.entries(parsed as Record<string, unknown>)) {
+    if (!SAFE_ID.test(ref) || !value || typeof value !== 'object' || Array.isArray(value)) throw new Error('credential registry entry is invalid');
+    const entry = value as Record<string, unknown>;
+    if (Object.keys(entry).some((key) => !['connection_id', 'env', 'field', 'scope'].includes(key))) throw new Error('credential registry entry is invalid');
+    const connectionId = entry['connection_id'];
+    const env = entry['env'];
+    const scope = entry['scope'];
+    const field = entry['field'];
+    if (typeof connectionId !== 'string' || !/^[A-Za-z0-9_-]{1,100}$/.test(connectionId)) throw new Error('credential registry entry is invalid');
+    if (typeof env !== 'string' || !/^[A-Z][A-Z0-9_]{0,63}$/.test(env)) throw new Error('credential registry entry is invalid');
+    if (typeof scope !== 'string' || !SAFE_ID.test(scope)) throw new Error('credential registry entry is invalid');
+    if (field !== undefined && (typeof field !== 'string' || !/^[a-z0-9_]{1,40}$/.test(field))) throw new Error('credential registry entry is invalid');
+    out[ref] = { connectionId, env, scope, ...(typeof field === 'string' ? { field } : {}) };
+  }
+  return out;
+}
 
 type State = 'queued' | 'starting' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'unknown';
 interface RunRecord {
@@ -506,11 +543,44 @@ export class RunnerRunCoordinator {
     const launchEnv = runtimeEnv(this.env, envAllowlist);
     if (envAllowlist.some((name) => !launchEnv[name])) return error('SERVER_MISCONFIGURED', 'an approved runtime environment secret is missing', 503);
     let boundModel: string | undefined;
-    if (body.credentialBindings !== undefined && !(Array.isArray(body.credentialBindings) && body.credentialBindings.length === 0)) {
+    // A run may declare a credential that lives in ZeroCreds. The request carries a
+    // reference and a scope; the value is resolved at dispatch time, so neither the
+    // run record nor the stored launch payload ever holds it.
+    const requestedBindings = Array.isArray(body.credentialBindings) ? body.credentialBindings : [];
+    const modelBindings = requestedBindings.filter((entry) => entry && typeof entry === 'object'
+      && !Array.isArray(entry) && 'type' in (entry as object));
+    const credentialRefs: Array<{ ref: string; scope: string }> = [];
+    for (const entry of requestedBindings) {
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry) || !('ref' in entry)) continue;
+      if (this.env.RUNNER_CREDENTIAL_BINDINGS_ENABLED !== 'true') {
+        return error('FEATURE_UNSUPPORTED', 'run credential bindings are disabled on this lane', 422);
+      }
+      const record = entry as Record<string, unknown>;
+      if (Object.keys(record).sort().join(',') !== 'ref,scope'
+          || typeof record['ref'] !== 'string' || !SAFE_ID.test(record['ref'])
+          || typeof record['scope'] !== 'string' || !SAFE_ID.test(record['scope'])) {
+        return error('INVALID_CREDENTIAL_BINDING', 'a run credential binding must be {ref, scope}', 400);
+      }
+      let registry: Record<string, SandboxCredential>;
+      try { registry = parseSandboxCredentials(this.env.ZEROCREDS_WALLET_CREDENTIALS); }
+      catch { return error('SERVER_MISCONFIGURED', 'the credential registry is invalid', 503); }
+      const configured = registry[record['ref']];
+      if (!configured) return error('CREDENTIAL_NOT_FOUND', 'the credential is not available to this Runner API', 404);
+      if (configured.scope !== record['scope']) return error('FORBIDDEN', 'the credential does not grant that scope', 403);
+      if (launchEnv[configured.env] !== undefined || envAllowlist.includes(configured.env)) {
+        return error('SERVER_MISCONFIGURED', 'the credential environment name collides with a runtime secret', 503);
+      }
+      if (credentialRefs.some((item) => item.ref === record['ref'])) continue;
+      credentialRefs.push({ ref: record['ref'] as string, scope: record['scope'] as string });
+    }
+    if (credentialRefs.length && modelBindings.length) {
+      return error('INVALID_CREDENTIAL_BINDING', 'a run cannot mix a credential binding with a model connection', 400);
+    }
+    if (modelBindings.length) {
       if (this.env.DEPLOYMENT_ENV === 'production' || this.env.RUNNER_BYOK_ENABLED !== 'true') {
         return error('FEATURE_UNSUPPORTED', 'hosted model connections are disabled on this lane', 422);
       }
-      const bindings = body.credentialBindings;
+      const bindings = modelBindings;
       if (!Array.isArray(bindings) || bindings.length !== 1 || !bindings[0] ||
           Object.keys(bindings[0]).sort().join(',') !== 'connectionId,type' || bindings[0].type !== 'openai' ||
           typeof bindings[0].connectionId !== 'string' || !SAFE_ID.test(bindings[0].connectionId)) {
@@ -599,7 +669,7 @@ export class RunnerRunCoordinator {
       const limits = body.limits;
       const launch = { runId, jobId, userTaskId: taskId, profileId: principal.profileId, conversationId, operationId: `op_${await digest(`${taskId}:${ownerGeneration}`).then((h) => h.slice(0, 24))}`,
           ownerGeneration, engine: { name: engine, adapterVersion: body.engine?.adapterVersion ?? '1', ...(boundModel || body.engine?.modelSettings?.model ? { modelSettings: { model: boundModel ?? body.engine.modelSettings.model } } : {}) },
-          input: { inlinePrompt: `${typeof inputPrompt === 'string' ? inputPrompt : ''}${instructions ? `${inputPrompt ? '\n\nAdditional instructions: ' : ''}${instructions}` : ''}` }, cwd: `/tmp/runner/${runId}`, envAllowlist, env: launchEnv, limits: { timeoutMs: clampInteger(limits.timeoutMs, 300_000, 1_000, 86_400_000), maxOutputBytes: clampInteger(limits.maxOutputBytes, 5_000_000, 1, 100_000_000), maxLogBytes: clampInteger(limits.maxLogBytes, 5_000_000, 1, 100_000_000) },
+          input: { inlinePrompt: `${typeof inputPrompt === 'string' ? inputPrompt : ''}${instructions ? `${inputPrompt ? '\n\nAdditional instructions: ' : ''}${instructions}` : ''}` }, cwd: `/tmp/runner/${runId}`, envAllowlist, env: launchEnv, ...(credentialRefs.length ? { credentialRefs } : {}), limits: { timeoutMs: clampInteger(limits.timeoutMs, 300_000, 1_000, 86_400_000), maxOutputBytes: clampInteger(limits.maxOutputBytes, 5_000_000, 1, 100_000_000), maxLogBytes: clampInteger(limits.maxLogBytes, 5_000_000, 1, 100_000_000) },
           ...(ingressManifest ? { ingressManifest: { ...ingressManifest, userTaskId: taskId, profileId: principal.profileId, runId, ownerGeneration } } : {}),
           repository: { fullName: repository ?? '', branch: `agent-run/${runId}`, ...(body.repository?.revision ? { revision: body.repository.revision } : {}) },
           ...(repositoryToken ? { publicationToken: repositoryToken } : {}),
@@ -963,6 +1033,52 @@ export class RunnerRunCoordinator {
     };
   }
 
+  /**
+   * Resolves the credentials a run declared, at the moment of dispatch. The
+   * request and the stored launch payload carry references only; the values exist
+   * in the launch that goes to the worker and nowhere else. A connection that was
+   * revoked after intake fails the run closed instead of starting without it.
+   */
+  private async resolveRunCredentials(run: RunRecord, launch: Record<string, unknown>,
+    refs: Array<{ ref: string; scope: string }>): Promise<
+      { ok: true; launch: { env: Record<string, string>; envAllowlist: string[] } }
+      | { ok: false; code: string; message: string }> {
+    let registry: Record<string, SandboxCredential>;
+    try { registry = parseSandboxCredentials(this.env.ZEROCREDS_WALLET_CREDENTIALS); }
+    catch { return { ok: false, code: 'SERVER_MISCONFIGURED', message: 'the credential registry is invalid' }; }
+    const resolution = WalletClient.resolveFor(run.profileId, run.tenantId, this.env);
+    if (!resolution.ok) {
+      return { ok: false, code: 'CREDENTIAL_UNAVAILABLE', message: `the credential profile is not mapped (${resolution.reason})` };
+    }
+    const env: Record<string, string> = { ...(launch['env'] as Record<string, string> | undefined ?? {}) };
+    const envAllowlist = Array.isArray(launch['envAllowlist']) ? [...launch['envAllowlist'] as string[]] : [];
+    for (const reference of refs) {
+      const configured = registry[reference.ref];
+      if (!configured || configured.scope !== reference.scope) {
+        return { ok: false, code: 'SERVER_MISCONFIGURED', message: 'the credential registry changed after admission' };
+      }
+      if (env[configured.env] !== undefined) {
+        return { ok: false, code: 'SERVER_MISCONFIGURED', message: 'the credential environment name is already in use' };
+      }
+      let granted;
+      try { granted = await resolution.client.grantValue(configured.connectionId, run.runId); }
+      catch (failure) {
+        const missing = failure instanceof WalletError && failure.code === 'not_found';
+        console.warn(JSON.stringify({ event: 'runner.credential_grant_failed', requestId: run.requestId, runId: run.runId,
+          ref: reference.ref, code: failure instanceof WalletError ? failure.code : 'unavailable' }));
+        return { ok: false, code: missing ? 'CREDENTIAL_REVOKED' : 'CREDENTIAL_UNAVAILABLE',
+          message: missing ? 'the credential is no longer stored' : 'the credential service is not available' };
+      }
+      const value = configured.field ? granted.fields[configured.field] : Object.values(granted.fields)[0];
+      if (typeof value !== 'string' || !value) {
+        return { ok: false, code: 'CREDENTIAL_UNAVAILABLE', message: 'the stored credential has no usable value' };
+      }
+      env[configured.env] = value;
+      envAllowlist.push(configured.env);
+    }
+    return { ok: true, launch: { env, envAllowlist } };
+  }
+
   private async revokeUserCatalog(runId: string): Promise<void> {
     const fetchImpl = this.env.FETCH ?? fetch;
     const response = await fetchImpl(`${MCP_USER.provisionUrl}/revoke`, {
@@ -1011,6 +1127,22 @@ export class RunnerRunCoordinator {
             nextEvent(run, 'run_dispatching', { attempt: run.launchAttempts });
             await this.writeRun(run);
             const launch = JSON.parse(await decrypt(run.launchCiphertext, this.env.RUN_LAUNCH_ENCRYPTION_KEY)) as Record<string, unknown>;
+            // The stored payload carries credential references only; the values are
+            // resolved here, once per dispatch attempt, and live in the launch that
+            // goes to the worker and nowhere else.
+            const credentialRefs = Array.isArray(launch['credentialRefs'])
+              ? launch['credentialRefs'] as Array<{ ref: string; scope: string }> : [];
+            if (credentialRefs.length) {
+              const resolved = await this.resolveRunCredentials(run, launch, credentialRefs);
+              if (!resolved.ok) {
+                run.lastError = resolved.message;
+                run.result = refusedLaunchResult(run);
+                transition(run, 'failed', { reason: 'credential_unavailable', code: resolved.code });
+                changed = true;
+                break;
+              }
+              Object.assign(launch, resolved.launch);
+            }
             if (run.mcpUserRequested && !run.mcpUserProvisioned) {
               const attachment = await this.userCatalogAttachment({ runId: run.runId, taskId: run.userTaskId,
                 profileId: run.profileId, ownerGeneration: run.ownerGeneration,
