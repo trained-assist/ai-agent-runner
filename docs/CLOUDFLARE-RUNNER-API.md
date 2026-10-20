@@ -326,11 +326,21 @@ fails if it is removed.
 
 The manual `Deploy and pair isolated sandbox3 live profile auth` workflow runs only from
 protected `main` after an explicit confirmation input. It deploys the reviewed Worker source,
-updates only `RUNNER_API_KEYS_SANDBOX3` and `AGENT_API_PROFILE_DELEGATION_SECRET`, then sends
+syncs the lane's shared secrets from the repository secret store, updates only
+`RUNNER_API_KEYS_SANDBOX3` and `AGENT_API_PROFILE_DELEGATION_SECRET`, then sends
 a signed read-only `GET /v1/capabilities` probe. It does not submit a task or call the VM/model.
 The GitHub `sandbox` environment must provide `SANDBOX3_RUNNER_API_KEY` and
 `SANDBOX3_PROFILE_DELEGATION_SECRET`; the CP sandbox must use the same pair. Existing base,
 canary, mock-only, and Telegram UX registries remain separate.
+
+`scripts/sandbox3-lane-secrets.mjs` writes the lane's shared secrets onto the sandbox3 Worker
+from the repository secret store, so the lane cannot silently drift away from it. It currently
+writes only `LLM_LADDER_TOKEN`, from the repository-level `LLM_LADDER_TOKEN` secret. The
+production and Telegram UX deploy tools sync the same token from the same store; without that
+sync the sandbox3 copy keeps whatever value it was last given, and a rotated token leaves the
+lane answering `401 unauthorized` to the model provider while every other lane works. The
+script never redeploys the Worker, never prints a secret, and never touches the lane's own
+registries — those stay with their dedicated provisioning scripts.
 
 The Telegram UX test principal is bound in the API key registry to the canonical task repository
 `trained-assist/ai-agent-runner`; the request cannot supply or override that binding. The Runner
