@@ -138,6 +138,7 @@ jobs:
     if: needs.gate.result == 'success'
     runs-on: ubuntu-latest
     permissions:
+      actions: write
       contents: write
       pull-requests: write
     steps:
@@ -224,6 +225,8 @@ jobs:
           git push origin "HEAD:refs/heads/main"
           git tag -a "vm-worker-v$next" -m "vm-worker v$next: OpenCode fork $TAG" HEAD
           git push origin "vm-worker-v$next"
+          # GITHUB_TOKEN push of a tag does not trigger workflows; dispatch explicitly.
+          gh workflow run vm-worker-release.yml -f build_tag=vm-worker-v$next
           echo "- worker release: \`vm-worker-v$next\`" >> "$GITHUB_STEP_SUMMARY"
       - name: Summarise the promotion
         run: |

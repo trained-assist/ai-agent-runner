@@ -5,9 +5,13 @@ on:
     tags: ['vm-worker-v*']
   workflow_dispatch:
     inputs:
+      build_tag:
+        description: Tag to build and publish (used by the promotion hook)
+        required: false
+        type: string
       release_tag:
         description: Existing signed release to deploy to the France sandbox
-        required: true
+        required: false
         type: string
 
 permissions:
@@ -15,22 +19,29 @@ permissions:
   id-token: write
   attestations: write
 
+env:
+  RELEASE_TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.build_tag || inputs.release_tag }}
+
 jobs:
   build-and-attest:
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.build_tag != '')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ env.RELEASE_TAG }}
       - uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: npm
       - name: Require the tagged commit to be on main
         run: |
+          set -euo pipefail
           git fetch origin main
-          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+          tagged_commit="$(git rev-parse HEAD)"
+          git merge-base --is-ancestor "$tagged_commit" origin/main
+          echo "Tag ${{ env.RELEASE_TAG }} points at $tagged_commit, which is on main."
       - name: Download and verify pinned OpenCode fork
         env:
           GH_TOKEN: ${{ github.token }}
@@ -68,7 +79,7 @@ jobs:
         id: bundle
         run: |
           VERSION="$(node -p "require('./package.json').version")"
-          test "$GITHUB_REF_NAME" = "vm-worker-v$VERSION"
+          test "${{ env.RELEASE_TAG }}" = "vm-worker-v$VERSION"
           STAGE="$RUNNER_TEMP/vm-worker-bundle"
           mkdir -p "$STAGE"
           cp package.json package-lock.json "$STAGE/"
@@ -89,7 +100,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" \
+          gh release create "${{ env.RELEASE_TAG }}" \
             ai-agent-vm-worker-linux-x64.tar.gz \
             ai-agent-vm-worker-linux-x64.tar.gz.sha256 \
             --title "VM worker ${{ steps.bundle.outputs.version }}" \
@@ -98,7 +109,7 @@ jobs:
   deploy-france-sandbox:
     name: Deploy signed release to France sandbox
     needs: build-and-attest
-    if: ${{ always() && (needs.build-and-attest.result == 'success' || github.event_name == 'workflow_dispatch') }}
+    if: ${{ always() && (needs.build-and-attest.result == 'success' || (github.event_name == 'workflow_dispatch' && inputs.build_tag == '')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     environment: france-sandbox
@@ -106,7 +117,6 @@ jobs:
       contents: read
       attestations: read
     env:
-      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
       GH_TOKEN: ${{ secrets.FRANCE_VM_RELEASE_READ_TOKEN || github.token }}
       VM_DEPLOY_KEY: ${{ secrets.FRANCE_VM_RELEASE_DEPLOY_KEY }}
     steps:
