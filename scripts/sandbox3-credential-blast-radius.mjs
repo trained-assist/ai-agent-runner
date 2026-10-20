@@ -247,7 +247,7 @@ export async function runCredentialBlastRadiusDrill({
    * drill planted it from the environment (a free model may not comply, and the
    * radius of a copy that exists does not depend on who wrote it).
    */
-  async function captureValue(runId, { plant = true } = {}) {
+  async function captureValue(runId, { plant = true, pause = false } = {}) {
     const deadline = Date.now() + captureWaitMs;
     let parsed = null;
     while (Date.now() < deadline) {
@@ -255,7 +255,12 @@ export async function runCredentialBlastRadiusDrill({
       if (state.stdout.trim()) {
         try { parsed = parseStateCwd(state.stdout); } catch { parsed = null; }
         if (parsed?.pid) {
-          const environ = await host.exec(`cat /proc/${parsed.pid}/environ 2>/dev/null || true`);
+          // Phase B freezes the exact process whose environment carries the
+          // credential as soon as the variable is observed. This removes the
+          // race where a fast model finishes between capture and SIGKILL.
+          const environ = await host.exec(pause
+            ? `if grep -zq ${shellQuote(`${envName}=`)} /proc/${parsed.pid}/environ 2>/dev/null && kill -STOP ${parsed.pid} 2>/dev/null; then cat /proc/${parsed.pid}/environ; else true; fi`
+            : `cat /proc/${parsed.pid}/environ 2>/dev/null || true`);
           const value = parseEngineEnv(environ.stdout, envName);
           if (value && value.length >= 4) {
             const leak = await host.exec(`cat ${parsed.cwd}/${LEAK_RELATIVE_PATH} 2>/dev/null || true`);
@@ -389,7 +394,7 @@ export async function runCredentialBlastRadiusDrill({
   });
 
   await step('B: the credential is in the engine environment and the copy is on the disk', async () => {
-    const captured = await captureValue(runB);
+    const captured = await captureValue(runB, { pause: true });
     valueB = captured;
     steps.push(`note the copy in the workspace was written by ${captured.writtenBy}`);
     return `value=${fingerprint(captured.value)}`;

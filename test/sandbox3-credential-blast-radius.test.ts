@@ -260,6 +260,8 @@ describe('sandbox3 credential blast-radius drill', () => {
       expect(steps.filter((line) => line.startsWith('FAIL'))).toEqual([]);
       // Гибнет вся контрольная группа: «хост умер», а не «умер один процесс».
       expect(host.calls.some((command) => command.includes('cgroup.kill') && command.includes('kill -9'))).toBe(true);
+      // Значение ловится атомарно с паузой процесса, чтобы быстрый run не успел закончиться до SIGKILL.
+      expect(host.calls.some((command) => command.includes('grep -zq') && command.includes('kill -STOP 4242'))).toBe(true);
       // Исход рана — измерение: координатор вправе переотдать ран после смерти хоста.
       expect(steps.some((line) => line.includes('the outcome of the run whose host died'))).toBe(true);
       // Профиль мёртвого рана тоже читается назад: значение не уходит с хоста.
