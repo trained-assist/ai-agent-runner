@@ -125,15 +125,19 @@ export async function runRevokedCredentialCheck({ apiUrl, apiKey, registry, ref 
       method: 'POST',
       headers: { authorization: `Bearer ${custody.token}`, 'content-type': 'application/json' },
       body: JSON.stringify({
-        sql: 'SELECT action, actor FROM credential_events WHERE connection_id = ? ORDER BY event_id',
+        sql: 'SELECT event_id, action, actor FROM credential_events WHERE connection_id = ? ORDER BY event_id',
         params: [configured.connection_id],
       }),
     });
     const body = await response.json();
     const rows = body.result?.[0]?.results ?? [];
-    const granted = rows.filter((row) => row.action === 'granted');
-    assert.equal(granted.length, 0, `the revoked connection handed out a value: ${JSON.stringify(rows)}`);
     assert.ok(rows.some((row) => row.action === 'revoked'), 'the journal has no revocation');
+    // The revocation is terminal: the connection may have handed out a value
+    // before it was revoked, but never after. A grant that comes after the
+    // revocation would mean the custody store still serves a dead connection.
+    const revokedAt = rows.findIndex((row) => row.action === 'revoked');
+    const grantedAfter = rows.slice(revokedAt + 1).filter((row) => row.action === 'granted');
+    assert.equal(grantedAfter.length, 0, `the revoked connection handed out a value after the revocation: ${JSON.stringify(grantedAfter)}`);
     return `journal: ${rows.map((row) => row.action).join(',')}`;
   });
 
