@@ -19,7 +19,7 @@ export function createVmProfileWorkspaceWorker(
       : legacy.prepare(spec, cwd, token),
     // Значения секретов рана доходят только до API-публикации: там файл агента
     // редактируется по значению перед загрузкой. Git-публикация (ветка GHA) этой
-    // редакции пока не делает — см. issue #470.
+    // редакции пока не делает — см. issue #471.
     publish: (spec, cwd, token, secrets) => spec.profileWorkspace?.savebackUrl
       ? apiSaveback.publish(spec, cwd, token, secrets)
       : legacy.publish(spec, cwd, token),
