@@ -17,7 +17,7 @@ const REGISTRY = {
 function makeHost({ agentWroteTheFile = true, sweepAfterKill = true, engineHasNoCredential = false, sweepBlocked = false } = {}) {
   const calls: string[] = [];
   let killed = false;
-  const state = JSON.stringify({ pid: 4242, spec: { cwd: '/var/lib/ai-agent-runner/workspaces/run_x' } });
+  const state = JSON.stringify({ pid: 4242, state: 'running', spec: { cwd: '/var/lib/ai-agent-runner/workspaces/run_x' } });
   const cleanup = sweepAfterKill && !sweepBlocked
     ? { status: 'completed', reason: 'run workspace and its MCP socket are gone' }
     : { status: 'blocked', reason: 'the workspace could not be removed: EACCES: permission denied' };
@@ -79,9 +79,9 @@ function makeApi({ state = 'succeeded' } = {}, host?: { killed: boolean }) {
 }
 
 describe('sandbox3 credential blast-radius drill', () => {
-  it('reads the workspace and the engine pid out of the run state', () => {
-    const parsed = parseStateCwd(JSON.stringify({ pid: 7, spec: { cwd: '/var/lib/ai-agent-runner/workspaces/run_x' } }));
-    expect(parsed).toEqual({ cwd: '/var/lib/ai-agent-runner/workspaces/run_x', pid: 7 });
+  it('reads the workspace, the engine pid and the run state out of the run state', () => {
+    const parsed = parseStateCwd(JSON.stringify({ pid: 7, state: 'running', spec: { cwd: '/var/lib/ai-agent-runner/workspaces/run_x' } }));
+    expect(parsed).toEqual({ cwd: '/var/lib/ai-agent-runner/workspaces/run_x', pid: 7, runState: 'running' });
   });
 
   it('reads the credential out of the engine environment', () => {
