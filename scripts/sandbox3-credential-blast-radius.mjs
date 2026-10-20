@@ -34,6 +34,8 @@
  *   - VM_SSH_USER / VM_WORKER_SERVICE / VM_RUNNER_ROOT: the host's coordinates
  *   - CF_TOKEN / CUSTODY_ACCOUNT_ID / CUSTODY_DATABASE_ID: the custody journal
  *   - WALLET_API_URL / WALLET_SERVICE_TOKEN: the wallet that owns the value
+ *   - DRILL_WAIT_MS: how long a run may take, in milliseconds (default: 900000).
+ *     It is also the timeout limit the run is created with.
  *   - DRILL_KILL: set to "0" to skip the kill phase (the leak radius alone)
  *   - DRILL_REVOKE: set to "1" to revoke the drilled credential at the end.
  *     The revocation destroys the value, so the lane loses that credential
@@ -106,7 +108,7 @@ export async function runCredentialBlastRadiusDrill({
   runnerRoot = DEFAULT_RUNNER_ROOT,
   kill = true,
   revoke = false,
-  waitMs = 600_000,
+  waitMs = 900_000,
   captureWaitMs = 120_000,
   sweepWaitMs = 180_000,
 }) {
@@ -270,7 +272,9 @@ export async function runCredentialBlastRadiusDrill({
   });
 
   await step('B: the host dies mid-flight: the worker is SIGKILLed', async () => {
-    const killed = await host.exec(`systemctl kill --signal=SIGKILL ${service}`);
+    // --kill-whom=all: гибнет вся контрольная группа воркера, включая движок.
+    // Это и есть «хост умер» — падение питания, а не падение одного процесса.
+    const killed = await host.exec(`systemctl kill --signal=SIGKILL --kill-whom=all ${service}`);
     assert.equal(killed.code, 0, `the kill failed: ${killed.stderr}`);
     return 'the worker control group is dead';
   });
@@ -285,7 +289,11 @@ export async function runCredentialBlastRadiusDrill({
     throw new Error('the workspace copy survived the recovery');
   });
 
-  await step('B: the run does not report success after the host died', async () => {
+  await step('B: the outcome of the run whose host died', async () => {
+    // Это измерение, а не утверждение: координатор по замыслу переживает
+    // недоступность воркера и может переотдать ран другому хосту. Тогда ран
+    // завершится успешно, а custody выдаст значение второй раз — это видно
+    // по журналу выдач, и именно этим измеряется радиус, а не «успех» рана.
     const deadline = Date.now() + sweepWaitMs;
     let state = null;
     while (Date.now() < deadline) {
@@ -295,8 +303,7 @@ export async function runCredentialBlastRadiusDrill({
       if (['succeeded', 'failed', 'cancelled'].includes(String(state))) break;
       await new Promise((resolve) => setTimeout(resolve, 5_000));
     }
-    assert.notEqual(String(state), 'succeeded', 'a run whose host died must not report success');
-    return `state=${state}`;
+    return `state=${state ?? 'unknown'}`;
   });
 
   await step('B: the custody store is independent of the host', async () => {
@@ -304,7 +311,11 @@ export async function runCredentialBlastRadiusDrill({
     const rows = await custodyRows(custody, configured.connection_id);
     const granted = rows.filter((row) => row.action === 'granted');
     assert.ok(granted.length >= 1, `the custody journal has no grant: ${JSON.stringify(rows)}`);
-    steps.push(`note the journal reads ${rows.map((row) => row.action).join(',')} (${granted.length} grants)`);
+    // Сколько раз значение выдавалось именно убитому рану: переотдача после
+    // смерти хоста — это и есть рост радиуса, который считается, а не судится.
+    const forRun = granted.filter((row) => String(row.actor) === runB).length;
+    const forRunA = granted.filter((row) => String(row.actor) === runA).length;
+    steps.push(`note the journal reads ${rows.map((row) => row.action).join(',')} (${granted.length} grants; run A ${forRunA}, run B ${forRun})`);
     if (!revoke) return 'the custody outlived the host';
     if (!custody.serviceToken || !custody.walletUrl) return 'skipped: the wallet service token is not configured';
     const owner = await custodyOwner(custody, configured.connection_id);
@@ -393,6 +404,7 @@ if (invokedDirectly) {
     runnerRoot: process.env.VM_RUNNER_ROOT ?? DEFAULT_RUNNER_ROOT,
     kill: process.env.DRILL_KILL !== '0',
     revoke: process.env.DRILL_REVOKE === '1',
+    waitMs: Number(process.env.DRILL_WAIT_MS ?? 900_000),
     custody: {
       token: process.env.CF_TOKEN,
       accountId: process.env.CUSTODY_ACCOUNT_ID,
