@@ -14,7 +14,8 @@
  *   A — the leak radius. The agent is asked to persist the credential in the
  *       middle of the run. The run finishes normally, and the value must not
  *       have reached the run record, the events, the runner log, the run state,
- *       the session transcript or the published profile.
+ *       the session transcript or the published profile — and the copy must not
+ *       survive on the host's disk when the run ends.
  *
  *   B — the kill. The agent is asked to persist the credential again, and the
  *       worker control group is SIGKILLed mid-flight. The run's outcome is a
@@ -164,6 +165,23 @@ export async function runCredentialBlastRadiusDrill({
   }
 
   const statePath = (runId) => `${runnerRoot}/runner/runs/${runId}/state.json`;
+  const checkpointPath = (runId) => `${runnerRoot}/runner/runs/${runId}/checkpoint.json`;
+
+  /**
+   * The run's own record of the cleanup: the checkpoint says whether the
+   * workspace was removed, and why not when it was not. Probing the file only
+   * ever says "gone" — a blocked sweep looks exactly like a clean host.
+   */
+  async function cleanupStatus(runId) {
+    const checkpoint = await host.exec(`test -e ${checkpointPath(runId)} && cat ${checkpointPath(runId)} || true`);
+    if (!checkpoint.stdout.trim()) return { status: 'pending', reason: null };
+    try {
+      const parsed = JSON.parse(checkpoint.stdout);
+      return { status: String(parsed.cleanup?.status ?? 'unknown'), reason: parsed.cleanup?.reason ?? null };
+    } catch {
+      return { status: 'unreadable', reason: null };
+    }
+  }
 
   async function startRun(label) {
     const taskId = `blast-radius-${label}-${Date.now()}`;
@@ -213,7 +231,10 @@ export async function runCredentialBlastRadiusDrill({
             const leak = await host.exec(`cat ${parsed.cwd}/${LEAK_RELATIVE_PATH} 2>/dev/null || true`);
             if (leak.stdout === value) return { value, cwd: parsed.cwd, writtenBy: 'the agent' };
             if (!plant) return { value, cwd: parsed.cwd, writtenBy: null };
-            await host.exec(`mkdir -p ${parsed.cwd}/blast && printf '%s' ${shellQuote(value)} > ${parsed.cwd}/${LEAK_RELATIVE_PATH}`);
+            // Копия сажается от владельца рабочего каталога и с его правами:
+            // иначе уборка упрётся в права файла, и это будет сказано о правах,
+            // а не о значении. Так копия неотличима от того, что записал бы агент.
+            await host.exec(`mkdir -p ${parsed.cwd}/blast && printf '%s' ${shellQuote(value)} > ${parsed.cwd}/${LEAK_RELATIVE_PATH} && chown --reference=${parsed.cwd} ${parsed.cwd}/blast ${parsed.cwd}/${LEAK_RELATIVE_PATH} && chmod 600 ${parsed.cwd}/${LEAK_RELATIVE_PATH}`);
             return { value, cwd: parsed.cwd, writtenBy: 'the drill' };
           }
         }
@@ -265,6 +286,20 @@ export async function runCredentialBlastRadiusDrill({
     return 'value-free';
   });
 
+  await step('A: the copy does not survive the run on the host', async () => {
+    if (!valueA) return 'skipped: the value was not captured';
+    // Рабочий каталог — тоже место, где значение может остаться. Штатный выход
+    // рана обязан его подмести: иначе значение продолжает лежать на хосте.
+    const deadline = Date.now() + sweepWaitMs;
+    while (Date.now() < deadline) {
+      const cleanup = await cleanupStatus(runA);
+      if (cleanup.status === 'completed') return 'the workspace was swept';
+      if (cleanup.status === 'blocked') throw new Error(`the cleanup was blocked: ${cleanup.reason}`);
+      await new Promise((resolve) => setTimeout(resolve, 2_000));
+    }
+    throw new Error('the workspace copy survived the run');
+  });
+
   await step('A: the published profile carries the file without the value', async () => {
     if (!valueA) return 'skipped: the value was not captured';
     const response = await runner(`/v1/runs/${runA}/result`);
@@ -304,8 +339,17 @@ export async function runCredentialBlastRadiusDrill({
   });
 
   await step('B: the host dies mid-flight: the worker is SIGKILLed', async () => {
+    if (!valueB?.cwd) return 'skipped: the value was not captured';
     // --kill-whom=all: гибнет вся контрольная группа воркера, включая движок.
     // Это и есть «хост умер» — падение питания, а не падение одного процесса.
+    //
+    // Убийство должно попасть по активному рану, а не по тому, что уже
+    // закончился: иначе drill измеряет штатный выход, а не смерть хоста.
+    // Проверяется до самого удара: если движок вышел за секунду до него,
+    // утверждение падает, а не молча проходит.
+    const before = await runner(`/v1/runs/${runB}/status`);
+    assert.notEqual(before.body?.state, 'succeeded', 'the run finished before the host died');
+    assert.notEqual(before.body?.state, 'failed', 'the run failed before the host died');
     const killed = await host.exec(killWorkerCgroup(service));
     assert.equal(killed.code, 0, `the kill failed: ${killed.stderr}`);
     assert.ok(!killed.stdout.includes('no main process'), killed.stdout);
@@ -316,6 +360,9 @@ export async function runCredentialBlastRadiusDrill({
     if (!valueB?.cwd) return 'skipped: the value was not captured';
     const deadline = Date.now() + sweepWaitMs;
     while (Date.now() < deadline) {
+      const cleanup = await cleanupStatus(runB);
+      if (cleanup.status === 'completed') return 'the workspace copy is gone';
+      if (cleanup.status === 'blocked') throw new Error(`the recovery blocked the sweep: ${cleanup.reason}`);
       const probe = await host.exec(`test -e ${valueB.cwd}/${LEAK_RELATIVE_PATH} && echo present || echo gone`);
       if (probe.stdout.trim() === 'gone') return 'the workspace copy is gone';
       await new Promise((resolve) => setTimeout(resolve, 2_000));

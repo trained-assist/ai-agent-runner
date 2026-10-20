@@ -14,17 +14,31 @@ const REGISTRY = {
   github: { connection_id: 'conn-drill', env: 'GITHUB_TOKEN', field: 'token', scope: 'repo' },
 };
 
-function makeHost({ agentWroteTheFile = true, sweepAfterKill = true, engineHasNoCredential = false } = {}) {
+function makeHost({ agentWroteTheFile = true, sweepAfterKill = true, engineHasNoCredential = false, sweepBlocked = false } = {}) {
   const calls: string[] = [];
   let killed = false;
   const state = JSON.stringify({ pid: 4242, spec: { cwd: '/var/lib/ai-agent-runner/workspaces/run_x' } });
+  const cleanup = sweepAfterKill && !sweepBlocked
+    ? { status: 'completed', reason: 'run workspace and its MCP socket are gone' }
+    : { status: 'blocked', reason: 'the workspace could not be removed: EACCES: permission denied' };
+  const checkpoint = JSON.stringify({ cleanup });
   return {
     calls,
+    get killed() { return killed; },
     async exec(command: string) {
       calls.push(command);
+      if (command.startsWith('cat /var/lib/ai-agent-runner/runner/runs/') && command.endsWith('events.jsonl')) {
+        return { stdout: 'token=[redacted]\n', stderr: '', code: 0 };
+      }
       if (command.startsWith('cat /var/lib/ai-agent-runner/runner/runs/')) return { stdout: state, stderr: '', code: 0 };
       if (command.includes('/proc/4242/environ')) {
         return { stdout: engineHasNoCredential ? 'PATH=/usr/bin\0' : `PATH=/usr/bin\0GITHUB_TOKEN=${SECRET}\0`, stderr: '', code: 0 };
+      }
+      if (command.includes('checkpoint.json')) {
+        // Чекпойнт рана: уборка помечена выполненной, если рабочий каталог
+        // убран. Блокированная уборка — это отдельная причина, а не «файл остался».
+        if (sweepBlocked || (!sweepAfterKill && killed)) return { stdout: checkpoint, stderr: '', code: 0 };
+        return { stdout: JSON.stringify({ cleanup: { status: 'completed', reason: 'run workspace and its MCP socket are gone' } }), stderr: '', code: 0 };
       }
       if (command.startsWith(`cat /var/lib/ai-agent-runner/workspaces/run_x/${LEAK_RELATIVE_PATH}`)) {
         return { stdout: agentWroteTheFile ? SECRET : '', stderr: '', code: 0 };
@@ -35,18 +49,18 @@ function makeHost({ agentWroteTheFile = true, sweepAfterKill = true, engineHasNo
         return { stdout: present ? 'present' : 'gone', stderr: '', code: 0 };
       }
       if (command.startsWith('mkdir -p')) return { stdout: '', stderr: '', code: 0 };
-      if (command.startsWith('cat /var/lib/ai-agent-runner/runner/runs/') && command.endsWith('events.jsonl')) {
-        return { stdout: `token=[redacted]\n`, stderr: '', code: 0 };
-      }
       return { stdout: '', stderr: '', code: 0 };
     },
   };
 }
 
-function makeApi({ state = 'succeeded' } = {}) {
+function makeApi({ state = 'succeeded' } = {}, host?: { killed: boolean }) {
   const requests: Array<{ url: string; method: string }> = [];
   const manifest = { profileChanges: { files: [{ path: LEAK_RELATIVE_PATH, sha256: 'a'.repeat(64), size: 10 }], deletes: [] } };
   const reply = (status: number, body: unknown) => ({ status, text: async () => JSON.stringify(body) });
+  // Пока хост жив, ран, который будет убит, идёт; после убийства — терминальный.
+  // Так проверка «убийство попало по активному рану» не проходит вхолостую.
+  let phaseASeen = false;
   return {
     requests,
     async fetch(url: string, init?: { method?: string }) {
@@ -54,7 +68,11 @@ function makeApi({ state = 'succeeded' } = {}) {
       const text = String(url);
       if (text.endsWith('/v1/runs') && (init?.method ?? 'GET') === 'POST') return reply(202, { runId: 'run_x' });
       if (text.includes('/result')) return reply(200, manifest);
-      if (text.endsWith('/status')) return reply(200, { state, answer: 'saved' });
+      if (text.endsWith('/status')) {
+        if (!host) return reply(200, { state, answer: 'saved' });
+        if (!phaseASeen) { phaseASeen = true; return reply(200, { state: 'succeeded', answer: 'saved' }); }
+        return reply(200, { state: host.killed ? 'succeeded' : 'running', answer: 'saved' });
+      }
       return reply(200, { events: [] });
     },
   };
@@ -92,7 +110,7 @@ describe('sandbox3 credential blast-radius drill', () => {
 
   it('measures the radius without ever printing the value', async () => {
     const host = makeHost();
-    const api = makeApi();
+    const api = makeApi({}, host);
     const originalFetch = globalThis.fetch;
     globalThis.fetch = api.fetch as unknown as typeof fetch;
     try {
@@ -120,7 +138,7 @@ describe('sandbox3 credential blast-radius drill', () => {
 
   it('plants the copy itself when the agent did not write it', async () => {
     const host = makeHost({ agentWroteTheFile: false });
-    const api = makeApi();
+    const api = makeApi({}, host);
     const originalFetch = globalThis.fetch;
     globalThis.fetch = api.fetch as unknown as typeof fetch;
     try {
@@ -137,6 +155,9 @@ describe('sandbox3 credential blast-radius drill', () => {
       expect(report).not.toContain(SECRET);
       expect(report).toContain('written by the drill');
       expect(host.calls.some((command) => command.startsWith('mkdir -p') && command.includes(SECRET))).toBe(true);
+      // Копия принадлежит владельцу рабочего каталога: иначе уборка упирается
+      // в права файла, и это говорит о правах, а не о значении.
+      expect(host.calls.some((command) => command.includes('chown --reference='))).toBe(true);
     } finally {
       globalThis.fetch = originalFetch;
     }
@@ -144,7 +165,7 @@ describe('sandbox3 credential blast-radius drill', () => {
 
   it('kills the whole worker control group, and reports the run outcome instead of judging it', async () => {
     const host = makeHost();
-    const api = makeApi();
+    const api = makeApi({}, host);
     const originalFetch = globalThis.fetch;
     globalThis.fetch = api.fetch as unknown as typeof fetch;
     try {
@@ -170,7 +191,7 @@ describe('sandbox3 credential blast-radius drill', () => {
 
   it('reports the value-dependent checks as skipped when the value was never captured', async () => {
     const host = makeHost({ engineHasNoCredential: true });
-    const api = makeApi();
+    const api = makeApi({}, host);
     const originalFetch = globalThis.fetch;
     globalThis.fetch = api.fetch as unknown as typeof fetch;
     try {
@@ -195,9 +216,62 @@ describe('sandbox3 credential blast-radius drill', () => {
     }
   });
 
+  it('reports a blocked sweep with the reason the recovery recorded', async () => {
+    const host = makeHost({ sweepBlocked: true });
+    const api = makeApi({}, host);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = api.fetch as unknown as typeof fetch;
+    try {
+      const steps = await runCredentialBlastRadiusDrill({
+        apiUrl: 'https://runner.example',
+        apiKey: 'key',
+        registry: REGISTRY,
+        host,
+        kill: true,
+        waitMs: 1_000,
+        captureWaitMs: 2_000,
+        sweepWaitMs: 2_000,
+      });
+      // Заблокированная уборка — это не «файл остался», а конкретная причина
+      // из чекпойнта рана: без неё оператор не знает, что чинить.
+      const failed = steps.filter((line) => line.startsWith('FAIL'));
+      expect(failed.length).toBeGreaterThan(0);
+      expect(failed.some((line) => line.includes('the recovery blocked the sweep'))).toBe(true);
+      expect(steps.join('\n')).not.toContain(SECRET);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('fails the drill when the kill would land on a run that already finished', async () => {
+    const host = makeHost();
+    // API без живой фазы: ран всегда терминален — убийство попало бы в пустоту.
+    const api = makeApi({ state: 'succeeded' });
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = api.fetch as unknown as typeof fetch;
+    try {
+      const steps = await runCredentialBlastRadiusDrill({
+        apiUrl: 'https://runner.example',
+        apiKey: 'key',
+        registry: REGISTRY,
+        host,
+        kill: true,
+        waitMs: 1_000,
+        captureWaitMs: 2_000,
+        sweepWaitMs: 2_000,
+      });
+      // Удар по завершившемуся рану измеряет штатный выход, а не смерть хоста.
+      const failed = steps.filter((line) => line.startsWith('FAIL'));
+      expect(failed.some((line) => line.includes('the run finished before the host died'))).toBe(true);
+      expect(steps.join('\n')).not.toContain(SECRET);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   it('fails the drill when a copy survives the recovery', async () => {
     const host = makeHost({ sweepAfterKill: false });
-    const api = makeApi();
+    const api = makeApi({}, host);
     const originalFetch = globalThis.fetch;
     globalThis.fetch = api.fetch as unknown as typeof fetch;
     try {
