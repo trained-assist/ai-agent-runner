@@ -310,6 +310,29 @@ run record, the event journal and the answers. A run that needs the value to sta
 out of the agent process as well needs the broker mode, where the credential
 performs the provider call itself.
 
+### Where the value is kept out
+
+The value is redacted **by value** from every path that persists it, not just
+from the places that carry it by design:
+
+| Path | What happens |
+| --- | --- |
+| Run record, status, event journal | the value is never written: it exists in the launch payload that goes to the worker and nowhere else |
+| Runner log, assistant messages, questions | redacted by value before the event is emitted |
+| Session transcript (`.session-traces/<id>.json`) | written already redacted; both the raw and the JSON-escaped form of the value are replaced, and the file stays valid JSON |
+| Published profile (the API saveback) | the bytes are redacted before the upload; the "the file changed while saving" check still compares the on-disk bytes, so the TOCTOU guarantee is unchanged |
+
+The values that reach the publication path are the run's own secret values, and
+they are erased right after the publication. The git publication path (the
+GitHub Actions lane) does not redact yet —
+[#471](https://github.com/trained-assist/ai-agent-runner/issues/471).
+
+These claims are measured, not asserted: the
+[credential blast-radius drill](CREDENTIAL-BLAST-RADIUS-DRILL.md) binds a
+credential, persists the value in the middle of a run, kills the host mid-flight
+and measures where the value ended up. Read that document before quoting any of
+the above — it also lists what the measurement does not cover.
+
 Local E2E (2026-10-19) ran the real chain under `wrangler dev`: Runner API Worker
 → ZeroCreds Node server → D1 metadata Worker on local D1 → OpenBao KV v2. The
 Runner API created a form, the user opened the form page, submitted a synthetic
