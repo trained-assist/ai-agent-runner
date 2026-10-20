@@ -78,7 +78,11 @@ export function parseStateCwd(stateText) {
   const state = JSON.parse(stateText);
   const cwd = state?.spec?.cwd;
   if (typeof cwd !== 'string' || !cwd.startsWith('/')) throw new Error('the run state has no workspace path');
-  return { cwd, pid: Number.isInteger(state?.pid) ? state.pid : null };
+  return {
+    cwd,
+    pid: Number.isInteger(state?.pid) ? state.pid : null,
+    runState: typeof state?.state === 'string' ? state.state : null,
+  };
 }
 
 /**
@@ -231,6 +235,13 @@ export async function runCredentialBlastRadiusDrill({
             const leak = await host.exec(`cat ${parsed.cwd}/${LEAK_RELATIVE_PATH} 2>/dev/null || true`);
             if (leak.stdout === value) return { value, cwd: parsed.cwd, writtenBy: 'the agent' };
             if (!plant) return { value, cwd: parsed.cwd, writtenBy: null };
+            // Копия сажается, только пока ран жив: уборка рана происходит на его
+            // выходе, и копия, посаженная после неё, осталась бы на диске навсегда
+            // (восстановление её уже не увидит). Живость ран читается у самого
+            // хоста: его state.json — это тот же источник, по которому идёт уборка.
+            if (parsed.runState && ['succeeded', 'failed', 'cancelled'].includes(parsed.runState)) {
+              throw new Error(`the run ended before the drill could plant the copy (host state=${parsed.runState})`);
+            }
             // Копия сажается от владельца рабочего каталога и с его правами:
             // иначе уборка упрётся в права файла, и это будет сказано о правах,
             // а не о значении. Так копия неотличима от того, что записал бы агент.

@@ -24,7 +24,7 @@ export interface BlastRadiusCustody {
 
 export function fingerprint(value: string): string;
 
-export function parseStateCwd(stateText: string): { cwd: string; pid: number | null };
+export function parseStateCwd(stateText: string): { cwd: string; pid: number | null; runState: string | null };
 
 export function parseEngineEnv(envText: string, name: string): string | null;
 
