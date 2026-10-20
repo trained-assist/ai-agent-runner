@@ -67,18 +67,26 @@ reports the Runner source commit and the OpenCode version, source commit, and bi
 `ai-agent-vm-worker.service` owns the long-running worker.
 `install-vm-worker.sh` is only a one-time bootstrap for the service account, unit,
 configuration templates, and updater. Each worker release pins a specific OpenCode
-preview tag and its source/archive/binary hashes. Before packaging, CI compares that pin
+preview tag and its source/archive/binary hashes in
+`deploy/vm-worker/opencode-release-pin.json`. Before packaging, CI compares that pin
 with the newest published `mem-preview` tag and fails if the pin is stale. A new OpenCode
 preview therefore requires an explicit pin change and worker release; builds never float
-to an unreviewed binary. The France auto-deploy is release-triggered in GitHub Actions;
-there is no workstation scheduler or VM self-update timer.
+to an unreviewed binary. The pin lives in a data file rather than in the release
+workflow on purpose: a GitHub Actions token cannot change files under
+`.github/workflows`, so a pin kept there could only be moved by a human, and the
+promotion hook could never deliver a new build on its own. The France auto-deploy is
+release-triggered in GitHub Actions; there is no workstation scheduler or VM
+self-update timer.
 The deployment job first refreshes the host updater from the tagged release itself.
 The updater installs itself only after a successful installation, so an updater that
 predates a release can refuse a bundle the newer updater would accept — for example
 when the OpenCode CLI prints its version with a prefix — and the release would then
 never reach production. Refreshing it first removes that deadlock: the updater that
 runs is always the one built and signed with the release, and its own checks still
-verify the attestation, the digests, and the bundle metadata.
+verify the attestation, the digests, and the bundle metadata. The updater travels
+through the same restricted deployment channel: the deploy key may only run
+`update vm-worker-vX.Y.Z`, `install-updater`, or `configure-production-ingress`, and
+`install-updater` takes the script on stdin after the release-read token.
 France bootstrap also installs the host shared libraries required by headless
 Playwright Chromium. It does not install a browser or restart the worker service;
 the agent may install a pinned Playwright package and browser inside its run workspace.

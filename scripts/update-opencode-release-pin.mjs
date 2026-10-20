@@ -1,14 +1,19 @@
 import { readFile, writeFile } from 'node:fs/promises';
 
 /**
- * Обновление пина сборки форка в `vm-worker-release.yml`.
+ * Обновление пина сборки форка.
  *
- * Пин — это пять значений в блоке `env` шага «Download and verify pinned
- * OpenCode fork». Их нельзя расставлять по одному: несовпадение версии и
- * бинарного sha256 означает, что подписанный релиз воркера соберётся с чужим
- * бинарём, а проверка в самом workflow это заметит только на CI. Поэтому
- * переписываем блок целиком и отказываем, если хоть одно значение не найдено
- * ровно один раз.
+ * Пин — это пять значений, которые задают, какую именно сборку форка OpenCode
+ * получит подписанный релиз воркера. Их нельзя расставлять по одному:
+ * несовпадение версии и бинарного sha256 означает, что подписанный релиз
+ * воркера соберётся с чужим бинарём, а проверка в самом CI это заметит
+ * только на сборке. Поэтому переписываем набор целиком и отказываем, если
+ * хоть одно значение отсутствует или не проходит проверку формы.
+ *
+ * Пин лежит в файле данных, а не в конфигурации workflow: токен GitHub
+ * Actions не может изменить файл под `.github/workflows`, поэтому пин в
+ * самом workflow обновлял только человек, и хук промоушена доставлял новую
+ * сборку вручную. Файл данных CI обновляет сам.
  */
 
 export const PIN_FIELDS = [
@@ -22,42 +27,50 @@ export const PIN_FIELDS = [
 const SOURCE_COMMIT = /^[0-9a-f]{40}$/;
 const SHA256 = /^[0-9a-f]{64}$/;
 const RELEASE_TAG = /^mem-preview-\d{8}-[A-Za-z0-9.-]+$/;
+const VERSION = /^[0-9A-Za-z][0-9A-Za-z.+-]*$/;
 
-/** Значения пина из текста workflow. Отсутствующее или продублированное поле — ошибка. */
-export function readOpenCodePin(workflowText) {
+/** Проверяет форму всех пяти значений пина. */
+export function assertOpenCodePin(pin) {
+  if (!RELEASE_TAG.test(pin?.OPENCODE_RELEASE_TAG ?? '')) throw new Error(`Invalid fork release tag: ${pin?.OPENCODE_RELEASE_TAG}`);
+  if (typeof pin?.OPENCODE_VERSION !== 'string' || !VERSION.test(pin.OPENCODE_VERSION)) {
+    throw new Error(`OpenCode version must be a plain version string: ${pin?.OPENCODE_VERSION}`);
+  }
+  if (!SOURCE_COMMIT.test(pin?.OPENCODE_SOURCE_SHA ?? '')) throw new Error('OpenCode source SHA must be a full 40-character Git SHA');
+  if (!SHA256.test(pin?.OPENCODE_ARCHIVE_SHA256 ?? '')) throw new Error('OpenCode archive SHA-256 must be 64 lowercase hex characters');
+  if (!SHA256.test(pin?.OPENCODE_BINARY_SHA256 ?? '')) throw new Error('OpenCode binary SHA-256 must be 64 lowercase hex characters');
+  return pin;
+}
+
+/** Значения пина из файла данных. Отсутствующее поле — ошибка. */
+export function readOpenCodePin(pinText) {
+  let parsed;
+  try {
+    parsed = JSON.parse(pinText);
+  } catch (error) {
+    throw new Error(`OpenCode pin file is not valid JSON: ${error.message}`);
+  }
   const pin = {};
   for (const field of PIN_FIELDS) {
-    const matches = [...workflowText.matchAll(new RegExp(`^\\s*${field}:\\s*(\\S+)\\s*$`, 'gm'))];
-    if (matches.length !== 1) {
-      throw new Error(`Expected exactly one ${field} line in the worker release workflow, found ${matches.length}`);
+    if (typeof parsed?.[field] !== 'string' || parsed[field].length === 0) {
+      throw new Error(`OpenCode pin file is missing ${field}`);
     }
-    pin[field] = matches[0][1];
+    pin[field] = parsed[field];
   }
-  return pin;
+  return assertOpenCodePin(pin);
 }
 
-export function assertOpenCodePin(pin) {
-  if (!RELEASE_TAG.test(pin.OPENCODE_RELEASE_TAG ?? '')) throw new Error(`Invalid fork release tag: ${pin.OPENCODE_RELEASE_TAG}`);
-  if (typeof pin.OPENCODE_VERSION !== 'string' || pin.OPENCODE_VERSION.length === 0) throw new Error('OpenCode version is required');
-  if (!SOURCE_COMMIT.test(pin.OPENCODE_SOURCE_SHA ?? '')) throw new Error('OpenCode source SHA must be a full 40-character Git SHA');
-  if (!SHA256.test(pin.OPENCODE_ARCHIVE_SHA256 ?? '')) throw new Error('OpenCode archive SHA-256 must be 64 lowercase hex characters');
-  if (!SHA256.test(pin.OPENCODE_BINARY_SHA256 ?? '')) throw new Error('OpenCode binary SHA-256 must be 64 lowercase hex characters');
-  return pin;
-}
-
-/** Переписывает блок пина целиком; возвращает новый текст workflow. */
-export function writeOpenCodePin(workflowText, pin) {
+/** Переписывает набор пина целиком; возвращает новое содержимое файла. */
+export function writeOpenCodePin(pinText, pin) {
   assertOpenCodePin(pin);
-  let updated = workflowText;
-  for (const field of PIN_FIELDS) {
-    const pattern = new RegExp(`^(\\s*)${field}:\\s*\\S+\\s*$`, 'gm');
-    const matches = [...updated.matchAll(pattern)];
-    if (matches.length !== 1) {
-      throw new Error(`Expected exactly one ${field} line to rewrite, found ${matches.length}`);
-    }
-    updated = updated.replace(pattern, `$1${field}: ${pin[field]}`);
+  let parsed;
+  try {
+    parsed = JSON.parse(pinText);
+  } catch (error) {
+    throw new Error(`OpenCode pin file is not valid JSON: ${error.message}`);
   }
-  return updated;
+  const updated = { ...parsed };
+  for (const field of PIN_FIELDS) updated[field] = pin[field];
+  return `${JSON.stringify(updated, null, 2)}\n`;
 }
 
 /** Собирает пин из решения гейта (`promotion-decision.json`). */
@@ -77,21 +90,23 @@ export function pinFromDecision(decision) {
 
 const invokedDirectly = process.argv[1]?.endsWith('update-opencode-release-pin.mjs');
 if (invokedDirectly) {
-  const [decisionPath, workflowPath, outputPath] = process.argv.slice(2);
-  if (!decisionPath || !workflowPath) {
-    throw new Error('Usage: update-opencode-release-pin.mjs <promotion-decision.json> <vm-worker-release.yml> [<output.yml>]');
+  const [decisionPath, pinPath, outputPath] = process.argv.slice(2);
+  if (!decisionPath || !pinPath) {
+    throw new Error('Usage: update-opencode-release-pin.mjs <promotion-decision.json> <opencode-release-pin.json> [<output.json>]');
   }
   const decision = JSON.parse(await readFile(decisionPath, 'utf8'));
   const pin = pinFromDecision(decision);
-  const current = readOpenCodePin(await readFile(workflowPath, 'utf8'));
+  const currentText = await readFile(pinPath, 'utf8');
+  const current = readOpenCodePin(currentText);
   const unchanged = PIN_FIELDS.every((field) => current[field] === pin[field]);
   if (unchanged) {
     process.stdout.write(`OpenCode pin is already ${pin.OPENCODE_RELEASE_TAG}; nothing to update\n`);
     process.exit(0);
   }
-  const updated = writeOpenCodePin(await readFile(workflowPath, 'utf8'), pin);
+  const updated = writeOpenCodePin(currentText, pin);
   // Без выходного пути пин переписывается на месте: иначе скрипт только
-  // печатал новый YAML, пин в файле не менялся, а хук рапортовал об успехе.
-  await writeFile(outputPath ?? workflowPath, updated);
-  process.stdout.write(`Pinned OpenCode fork ${pin.OPENCODE_RELEASE_TAG} (${pin.OPENCODE_SOURCE_SHA}) in ${outputPath ?? workflowPath}\n`);
+  // печатал новый файл, пин в репозитории не менялся, а хук рапортовал об
+  // успешном промоушене.
+  await writeFile(outputPath ?? pinPath, updated);
+  process.stdout.write(`Pinned OpenCode fork ${pin.OPENCODE_RELEASE_TAG} (${pin.OPENCODE_SOURCE_SHA}) in ${outputPath ?? pinPath}\n`);
 }

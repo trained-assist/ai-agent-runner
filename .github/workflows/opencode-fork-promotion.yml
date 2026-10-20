@@ -54,14 +54,14 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-      - name: Resolve the pinned OpenCode build from the worker release workflow
+      - name: Resolve the pinned OpenCode build from the worker release pin
         id: active
         run: |
           set -euo pipefail
           node --input-type=module -e '
             import { readFileSync, appendFileSync } from "node:fs";
             import { readOpenCodePin } from "./scripts/update-opencode-release-pin.mjs";
-            const pin = readOpenCodePin(readFileSync(".github/workflows/vm-worker-release.yml", "utf8"));
+            const pin = readOpenCodePin(readFileSync("deploy/vm-worker/opencode-release-pin.json", "utf8"));
             appendFileSync(process.env.GITHUB_OUTPUT, `source_commit=${pin.OPENCODE_SOURCE_SHA}\ntag=${pin.OPENCODE_RELEASE_TAG}\n`);
           '
       - name: Fetch published fork releases
@@ -155,10 +155,10 @@ jobs:
           set -euo pipefail
           node scripts/update-opencode-release-pin.mjs \
             "$RUNNER_TEMP/promotion/promotion-decision.json" \
-            .github/workflows/vm-worker-release.yml
-          if git diff --quiet -- .github/workflows/vm-worker-release.yml; then
+            deploy/vm-worker/opencode-release-pin.json
+          if git diff --quiet -- deploy/vm-worker/opencode-release-pin.json; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "The worker release workflow already pins ${{ needs.detect.outputs.tag }}." >> "$GITHUB_STEP_SUMMARY"
+            echo "The worker release pin already points at ${{ needs.detect.outputs.tag }}." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
           echo "changed=true" >> "$GITHUB_OUTPUT"
@@ -174,7 +174,7 @@ jobs:
           git config user.name "opencode-promotion"
           git config user.email "opencode-promotion@users.noreply.github.com"
           git checkout -b "$branch"
-          git add .github/workflows/vm-worker-release.yml
+          git add deploy/vm-worker/opencode-release-pin.json
           git commit -m "chore(vm-worker): pin verified OpenCode fork $TAG"
           git push --force-with-lease origin "$branch"
           body="$(printf 'The promotion gate passed for `%s` (`%s`).\n\nThis pins the verified fork build so the next signed `vm-worker-v*` release bundles it, and the France deploy job installs that release.\n\nEvidence: the `promotion-decision` artifact of run %s.\n' "$TAG" "$SOURCE" "$GITHUB_RUN_ID")"

@@ -34,13 +34,13 @@ jobs:
       - name: Download and verify pinned OpenCode fork
         env:
           GH_TOKEN: ${{ github.token }}
-          OPENCODE_RELEASE_TAG: mem-preview-20261020-ladder-cache-7a12f66b4abc
-          OPENCODE_VERSION: 0.0.0-ladder-cache-202610200457
-          OPENCODE_SOURCE_SHA: 7a12f66b4abc741d380af2125ef9fe4e72d43f53
-          OPENCODE_ARCHIVE_SHA256: abc10c46c488795a69621f87f5b9fcb30277874ea5398d19375099581f0f4d88
-          OPENCODE_BINARY_SHA256: 9bc3f8c84236e2e9225df8ab0b0514799b9b4712af5d6149d680011847c2edb1
         run: |
           set -euo pipefail
+          # Пин форка лежит в файле данных, а не в конфигурации workflow:
+          # токен GitHub Actions не может изменить файл под
+          # .github/workflows, поэтому пин в самом workflow обновлял только
+          # человек, и хук промоушена доставлял новую сборку вручную.
+          eval "$(node scripts/read-opencode-release-pin.mjs deploy/vm-worker/opencode-release-pin.json)"
           gh api --paginate --slurp 'repos/gpt-mem/opencode-mem/releases?per_page=100' > "$RUNNER_TEMP/opencode-releases.json"
           node scripts/assert-opencode-release-freshness.mjs "$RUNNER_TEMP/opencode-releases.json" \
             "$OPENCODE_RELEASE_TAG" "$OPENCODE_SOURCE_SHA" "$OPENCODE_ARCHIVE_SHA256"
@@ -112,35 +112,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Refresh the host updater from this tagged release
-        env:
-          SSH_HOST: ${{ secrets.VM2_SSH_HOST }}
-          SSH_USER: ${{ secrets.VM2_SSH_USER }}
-          SSH_KEY: ${{ secrets.VM2_SSH_PRIVATE_KEY }}
-          SSH_KNOWN_HOSTS: ${{ secrets.VM2_KNOWN_HOSTS }}
         run: |
           set -euo pipefail
           # Апдейтер на хосте ставит себя сам — но только ПОСЛЕ успешной
           # установки. Старый апдейтер вправе отвергнуть бандл, который новый
           # поставил бы (например, из-за формата версии), и тогда релиз не
-          # доедет до прода никогда. Поэтому перед вызовом кладём на хост
-          # апдейтер из этого же тега: он собран и подписан вместе с релизом,
-          # а собственные проверки апдейтера всё равно сверяют подпись,
-          # дайджесты и метаданные бандла.
+          # доедет до прода никогда. Поэтому перед вызовом доставляем апдейтер
+          # из этого же тега по каналу деплоя: скрипт идёт в stdin после
+          # строки с токеном, а собственные проверки апдейтера всё равно
+          # сверяют подпись, дайджесты и метаданные бандла.
           install -m 0700 -d "$RUNNER_TEMP/ssh"
-          install -m 0600 /dev/null "$RUNNER_TEMP/ssh/id_vm_worker"
-          printf '%s\n' "$SSH_KEY" > "$RUNNER_TEMP/ssh/id_vm_worker"
-          printf '%s\n' "$SSH_KNOWN_HOSTS" > "$RUNNER_TEMP/ssh/known_hosts"
-          ssh_options=(-i "$RUNNER_TEMP/ssh/id_vm_worker" -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o BatchMode=yes -o UserKnownHostsFile="$RUNNER_TEMP/ssh/known_hosts" -o ConnectTimeout=15)
-          scp "${ssh_options[@]}" scripts/deploy-vm-worker-release.sh "$SSH_USER@$SSH_HOST:/tmp/ai-agent-vm-worker-update"
-          ssh "${ssh_options[@]}" "$SSH_USER@$SSH_HOST" 'set -euo pipefail
-            systemctl cat ai-agent-vm-worker >/dev/null
-            if [ "$(id -u)" -ne 0 ]; then
-              sudo -n install -o root -g root -m 0755 /tmp/ai-agent-vm-worker-update /usr/local/sbin/ai-agent-vm-worker-update
-            else
-              install -o root -g root -m 0755 /tmp/ai-agent-vm-worker-update /usr/local/sbin/ai-agent-vm-worker-update
-            fi
-            rm -f /tmp/ai-agent-vm-worker-update
-            sha256sum /usr/local/sbin/ai-agent-vm-worker-update'
+          install -m 0600 /dev/null "$RUNNER_TEMP/ssh/id_ed25519"
+          printf '%s\n' "$VM_DEPLOY_KEY" > "$RUNNER_TEMP/ssh/id_ed25519"
+          install -m 0600 deploy/vm-worker/france-deploy-known-hosts "$RUNNER_TEMP/ssh/known_hosts"
+          {
+            printf '%s\n' "$GH_TOKEN"
+            cat scripts/deploy-vm-worker-release.sh
+          } | ssh -i "$RUNNER_TEMP/ssh/id_ed25519" \
+            -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$RUNNER_TEMP/ssh/known_hosts" \
+            -o ConnectTimeout=15 root@169.58.15.230 "install-updater"
       - name: Validate target release and deployment credential
         run: |
           set -euo pipefail

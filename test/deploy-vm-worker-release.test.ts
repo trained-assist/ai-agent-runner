@@ -26,17 +26,23 @@ describe('VM worker release updater safety contract', () => {
   it('refreshes the host updater from the tagged release before it deploys', async () => {
     const workflow = await readFile(releaseWorkflowPath, 'utf8');
     const updater = await readFile(updaterPath, 'utf8');
+    const wrapper = await readFile(ghaUpdatePath, 'utf8');
     // Апдейтер на хосте обновляет себя только после успешной установки, поэтому
     // старый апдейтер может заблокировать релиз навсегда. Деплой обязан сначала
-    // положить на хост апдейтер из того же тега.
+    // доставить апдейтер из того же тега по каналу деплоя.
     expect(workflow).toContain('Refresh the host updater from this tagged release');
-    expect(workflow).toContain('scripts/deploy-vm-worker-release.sh "$SSH_USER@$SSH_HOST:/tmp/ai-agent-vm-worker-update"');
-    expect(workflow).toContain('install -o root -g root -m 0755 /tmp/ai-agent-vm-worker-update /usr/local/sbin/ai-agent-vm-worker-update');
+    expect(workflow).toContain('cat scripts/deploy-vm-worker-release.sh');
+    expect(workflow).toContain('"install-updater"');
     const refreshAt = workflow.indexOf('Refresh the host updater from this tagged release');
     const deployAt = workflow.indexOf('"update $RELEASE_TAG"');
     expect(refreshAt).toBeGreaterThan(-1);
     expect(deployAt).toBeGreaterThan(refreshAt);
     expect(updater).toContain('If the host updater predates this release, refresh it from the tagged release first');
+    // Канал деплоя принимает обновление апдейтера: скрипт приходит в stdin
+    // после строки с токеном и ставится тем же путём, что и сам воркер.
+    expect(wrapper).toContain("'install-updater'");
+    expect(wrapper).toContain('install -o root -g root -m 0755 "$incoming" "$updater"');
+    expect(wrapper).toContain('bash -n "$incoming"');
   });
 
   it('deploys the signed release to the France sandbox only', async () => {

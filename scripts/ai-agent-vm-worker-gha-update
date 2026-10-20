@@ -6,8 +6,45 @@ command="${SSH_ORIGINAL_COMMAND:-}"
 if [[ "$command" == 'configure-production-ingress' ]]; then
   exec /usr/local/sbin/ai-agent-vm-worker-configure-production-ingress
 fi
+
+# `install-updater` обновляет апдейтер на хосте. Апдейтер ставит себя сам, но
+# только ПОСЛЕ успешной установки, поэтому старый апдейтер может отвергнуть
+# бандл, который новый поставил бы, — и релиз не доедет до прода никогда.
+# Чтобы канал деплоя не зависел от состояния хоста, сам апдейтер доставляется
+# по этому же каналу: скрипт приходит в stdin после строки с токеном.
+if [[ "$command" == 'install-updater' ]]; then
+  if ! IFS= read -r -t 15 gh_token; then
+    echo 'GitHub release-read token was not received on stdin' >&2
+    exit 2
+  fi
+  if [[ ! "$gh_token" =~ ^[[:graph:]]{20,4096}$ ]]; then
+    echo 'GitHub release-read token has an invalid format' >&2
+    exit 2
+  fi
+  export GH_TOKEN="$gh_token"
+  unset gh_token
+  incoming="$(mktemp)"
+  trap 'rm -f "${incoming}"' EXIT
+  cat > "$incoming"
+  if [[ ! -s "$incoming" ]]; then
+    echo 'Updater script was not received on stdin' >&2
+    exit 2
+  fi
+  if ! head -n 1 "$incoming" | grep -q '^#!/usr/bin/env bash'; then
+    echo 'Updater script is not a bash script' >&2
+    exit 2
+  fi
+  if ! bash -n "$incoming"; then
+    echo 'Updater script does not parse' >&2
+    exit 2
+  fi
+  install -o root -g root -m 0755 "$incoming" "$updater"
+  sha256sum "$updater"
+  exit 0
+fi
+
 if [[ ! "$command" =~ ^update\ (vm-worker-v[0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
-  echo 'Only update vm-worker-vX.Y.Z or configure-production-ingress is allowed for this key' >&2
+  echo 'Only update vm-worker-vX.Y.Z, install-updater or configure-production-ingress is allowed for this key' >&2
   exit 2
 fi
 release_tag="${BASH_REMATCH[1]}"
