@@ -102,6 +102,26 @@ if [[ ! "$inventory_target" =~ ^/[A-Za-z0-9._/-]+$ || "$inventory_target" == *'.
 fi
 install -o root -g root -m 0644 "$inventory_source" "$inventory_target"
 echo "Installed signed VM worker binding inventory for ${worker_id} at $inventory_target"
+# Конфиг движка — такой же хостовый актив, как инвентарь: ран читает его на
+# старте, и копия на хосте стареет вместе с релизом, который её привёз. Раньше
+# этот файл ставила только первичная установка, поэтому хост мог годами
+# раздавать рану старый конфиг (модель, заголовки Ladder) при новом воркере.
+# Установка идёт ДО проверки «уже на этой версии»: иначе релиз, который
+# ничего не меняет в бандле, оставил бы хост со старым конфигом.
+engine_config_dir="$(sed -n 's/^AGENT_API_ENGINE_CONFIG_DIR=//p' "$config_file" | tail -n 1 | sed 's/^"//;s/"$//')"
+engine_config_dir="${engine_config_dir:-/etc/ai-agent-runner/engine-config}"
+if [[ ! "$engine_config_dir" =~ ^/[A-Za-z0-9._/-]+$ || "$engine_config_dir" == *'..'* ]]; then
+  echo 'AGENT_API_ENGINE_CONFIG_DIR is missing or invalid in the service configuration' >&2
+  exit 1
+fi
+engine_config_source="${release_dir}/deploy/vm-worker/engine-config/opencode.json"
+if [[ ! -f "$engine_config_source" ]]; then
+  echo 'Signed VM worker release is missing its OpenCode engine config template' >&2
+  exit 1
+fi
+install -d -o root -g root -m 0755 "$engine_config_dir"
+install -o root -g root -m 0644 "$engine_config_source" "${engine_config_dir}/opencode.json"
+echo "Installed signed VM worker engine config template at ${engine_config_dir}/opencode.json"
 old_target="$(readlink -f "${root}/current" 2>/dev/null || true)"
 old_opencode_target="$(readlink -f "${opencode_path}" 2>/dev/null || true)"
 # Хост не должен переопределять путь к бинарю: управляемая ссылка

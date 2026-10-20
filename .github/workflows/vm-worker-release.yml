@@ -97,6 +97,11 @@ jobs:
           cp scripts/deploy-vm-worker-release.sh scripts/assert-vm-worker-update-ready.mjs scripts/select-vm-worker-inventory.mjs scripts/ai-agent-vm-worker-gha-update scripts/ai-agent-vm-worker-configure-production-ingress "$STAGE/scripts/"
           mkdir -p "$STAGE/deploy/vm-worker/inventory"
           cp deploy/vm-worker/inventory/france.json "$STAGE/deploy/vm-worker/inventory/"
+          # Конфиг движка — хостовый актив, который ран читает на старте. Он едет
+          # в бандле тем же подписанным релизом: хост, поставленный раньше, не
+          # обновляет этот файл сам и остаётся на старой копии навсегда.
+          mkdir -p "$STAGE/deploy/vm-worker/engine-config"
+          cp deploy/vm-worker/engine-config/opencode.json "$STAGE/deploy/vm-worker/engine-config/"
           (cd "$STAGE" && npm ci --omit=dev)
           tar -czf ai-agent-vm-worker-linux-x64.tar.gz -C "$STAGE" .
           sha256sum ai-agent-vm-worker-linux-x64.tar.gz > ai-agent-vm-worker-linux-x64.tar.gz.sha256

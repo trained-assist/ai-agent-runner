@@ -85,7 +85,7 @@ and remained ready.
 | `VM_WORKER_TOKEN` | Worker copy in `/etc/ai-agent-runner/worker.env`, root-owned mode 0600; matching write-only Cloudflare sandbox Worker secret `VM_WORKER_TOKEN`. Values are not recorded here. Owner and rotation date remain unassigned in runtime inventory and appear as readiness warnings. |
 | `VM_WORKER_URL` | Cloudflare sandbox Worker secret, set to the VM2 HTTPS worker route above. |
 | `LLM_LADDER_TOKEN` | Cloudflare sandbox Worker secret. It is allowlisted and passed to OpenCode only as a per-run model credential; never stored in the checked-in engine template. |
-| OpenCode engine config | `/etc/ai-agent-runner/engine-config/opencode.json`, root-owned; derived from the checked-in template. Pins `ladder/free` and reads the API credential from `{env:LLM_LADDER_TOKEN}`. |
+| OpenCode engine config | `/etc/ai-agent-runner/engine-config/opencode.json`, root-owned; installed from the checked-in template `deploy/vm-worker/engine-config/opencode.json` by the signed release updater. Pins `ladder/free` and reads the API credential from `{env:LLM_LADDER_TOKEN}`. The updater refreshes it on every release, including a release whose bundle is otherwise unchanged, because the run reads the file at start. |
 | Canary principal | Added through the write-only `RUNNER_API_KEYS_ADDITIONAL` Cloudflare secret. Scoped to repository `trained-assist/ai-agent-runner`, run read/write, and engine `eu-vm-agent-run`. The existing `RUNNER_API_KEYS` registry was preserved. |
 | Post-run cleanup | Canary finished successfully; `activeRuns` was 0, no `opencode` process remained, and no `run_*` directory remained in the worker workspace. |
 
