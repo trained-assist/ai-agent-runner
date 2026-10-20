@@ -287,6 +287,9 @@ run starts:
   `{"github": {"connection_id": "...", "env": "GITHUB_TOKEN", "field": "token",
   "scope": "repo"}}`. The environment name and the connection come from it, so a
   request can never choose where a value lands or which connection it comes from.
+  The sandbox3 lane also carries `github-revoked`, a ref to a connection that was
+  revoked after intake. It is the fixture that lets the live lane keep proving
+  that a revoked credential fails the run closed.
 - The value is resolved at dispatch, not at admission: the Runner API asks the
   wallet for a run-scoped grant with a machine assertion that names the run. The
   stored launch payload and the run record carry the reference only; the value

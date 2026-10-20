@@ -19,7 +19,7 @@
     "ALLOWED_REPOSITORIES": "trained-assist/ai-agent-runner",
     "ALLOWED_ENVIRONMENT_NAMES": "LLM_LADDER_TOKEN,GITHUB_TOKEN",
     "RUNNER_CREDENTIAL_BINDINGS_ENABLED": "true",
-    "ZEROCREDS_WALLET_CREDENTIALS": "{\"github\":{\"connection_id\":\"2aaa6cbc-276c-45fc-9a11-dc4339df6c58\",\"env\":\"GITHUB_TOKEN\",\"field\":\"token\",\"scope\":\"repo\"}}",
+    "ZEROCREDS_WALLET_CREDENTIALS": "{\"github\":{\"connection_id\":\"2aaa6cbc-276c-45fc-9a11-dc4339df6c58\",\"env\":\"GITHUB_TOKEN\",\"field\":\"token\",\"scope\":\"repo\"},\"github-revoked\":{\"connection_id\":\"736af6da-1dea-4933-a1ce-a73c9beb5c4d\",\"env\":\"GITHUB_TOKEN\",\"field\":\"token\",\"scope\":\"repo\"}}",
     "SANDBOX_CLEANUP_PROFILES": "sandbox3-vm2-live-canary"
   }
 }
