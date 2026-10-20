@@ -55,10 +55,10 @@ function makeHost({ agentWroteTheFile = true, sweepAfterKill = true, engineHasNo
   };
 }
 
-function makeApi({ state = 'succeeded' } = {}, host?: { killed: boolean }) {
+function makeApi({ state = 'succeeded' } = {}, host?: { killed: boolean }, journal: Array<Record<string, unknown>> = []) {
   const requests: Array<{ url: string; method: string }> = [];
   const manifest = { profileChanges: { files: [{ path: LEAK_RELATIVE_PATH, sha256: 'a'.repeat(64), size: 10 }], deletes: [] } };
-  const reply = (status: number, body: unknown) => ({ status, text: async () => JSON.stringify(body) });
+  const reply = (status: number, body: unknown) => ({ status, text: async () => JSON.stringify(body), json: async () => body });
   // Пока хост жив, ран, который будет убит, идёт; после убийства — терминальный.
   // Так проверка «убийство попало по активному рану» не проходит вхолостую.
   let phaseASeen = false;
@@ -67,12 +67,17 @@ function makeApi({ state = 'succeeded' } = {}, host?: { killed: boolean }) {
     async fetch(url: string, init?: { method?: string }) {
       requests.push({ url: String(url), method: init?.method ?? 'GET' });
       const text = String(url);
+      if (text.startsWith('https://api.cloudflare.com/')) {
+        return reply(200, { result: [{ results: journal }] });
+      }
       if (text.endsWith('/v1/runs') && (init?.method ?? 'GET') === 'POST') return reply(202, { runId: 'run_x' });
       if (text.includes('/result')) return reply(200, manifest);
       if (text.endsWith('/status')) {
-        if (!host) return reply(200, { state, answer: 'saved' });
-        if (!phaseASeen) { phaseASeen = true; return reply(200, { state: 'succeeded', answer: 'saved' }); }
-        return reply(200, { state: host.killed ? 'succeeded' : 'running', answer: 'saved' });
+        // Счётчик доставок — факт хоста: сколько воркеров получили значение.
+        const counted = { credentialDeliveries: 1, credentialGrantRepeats: 0 };
+        if (!host) return reply(200, { state, answer: 'saved', ...counted });
+        if (!phaseASeen) { phaseASeen = true; return reply(200, { state: 'succeeded', answer: 'saved', ...counted }); }
+        return reply(200, { state: host.killed ? 'succeeded' : 'running', answer: 'saved', ...counted });
       }
       return reply(200, { events: [] });
     },
@@ -302,6 +307,61 @@ describe('sandbox3 credential blast-radius drill', () => {
         sweepWaitMs: 2_000,
       });
       expect(steps.filter((line) => line.startsWith('FAIL')).length).toBeGreaterThan(0);
+      expect(steps.join('\n')).not.toContain(SECRET);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('reports how many hosts received the value', async () => {
+    const host = makeHost();
+    const api = makeApi({}, host);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = api.fetch as unknown as typeof fetch;
+    try {
+      const steps = await runCredentialBlastRadiusDrill({
+        apiUrl: 'https://runner.example',
+        apiKey: 'key',
+        registry: REGISTRY,
+        host,
+        kill: false,
+        captureWaitMs: 2_000,
+        sweepWaitMs: 2_000,
+      });
+      // Радиус — это число, а не ощущение: сколько хостов получили значение.
+      expect(steps.some((line) => line.includes('deliveries=1 repeats=0'))).toBe(true);
+      expect(steps.join('\n')).not.toContain(SECRET);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('fails the drill when the custody journal holds a second grant for one run', async () => {
+    const host = makeHost();
+    // Custody выдаёт грант один раз на ран. Две выдачи одному рану — это
+    // либо сломанная идемпотентность, либо рост радиуса, который drill обязан
+    // показать, а не пройти.
+    const journal = [
+      { event_id: 1, action: 'granted', actor: 'run_x' },
+      { event_id: 2, action: 'granted', actor: 'run_x' },
+    ];
+    const api = makeApi({}, host, journal);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = api.fetch as unknown as typeof fetch;
+    try {
+      const steps = await runCredentialBlastRadiusDrill({
+        apiUrl: 'https://runner.example',
+        apiKey: 'key',
+        registry: REGISTRY,
+        host,
+        custody: { token: 'cf-token', accountId: 'account', databaseId: 'database' },
+        kill: true,
+        waitMs: 1_000,
+        captureWaitMs: 2_000,
+        sweepWaitMs: 2_000,
+      });
+      const failed = steps.filter((line) => line.startsWith('FAIL'));
+      expect(failed.some((line) => line.includes('the custody journal holds 2 grants for run A'))).toBe(true);
       expect(steps.join('\n')).not.toContain(SECRET);
     } finally {
       globalThis.fetch = originalFetch;

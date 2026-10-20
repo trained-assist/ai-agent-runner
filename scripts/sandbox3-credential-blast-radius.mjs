@@ -286,6 +286,19 @@ export async function runCredentialBlastRadiusDrill({
     return 'value-free';
   });
 
+  await step('A: the host counts the hosts that received the value', async () => {
+    // Радиус креды — это число. Custody считает выдачи (одна выдача на ран),
+    // хост считает доставки (сколько воркеров получили значение). Ран A не
+    // переотдавался, поэтому доставка ровно одна, а повторов быть не может.
+    const status = await runner(`/v1/runs/${runA}/status`);
+    assert.equal(status.status, 200, status.text);
+    const deliveries = Number(status.body?.credentialDeliveries ?? 0);
+    const repeats = Number(status.body?.credentialGrantRepeats ?? 0);
+    assert.ok(deliveries >= 1, 'the run reports no credential delivery');
+    assert.equal(repeats, 0, `the custody recognised ${repeats} grant(s) of this run as a repeat`);
+    return `deliveries=${deliveries} repeats=${repeats}`;
+  });
+
   await step('A: the value does not reach the runner log, the run state or the session transcript', async () => {
     if (!valueA) return 'skipped: the value was not captured';
     const log = await host.exec(`cat ${runnerRoot}/runner/runs/${runA}/events.jsonl 2>/dev/null || true`);
@@ -384,8 +397,9 @@ export async function runCredentialBlastRadiusDrill({
   await step('B: the outcome of the run whose host died', async () => {
     // Это измерение, а не утверждение: координатор по замыслу переживает
     // недоступность воркера и может переотдать ран другому хосту. Тогда ран
-    // завершится успешно, а custody выдаст значение второй раз — это видно
-    // по журналу выдач, и именно этим измеряется радиус, а не «успех» рана.
+    // завершится успешно, и значение получат два хоста — это видно по счётчику
+    // доставок на стороне хоста (custody хранит одну выдачу на ран), и именно
+    // этим измеряется радиус, а не «успех» рана.
     const deadline = Date.now() + sweepWaitMs;
     let state = null;
     while (Date.now() < deadline) {
@@ -403,11 +417,18 @@ export async function runCredentialBlastRadiusDrill({
     const rows = await custodyRows(custody, configured.connection_id);
     const granted = rows.filter((row) => row.action === 'granted');
     assert.ok(granted.length >= 1, `the custody journal has no grant: ${JSON.stringify(rows)}`);
-    // Сколько раз значение выдавалось именно убитому рану: переотдача после
-    // смерти хоста — это и есть рост радиуса, который считается, а не судится.
+    // Custody выдаёт грант один раз на ран: повторный запрос — это тот же грант,
+    // и журнал не растёт. Поэтому число выдач в журнале — это факт custody, а
+    // радиус (сколько хостов получили значение) измеряется на стороне хоста.
     const forRun = granted.filter((row) => String(row.actor) === runB).length;
     const forRunA = granted.filter((row) => String(row.actor) === runA).length;
+    assert.equal(forRunA, 1, `the custody journal holds ${forRunA} grants for run A`);
+    assert.equal(forRun, 1, `the custody journal holds ${forRun} grants for run B`);
+    const statusB = await runner(`/v1/runs/${runB}/status`);
+    const deliveriesB = Number(statusB.body?.credentialDeliveries ?? 0);
+    const repeatsB = Number(statusB.body?.credentialGrantRepeats ?? 0);
     steps.push(`note the journal reads ${rows.map((row) => row.action).join(',')} (${granted.length} grants; run A ${forRunA}, run B ${forRun})`);
+    steps.push(`note the host counts ${deliveriesB} deliveries to run B, of which ${repeatsB} the custody recognised as the same grant`);
     if (!revoke) return 'the custody outlived the host';
     if (!custody.serviceToken || !custody.walletUrl) return 'skipped: the wallet service token is not configured';
     const owner = await custodyOwner(custody, configured.connection_id);

@@ -55,6 +55,13 @@ export interface WalletGrant {
   fields: Record<string, string>;
   version: number | null;
   expiresAt: string | null;
+  /**
+   * True when the custody already recorded this grant for this run: the value
+   * is answered again because the run needs it, but the journal did not grow.
+   * A retry, a capacity cut-over and a replacement host after a crash all land
+   * here, so the host can count how many workers received the value.
+   */
+  replay: boolean;
 }
 
 export interface WalletFormRequest {
@@ -208,7 +215,7 @@ export class WalletClient {
     if (!Object.keys(fields).length) throw new WalletError('unavailable', 'the credential service returned an empty value');
     const version = body['version'];
     return { fields, version: typeof version === 'number' ? version : null,
-      expiresAt: text(body['expires_at']) };
+      expiresAt: text(body['expires_at']), replay: body['replay'] === true };
   }
 
   /** Signs a one-call host assertion and forwards the request to the wallet API. */
