@@ -12,6 +12,7 @@ import type { CapacityAdmission, CapacityEnvelope, CapacityReservationStore, Hos
 import { redactSecrets } from '../redact.js';
 import { checkVmWorkerBindings, type VmWorkerBindingsInventory } from './bindings-inventory.js';
 import type { VmWorkerBuildInfo } from './build-info.js';
+import type { VmWorkerEngineStatus } from './engine-status.js';
 import { StorageError } from '../storage/errors.js';
 import { agentHistory } from './agent-history.js';
 
@@ -51,6 +52,8 @@ export interface VmWorkerServerOptions {
   buildInfo?: VmWorkerBuildInfo;
   bindingsInventory?: VmWorkerBindingsInventory;
   engineAvailable?: () => boolean;
+  /** Фактически исполняемый бинарь движка: путь, sha256 и версия. */
+  engineStatus?: VmWorkerEngineStatus;
   /** Optional durable object store used to persist the session event log in Google Storage. */
   blobStore?: BlobStore;
   storage?: BlobStore;
@@ -98,6 +101,7 @@ export function createVmWorkerServer(options: VmWorkerServerOptions): VmWorkerSe
       sendJson(res, 200, {
         service: 'ai-agent-vm-worker',
         build: options.buildInfo ?? { schemaVersion: 1, version: '0.0.0-dev', sourceCommit: 'unknown', builtAt: new Date(0).toISOString() },
+        engine: options.engineStatus ?? null,
         worker: options.bindingsInventory ? { workerId: options.bindingsInventory.workerId, region: options.bindingsInventory.region } : null,
         bindings: { ready: bindings.ready, missingRequired: bindings.missingRequired, warnings: bindings.warnings, inventory: bindings.bindings },
       });

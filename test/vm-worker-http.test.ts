@@ -31,6 +31,17 @@ describe('installable VM HTTP worker', () => {
     expect(ready.status).toBe(200);
     expect((await ready.json() as { checks: { capacity: { state: string } } }).checks.capacity.state).toBe('available');
 
+    // /version рапортует не только о подписанном бандле, но и о бинаре, который
+    // воркер исполняет на самом деле: иначе уход на чужую сборку не виден.
+    const version = await fetch(`${fixture.base}/version`);
+    expect(version.status).toBe(200);
+    expect((await version.json() as { engine: { binaryPath: string; binarySha256: string; binaryVersion: string } }).engine).toEqual({
+      name: 'opencode',
+      binaryPath: '/usr/local/bin/opencode',
+      binarySha256: 'b'.repeat(64),
+      binaryVersion: '0.0.0-ladder-cache-test',
+    });
+
     const unauthenticated = await fetch(`${fixture.base}/v1/launch`, { method: 'POST', body: JSON.stringify(launchRequest()) });
     expect(unauthenticated.status).toBe(401);
 
@@ -440,6 +451,12 @@ async function startFixture(input: { engineName?: string; cpuPercent?: number; b
     buildInfo: { schemaVersion: 1, version: '0.1.0-test', sourceCommit: 'a'.repeat(40), builtAt: new Date().toISOString() },
     ...(input.bindingsInventory ? { bindingsInventory: input.bindingsInventory } : {}),
     engineAvailable: () => true,
+    engineStatus: {
+      name: 'opencode',
+      binaryPath: '/usr/local/bin/opencode',
+      binarySha256: 'b'.repeat(64),
+      binaryVersion: '0.0.0-ladder-cache-test',
+    },
   });
   await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
   const address = server.address();

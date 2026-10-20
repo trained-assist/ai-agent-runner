@@ -14,6 +14,10 @@ name: OpenCode fork promotion
 on:
   schedule:
     - cron: '41 */6 * * *'
+  # Тот же путь, что и по расписанию, но без ожидания ближайшего тика: пуш в
+  # ветку `opencode-promotion-run` немедленно перезапускает детектор и гейт.
+  push:
+    branches: [opencode-promotion-run]
   workflow_dispatch:
     inputs:
       candidate_tag:

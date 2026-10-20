@@ -64,6 +64,17 @@ for (const [region, prefix] of [['France', 'EU']]) {
     } else {
       process.stdout.write(`${region}: OpenCode ${expectedRelease.opencodeVersion} (${expectedRelease.opencodeSourceCommit}, ${expectedRelease.opencodeBinarySha256}) matches ${expectedRelease.tag}.\n`);
     }
+    // Бандл и исполняемый бинарь — разные вещи: хост может переопределить путь
+    // через OPENCODE_BIN. Сверяем именно то, что воркер запускает, иначе
+    // уход на чужую сборку остаётся невидимым.
+    const engine = version?.engine;
+    if (!/^[0-9a-f]{64}$/.test(engine?.binarySha256 ?? '')) {
+      warn(`${region} engine binary unknown`, 'The worker does not report the OpenCode binary it executes.');
+    } else if (engine.binarySha256 !== expectedRelease.opencodeBinarySha256) {
+      warn(`${region} engine binary drift`, `executed=${engine.binarySha256} (${engine.binaryVersion ?? 'unknown'}) at ${engine.binaryPath ?? 'unknown'}; release=${expectedRelease.opencodeBinarySha256}`);
+    } else {
+      process.stdout.write(`${region}: engine binary ${engine.binarySha256} (${engine.binaryVersion ?? 'unknown'}) at ${engine.binaryPath ?? 'unknown'}.\n`);
+    }
     if (!/^[0-9a-f]{40}$/.test(deployedCommit ?? '')) {
       warn(`${region} worker build unknown`, 'The worker does not report a verified source commit.');
     } else if (deployedCommit !== expectedCommit) {

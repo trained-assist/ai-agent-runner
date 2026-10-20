@@ -46,6 +46,20 @@ describe('VM worker release updater safety contract', () => {
     expect(updater).toContain('assert-vm-worker-update-ready.mjs" "$(dirname -- "${updater_path}")/assert-vm-worker-update-ready.mjs');
   });
 
+  it('refuses to update a host that overrides the managed OpenCode path', async () => {
+    const updater = await readFile(updaterPath, 'utf8');
+    const guard = updater.indexOf('OPENCODE_BIN in ${config_file} points to');
+    const switchRelease = updater.indexOf('mv -Tf "${root}/.current.$$" "${root}/current"');
+    // Хост, который переопределяет путь к бинарю, обходит управляемую ссылку
+    // и продолжает исполнять старую сборку: обновление обязано остановиться
+    // до переключения релиза, а не рапортовать об успехе.
+    expect(guard).toBeGreaterThanOrEqual(0);
+    expect(guard).toBeLessThan(switchRelease);
+    expect(updater).toContain("sed -n 's/^OPENCODE_BIN=//p' \"$config_file\"");
+    // И post-deploy проверка сверяет именно исполняемый бинарь.
+    expect(updater).toContain('v.engine?.binarySha256!==process.argv[5]');
+  });
+
   it('validates the endpoint before switching releases and requires readyz', async () => {
     const updater = await readFile(updaterPath, 'utf8');
     const workflow = await readFile(releaseWorkflowPath, 'utf8');

@@ -78,6 +78,23 @@ the agent may install a pinned Playwright package and browser inside its run wor
 Run `scripts/install-playwright-runtime.sh` once as root on an existing France VM to
 apply the same dependency set without replacing the active worker release.
 
+### The OpenCode binary the worker actually runs
+
+The release bundle and the running binary are two different facts, and the host can
+make them diverge. `build.opencode` in `/version` describes the binary inside the
+signed bundle; `engine` in the same response describes the binary the worker
+executes right now — its path, SHA-256, and version. The updater refuses to update a
+host whose `OPENCODE_BIN` points anywhere other than the managed
+`/usr/local/bin/opencode` symlink, because such a host keeps executing a build the
+release never installed. The deployment drift check compares the executed binary
+against the one the latest release bundles and fails on a mismatch.
+
+Keep `OPENCODE_BIN` in `/etc/ai-agent-runner/worker.env` pointing at
+`/usr/local/bin/opencode`. The updater flips that symlink to the new bundle on every
+release, and the rollback restores the previous one. A host that hardcodes a path
+into a versioned release directory keeps running that old build after a successful
+deployment.
+
 ### Pinned Registry test MCP
 
 The France VM worker accepts remote MCP launch data only for the fixed

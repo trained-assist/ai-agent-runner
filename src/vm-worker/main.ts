@@ -10,6 +10,7 @@ import { createVmWorkerServer } from './http-server.js';
 import { Runner } from '../runner/runner.js';
 import { readVmWorkerBindingsInventory } from './bindings-inventory.js';
 import { readVmWorkerBuildInfo } from './build-info.js';
+import { describeEngineStatus } from './engine-status.js';
 import { createControlPlaneIngressResolverFromEnv } from '../storage/ingress-artifact.js';
 import { resolveErrorPublisher } from '../contracts/error-publisher.js';
 import { createRunBranchWorker } from '../workspace/run-branch-worker.js';
@@ -48,6 +49,10 @@ async function main(): Promise<void> {
   }
   const binary = process.env['OPENCODE_BIN']?.trim() || undefined;
   const engine = new OpenCodeAdapter(binary ? { binary, model: process.env.OPENCODE_MODEL ?? 'ladder/free' } : { model: process.env.OPENCODE_MODEL ?? 'ladder/free' });
+  // Что воркер исполняет на самом деле, а не что лежит в подписанном бандле:
+  // хост может переопределить путь через OPENCODE_BIN, и без этой сверки
+  // такой уход на другую сборку остаётся незаметным.
+  const engineStatus = await describeEngineStatus(engine.resolveBinary());
   const token = required('VM_WORKER_TOKEN');
   const allowedRepositories = list('VM_WORKER_ALLOWED_REPOSITORIES');
   const allowedEnvironmentNames = list('VM_WORKER_ALLOWED_ENV');
@@ -109,6 +114,7 @@ async function main(): Promise<void> {
     buildInfo: readVmWorkerBuildInfo(),
     bindingsInventory,
     engineAvailable: () => engine.isAvailable(),
+    engineStatus,
   });
   const resumedReservations = await server.resumeCapacityMonitors();
   const host = process.env['VM_WORKER_BIND']?.trim() || '127.0.0.1';
