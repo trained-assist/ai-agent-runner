@@ -243,10 +243,12 @@ resulting connection by an opaque id.
   connection stays known — it is never quietly removed — so a later run can
   tell "revoked" from "never existed".
 
-The credential value never enters the Runner API: it is written straight to the
-wallet's OpenBao path, and the Runner API only ever sees the connection reference.
+The credential value never enters the Runner API at intake: it is written straight to the
+wallet's custody store, and the Runner API only ever sees the connection reference.
 `connection_id` is a reference, not a bearer token, and it is bound by the wallet
-API to the owner and profile that created it.
+API to the owner and profile that created it. A run that binds the credential does
+receive the value — at dispatch, in the launch payload (see below), never in an
+answer.
 
 Trust boundary:
 
@@ -267,6 +269,37 @@ binding, `503` when the wallet configuration or the wallet service is unavailabl
 `502` when the wallet API rejects the Runner identity, `400` for a malformed form
 request, `404` for an unknown connection, `409` for a reused idempotency key. An
 upstream body is never echoed back.
+
+## Run credential bindings
+
+A run can ask for a credential that the user granted once. The request carries a
+reference and a scope — never a value — and the host resolves the value when the
+run starts:
+
+- `POST /v1/runs` accepts `credentialBindings: [{ref, scope}]` when
+  `RUNNER_CREDENTIAL_BINDINGS_ENABLED` is `true`. The binding is validated
+  against host policy at admission: the shape must be exactly `{ref, scope}`, the
+  `ref` must be in the credential registry, the `scope` must be the one the
+  registry grants, and the environment name must not collide with a runtime
+  secret. A binding cannot be mixed with a model connection.
+- The registry (`ZEROCREDS_WALLET_CREDENTIALS`) is host configuration:
+  `{"github": {"connection_id": "...", "env": "GITHUB_TOKEN", "field": "token",
+  "scope": "repo"}}`. The environment name and the connection come from it, so a
+  request can never choose where a value lands or which connection it comes from.
+- The value is resolved at dispatch, not at admission: the Runner API asks the
+  wallet for a run-scoped grant with a machine assertion that names the run. The
+  stored launch payload and the run record carry the reference only; the value
+  exists in the launch that goes to the worker and nowhere else. A connection
+  that was revoked after intake fails the run closed instead of starting without
+  the credential.
+
+This is the "trusted runtime" mode of
+[ai-agent-runner#438](https://github.com/trained-assist/ai-agent-runner/issues/438):
+the value reaches the agent's process environment, so the agent can use `gh` or
+`git` without asking a human — and the value stays out of the model context, the
+run record, the event journal and the answers. A run that needs the value to stay
+out of the agent process as well needs the broker mode, where the credential
+performs the provider call itself.
 
 Local E2E (2026-10-19) ran the real chain under `wrangler dev`: Runner API Worker
 → ZeroCreds Node server → D1 metadata Worker on local D1 → OpenBao KV v2. The

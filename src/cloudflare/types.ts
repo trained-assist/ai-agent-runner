@@ -70,6 +70,10 @@ export interface RunnerWorkerEnv {
   ZEROCREDS_WALLET_ASSERTION_PRIVATE_JWK?: string;
   /** Map of Runner profile id to the ZeroCreds wallet owner and profile of that user. */
   ZEROCREDS_WALLET_PROFILES?: string;
+  /** Registry of ZeroCreds credentials a run may bind: ref to connection, environment name, field and scope. */
+  ZEROCREDS_WALLET_CREDENTIALS?: string;
+  /** Enables run credential bindings resolved through the ZeroCreds wallet. */
+  RUNNER_CREDENTIAL_BINDINGS_ENABLED?: string;
   /** Sandbox-only service grant to the authenticated MCP Host user catalog. */
   MCP_USER_AUTH_TOKEN?: string;
   /** Explicit emergency gate. Static sandbox-user mappings are disabled unless the disposable lifecycle is provisioned. */
