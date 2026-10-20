@@ -272,6 +272,11 @@ describe('the artifact export', () => {
         expect(logs.join('\n')).toContain('the run secret values are unknown after a worker restart');
         // The refused workspace does not stay on the host: it may hold a copy of the value.
         expect(existsSync(join(harness.rootDir, 'ws', receipt.runId))).toBe(false);
+        // The run says what happened, so the lane can report it instead of guessing.
+        const snapshot = harness.runner.getRun(receipt.runId);
+        expect(snapshot?.result?.publicationOutcome).toBe('refused');
+        expect(snapshot?.result?.persistence).toBe('failed');
+        expect(snapshot?.result?.persistenceReason).toContain('refused');
       } finally {
         harness.runner.dispose();
       }

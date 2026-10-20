@@ -65,7 +65,12 @@ export interface RunResult {
    * `not_required` — выходы не объявлялись, `failed` — ни один выход не сохранён.
    */
   persistence: 'pending' | 'persisted' | 'failed' | 'not_required';
-  publicationOutcome?: 'published' | 'not_requested' | 'failed';
+  /**
+   * What happened to the profile publication. `refused` is not a failure of the
+   * upload: the run refused to publish bytes it could not clear, because the
+   * values of its secrets died with the worker's memory.
+   */
+  publicationOutcome?: 'published' | 'not_requested' | 'failed' | 'refused';
   /** Причина статуса сохранения (какой выход остался единственной копией и почему). */
   persistenceReason?: string;
   /** Commit published by a profile-workspace worker; never contains credentials. */
@@ -248,7 +253,7 @@ export function validateRunResult(input: unknown): ValidationResult<RunResult> {
   }
   // согласованность: сохранение обязано объясняться, иначе «почему не persisted» не прочитать
   if (input['persistenceReason'] !== undefined) checkString(input['persistenceReason'], 'result.persistenceReason', collector, 500);
-  if (input['publicationOutcome'] !== undefined && !(['published', 'not_requested', 'failed'] as const).includes(input['publicationOutcome'] as 'published' | 'not_requested' | 'failed')) collector.push('result.publicationOutcome: expected published | not_requested | failed');
+  if (input['publicationOutcome'] !== undefined && !(['published', 'not_requested', 'failed', 'refused'] as const).includes(input['publicationOutcome'] as 'published' | 'not_requested' | 'failed' | 'refused')) collector.push('result.publicationOutcome: expected published | not_requested | failed | refused');
   if (input['cleanupReason'] !== undefined) checkString(input['cleanupReason'], 'result.cleanupReason', collector, 500);
   if (input['persistence'] === 'failed' && typeof input['cleanupReason'] !== 'string') {
     collector.push('result.cleanupReason: a failed persistence must carry the cleanup reason');

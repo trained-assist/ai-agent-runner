@@ -16,7 +16,7 @@ const REGISTRY = {
   github: { connection_id: 'conn-drill', env: 'GITHUB_TOKEN', field: 'token', scope: 'repo' },
 };
 
-function makeHost({ agentWroteTheFile = true, sweepAfterKill = true, engineHasNoCredential = false, sweepBlocked = false } = {}) {
+function makeHost({ agentWroteTheFile = true, sweepAfterKill = true, engineHasNoCredential = false, sweepBlocked = false, resultReason = '' } = {}) {
   const calls: string[] = [];
   let killed = false;
   const state = JSON.stringify({ pid: 4242, state: 'running', spec: { cwd: '/var/lib/ai-agent-runner/workspaces/run_x' } });
@@ -32,6 +32,10 @@ function makeHost({ agentWroteTheFile = true, sweepAfterKill = true, engineHasNo
       if (command.startsWith('cat /var/lib/ai-agent-runner/runner/runs/') && command.endsWith('events.jsonl')) {
         return { stdout: 'token=[redacted]\n', stderr: '', code: 0 };
       }
+      if (command.includes('result.json')) {
+        // Собственная запись рана на хосте: там появляется причина отказа.
+        return { stdout: JSON.stringify({ persistence: 'failed', persistenceReason: resultReason }), stderr: '', code: 0 };
+      }
       if (command.startsWith('cat /var/lib/ai-agent-runner/runner/runs/')) return { stdout: state, stderr: '', code: 0 };
       if (command.includes('/proc/4242/environ')) {
         return { stdout: engineHasNoCredential ? 'PATH=/usr/bin\0' : `PATH=/usr/bin\0GITHUB_TOKEN=${SECRET}\0`, stderr: '', code: 0 };
@@ -45,7 +49,7 @@ function makeHost({ agentWroteTheFile = true, sweepAfterKill = true, engineHasNo
       if (command.startsWith(`cat /var/lib/ai-agent-runner/workspaces/run_x/${LEAK_RELATIVE_PATH}`)) {
         return { stdout: agentWroteTheFile ? SECRET : '', stderr: '', code: 0 };
       }
-      if (command.startsWith('systemctl kill') || command.includes('cgroup.procs')) { killed = true; return { stdout: 'killed /system.slice/ai-agent-vm-worker.service', stderr: '', code: 0 }; }
+      if (command.includes('cgroup.kill') || command.includes('cgroup.procs')) { killed = true; return { stdout: 'killed /system.slice/ai-agent-vm-worker.service', stderr: '', code: 0 }; }
       if (command.startsWith('test -e')) {
         const present = !sweepAfterKill || !killed;
         return { stdout: present ? 'present' : 'gone', stderr: '', code: 0 };
@@ -56,14 +60,21 @@ function makeHost({ agentWroteTheFile = true, sweepAfterKill = true, engineHasNo
   };
 }
 
-function makeApi({ state = 'succeeded', publishedBytes = 'token=[redacted]\n', deadRunPublishes = true } = {}, host?: { killed: boolean }, journal: Array<Record<string, unknown>> = []) {
+function makeApi({ state = 'succeeded', publishedBytes = 'token=[redacted]\n', deadRunPublishes = 'published' } = {}, host?: { killed: boolean }, journal: Array<Record<string, unknown>> = []) {
   const requests: Array<{ url: string; method: string }> = [];
   const bytes = Buffer.from(publishedBytes);
   const publishedDigest = createHash('sha256').update(bytes).digest('hex');
   const manifest = { profileChanges: { files: [{ path: LEAK_RELATIVE_PATH, sha256: publishedDigest, size: bytes.length }], deletes: [] } };
   // Ран, чей хост умер, публикует профиль только если хост успел это сделать. Когда
-  // публикация отказана (значения секретов ран уже не знает), профиля нет вовсе.
-  const deadManifest = { profileChanges: { files: [], deletes: [] } };
+  // публикация отказана (значения секретов ран уже не знает), профиля нет вовсе, а
+  // ран говорит почему. Молчание — третий случай: так измерение было бы пустым.
+  const deadManifest = {
+    profileChanges: { files: [], deletes: [] },
+    persistence: 'failed',
+    persistenceReason: 'profile saveback upload was refused: the run secret values are unknown, so the bytes could not be cleared',
+    publicationOutcome: 'refused',
+  };
+  const silentManifest = { profileChanges: { files: [], deletes: [] } };
   const reply = (status: number, body: unknown) => ({ status, headers: new Headers(), text: async () => JSON.stringify(body), json: async () => body,
     arrayBuffer: async () => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) });
   // Пока хост жив, ран, который будет убит, идёт; после убийства — терминальный.
@@ -85,7 +96,13 @@ function makeApi({ state = 'succeeded', publishedBytes = 'token=[redacted]\n', d
         response.headers = new Headers({ 'x-content-sha256': publishedDigest });
         return response;
       }
-      if (text.includes('/result')) return reply(200, host?.killed && !deadRunPublishes ? deadManifest : manifest);
+      if (text.includes('/result')) {
+        if (host?.killed) {
+          if (deadRunPublishes === 'refused') return reply(200, deadManifest);
+          if (deadRunPublishes === 'silent') return reply(200, silentManifest);
+        }
+        return reply(200, manifest);
+      }
       if (text.endsWith('/status')) {
         // Счётчик доставок — факт хоста: сколько воркеров получили значение.
         const counted = { credentialDeliveries: 1, credentialGrantRepeats: 0 };
@@ -128,14 +145,16 @@ describe('sandbox3 credential blast-radius drill', () => {
   });
 
   it('kills the whole worker control group, not one process', () => {
-    const command = killWorkerCgroup('ai-agent-vm-worker.service');
-    // `systemctl kill` по умолчанию бьёт только главный процесс, а
-    // `--kill-whom=all` на этой systemd отказывает — поэтому контрольная группа
-    // разбирается по себе: движок и MCP-серверы должны умереть вместе с воркером.
+    const command = killWorkerCgroup('ai-agent-vm-worker.service', 4242);
+    // Убиваем PID движка, который несёт секрет, и всю контрольную группу с
+    // дочерними группами, чтобы ни агент, ни MCP-процессы не пережили drill.
     expect(command).toContain('systemctl show -p MainPID');
+    expect(command).toContain('kill -9 4242');
+    expect(command).toContain('cgroup.kill');
     expect(command).toContain('cgroup.procs');
     expect(command).toContain('kill -9');
     expect(command).not.toContain('systemctl kill');
+    expect(() => killWorkerCgroup('ai-agent-vm-worker.service', 0)).toThrow('positive integer');
   });
 
   it('quotes a value for the shell', () => {
@@ -240,7 +259,7 @@ describe('sandbox3 credential blast-radius drill', () => {
       });
       expect(steps.filter((line) => line.startsWith('FAIL'))).toEqual([]);
       // Гибнет вся контрольная группа: «хост умер», а не «умер один процесс».
-      expect(host.calls.some((command) => command.includes('cgroup.procs') && command.includes('kill -9'))).toBe(true);
+      expect(host.calls.some((command) => command.includes('cgroup.kill') && command.includes('kill -9'))).toBe(true);
       // Исход рана — измерение: координатор вправе переотдать ран после смерти хоста.
       expect(steps.some((line) => line.includes('the outcome of the run whose host died'))).toBe(true);
       // Профиль мёртвого рана тоже читается назад: значение не уходит с хоста.
@@ -255,7 +274,57 @@ describe('sandbox3 credential blast-radius drill', () => {
     // Хост умер до публикации: ран больше не знает значений своих секретов, поэтому
     // профиль не публикуется вовсе. Это тоже результат: наружу не ушло ничего.
     const host = makeHost();
-    const api = makeApi({ deadRunPublishes: false }, host);
+    const api = makeApi({ deadRunPublishes: 'refused' }, host);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = api.fetch as unknown as typeof fetch;
+    try {
+      const steps = await runCredentialBlastRadiusDrill({
+        apiUrl: 'https://runner.example',
+        apiKey: 'key',
+        registry: REGISTRY,
+        host,
+        kill: true,
+        captureWaitMs: 2_000,
+        sweepWaitMs: 2_000,
+      });
+      expect(steps.filter((line) => line.startsWith('FAIL'))).toEqual([]);
+      expect(steps.join('\n')).toContain('the publication was refused: nothing left the host');
+      expect(steps.join('\n')).not.toContain(SECRET);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('fails the dead run publication check when nothing was published and the run did not say why', async () => {
+    // Молчание — это не измерение. Если профиль не опубликован и ран не объяснил
+    // почему, шаг падает: иначе проверка проходила бы вхолостую.
+    const host = makeHost();
+    const api = makeApi({ deadRunPublishes: 'silent' }, host);
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = api.fetch as unknown as typeof fetch;
+    try {
+      const steps = await runCredentialBlastRadiusDrill({
+        apiUrl: 'https://runner.example',
+        apiKey: 'key',
+        registry: REGISTRY,
+        host,
+        kill: true,
+        captureWaitMs: 2_000,
+        sweepWaitMs: 2_000,
+      });
+      const failed = steps.filter((line) => line.startsWith('FAIL'));
+      expect(failed.some((line) => line.includes('the profile published by the dead run carries no value'))).toBe(true);
+      expect(steps.join('\n')).not.toContain(SECRET);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('takes the refusal from the own record of the run when the lane does not name it', async () => {
+    // Полоса может не знать о поле: причина отказа живёт в записи рана на хосте,
+    // и drill берёт её оттуда, а не выдаёт отсутствие публикации за измерение.
+    const host = makeHost({ resultReason: 'profile saveback upload was refused: the run secret values are unknown, so the bytes could not be cleared' });
+    const api = makeApi({ deadRunPublishes: 'silent' }, host);
     const originalFetch = globalThis.fetch;
     globalThis.fetch = api.fetch as unknown as typeof fetch;
     try {

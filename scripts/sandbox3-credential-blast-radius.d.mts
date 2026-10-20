@@ -28,7 +28,7 @@ export function parseStateCwd(stateText: string): { cwd: string; pid: number | n
 
 export function parseEngineEnv(envText: string, name: string): string | null;
 
-export function killWorkerCgroup(service: string): string;
+export function killWorkerCgroup(service: string, runPid: number): string;
 
 export function shellQuote(value: string): string;
 

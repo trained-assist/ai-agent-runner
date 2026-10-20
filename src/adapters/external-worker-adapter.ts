@@ -236,7 +236,7 @@ export interface LaunchResult {
   profileChanges?: { files: Array<{ path: string; sha256: string; size: number }>; deletes: string[] };
   sessionCheckpoint?: SessionCheckpointRef;
   failure?: LaunchFailure;
-  publicationOutcome?: 'published' | 'not_requested' | 'failed';
+  publicationOutcome?: 'published' | 'not_requested' | 'failed' | 'refused';
 }
 
 export interface WorkerCancelResult {
@@ -677,7 +677,7 @@ export function validateLaunchResult(input: unknown, expectedRunId: string): Val
     }
   }
 
-  if (input['publicationOutcome'] !== undefined && !(['published', 'not_requested', 'failed'] as const).includes(input['publicationOutcome'] as 'published' | 'not_requested' | 'failed')) collector.push('launch.publicationOutcome: expected published | not_requested | failed');
+  if (input['publicationOutcome'] !== undefined && !(['published', 'not_requested', 'failed', 'refused'] as const).includes(input['publicationOutcome'] as 'published' | 'not_requested' | 'failed' | 'refused')) collector.push('launch.publicationOutcome: expected published | not_requested | failed | refused');
   const failure = input['failure'];
   if (failure !== undefined) {
     if (!checkObject(failure, 'launch.failure', collector)) {
