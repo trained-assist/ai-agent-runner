@@ -104,5 +104,10 @@ describe('worker release plan', () => {
     expect(workflow).toContain('gh pr create');
     expect(workflow).toContain('gh pr merge');
     expect(workflow).toContain('statusCheckRollup');
+    // Если секрета нет, CI на ветке PR не запустится никогда: тогда PR не
+    // может быть ревизией, и гейт остаётся единственной ревизией — пин
+    // должен доехать до main сам, а не висеть до конца часа.
+    expect(workflow).toContain('without_checks');
+    expect(workflow).toContain('landing the gated pin on main directly');
   });
 });
