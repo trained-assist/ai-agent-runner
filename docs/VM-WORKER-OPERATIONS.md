@@ -323,6 +323,17 @@ On restart, queued runs are failed closed instead of relaunched with missing
 memory-only credentials. Already-running child processes are reconciled by Runner
 recovery, and capacity reservations stay active until terminal state is observed.
 
+Recovery also owns the cleanup of a run whose worker died: the workspace, the
+engine and the MCP socket are swept, and the run's checkpoint records whether
+the cleanup finished. When it cannot finish, the result says `cleanup: pending`
+with the exact reason instead of claiming the workspace is gone — so a leftover
+is visible in the run record, not only on the disk.
+
+The [credential blast-radius drill](CREDENTIAL-BLAST-RADIUS-DRILL.md) measures
+this host: it kills the worker's whole control group with SIGKILL while a run is
+alive. That kills every run on the host, so the drill is pointed at a sandbox
+worker and never at a host that serves anything else.
+
 The Cloudflare Runner API selects the France VM worker for these sandbox lanes. A VM only
 answers its own health/capacity and runs accepted work; it never routes to another VM or GHA.
 These lanes do not fall back to GitHub Actions when France is unavailable.

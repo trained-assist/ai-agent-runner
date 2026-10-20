@@ -9,7 +9,7 @@ from `main`. An isolated, test-only Runner API service exists on SSH target `vm2
 (`agent-runner-api-mcp-test.service`, loopback port 18882); it is not the production API.
 EU VM2 at `169.58.15.230` is a separate, verified France sandbox execution worker at
 `https://eu-vm-worker.169-58-15-230.sslip.io`, currently on signed release
-`vm-worker-v0.3.5`; do not conflate it with the old API host or production. The user has
+`vm-worker-v0.3.46`; do not conflate it with the old API host or production. The user has
 authorized iterative updates to this sandbox worker as part of the current E2E rollout
 task. Never install or update production through this authorization.
 
@@ -38,7 +38,10 @@ reachability before claiming readiness.
 [API-SANDBOX-OPERATIONS.md](API-SANDBOX-OPERATIONS.md); its deploy probe checks
 `GET /healthz` and an authenticated unknown-run status. A successful test API health check
 does not establish model execution or MCP invocation. The VM worker health, readiness,
-and version paths are separate and remain unprovisioned here.
+and version paths are separate and remain unprovisioned here. For the credential
+path, the live observation is the
+[credential blast-radius drill](CREDENTIAL-BLAST-RADIUS-DRILL.md): it measures where a
+granted value ends up on the France worker and what survives the host dying.
 
 **Reset/retry:** local tests clean up their own fixtures. The isolated API candidate
 installer keeps versioned releases and a target-specific rollback command. Reconcile

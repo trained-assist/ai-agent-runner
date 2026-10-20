@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { readFileSync } from 'node:fs';
 import {
   BLAST_RADIUS_REF,
   LEAK_RELATIVE_PATH,
@@ -79,6 +80,21 @@ function makeApi({ state = 'succeeded' } = {}, host?: { killed: boolean }) {
 }
 
 describe('sandbox3 credential blast-radius drill', () => {
+  it('names every environment variable it reads in the runbook', () => {
+    // Док — единственное место, где оператор берёт эти переменные. Если скрипт
+    // начал читать новую, а док молчит, оператор не узнает, что её надо задать.
+    const script = readFileSync(new URL('../scripts/sandbox3-credential-blast-radius.mjs', import.meta.url), 'utf8');
+    const doc = readFileSync(new URL('../docs/CREDENTIAL-BLAST-RADIUS-DRILL.md', import.meta.url), 'utf8');
+    const names = [...new Set([...script.matchAll(/process\.env\.([A-Z0-9_]+)/g)].map((match) => match[1]!))];
+    const missing = names.filter((name) => !doc.includes(name)).sort();
+    expect(missing, `переменные без строки в доке: ${missing.join(', ')}`).toEqual([]);
+  });
+
+  it('is reachable from the repository index', () => {
+    const index = readFileSync(new URL('../AGENTS.md', import.meta.url), 'utf8');
+    expect(index).toContain('docs/CREDENTIAL-BLAST-RADIUS-DRILL.md');
+  });
+
   it('reads the workspace, the engine pid and the run state out of the run state', () => {
     const parsed = parseStateCwd(JSON.stringify({ pid: 7, state: 'running', spec: { cwd: '/var/lib/ai-agent-runner/workspaces/run_x' } }));
     expect(parsed).toEqual({ cwd: '/var/lib/ai-agent-runner/workspaces/run_x', pid: 7, runState: 'running' });

@@ -10,6 +10,8 @@ duplicated here.
 - [Prohibitions and restrictions](docs/PROHIBITIONS.md) — what may not be disabled, and the
   evidence a restriction needs before it is introduced.
 - [Credentials](docs/CREDENTIALS.md) — which keychain items exist and how secrets are read.
+- [Credential blast-radius drill](docs/CREDENTIAL-BLAST-RADIUS-DRILL.md) — where a
+  credential value ends up, and what survives the host dying.
 
 ## Engineering practice
 
