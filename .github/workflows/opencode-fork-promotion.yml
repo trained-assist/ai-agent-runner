@@ -228,23 +228,31 @@ jobs:
           # Сливаем только на зелёном CI: это и есть ревизия, которая раньше
           # закрывалась ручным merge. Прогон раннера идёт 10-20 минут, поэтому
           # ждём явно, а не полагаемся на auto-merge (на репозитории он выключен).
+          # Разбор проверок живёт в scripts/promotion-pr-checks.mjs: у PR их
+          # несколько, и сравнение списка с одним значением никогда не давало
+          # «зелёного» PR, а значит и merge.
           deadline=$((SECONDS + 3600))
           while (( SECONDS < deadline )); do
-            conclusion="$(gh pr view "$BRANCH" --json statusCheckRollup --jq '[(.statusCheckRollup // []) | if length == 0 then "none" else ([.[] | (.conclusion // .status // "PENDING")] | join(",")) end]' || echo 'unreachable')"
-            case "$conclusion" in
-              SUCCESS|success)
+            state="$(gh pr view "$BRANCH" --json state,statusCheckRollup | node scripts/promotion-pr-checks.mjs 2>/dev/null || echo unreachable)"
+            case "$state" in
+              green)
                 echo "Checks on $BRANCH are green; merging."
                 gh pr merge "$BRANCH" --merge --delete-branch
                 echo "- promotion pull request merged: \`true\`" >> "$GITHUB_STEP_SUMMARY"
                 exit 0
                 ;;
-              FAILURE|failure|CANCELLED|cancelled|TIMED_OUT|timed_out|ACTION_REQUIRED|action_required|STARTUP_FAILURE|startup_failure)
-                echo "Checks on $BRANCH failed ($conclusion); leaving the pull request open for review." >&2
-                echo "- promotion pull request merged: \`false\` (checks $conclusion)" >> "$GITHUB_STEP_SUMMARY"
+              merged)
+                echo "Pull request for $BRANCH is already merged."
+                echo "- promotion pull request merged: \`true\` (already merged)" >> "$GITHUB_STEP_SUMMARY"
+                exit 0
+                ;;
+              failed)
+                echo "Checks on $BRANCH failed; leaving the pull request open for review." >&2
+                echo "- promotion pull request merged: \`false\` (checks failed)" >> "$GITHUB_STEP_SUMMARY"
                 exit 0
                 ;;
             esac
-            echo "Waiting for checks on $BRANCH ($conclusion)"
+            echo "Waiting for checks on $BRANCH ($state)"
             sleep 60
           done
           echo "Checks on $BRANCH did not finish within an hour; the next hook run resumes the promotion." >&2
