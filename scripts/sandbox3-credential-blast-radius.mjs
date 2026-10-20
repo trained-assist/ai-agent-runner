@@ -17,9 +17,10 @@
  *       the session transcript or the published profile.
  *
  *   B — the kill. The agent is asked to persist the credential again, and the
- *       worker is SIGKILLed mid-flight. The run must not report success, the
- *       copy on the dead host's disk must be swept by the recovery, and the
- *       custody store must stay independent of the host.
+ *       worker control group is SIGKILLed mid-flight. The run's outcome is a
+ *       measurement (the coordinator may re-dispatch it), the copy on the dead
+ *       host's disk must be swept by the recovery, and the custody store must
+ *       stay independent of the host.
  *
  * The drill never prints the value. It compares by exact value inside the
  * process and reports only booleans, counts and hashes.
@@ -84,13 +85,36 @@ export function parseStateCwd(stateText) {
  * mode. Anything that can read the host's processes can read the value — that
  * is the exposure the drill measures, not a defect of the drill.
  */
+/**
+ * The engine environment is NUL-separated on the host (`/proc/<pid>/environ`).
+ * A caller that pipes it through `tr '\0' '\n'` gets newlines instead, so both
+ * separators are accepted: the drill reads the file raw, and the fake host in
+ * the tests hands back the same bytes.
+ */
 export function parseEngineEnv(envText, name) {
-  for (const entry of envText.split('\0')) {
+  for (const entry of envText.split(/[\0\n]/)) {
     const at = entry.indexOf('=');
     if (at === -1) continue;
     if (entry.slice(0, at) === name) return entry.slice(at + 1);
   }
   return null;
+}
+
+/**
+ * "The host died" is the whole worker control group, not one process: the
+ * worker, the engine it spawned and the MCP servers it started. `systemctl
+ * kill` defaults to the main process only, and `--kill-whom=all` refuses on
+ * this systemd ("Failed to send signal SIGKILL to auxiliary processes"), so
+ * the drill takes the cgroup apart itself.
+ */
+export function killWorkerCgroup(service) {
+  return [
+    `MAIN=$(systemctl show -p MainPID --value ${service})`,
+    `[ -n "$MAIN" ] && [ "$MAIN" != 0 ] || { echo "the service has no main process"; exit 1; }`,
+    `CG=$(sed 's/^0:://' /proc/$MAIN/cgroup)`,
+    `for p in $(cat /sys/fs/cgroup$CG/cgroup.procs); do kill -9 $p 2>/dev/null || true; done`,
+    `echo "killed $CG"`,
+  ].join('; ');
 }
 
 export function shellQuote(value) {
@@ -183,7 +207,7 @@ export async function runCredentialBlastRadiusDrill({
       if (state.stdout.trim()) {
         try { parsed = parseStateCwd(state.stdout); } catch { parsed = null; }
         if (parsed?.pid) {
-          const environ = await host.exec(`tr '\\0' '\\n' < /proc/${parsed.pid}/environ 2>/dev/null || true`);
+          const environ = await host.exec(`cat /proc/${parsed.pid}/environ 2>/dev/null || true`);
           const value = parseEngineEnv(environ.stdout, envName);
           if (value && value.length >= 4) {
             const leak = await host.exec(`cat ${parsed.cwd}/${LEAK_RELATIVE_PATH} 2>/dev/null || true`);
@@ -194,7 +218,7 @@ export async function runCredentialBlastRadiusDrill({
           }
         }
       }
-      await new Promise((resolve) => setTimeout(resolve, 3_000));
+      await new Promise((resolve) => setTimeout(resolve, 1_000));
     }
     throw new Error('the engine environment never carried the credential');
   }
@@ -222,6 +246,7 @@ export async function runCredentialBlastRadiusDrill({
   });
 
   await step('A: the value does not reach the run record, the status or the events', async () => {
+    if (!valueA) return 'skipped: the value was not captured';
     const status = await runner(`/v1/runs/${runA}/status`);
     const events = await runner(`/v1/runs/${runA}/events?cursor=0`);
     const record = status.text + events.text;
@@ -230,6 +255,7 @@ export async function runCredentialBlastRadiusDrill({
   });
 
   await step('A: the value does not reach the runner log, the run state or the session transcript', async () => {
+    if (!valueA) return 'skipped: the value was not captured';
     const log = await host.exec(`cat ${runnerRoot}/runner/runs/${runA}/events.jsonl 2>/dev/null || true`);
     assert.ok(!log.stdout.includes(valueA), 'the value must not appear in the runner log');
     const state = await host.exec(`cat ${statePath(runA)}`);
@@ -240,11 +266,17 @@ export async function runCredentialBlastRadiusDrill({
   });
 
   await step('A: the published profile carries the file without the value', async () => {
+    if (!valueA) return 'skipped: the value was not captured';
     const response = await runner(`/v1/runs/${runA}/result`);
     assert.equal(response.status, 200, response.text);
     const manifest = response.body?.profileChanges?.files ?? [];
     const entry = manifest.find((file) => file.path === LEAK_RELATIVE_PATH);
-    if (!entry) return 'skipped: the run published no manifest';
+    if (!entry) {
+      // Полоса API не публикует профиль вовсе: profileWorkspace отклоняется
+      // координатором (422 FEATURE_UNSUPPORTED). Тогда публикационный путь
+      // редакции не покрыт этим прогоном — это отдельная задача.
+      return 'skipped: the lane publishes no profile (profileWorkspace is rejected by the API)';
+    }
     const raw = createHash('sha256').update(valueA).digest('hex');
     assert.notEqual(entry.sha256, raw, 'the published file carries the value');
     return `published without the value (${entry.size} bytes)`;
@@ -274,12 +306,14 @@ export async function runCredentialBlastRadiusDrill({
   await step('B: the host dies mid-flight: the worker is SIGKILLed', async () => {
     // --kill-whom=all: гибнет вся контрольная группа воркера, включая движок.
     // Это и есть «хост умер» — падение питания, а не падение одного процесса.
-    const killed = await host.exec(`systemctl kill --signal=SIGKILL --kill-whom=all ${service}`);
+    const killed = await host.exec(killWorkerCgroup(service));
     assert.equal(killed.code, 0, `the kill failed: ${killed.stderr}`);
+    assert.ok(!killed.stdout.includes('no main process'), killed.stdout);
     return 'the worker control group is dead';
   });
 
   await step('B: the copy on the dead host is swept by the recovery, not by the kill', async () => {
+    if (!valueB?.cwd) return 'skipped: the value was not captured';
     const deadline = Date.now() + sweepWaitMs;
     while (Date.now() < deadline) {
       const probe = await host.exec(`test -e ${valueB.cwd}/${LEAK_RELATIVE_PATH} && echo present || echo gone`);

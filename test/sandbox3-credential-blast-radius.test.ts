@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   BLAST_RADIUS_REF,
   LEAK_RELATIVE_PATH,
+  killWorkerCgroup,
   parseEngineEnv,
   parseStateCwd,
   runCredentialBlastRadiusDrill,
@@ -13,7 +14,7 @@ const REGISTRY = {
   github: { connection_id: 'conn-drill', env: 'GITHUB_TOKEN', field: 'token', scope: 'repo' },
 };
 
-function makeHost({ agentWroteTheFile = true, sweepAfterKill = true } = {}) {
+function makeHost({ agentWroteTheFile = true, sweepAfterKill = true, engineHasNoCredential = false } = {}) {
   const calls: string[] = [];
   let killed = false;
   const state = JSON.stringify({ pid: 4242, spec: { cwd: '/var/lib/ai-agent-runner/workspaces/run_x' } });
@@ -22,11 +23,13 @@ function makeHost({ agentWroteTheFile = true, sweepAfterKill = true } = {}) {
     async exec(command: string) {
       calls.push(command);
       if (command.startsWith('cat /var/lib/ai-agent-runner/runner/runs/')) return { stdout: state, stderr: '', code: 0 };
-      if (command.includes('/proc/4242/environ')) return { stdout: `PATH=/usr/bin\0GITHUB_TOKEN=${SECRET}\0`, stderr: '', code: 0 };
+      if (command.includes('/proc/4242/environ')) {
+        return { stdout: engineHasNoCredential ? 'PATH=/usr/bin\0' : `PATH=/usr/bin\0GITHUB_TOKEN=${SECRET}\0`, stderr: '', code: 0 };
+      }
       if (command.startsWith(`cat /var/lib/ai-agent-runner/workspaces/run_x/${LEAK_RELATIVE_PATH}`)) {
         return { stdout: agentWroteTheFile ? SECRET : '', stderr: '', code: 0 };
       }
-      if (command.startsWith('systemctl kill')) { killed = true; return { stdout: '', stderr: '', code: 0 }; }
+      if (command.startsWith('systemctl kill') || command.includes('cgroup.procs')) { killed = true; return { stdout: 'killed /system.slice/ai-agent-vm-worker.service', stderr: '', code: 0 }; }
       if (command.startsWith('test -e')) {
         const present = !sweepAfterKill || !killed;
         return { stdout: present ? 'present' : 'gone', stderr: '', code: 0 };
@@ -66,6 +69,20 @@ describe('sandbox3 credential blast-radius drill', () => {
   it('reads the credential out of the engine environment', () => {
     expect(parseEngineEnv('PATH=/usr/bin\0GITHUB_TOKEN=secret-value\0', 'GITHUB_TOKEN')).toBe('secret-value');
     expect(parseEngineEnv('PATH=/usr/bin\0', 'GITHUB_TOKEN')).toBeNull();
+    // Реальный путь читает файл как есть; вызов через `tr` даёт переводы строк.
+    expect(parseEngineEnv('PATH=/usr/bin\nGITHUB_TOKEN=secret-value\n', 'GITHUB_TOKEN')).toBe('secret-value');
+    expect(parseEngineEnv('A=1\nB=2\nGITHUB_TOKEN=secret-value\nC=3\n', 'GITHUB_TOKEN')).toBe('secret-value');
+  });
+
+  it('kills the whole worker control group, not one process', () => {
+    const command = killWorkerCgroup('ai-agent-vm-worker.service');
+    // `systemctl kill` по умолчанию бьёт только главный процесс, а
+    // `--kill-whom=all` на этой systemd отказывает — поэтому контрольная группа
+    // разбирается по себе: движок и MCP-серверы должны умереть вместе с воркером.
+    expect(command).toContain('systemctl show -p MainPID');
+    expect(command).toContain('cgroup.procs');
+    expect(command).toContain('kill -9');
+    expect(command).not.toContain('systemctl kill');
   });
 
   it('quotes a value for the shell', () => {
@@ -142,9 +159,36 @@ describe('sandbox3 credential blast-radius drill', () => {
       });
       expect(steps.filter((line) => line.startsWith('FAIL'))).toEqual([]);
       // Гибнет вся контрольная группа: «хост умер», а не «умер один процесс».
-      expect(host.calls.some((command) => command.includes('--kill-whom=all'))).toBe(true);
+      expect(host.calls.some((command) => command.includes('cgroup.procs') && command.includes('kill -9'))).toBe(true);
       // Исход рана — измерение: координатор вправе переотдать ран после смерти хоста.
       expect(steps.some((line) => line.includes('the outcome of the run whose host died'))).toBe(true);
+      expect(steps.join('\n')).not.toContain(SECRET);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('reports the value-dependent checks as skipped when the value was never captured', async () => {
+    const host = makeHost({ engineHasNoCredential: true });
+    const api = makeApi();
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = api.fetch as unknown as typeof fetch;
+    try {
+      const steps = await runCredentialBlastRadiusDrill({
+        apiUrl: 'https://runner.example',
+        apiKey: 'key',
+        registry: REGISTRY,
+        ref: BLAST_RADIUS_REF,
+        host,
+        kill: false,
+        waitMs: 1_000,
+        captureWaitMs: 200,
+        sweepWaitMs: 200,
+      });
+      expect(steps.some((line) => line.startsWith('FAIL'))).toBe(true);
+      // Проверки радиуса не должны дать ложной находки: без значения они
+      // пропускаются, а не «проходят» по строке "null".
+      expect(steps.some((line) => line.includes('skipped: the value was not captured'))).toBe(true);
       expect(steps.join('\n')).not.toContain(SECRET);
     } finally {
       globalThis.fetch = originalFetch;
