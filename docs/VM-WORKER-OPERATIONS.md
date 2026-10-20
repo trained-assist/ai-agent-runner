@@ -217,15 +217,23 @@ Each release is built from a tag that must already be reachable from `main`. Git
 Actions publishes a Linux bundle and SHA-256 checksum, then creates a keyless SLSA
 provenance attestation. The updater checks the checksum, verifies the attestation's
 repository, signer workflow and tag ref, unpacks into a commit-specific directory,
-switches the `current` symlink atomically, restarts systemd, and verifies `/version`
-matches the exact source SHA and `/readyz` is healthy. A restart, liveness, readiness,
-or source SHA failure restores the previous symlink and restarts the previous release.
-Do not deploy a checkout or manually replace files in `current`.
+installs the release's host assets, switches the `current` symlink atomically, restarts
+systemd, and verifies `/version` matches the exact source SHA and `/readyz` is healthy.
+A restart, liveness, readiness, or source SHA failure restores the previous symlink and
+restarts the previous release. Do not deploy a checkout or manually replace files in
+`current`.
+
+The host assets are the binding inventory and the OpenCode engine config template. The
+updater installs both from the signed release, and it installs the engine config before
+the "already at this version" check: a run reads that file at start, so a host that kept
+a stale copy would silently run the agent against an old model or old provider headers
+and lose the answer. A release that does not carry the template is refused.
 
 Set the region-specific `VM_WORKER_ENGINE` to `eu-vm-agent-run` or `rf-vm-agent-run`.
-Set `AGENT_API_ENGINE_CONFIG_DIR` to the root-owned engine template directory. The France
-template pins OpenCode to `ladder/free`; only the run-scoped `LLM_LADDER_TOKEN` enters the
-agent environment. The worker refuses to start when its OpenCode template is absent.
+Set `AGENT_API_ENGINE_CONFIG_DIR` to the root-owned engine template directory; the updater
+installs the signed release's template into it. The France template pins OpenCode to
+`ladder/free`; only the run-scoped `LLM_LADDER_TOKEN` enters the agent environment. The
+worker refuses to start when its OpenCode template is absent.
 Set a unique `VM_WORKER_ID`, public HTTPS origin, a random `VM_WORKER_TOKEN` of at
 least 24 characters, the central API callback origin, approved repositories/environment
 names, GCS bucket, OpenCode path, and CPU/RAM reservation percentages. The configured

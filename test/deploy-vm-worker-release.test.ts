@@ -23,6 +23,29 @@ describe('VM worker release updater safety contract', () => {
     expect(updater).toContain('scripts/select-vm-worker-inventory.mjs');
   });
 
+  it('refreshes the host engine config template from the signed release', async () => {
+    const updater = await readFile(updaterPath, 'utf8');
+    const workflow = await readFile(releaseWorkflowPath, 'utf8');
+    // Конфиг движка — хостовый актив, который ран читает на старте. Хост ставил
+    // его только при первичной установке, поэтому копия на нём могла годами
+    // отставать от репозитория: новый воркер отдавал рану старую модель и
+    // старые заголовки Ladder, и агент молча терял ответ.
+    expect(workflow).toContain('cp deploy/vm-worker/engine-config/opencode.json "$STAGE/deploy/vm-worker/engine-config/"');
+    expect(updater).toContain('engine_config_source="${release_dir}/deploy/vm-worker/engine-config/opencode.json"');
+    expect(updater).toContain('install -o root -g root -m 0644 "$engine_config_source" "${engine_config_dir}/opencode.json"');
+    expect(updater).toContain("sed -n 's/^AGENT_API_ENGINE_CONFIG_DIR=//p' \"$config_file\"");
+    // Релиз без шаблона — поломанный релиз: без него хост остался бы со
+    // старым конфигом, и обновление обязано остановиться, а не отчитаться об
+    // успехе.
+    expect(updater).toContain('Signed VM worker release is missing its OpenCode engine config template');
+    // Установка идёт до проверки «хост уже на этой версии»: релиз, который не
+    // меняет бандл, всё равно обязан починить хостовый актив.
+    const install = updater.indexOf('install -o root -g root -m 0644 "$engine_config_source"');
+    const noOp = updater.indexOf('VM worker already at version=');
+    expect(install).toBeGreaterThanOrEqual(0);
+    expect(install).toBeLessThan(noOp);
+  });
+
   it('refreshes the host updater from the tagged release before it deploys', async () => {
     const workflow = await readFile(releaseWorkflowPath, 'utf8');
     const updater = await readFile(updaterPath, 'utf8');
