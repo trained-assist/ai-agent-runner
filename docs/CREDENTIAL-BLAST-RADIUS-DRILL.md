@@ -41,6 +41,7 @@ finishes normally.
 | The run finishes | the delivery did not break the run |
 | The value is not in the run record, the status or the events | the record is value-free |
 | The value is not in the runner log, the run state or the session transcript | the per-run persistence paths are value-free |
+| The host counts the hosts that received the value | the radius is a number: one delivery, and the custody recognised no repeat |
 | The copy does not survive the run on the host | the workspace is swept when the run ends |
 | The published profile carries the file without the value | the publication path is value-free (skipped on lanes that publish no profile) |
 
@@ -54,13 +55,20 @@ died" means — a power cut, not one process exiting.
 | The kill landed on a run that was still alive | the measurement is of a death, not of a normal exit |
 | The copy on the dead host is swept by the recovery | the recovery removes the run's leftovers; the kill itself removes nothing |
 | The outcome of the run whose host died | measured, not judged — see below |
-| The custody store is independent of the host | the value outlived the host, and the journal shows how many times it was granted |
+| The custody store is independent of the host | the value outlived the host, and the journal kept one grant for the run |
 
 The outcome of a killed run is a **measurement**, not an assertion. The
 coordinator is designed to survive an unreachable worker and may hand the run
-to another host; then the run succeeds and the custody grants the value a
-second time. That is the radius growing, and the drill counts it: the custody
-step reports the grants per run.
+to another host; then the run succeeds and the value is delivered to a second
+host. That is the radius growing, and the drill counts it — but the two sides
+count different things, and the drill reports both:
+
+- the **custody** records one grant per run. A repeat request is the same
+  grant, so the journal does not grow, and the journal says how many runs
+  consumed the value;
+- the **host** counts the deliveries: how many workers received the value in
+  their launch, and how many of those the custody recognised as the same
+  grant. That is the radius.
 
 ## Running it
 
@@ -161,8 +169,9 @@ grant for that run.
   ([#486](https://github.com/trained-assist/ai-agent-runner/issues/486)).
 - **A re-dispatch hands the value out again.** The coordinator resolves the
   credential on every dispatch attempt, so a run that is handed to another host
-  after a kill is granted the value once more. The drill counts the grants per
-  run
+  after a kill is delivered the value once more. The custody now records one
+  grant per run, and the host counts the deliveries, so the growth of the
+  radius is a number rather than an inference from the journal
   ([#478](https://github.com/trained-assist/ai-agent-runner/issues/478)).
 - **A stored value never expires.** The custody keeps the value until it is
   explicitly revoked; there is no lease

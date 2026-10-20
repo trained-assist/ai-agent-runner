@@ -297,6 +297,17 @@ run starts:
   holds the value in its process environment and keeps it out of its run spec.
   A connection that was revoked after intake fails the run closed instead of
   starting without the credential.
+- The custody grants a run **once**. A retry, a capacity cut-over to another
+  worker and a replacement host after a crash all ask again, and those are the
+  same grant, so the custody journal keeps one `granted` event for the run and
+  answers the repeat with `replay: true`. The value is still returned — the run
+  needs it to work.
+- The run status reports the **radius** as a number: `credentialDeliveries` is
+  how many workers received the value in their launch, and
+  `credentialGrantRepeats` is how many of those the custody recognised as the
+  same grant. A worker that refused the launch has already received the value in
+  the request body, so a delivery is counted when the launch is sent, not when
+  it is accepted.
 - The environment name must also be approved on the worker host
   (`VM_WORKER_ALLOWED_ENV`). The worker refuses a launch whose allowlist names a
   variable the host has not approved, so a lane that enables credential bindings

@@ -59,6 +59,14 @@ interface RunRecord {
   workerFinalizingObservedAt?: string | null;
   logsPending?: boolean;
   launchAttempts: number; result?: Record<string, unknown>; workerReceipt?: Record<string, unknown>;
+  /**
+   * How many times a credential value was handed to a worker for this run, and
+   * how many of those the custody recognized as the same grant. The radius of a
+   * credential is the number of hosts that received it, and this is where that
+   * number lives: the custody knows the grants, the host knows the deliveries.
+   */
+  credentialDeliveries?: number;
+  credentialGrantRepeats?: number;
   capacityRetryAttempts?: number;
   capacityRetryAt?: string;
   capacityQueuedAt?: string;
@@ -154,6 +162,11 @@ function view(run: RunRecord): Record<string, unknown> {
     ...(run.capacityRetryAt ? { queueReason: 'worker_capacity', retryAt: run.capacityRetryAt } : {}),
     ...(run.capacityQueuedAt ? { capacityQueuedAt: run.capacityQueuedAt, capacityWaitMs: run.capacityWaitMs ?? Date.now() - Date.parse(run.capacityQueuedAt) }
       : run.capacityWaitMs !== undefined ? { capacityWaitMs: run.capacityWaitMs } : {}),
+    // How many hosts received the credential value, and how many of those the
+    // custody recognized as the same grant. The radius is a number, and it is
+    // reported with the run instead of being reconstructed afterwards.
+    ...(run.credentialDeliveries ? { credentialDeliveries: run.credentialDeliveries,
+      credentialGrantRepeats: run.credentialGrantRepeats ?? 0 } : {}),
     output: run.output ?? { stdout: '', stderr: '', updatedAt: null, truncated: false },
     sequence: run.sequence, fencing: { rejected: 0 }, answer: run.answer };
 }
@@ -1050,7 +1063,7 @@ export class RunnerRunCoordinator {
    */
   private async resolveRunCredentials(run: RunRecord, launch: Record<string, unknown>,
     refs: Array<{ ref: string; scope: string }>): Promise<
-      { ok: true; env: Record<string, string>; envAllowlist: string[] }
+      { ok: true; env: Record<string, string>; envAllowlist: string[]; replays: number }
       | { ok: false; code: string; message: string }> {
     let registry: Record<string, SandboxCredential>;
     try { registry = parseSandboxCredentials(this.env.ZEROCREDS_WALLET_CREDENTIALS); }
@@ -1061,6 +1074,7 @@ export class RunnerRunCoordinator {
     }
     const env: Record<string, string> = {};
     const envAllowlist: string[] = [];
+    let replays = 0;
     const runtimeEnv = launch['env'] as Record<string, string> | undefined ?? {};
     const runtimeNames = new Set(Array.isArray(launch['envAllowlist']) ? launch['envAllowlist'] as string[] : []);
     for (const reference of refs) {
@@ -1086,8 +1100,12 @@ export class RunnerRunCoordinator {
       }
       env[configured.env] = value;
       envAllowlist.push(configured.env);
+      if (granted.replay) replays += 1;
     }
-    return { ok: true, env, envAllowlist };
+    // The custody says whether this run already held the grant. It is the
+    // custody's own fact, and it is what lets the host count the deliveries
+    // instead of guessing them.
+    return { ok: true, env, envAllowlist, replays };
   }
 
   private async revokeUserCatalog(runId: string): Promise<void> {
@@ -1144,6 +1162,7 @@ export class RunnerRunCoordinator {
             const credentialRefs = Array.isArray(launch['credentialRefs'])
               ? launch['credentialRefs'] as Array<{ ref: string; scope: string }> : [];
             let credentialEnv: { env: Record<string, string>; envAllowlist: string[] } | undefined;
+            let credentialReplays = 0;
             if (credentialRefs.length) {
               const resolved = await this.resolveRunCredentials(run, launch, credentialRefs);
               if (!resolved.ok) {
@@ -1154,6 +1173,7 @@ export class RunnerRunCoordinator {
                 break;
               }
               credentialEnv = { env: resolved.env, envAllowlist: resolved.envAllowlist };
+              credentialReplays = resolved.replays;
             }
             if (run.mcpUserRequested && !run.mcpUserProvisioned) {
               const attachment = await this.userCatalogAttachment({ runId: run.runId, taskId: run.userTaskId,
@@ -1175,6 +1195,15 @@ export class RunnerRunCoordinator {
               ? { ...launch, env: { ...(launch['env'] as Record<string, string> | undefined ?? {}), ...credentialEnv.env },
                 envAllowlist: [...(launch['envAllowlist'] as string[] | undefined ?? []), ...credentialEnv.envAllowlist] }
               : launch;
+            // The value left the custody and is about to go on the wire to this
+            // worker. Count it here, before the request, and not after the
+            // acceptance: a worker that refuses the launch has already received
+            // the value in the request body, and the radius of a credential is
+            // the number of hosts that received it.
+            if (credentialEnv) {
+              run.credentialDeliveries = (run.credentialDeliveries ?? 0) + 1;
+              run.credentialGrantRepeats = (run.credentialGrantRepeats ?? 0) + credentialReplays;
+            }
             const response = await this.worker(run.engine, '/v1/launch', 'POST', workerLaunch);
             if (!response.ok) {
               const rejection = await response.clone().json().catch(() => null);

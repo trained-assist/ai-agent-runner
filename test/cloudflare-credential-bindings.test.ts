@@ -112,7 +112,13 @@ describe('Cloudflare Runner credential bindings', () => {
     expect(JSON.stringify(stored)).not.toContain(SECRET);
     expect(JSON.stringify(stored.runs[runId])).not.toContain(SECRET);
     const status = await coordinator.fetch(call(`/v1/runs/${runId}/status`));
-    expect(await status.text()).not.toContain(SECRET);
+    const statusText = await status.text();
+    expect(statusText).not.toContain(SECRET);
+    // The radius of the value is a number, and it is reported with the run: one
+    // host received it, and the custody did not recognise the grant as a repeat.
+    const statusBody = JSON.parse(statusText) as { credentialDeliveries?: number; credentialGrantRepeats?: number };
+    expect(statusBody.credentialDeliveries).toBe(1);
+    expect(statusBody.credentialGrantRepeats).toBe(0);
   });
 
   it('refuses a binding that the host policy does not allow', async () => {
@@ -189,10 +195,14 @@ describe('Cloudflare Runner credential bindings', () => {
     const { coordinator, storage, launched, env } = setup();
     env.GHA_WORKER_URL = 'https://gha.example';
     env.GHA_WORKER_TOKEN = 'gha-worker-secret-for-test-only';
+    let grants = 0;
     env.FETCH = async (input, init) => {
       const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
       if (url.hostname === 'wallet.example') {
-        return Response.json({ connection_id: 'conn-1', value: { token: SECRET }, version: 3 });
+        grants += 1;
+        // The custody answers "this run already held the grant" the second time:
+        // the cutover asks again for the same run.
+        return Response.json({ connection_id: 'conn-1', value: { token: SECRET }, version: 3, replay: grants > 1 });
       }
       if (url.hostname === 'france.example') return Response.json({ accepted: false, code: 'WORKER_CAPACITY', cpuPercent: 60.1 }, { status: 503 });
       if (url.pathname === '/v1/launch') {
@@ -217,5 +227,13 @@ describe('Cloudflare Runner credential bindings', () => {
     expect(payload['engine']).toMatchObject({ name: 'azure-cloud' });
     expect(JSON.stringify(payload)).not.toContain(SECRET);
     expect((payload['env'] as Record<string, unknown> | undefined)?.['GITHUB_TOKEN']).toBeUndefined();
+
+    // France received the value in the launch body before it refused, and GHA
+    // received it in the one that was accepted: two hosts, two grants, and the
+    // custody recognised the second grant as the run's own first one.
+    const status = await coordinator.fetch(call(`/v1/runs/${runId}/status`));
+    const statusBody = JSON.parse(await status.text()) as { credentialDeliveries?: number; credentialGrantRepeats?: number };
+    expect(statusBody.credentialDeliveries).toBe(2);
+    expect(statusBody.credentialGrantRepeats).toBe(1);
   });
 });
