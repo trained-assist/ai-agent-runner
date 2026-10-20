@@ -174,7 +174,14 @@ jobs:
           branch="opencode-promotion/$TAG"
           git config user.name "opencode-promotion"
           git config user.email "opencode-promotion@users.noreply.github.com"
-          git checkout -b "$branch"
+          # Ветку и пуш в main строим от свежего origin/main: пока гейт
+          # шёл, репозиторий мог уехать вперёд, и тогда форвард-пуш был бы
+          # отклонён. Сохраняем точный пин, который проверил гейт, и
+          # накладываем его поверх актуального main.
+          git fetch origin main
+          cp deploy/vm-worker/opencode-release-pin.json "$RUNNER_TEMP/pin.json"
+          git checkout -B "$branch" origin/main
+          cp "$RUNNER_TEMP/pin.json" deploy/vm-worker/opencode-release-pin.json
           git add deploy/vm-worker/opencode-release-pin.json
           git commit -m "chore(vm-worker): pin verified OpenCode fork $TAG"
           # Ветка принадлежит хуку: она может остаться от прошлой попытки,
@@ -211,12 +218,12 @@ jobs:
           # подпись, дайджесты и метаданные бандла, а недовый процесс
           # откатывается на прежний релиз.
           git fetch origin main
+          git checkout -B release/promotion origin/main
           pinned_source="$(node -p "require('./deploy/vm-worker/opencode-release-pin.json').OPENCODE_SOURCE_SHA")"
           if [[ "$pinned_source" != "$SOURCE" ]]; then
             echo "main does not pin $SOURCE yet (it pins $pinned_source); the release waits for the merged pin" >&2
             exit 0
           fi
-          git checkout -B release/promotion origin/main
           current="$(node -p "require('./package.json').version")"
           next="$(node -e 'const [a,b,c]=process.argv[1].split(".").map(Number); process.stdout.write(`${a}.${b}.${c+1}`)' "$current")"
           npm version --no-git-tag-version --allow-same-version "$next" >/dev/null
