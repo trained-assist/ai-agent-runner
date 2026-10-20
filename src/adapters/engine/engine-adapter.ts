@@ -8,6 +8,12 @@ export interface EngineStartContext {
   spec: RunSpec;
   cwd: string;
   env: Record<string, string>;
+  /**
+   * Значения секретов окружения рана (credential binding'и, токены MCP, ключ модели).
+   * Движок не должен оставлять их в персистентных артефактах рана: транскрипт сессии
+   * уезжает в архив профиля, а рабочие файлы — в образ профиля.
+   */
+  secrets?: readonly string[];
   onLog: (stream: EngineLogStream, line: string) => void;
   /** Completed user-facing OpenCode message emitted before a tool-call step. */
   onAssistantMessage?: (message: { sessionId: string; messageId: string; text: string }) => void;

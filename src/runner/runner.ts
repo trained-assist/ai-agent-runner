@@ -32,7 +32,7 @@ import { artifactNameFor, mimeForName } from '../storage/export-manifest.js';
 import type { RunExportManifest } from '../storage/export-manifest.js';
 import { isRegularFile, resolveExistingInsideRoot, resolveInsideRoot } from '../storage/local-paths.js';
 import { profileKey } from '../storage/keys.js';
-import { redactSecrets, specHash, truncateLine, writeFileAtomic } from './util.js';
+import { redactSecretValues, redactSecrets, specHash, truncateLine, writeFileAtomic } from './util.js';
 import {
   AGENT_MANIFEST_PATH,
   mergeOutputPlan,
@@ -290,6 +290,12 @@ interface InternalRun {
   runtimeEnv: Record<string, string>;
   /** Allowlisted secret values used to scrub engine output before it reaches durable logs. */
   runtimeSecrets: string[];
+  /**
+   * Значения секретов, которые не должны уйти с хоста в артефактах рана: транскрипт
+   * сессии и опубликованные файлы профиля. Живут дольше `runtimeSecrets`: движок уже
+   * умер, а публикация профиля ещё впереди. Стираются сразу после публикации.
+   */
+  publicationSecrets: string[];
   workspaceToken: string | null;
   repositoryCommit: string | null;
   workspacePublishFailed: boolean;
@@ -411,11 +417,7 @@ function formatMcpFields(fields: McpLogFields): string {
 }
 
 function redactRunSecrets(text: string, secrets: readonly string[]): string {
-  let result = text;
-  for (const secret of secrets) {
-    if (secret.length >= 4 && result.includes(secret)) result = result.split(secret).join('[redacted]');
-  }
-  return result;
+  return redactSecretValues(text, secrets);
 }
 
 export class Runner {
@@ -467,6 +469,7 @@ export class Runner {
       stdoutAnswerBytes: 0,
         runtimeEnv: {},
         runtimeSecrets: [],
+        publicationSecrets: [],
         workspaceToken: null,
         repositoryCommit: state.profileWorkspaceCommit ?? state.result?.repositoryCommit ?? null,
         workspacePublishFailed: false,
@@ -677,6 +680,7 @@ export class Runner {
       repositoryCommit: null,
       workspacePublishFailed: false,
       sessionCheckpoint: null,
+      publicationSecrets: [],
     });
     this.emit(state, 'claimed', { operationId });
     void this.execute(spec.runId).catch(() => undefined);
@@ -1278,10 +1282,12 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
         return;
       }
       this.setStartPhase(st, 'spawn');
+      const engineEnv = this.buildEngineEnv(run, st.spec);
       handle = await adapter.start({
         spec: st.spec,
         cwd: st.spec.cwd,
-        env: this.buildEngineEnv(run, st.spec),
+        env: engineEnv,
+        secrets: [...run.runtimeSecrets],
         ...(run.room
           ? {
               identity: run.room.identity,
@@ -1783,6 +1789,7 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
       if (Object.prototype.hasOwnProperty.call(run.runtimeEnv, name)) env[name] = run.runtimeEnv[name]!;
     }
     run.runtimeSecrets = spec.envAllowlist.map((name) => env[name]).filter((value): value is string => typeof value === 'string' && value.length >= 4);
+    run.publicationSecrets = [...run.runtimeSecrets];
     const room = run.room;
     if (room) {
       // run-scoped HOME/config/cache/tmp: движок не видит и не пишет пользовательский
@@ -2245,11 +2252,11 @@ private async markOrphaned(run: InternalRun, report: RecoveryReport): Promise<vo
         } else {
           if (!run && !st.spec.profileWorkspace.savebackUrl) throw new Error('profile workspace runtime state is unavailable');
           if (!run?.workspaceToken && !st.spec.profileWorkspace.savebackUrl) throw new Error('profile workspace publication credential is unavailable');
-          const publishedCommit = await this.opts.profileWorkspace.publish(st.spec, st.spec.cwd, run?.workspaceToken ?? undefined);
+          const publishedCommit = await this.opts.profileWorkspace.publish(st.spec, st.spec.cwd, run?.workspaceToken ?? undefined, run?.publicationSecrets);
           if (run) run.repositoryCommit = publishedCommit;
           st.profileWorkspaceCommit = publishedCommit;
           this.store.saveState(st);
-          if (run) run.workspaceToken = null;
+          if (run) { run.workspaceToken = null; run.publicationSecrets = []; }
         }
         if (st.spec.profileWorkspace.savebackUrl && !st.result?.profileChanges) {
           const changes = this.opts.profileWorkspace.changes?.(st.spec);

@@ -29,10 +29,11 @@ describe('VM profile workspace wrapper', () => {
     });
 
     await worker.prepare(spec, '/tmp/profile', 'run-scoped-saveback-capability-0123456789');
-    await worker.publish(spec, '/tmp/profile', 'run-scoped-saveback-capability-0123456789');
+    await worker.publish(spec, '/tmp/profile', 'run-scoped-saveback-capability-0123456789', ['ghp_secretvalue0123456789']);
 
     expect(prepare).toHaveBeenCalledWith(spec, '/tmp/profile', 'run-scoped-saveback-capability-0123456789');
-    expect(publish).toHaveBeenCalledWith(spec, '/tmp/profile', 'run-scoped-saveback-capability-0123456789');
+    // Значения секретов рана доходят до публикации: опубликованный файл не должен унести их.
+    expect(publish).toHaveBeenCalledWith(spec, '/tmp/profile', 'run-scoped-saveback-capability-0123456789', ['ghp_secretvalue0123456789']);
     expect(legacy.prepare).not.toHaveBeenCalled();
     expect(legacy.publish).not.toHaveBeenCalled();
   });
