@@ -86,7 +86,7 @@ export class OpenCodeAdapter implements EngineAdapter {
         throw new EngineStartupError('restored OpenCode session checkpoint failed archive integrity validation');
       }
       sessionId = resume.sessionId;
-      const importLaunch = launchCommand(ctx, binary, ['import', checkpointPath]);
+      const importLaunch = launchCommand(ctx, binary, ['session', 'import', checkpointPath]);
       const imported = await new Promise<number | null>((resolve, reject) => {
         const importer = spawn(importLaunch.command, importLaunch.args, {
           cwd: ctx.cwd,
@@ -120,6 +120,21 @@ export class OpenCodeAdapter implements EngineAdapter {
     // message ends in a tool-call step; the final stop message remains covered
     // by the ordinary terminal result path, so it is not delivered twice.
     const pendingAssistantText = new Map<string, { sessionId: string; parts: string[]; chars: number }>();
+    // The engine can finish a step without publishing the matching step_finish:
+    // the Ladder cache replays a completed answer that way. The completed text
+    // was buffered for that step, and without a step_finish it would be dropped,
+    // so the run would end with no answer at all. After a clean exit the last
+    // buffered text is the agent's answer, and it is published instead of lost.
+    const flushPendingAssistantText = (): void => {
+      let lastKey: string | null = null;
+      for (const key of pendingAssistantText.keys()) lastKey = key;
+      if (lastKey === null) return;
+      const pending = pendingAssistantText.get(lastKey);
+      pendingAssistantText.delete(lastKey);
+      if (!pending) return;
+      const text = pending.parts.join('').trim();
+      if (text) ctx.onLog('stdout', text);
+    };
     return handleForChild(child, {
       onLog: (stream, line) => {
         if (stream === 'stdout') {
@@ -192,6 +207,9 @@ export class OpenCodeAdapter implements EngineAdapter {
         ctx.onLog(stream, line);
       },
       onExit: (code, signal) => {
+        // A clean exit means the engine finished on its own terms, so a text it
+        // completed but never closed with a step_finish is its answer.
+        if (code === 0 && !signal) flushPendingAssistantText();
         if (!shouldExport) {
           ctx.onExit(code, signal);
           return;
@@ -207,7 +225,7 @@ export class OpenCodeAdapter implements EngineAdapter {
         try {
           checkpointPath = join(ctx.cwd, '.session-traces', `${sessionId}.json`);
           mkdirSync(join(ctx.cwd, '.session-traces'), { recursive: true, mode: 0o700 });
-          const exportLaunch = launchCommand(ctx, binary, ['export', sessionId]);
+          const exportLaunch = launchCommand(ctx, binary, ['session', 'export', sessionId]);
           const exporter = spawn(exportLaunch.command, exportLaunch.args, {
             cwd: ctx.cwd,
             env: ctx.env,

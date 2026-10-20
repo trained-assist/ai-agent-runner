@@ -45,7 +45,7 @@ describe('OpenCodeAdapter', () => {
       writeFileSync(indexPath, JSON.stringify({ inputItems: [{ text: 'context', artifacts: [{ path: '00-voice.ogg' }] }] }));
       const capturedArgs = join(cwd, 'captured-args.txt');
       const fakeOpenCode = join(cwd, 'opencode-stub.sh');
-      writeFileSync(fakeOpenCode, '#!/bin/sh\nif [ "$1" = "export" ]; then printf "{}\\n"; exit 0; fi\nprintf "%s\\n" "$@" > "$CAPTURE_ARGS"\n');
+      writeFileSync(fakeOpenCode, '#!/bin/sh\nif [ "$1" = "session" ] && [ "$2" = "export" ]; then printf "{}\\n"; exit 0; fi\nprintf "%s\\n" "$@" > "$CAPTURE_ARGS"\n');
       chmodSync(fakeOpenCode, 0o700);
       const originalPrompt = runSpec.input?.inlinePrompt;
       runSpec.ingressManifest = {
@@ -81,8 +81,8 @@ describe('OpenCodeAdapter', () => {
       const sessionId = 'ses_01J9A3J9Y7V8W2K4M6N0PQRSTZ';
       writeFileSync(fakeOpenCode, [
         '#!/bin/sh',
-        'if [ "$1" = "export" ]; then',
-        '  printf \'{"info":{"id":"%s"},"messages":[]}\\n\' "$2"',
+        'if [ "$1" = "session" ] && [ "$2" = "export" ]; then',
+        '  printf \'{"info":{"id":"%s"},"messages":[]}\\n\' "$3"',
         '  exit 0',
         'fi',
         'printf "%s\\n" "$@" > "$CAPTURE_ARGS"',
@@ -112,7 +112,7 @@ describe('OpenCodeAdapter', () => {
       const fakeOpenCode = join(cwd, 'opencode-stub.sh');
       writeFileSync(fakeOpenCode, [
         '#!/bin/sh',
-        'if [ "$1" = "export" ]; then printf \'{"info":{"id":"%s"},"messages":[]}\\n\' "$2"; exit 0; fi',
+        'if [ "$1" = "session" ] && [ "$2" = "export" ]; then printf \'{"info":{"id":"%s"},"messages":[]}\\n\' "$3"; exit 0; fi',
         `printf '%s\\n' '${JSON.stringify({ type: 'question_asked', sessionID: sessionId, request: { id: 'question-1', sessionID: sessionId, questions: [{ header: 'Choice', question: 'Which environment?', multiple: false, options: [{ label: 'Sandbox', description: 'Test safely' }] },], tool: { callID: 'call-1' } } })}'`,
       ].join('\n'));
       chmodSync(fakeOpenCode, 0o700);
@@ -147,7 +147,7 @@ describe('OpenCodeAdapter', () => {
       const binary = join(cwd, 'opencode-stub.sh');
       writeFileSync(binary, [
         '#!/bin/sh',
-        'if [ "$1" = "export" ]; then printf \'{"info":{"id":"%s"},"messages":[]}\\n\' "$2"; exit 0; fi',
+        'if [ "$1" = "session" ] && [ "$2" = "export" ]; then printf \'{"info":{"id":"%s"},"messages":[]}\\n\' "$3"; exit 0; fi',
         `printf '%s\\n' '${JSON.stringify({ type: 'text', sessionID: sessionId, part: { type: 'text', id: 'prt_01J9A3J9Y7V8W2K4M6N0PQRSTZ', messageID: toolMessageId, text: 'Сейчас проверю.', time: { end: 1 } } })}'`,
         `printf '%s\\n' '${JSON.stringify({ type: 'step_finish', sessionID: sessionId, part: { type: 'step-finish', messageID: toolMessageId, reason: 'tool-calls' } })}'`,
         `printf '%s\\n' '${JSON.stringify({ type: 'text', sessionID: sessionId, part: { type: 'text', id: 'prt_01J9A3J9Y7V8W2K4M6N0PQRST0', messageID: finalMessageId, text: 'Готово.', time: { end: 2 } } })}'`,
@@ -169,6 +169,64 @@ describe('OpenCodeAdapter', () => {
     }
   });
 
+  it('publishes the completed answer when the engine exits without the matching step_finish', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'opencode-unclosed-step-'));
+    try {
+      const sessionId = 'ses_01J9A3J9Y7V8W2K4M6N0PQRSTZ';
+      const messageId = 'msg_01J9A3J9Y7V8W2K4M6N0PQRSTZ';
+      const binary = join(cwd, 'opencode-stub.sh');
+      writeFileSync(binary, [
+        '#!/bin/sh',
+        'if [ "$1" = "session" ] && [ "$2" = "export" ]; then printf \'{"info":{"id":"%s"},"messages":[]}\\n\' "$3"; exit 0; fi',
+        `printf '%s\\n' '${JSON.stringify({ type: 'step_start', sessionID: sessionId, part: { type: 'step-start', messageID: messageId } })}'`,
+        `printf '%s\\n' '${JSON.stringify({ type: 'text', sessionID: sessionId, part: { type: 'text', id: 'prt_01J9A3J9Y7V8W2K4M6N0PQRSTZ', messageID: messageId, text: 'present', time: { end: 1 } } })}'`,
+      ].join('\n'));
+      chmodSync(binary, 0o700);
+      const { ctx, exit } = makeContext(cwd, {});
+      ctx.spec.input = { inlinePrompt: 'Answer with one word.' };
+      const outputLines: Array<{ stream: string; text: string }> = [];
+      ctx.onLog = (stream, text) => outputLines.push({ stream, text });
+      await new OpenCodeAdapter({ binary }).start(ctx);
+      const result = await exit;
+      // The engine completed the text and exited without closing the step with a
+      // step_finish. The answer must not be dropped: a run that produced an
+      // answer may not end with none.
+      expect(result.code).toBe(0);
+      expect(outputLines.filter((line) => line.stream === 'stdout').map((line) => line.text)).toEqual(['present']);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('imports and exports the session through the session subcommands of the pinned CLI', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'opencode-session-commands-'));
+    try {
+      const sessionId = 'ses_01J9A3J9Y7V8W2K4M6N0PQRSTZ';
+      const binary = join(cwd, 'opencode-stub.sh');
+      const calls = join(cwd, 'calls.txt');
+      writeFileSync(binary, [
+        '#!/bin/sh',
+        'if [ "$1" = "session" ] && [ "$2" = "import" ]; then echo "session import $3" >> "$CALLS"; exit 0; fi',
+        'if [ "$1" = "session" ] && [ "$2" = "export" ]; then echo "session export $3" >> "$CALLS"; printf \'{"info":{"id":"%s"},"messages":[]}\\n\' "$3"; exit 0; fi',
+        'echo "run $@" >> "$CALLS"',
+        `printf '%s\\n' '${JSON.stringify({ type: 'step_start', sessionID: sessionId, part: { type: 'step-start', messageID: 'msg_01J9A3J9Y7V8W2K4M6N0PQRSTZ' } })}'`,
+      ].join('\n'));
+      chmodSync(binary, 0o700);
+      const { ctx, exit } = makeContext(cwd, { CALLS: calls });
+      ctx.spec.input = { inlinePrompt: 'Do a task.' };
+      await new OpenCodeAdapter({ binary }).start(ctx);
+      await exit;
+      // The pinned CLI keeps both commands under `session`. The bare `export`
+      // and `import` commands print help and exit 1, so the session checkpoint
+      // was never written and a resume could never work.
+      const recorded = readFileSync(calls, 'utf8');
+      expect(recorded).toContain(`session export ${sessionId}`);
+      expect(recorded).not.toContain('\nexport ');
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
   it('imports a durable prior session before continuing it with the same OpenCode session id', async () => {
     const cwd = mkdtempSync(join(tmpdir(), 'opencode-resume-'));
     try {
@@ -181,8 +239,8 @@ describe('OpenCodeAdapter', () => {
       const capture = join(cwd, 'calls.txt');
       writeFileSync(fakeOpenCode, [
         '#!/bin/sh',
-        'if [ "$1" = "import" ]; then touch "$IMPORTED"; echo import >> "$CAPTURE"; exit 0; fi',
-        'if [ "$1" = "export" ]; then printf \'{"info":{"id":"%s"},"messages":[]}\\n\' "$2"; exit 0; fi',
+        'if [ "$1" = "session" ] && [ "$2" = "import" ]; then touch "$IMPORTED"; echo import >> "$CAPTURE"; exit 0; fi',
+        'if [ "$1" = "session" ] && [ "$2" = "export" ]; then printf \'{"info":{"id":"%s"},"messages":[]}\\n\' "$3"; exit 0; fi',
         '[ -f "$IMPORTED" ] || exit 9',
         'printf "%s\\n" "$@" >> "$CAPTURE"',
       ].join('\n'));

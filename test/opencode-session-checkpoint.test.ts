@@ -53,8 +53,8 @@ describe('durable OpenCode session checkpoint', () => {
       writeFileSync(binary, [
         '#!/bin/sh',
         'mkdir -p "$PWD/.session-traces"',
-        'if [ "$1" = "import" ]; then touch "$PWD/.runner-imported"; exit 0; fi',
-        'if [ "$1" = "export" ]; then printf \'{"info":{"id":"%s"},"messages":[{"role":"assistant"}]}\\n\' "$2"; exit 0; fi',
+        'if [ "$1" = "session" ] && [ "$2" = "import" ]; then touch "$PWD/.runner-imported"; exit 0; fi',
+        'if [ "$1" = "session" ] && [ "$2" = "export" ]; then printf \'{"info":{"id":"%s"},"messages":[{"role":"assistant"}]}\\n\' "$3"; exit 0; fi',
         '[ "$1" = "run" ] || exit 20',
         `session_id="${sessionId}"; previous=""`,
         'for arg in "$@"; do if [ "$previous" = "--session" ]; then session_id="$arg"; fi; previous="$arg"; done',
