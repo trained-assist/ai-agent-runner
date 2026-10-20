@@ -43,7 +43,15 @@ finishes normally.
 | The value is not in the runner log, the run state or the session transcript | the per-run persistence paths are value-free |
 | The host counts the hosts that received the value | the radius is a number: one delivery, and the custody recognised no repeat |
 | The copy does not survive the run on the host | the workspace is swept when the run ends |
-| The published profile carries the file without the value | the publication path is value-free (skipped on lanes that publish no profile) |
+| The published profile carries the file without the value | the publication path is value-free: the drill reads the published bytes back and compares them, it does not trust the manifest |
+
+**The publication step reads the bytes back.** The lane publishes the agent's
+files through its own profile workspace: the worker uploads them to the lane
+with a run-scoped capability, and the lane serves them back. The drill does not
+trust the manifest — it fetches the published bytes and compares them. The
+digest of the bytes must equal the digest in the manifest, the bytes must carry
+the redaction marker, and they must not carry the value. A manifest that hashes
+correctly while the bytes carry the value would be a passing test of nothing.
 
 **Phase B — the kill.** The second run repeats the delivery, and the drill
 SIGKILLs the worker's whole control group while the run is alive: the worker,
@@ -127,12 +135,6 @@ the report never contains the value.
   send the value to: the lane has no browser MCP attached
   ([#479](https://github.com/trained-assist/ai-agent-runner/issues/479)). The
   measurement is one-sided — the drill proves where the value does *not* end up.
-- **It does not cover the published profile on the Runner API lane.** The API
-  rejects `profileWorkspace` (`422 FEATURE_UNSUPPORTED`), so the lane publishes
-  no profile and the step is skipped
-  ([#482](https://github.com/trained-assist/ai-agent-runner/issues/482)). The
-  publication redaction itself is covered by unit tests
-  (`test/api-saveback-worker.test.ts`).
 - **It does not cover the archive upload.** The session log export needs a
   signed URL, which the R2 backend cannot produce, so on this lane the export
   does not happen at all
@@ -140,7 +142,9 @@ the report never contains the value.
   transcript is checked on the host, where it is written already redacted.
 - **It does not cover the git publication path.** The GitHub Actions lane
   publishes the agent's files without redaction
-  ([#471](https://github.com/trained-assist/ai-agent-runner/issues/471)).
+  ([#471](https://github.com/trained-assist/ai-agent-runner/issues/471)). The
+  Runner API lane publishes through its own profile workspace, where the
+  published bytes are edited by value before they leave the host.
 
 ## The measured run (2026-10-20, worker 0.3.46, France sandbox worker)
 

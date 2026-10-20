@@ -168,6 +168,16 @@ export async function runCredentialBlastRadiusDrill({
     return { status: response.status, text, body: parsed };
   }
 
+  /** Reads the published bytes themselves: a hash says what should have landed, the bytes say what did. */
+  async function runnerBytes(path) {
+    const response = await fetch(`${apiUrl}${path}`, {
+      headers: { authorization: `Bearer ${apiKey}` },
+      signal: AbortSignal.timeout(30_000),
+    });
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    return { status: response.status, bytes, sha256: response.headers.get('x-content-sha256'), text: new TextDecoder().decode(bytes) };
+  }
+
   const statePath = (runId) => `${runnerRoot}/runner/runs/${runId}/state.json`;
   const checkpointPath = (runId) => `${runnerRoot}/runner/runs/${runId}/checkpoint.json`;
 
@@ -187,7 +197,7 @@ export async function runCredentialBlastRadiusDrill({
     }
   }
 
-  async function startRun(label) {
+  async function startRun(label, { profileWorkspace = false } = {}) {
     const taskId = `blast-radius-${label}-${Date.now()}`;
     const response = await runner('/v1/runs', {
       method: 'POST',
@@ -197,6 +207,9 @@ export async function runCredentialBlastRadiusDrill({
         input: { inlinePrompt: PROMPT.join(' ').replaceAll('CREDENTIAL_ENV_NAME', envName) },
         envAllowlist: ['LLM_LADDER_TOKEN'],
         credentialBindings: [{ ref, scope: configured.scope }],
+        // Полоса публикует профиль: без этого запроса координатор не даёт рану
+        // публиковать, и шаг проверки публикации нечего проверять.
+        ...(profileWorkspace ? { profileWorkspace: {} } : {}),
         limits: { timeoutMs: waitMs },
       },
     });
@@ -260,7 +273,7 @@ export async function runCredentialBlastRadiusDrill({
   let valueA = null;
 
   await step('A: the Runner API accepts a run that binds the credential', async () => {
-    runA = await startRun('leak');
+    runA = await startRun('leak', { profileWorkspace: true });
     return runA;
   });
 
@@ -330,15 +343,18 @@ export async function runCredentialBlastRadiusDrill({
     assert.equal(response.status, 200, response.text);
     const manifest = response.body?.profileChanges?.files ?? [];
     const entry = manifest.find((file) => file.path === LEAK_RELATIVE_PATH);
-    if (!entry) {
-      // Полоса API не публикует профиль вовсе: profileWorkspace отклоняется
-      // координатором (422 FEATURE_UNSUPPORTED). Тогда публикационный путь
-      // редакции не покрыт этим прогоном — это отдельная задача.
-      return 'skipped: the lane publishes no profile (profileWorkspace is rejected by the API)';
-    }
+    assert.ok(entry, `the run published no ${LEAK_RELATIVE_PATH}: ${JSON.stringify(response.body?.profileChanges ?? null)}`);
+    // Манифест говорит, что должно было приземлиться; байты говорят, что приземлилось.
+    const published = await runnerBytes(`/v1/runs/${runA}/profile-changes?path=${encodeURIComponent(LEAK_RELATIVE_PATH)}`);
+    assert.equal(published.status, 200, `the published bytes are not readable: HTTP ${published.status}`);
+    const digest = createHash('sha256').update(published.bytes).digest('hex');
+    assert.equal(digest, entry.sha256, 'the published bytes do not match the published manifest');
+    assert.equal(published.sha256, entry.sha256, 'the published bytes carry another digest in the header');
+    assert.ok(!published.text.includes(valueA), 'the published file carries the value');
+    assert.ok(published.text.includes('[redacted]'), 'the published file carries no redaction marker');
     const raw = createHash('sha256').update(valueA).digest('hex');
     assert.notEqual(entry.sha256, raw, 'the published file carries the value');
-    return `published without the value (${entry.size} bytes)`;
+    return `published without the value (${entry.size} bytes, sha256 ${digest.slice(0, 16)})`;
   });
 
   if (!kill) {
