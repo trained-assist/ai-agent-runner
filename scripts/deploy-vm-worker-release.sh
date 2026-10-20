@@ -59,6 +59,7 @@ actual_opencode_sha="$(sha256sum "${opencode_file}" | cut -d' ' -f1)"
 actual_opencode_version="$(printf '%s' "$("${opencode_file}" --version)" | sed -E 's/^opencode[[:space:]]+v?//')"
 if [[ "${actual_opencode_sha}" != "${opencode_sha}" || "${actual_opencode_version}" != "${opencode_version}" ]]; then
   echo "Bundled OpenCode version or SHA-256 does not match signed build metadata" >&2
+  echo "If the host updater predates this release, refresh it from the tagged release first" >&2
   exit 1
 fi
 release_dir="${root}/releases/${source_commit}"

@@ -23,6 +23,22 @@ describe('VM worker release updater safety contract', () => {
     expect(updater).toContain('scripts/select-vm-worker-inventory.mjs');
   });
 
+  it('refreshes the host updater from the tagged release before it deploys', async () => {
+    const workflow = await readFile(releaseWorkflowPath, 'utf8');
+    const updater = await readFile(updaterPath, 'utf8');
+    // Апдейтер на хосте обновляет себя только после успешной установки, поэтому
+    // старый апдейтер может заблокировать релиз навсегда. Деплой обязан сначала
+    // положить на хост апдейтер из того же тега.
+    expect(workflow).toContain('Refresh the host updater from this tagged release');
+    expect(workflow).toContain('scripts/deploy-vm-worker-release.sh "$SSH_USER@$SSH_HOST:/tmp/ai-agent-vm-worker-update"');
+    expect(workflow).toContain('install -o root -g root -m 0755 /tmp/ai-agent-vm-worker-update /usr/local/sbin/ai-agent-vm-worker-update');
+    const refreshAt = workflow.indexOf('Refresh the host updater from this tagged release');
+    const deployAt = workflow.indexOf('"update $RELEASE_TAG"');
+    expect(refreshAt).toBeGreaterThan(-1);
+    expect(deployAt).toBeGreaterThan(refreshAt);
+    expect(updater).toContain('If the host updater predates this release, refresh it from the tagged release first');
+  });
+
   it('deploys the signed release to the France sandbox only', async () => {
     const workflow = await readFile(releaseWorkflowPath, 'utf8');
     expect(workflow).toContain('Deploy signed release to France sandbox');

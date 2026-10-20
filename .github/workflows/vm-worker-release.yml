@@ -111,6 +111,36 @@ jobs:
       VM_DEPLOY_KEY: ${{ secrets.FRANCE_VM_RELEASE_DEPLOY_KEY }}
     steps:
       - uses: actions/checkout@v4
+      - name: Refresh the host updater from this tagged release
+        env:
+          SSH_HOST: ${{ secrets.VM2_SSH_HOST }}
+          SSH_USER: ${{ secrets.VM2_SSH_USER }}
+          SSH_KEY: ${{ secrets.VM2_SSH_PRIVATE_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.VM2_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          # Апдейтер на хосте ставит себя сам — но только ПОСЛЕ успешной
+          # установки. Старый апдейтер вправе отвергнуть бандл, который новый
+          # поставил бы (например, из-за формата версии), и тогда релиз не
+          # доедет до прода никогда. Поэтому перед вызовом кладём на хост
+          # апдейтер из этого же тега: он собран и подписан вместе с релизом,
+          # а собственные проверки апдейтера всё равно сверяют подпись,
+          # дайджесты и метаданные бандла.
+          install -m 0700 -d "$RUNNER_TEMP/ssh"
+          install -m 0600 /dev/null "$RUNNER_TEMP/ssh/id_vm_worker"
+          printf '%s\n' "$SSH_KEY" > "$RUNNER_TEMP/ssh/id_vm_worker"
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > "$RUNNER_TEMP/ssh/known_hosts"
+          ssh_options=(-i "$RUNNER_TEMP/ssh/id_vm_worker" -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o BatchMode=yes -o UserKnownHostsFile="$RUNNER_TEMP/ssh/known_hosts" -o ConnectTimeout=15)
+          scp "${ssh_options[@]}" scripts/deploy-vm-worker-release.sh "$SSH_USER@$SSH_HOST:/tmp/ai-agent-vm-worker-update"
+          ssh "${ssh_options[@]}" "$SSH_USER@$SSH_HOST" 'set -euo pipefail
+            systemctl cat ai-agent-vm-worker >/dev/null
+            if [ "$(id -u)" -ne 0 ]; then
+              sudo -n install -o root -g root -m 0755 /tmp/ai-agent-vm-worker-update /usr/local/sbin/ai-agent-vm-worker-update
+            else
+              install -o root -g root -m 0755 /tmp/ai-agent-vm-worker-update /usr/local/sbin/ai-agent-vm-worker-update
+            fi
+            rm -f /tmp/ai-agent-vm-worker-update
+            sha256sum /usr/local/sbin/ai-agent-vm-worker-update'
       - name: Validate target release and deployment credential
         run: |
           set -euo pipefail

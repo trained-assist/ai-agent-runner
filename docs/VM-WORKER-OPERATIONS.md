@@ -72,6 +72,13 @@ with the newest published `mem-preview` tag and fails if the pin is stale. A new
 preview therefore requires an explicit pin change and worker release; builds never float
 to an unreviewed binary. The France auto-deploy is release-triggered in GitHub Actions;
 there is no workstation scheduler or VM self-update timer.
+The deployment job first refreshes the host updater from the tagged release itself.
+The updater installs itself only after a successful installation, so an updater that
+predates a release can refuse a bundle the newer updater would accept — for example
+when the OpenCode CLI prints its version with a prefix — and the release would then
+never reach production. Refreshing it first removes that deadlock: the updater that
+runs is always the one built and signed with the release, and its own checks still
+verify the attestation, the digests, and the bundle metadata.
 France bootstrap also installs the host shared libraries required by headless
 Playwright Chromium. It does not install a browser or restart the worker service;
 the agent may install a pinned Playwright package and browser inside its run workspace.
