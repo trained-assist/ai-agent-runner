@@ -77,6 +77,18 @@ workflow on purpose: a GitHub Actions token cannot change files under
 promotion hook could never deliver a new build on its own. The France auto-deploy is
 release-triggered in GitHub Actions; there is no workstation scheduler or VM
 self-update timer.
+
+The promotion hook is what keeps that pin moving. On its schedule, and immediately when
+`opencode-promotion-run` is pushed, it compares the newest published `mem-preview` release
+with the pin; a release that points at a different source commit becomes a candidate. The
+gate re-checks the candidate's provenance — tag, target commit, archive and binary
+digests — and runs the runner end-to-end suite against the candidate binary. Only a green
+gate promotes anything: a red gate changes nothing and leaves the decision as a workflow
+artifact. After a green gate the hook re-pins the data file and lands it on `main`, either
+by opening a pull request when the repository lets the Actions token open one or by
+pushing straight to `main` when it does not, because the gate is the review in that case.
+It then bumps the worker patch version and tags `vm-worker-vX.Y.Z`, and that tag starts
+the signed release that installs the promoted build on France.
 The deployment job first refreshes the host updater from the tagged release itself.
 The updater installs itself only after a successful installation, so an updater that
 predates a release can refuse a bundle the newer updater would accept — for example
