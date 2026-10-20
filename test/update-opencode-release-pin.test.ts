@@ -1,3 +1,8 @@
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { pinFromDecision, readOpenCodePin, writeOpenCodePin } from '../scripts/update-opencode-release-pin.mjs';
 
@@ -68,5 +73,30 @@ describe('OpenCode fork pin in the VM worker release workflow', () => {
     };
     expect(pinFromDecision({ outcome: 'promote', candidate })).toEqual(nextPin);
     expect(() => pinFromDecision({ outcome: 'hold', candidate })).toThrow('not a promotion');
+  });
+
+  it('rewrites the pinned workflow in place when the command runs without an output path', () => {
+    // Хук промоушена вызывает скрипт с двумя аргументами и ждёт, что файл
+    // изменится. Раньше скрипт только печатал новый YAML: пин оставался
+    // прежним, а хук рапортовал об успешном промоушене.
+    const dir = mkdtempSync(join(tmpdir(), 'ai-agent-runner-pin-'));
+    const workflowPath = join(dir, 'vm-worker-release.yml');
+    writeFileSync(workflowPath, workflow);
+    const decisionPath = join(dir, 'promotion-decision.json');
+    writeFileSync(decisionPath, JSON.stringify({
+      outcome: 'promote',
+      candidate: {
+        tag: nextPin.OPENCODE_RELEASE_TAG,
+        version: nextPin.OPENCODE_VERSION,
+        sourceCommit: nextPin.OPENCODE_SOURCE_SHA,
+        archiveSha256: nextPin.OPENCODE_ARCHIVE_SHA256,
+        binarySha256: nextPin.OPENCODE_BINARY_SHA256,
+      },
+    }));
+
+    const script = fileURLToPath(new URL('../scripts/update-opencode-release-pin.mjs', import.meta.url));
+    const result = spawnSync(process.execPath, [script, decisionPath, workflowPath], { encoding: 'utf8' });
+    expect(result.status).toBe(0);
+    expect(readOpenCodePin(readFileSync(workflowPath, 'utf8'))).toEqual(nextPin);
   });
 });

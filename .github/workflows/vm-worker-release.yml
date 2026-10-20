@@ -53,7 +53,12 @@ jobs:
           tar -xzf "$RUNNER_TEMP/$asset" -C "$RUNNER_TEMP/opencode-fork"
           test -x "$RUNNER_TEMP/opencode-fork/opencode"
           echo "$OPENCODE_BINARY_SHA256  $RUNNER_TEMP/opencode-fork/opencode" | sha256sum --check --status
-          test "$("$RUNNER_TEMP/opencode-fork/opencode" --version)" = "$OPENCODE_VERSION"
+          # Сборки форка печатают версию как "opencode v<version>", а пин хранит
+          # версию без префикса: сравниваем нормализованные значения, иначе
+          # любой бинарь v2-линии не проходит проверку.
+          reported_opencode_version="$("$RUNNER_TEMP/opencode-fork/opencode" --version)"
+          normalized_opencode_version="$(printf '%s' "$reported_opencode_version" | sed -E 's/^opencode[[:space:]]+v?//')"
+          test "$normalized_opencode_version" = "$OPENCODE_VERSION"
           echo "OPENCODE_VERSION=$OPENCODE_VERSION" >> "$GITHUB_ENV"
           echo "OPENCODE_SOURCE_SHA=$OPENCODE_SOURCE_SHA" >> "$GITHUB_ENV"
           echo "OPENCODE_BINARY_SHA256=$OPENCODE_BINARY_SHA256" >> "$GITHUB_ENV"

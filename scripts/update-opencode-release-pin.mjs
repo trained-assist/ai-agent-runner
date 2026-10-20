@@ -90,7 +90,8 @@ if (invokedDirectly) {
     process.exit(0);
   }
   const updated = writeOpenCodePin(await readFile(workflowPath, 'utf8'), pin);
-  if (outputPath) await writeFile(outputPath, updated);
-  else process.stdout.write(updated);
-  process.stdout.write(`Pinned OpenCode fork ${pin.OPENCODE_RELEASE_TAG} (${pin.OPENCODE_SOURCE_SHA}) in ${workflowPath}\n`);
+  // Без выходного пути пин переписывается на месте: иначе скрипт только
+  // печатал новый YAML, пин в файле не менялся, а хук рапортовал об успехе.
+  await writeFile(outputPath ?? workflowPath, updated);
+  process.stdout.write(`Pinned OpenCode fork ${pin.OPENCODE_RELEASE_TAG} (${pin.OPENCODE_SOURCE_SHA}) in ${outputPath ?? workflowPath}\n`);
 }

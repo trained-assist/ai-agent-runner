@@ -60,6 +60,19 @@ describe('VM worker release updater safety contract', () => {
     expect(updater).toContain('v.engine?.binarySha256!==process.argv[5]');
   });
 
+  it('compares the OpenCode version without the CLI prefix', async () => {
+    const updater = await readFile(updaterPath, 'utf8');
+    const workflow = await readFile(releaseWorkflowPath, 'utf8');
+    // Сборки форка печатают версию как "opencode v<version>", а пин хранит
+    // версию без префикса: и релиз, и апдейтер на хосте обязаны сравнивать
+    // нормализованные значения, иначе любая сборка v2-линии не проходит.
+    const normalization = "sed -E 's/^opencode[[:space:]]+v?//'";
+    expect(updater).toContain(normalization);
+    expect(workflow).toContain(normalization);
+    expect(updater).not.toContain('"$("${opencode_file}" --version)" != "${opencode_version}"');
+    expect(workflow).not.toContain('test "$("$RUNNER_TEMP/opencode-fork/opencode" --version)" = "$OPENCODE_VERSION"');
+  });
+
   it('validates the endpoint before switching releases and requires readyz', async () => {
     const updater = await readFile(updaterPath, 'utf8');
     const workflow = await readFile(releaseWorkflowPath, 'utf8');
