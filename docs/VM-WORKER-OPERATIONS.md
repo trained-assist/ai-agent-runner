@@ -83,17 +83,40 @@ promotion hook could never deliver a new build on its own. The France auto-deplo
 release-triggered in GitHub Actions; there is no workstation scheduler or VM
 self-update timer.
 
-The promotion hook is what keeps that pin moving. On its schedule, and immediately when
-`opencode-promotion-run` is pushed, it compares the newest published `mem-preview` release
-with the pin; a release that points at a different source commit becomes a candidate. The
-gate re-checks the candidate's provenance — tag, target commit, archive and binary
-digests — and runs the runner end-to-end suite against the candidate binary. Only a green
-gate promotes anything: a red gate changes nothing and leaves the decision as a workflow
-artifact. After a green gate the hook re-pins the data file and lands it on `main`, either
-by opening a pull request when the repository lets the Actions token open one or by
-pushing straight to `main` when it does not, because the gate is the review in that case.
-It then bumps the worker patch version and tags `vm-worker-vX.Y.Z`, and that tag starts
-the signed release that installs the promoted build on France.
+The promotion hook is what keeps that pin moving, and it needs no human in the loop. On its
+schedule, and immediately when `opencode-promotion-run` is pushed, it compares the newest
+published `mem-preview` release with the pin; a release that points at a different source
+commit becomes a candidate. The gate re-checks the candidate's provenance — tag, target
+commit, archive and binary digests — and runs the runner end-to-end suite against the
+candidate binary. Only a green gate promotes anything: a red gate changes nothing and
+leaves the decision as a workflow artifact. After a green gate the hook re-pins the data
+file and opens a pull request that carries the pin. The pull request is opened and merged
+with the repository token from the `PROMOTION_GITHUB_TOKEN` secret, not with the workflow
+token: a pull request created by the workflow token does not start CI on its own branch,
+so there would be no green CI to wait for before the merge. The hook waits for the
+checks on the pull request to pass and merges it itself; if a check fails, the pull
+request stays open for review and the promotion stops there. If the repository ever
+refuses pull requests from Actions again, the hook falls back to pushing the gated pin
+straight to `main`, because the gate is then the only review.
+
+Cutting the worker release is a separate step from the promotion, and it is what closes
+the loop. Production serves the newest signed `vm-worker-v*` release, not the `main`
+branch, so a pin that reached `main` without a matching release would leave the host on
+the old build. After the promotion job the hook compares the pin on `main` with the pin
+recorded in the newest signed release and, when they differ, bumps the worker patch
+version, tags `vm-worker-vX.Y.Z`, and dispatches the signed release that installs the
+promoted build on France. That comparison is also the repair path: a promotion whose
+release step failed, or a pin merged by hand, is picked up by the next hook run without
+anyone re-running a release by hand.
+
+Two repository settings back the pull request path. The organization must allow
+GitHub Actions to create and approve pull requests
+(`can_approve_pull_request_reviews` on the organization and on this repository), and the
+`PROMOTION_GITHUB_TOKEN` repository secret must hold a token that can open and merge
+pull requests and push to `main` — contents, pull requests, and workflows read/write.
+Without the secret the hook still runs, but the pull request is opened with the workflow
+token, whose pull requests do not trigger CI, and the hook then falls back to landing
+the gated pin directly on `main`.
 The deployment job first refreshes the host updater from the tagged release itself.
 The updater installs itself only after a successful installation, so an updater that
 predates a release can refuse a bundle the newer updater would accept — for example

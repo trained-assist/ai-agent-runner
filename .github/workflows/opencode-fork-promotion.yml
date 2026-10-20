@@ -165,8 +165,13 @@ jobs:
           echo "changed=true" >> "$GITHUB_OUTPUT"
       - name: Open a pull request that carries the verified pin
         if: steps.pin.outputs.changed == 'true'
+        id: pull
         env:
-          GH_TOKEN: ${{ github.token }}
+          # PR и merge делаем токеном из секретов, а не github.token: PR,
+          # созданный токеном Actions, не запускает CI на своей ветке, и
+          # зелёного прогона на самое промоушен никогда не было бы. Токен
+          # хранится в секрете репозитория, значение нигде не печатается.
+          GH_TOKEN: ${{ secrets.PROMOTION_GITHUB_TOKEN || github.token }}
           TAG: ${{ needs.detect.outputs.tag }}
           SOURCE: ${{ needs.detect.outputs.source_commit }}
         run: |
@@ -190,42 +195,135 @@ jobs:
           body="$(printf 'The promotion gate passed for `%s` (`%s`).\n\nThis pins the verified fork build so the next signed `vm-worker-v*` release bundles it, and the France deploy job installs that release.\n\nEvidence: the `promotion-decision` artifact of run %s.\n' "$TAG" "$SOURCE" "$GITHUB_RUN_ID")"
           if gh pr view "$branch" >/dev/null 2>&1; then
             gh pr comment "$branch" --body "$body"
+          elif gh pr create --title "chore(vm-worker): pin verified OpenCode fork $TAG" --body "$body" --head "$branch" --base main; then
+            echo "Opened pull request for $branch"
+          else
+            # Политика репозитория может запрещать токену Actions создавать PR.
+            # Тогда гейт — единственная ревизия: он проверил происхождение
+            # сборки и прогнал e2e раннера против кандидата. Поэтому пин
+            # доезжает до main сам, быстрым форвард-пушем: если main уехал
+            # вперёд, пуш будет отклонён и пин останется ждать следующего
+            # прогона хука.
+            echo "GitHub Actions may not open pull requests in this repository; landing the gated pin on main directly." >&2
+            git push origin "HEAD:refs/heads/main"
+            echo "- landed on main directly: \`true\`" >> "$GITHUB_STEP_SUMMARY"
+            # Ни ветки, ни PR нет, пин уже в main: шаг merge должен
+            # пропуститься, иначе он упрётся в `gh pr view` и завалит
+            # промоушен, который уже отработал.
+            echo "branch=" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          if gh pr create --title "chore(vm-worker): pin verified OpenCode fork $TAG" --body "$body" --head "$branch" --base main; then
-            exit 0
-          fi
-          # Политика репозитория может запрещать токену Actions создавать PR.
-          # Тогда гейт — единственная ревизия: он проверил происхождение
-          # сборки и прогнал e2e раннера против кандидата. Поэтому пин
-          # доезжает до main сам, быстрым форвард-пушем: если main уехал
-          # вперёд, пуш будет отклонён и пин останется ждать следующего
-          # прогона хука.
-          echo "GitHub Actions may not open pull requests in this repository; landing the gated pin on main directly." >&2
-          git push origin "HEAD:refs/heads/main"
-          echo "- landed on main directly: \`true\`" >> "$GITHUB_STEP_SUMMARY"
-      - name: Release the worker with the promoted pin
-        if: steps.pin.outputs.changed == 'true'
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+      - name: Merge the promotion pull request once its CI is green
+        if: steps.pin.outputs.changed == 'true' && steps.pull.outputs.branch != ''
         env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ needs.detect.outputs.tag }}
-          SOURCE: ${{ needs.detect.outputs.source_commit }}
+          GH_TOKEN: ${{ secrets.PROMOTION_GITHUB_TOKEN || github.token }}
+          BRANCH: ${{ steps.pull.outputs.branch }}
         run: |
           set -euo pipefail
-          # Гейт прошёл и пин лёг в main: поднимаем версию воркера и помечаем
-          # релиз, чтобы подписанный релиз собрался и доехал до прода. Релиз
-          # неизменяемый, тег vm-worker-vX.Y.Z; сборка и деплой проверяют
-          # подпись, дайджесты и метаданные бандла, а недовый процесс
-          # откатывается на прежний релиз.
-          git fetch origin main
-          git checkout -B release/promotion origin/main
-          pinned_source="$(node -p "require('./deploy/vm-worker/opencode-release-pin.json').OPENCODE_SOURCE_SHA")"
-          if [[ "$pinned_source" != "$SOURCE" ]]; then
-            echo "main does not pin $SOURCE yet (it pins $pinned_source); the release waits for the merged pin" >&2
+          if ! gh pr view "$BRANCH" >/dev/null 2>&1; then
+            echo "Pull request for $BRANCH is gone; main already carries the gated pin."
             exit 0
           fi
+          # Сливаем только на зелёном CI: это и есть ревизия, которая раньше
+          # закрывалась ручным merge. Прогон раннера идёт 10-20 минут, поэтому
+          # ждём явно, а не полагаемся на auto-merge (на репозитории он выключен).
+          deadline=$((SECONDS + 3600))
+          while (( SECONDS < deadline )); do
+            conclusion="$(gh pr view "$BRANCH" --json statusCheckRollup --jq '[(.statusCheckRollup // []) | if length == 0 then "none" else ([.[] | (.conclusion // .status // "PENDING")] | join(",")) end]' || echo 'unreachable')"
+            case "$conclusion" in
+              SUCCESS|success)
+                echo "Checks on $BRANCH are green; merging."
+                gh pr merge "$BRANCH" --merge --delete-branch
+                echo "- promotion pull request merged: \`true\`" >> "$GITHUB_STEP_SUMMARY"
+                exit 0
+                ;;
+              FAILURE|failure|CANCELLED|cancelled|TIMED_OUT|timed_out|ACTION_REQUIRED|action_required|STARTUP_FAILURE|startup_failure)
+                echo "Checks on $BRANCH failed ($conclusion); leaving the pull request open for review." >&2
+                echo "- promotion pull request merged: \`false\` (checks $conclusion)" >> "$GITHUB_STEP_SUMMARY"
+                exit 0
+                ;;
+            esac
+            echo "Waiting for checks on $BRANCH ($conclusion)"
+            sleep 60
+          done
+          echo "Checks on $BRANCH did not finish within an hour; the next hook run resumes the promotion." >&2
+          echo "- promotion pull request merged: \`false\` (checks still running)" >> "$GITHUB_STEP_SUMMARY"
+      - name: Summarise the promotion
+        run: |
+          {
+            echo "### OpenCode fork promotion"
+            echo "- candidate: \`${{ needs.detect.outputs.tag }}\` (\`${{ needs.detect.outputs.source_commit }}\`)"
+            echo "- pin updated: \`${{ steps.pin.outputs.changed }}\`"
+            echo "- promotion pull request: \`${{ steps.pull.outputs.branch || 'direct to main' }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  release:
+    name: Cut a signed worker release that serves the pinned build
+    # Цикл замыкается здесь, а не в промоушене: прод обслуживает последний
+    # подписанный релиз, а не ветку main. Поэтому отставшим считается любой
+    # коммит main, чей пин отличается от того, что лежит в последнем релизе
+    # `vm-worker-v*` — будь пин там положил промоушен, падение деплой-части
+    # прошлого цикла, или ручная правка. Решение принимает скрипт по двум
+    # файлам пина, так что человек в цикл не входит ни на одном шаге.
+    needs: [detect, promote]
+    # Релиз режется по сверке пина, а не по исходу промоушена: даже если
+    # промоушен упал, пин в main может уже обслуживаться не той сборкой,
+    # и починка не должна ждать следующего тика расписания.
+    if: ${{ always() && needs.detect.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      actions: write
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Plan the worker release against the newest signed release
+        id: plan
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          git fetch origin --tags --force
+          git show origin/main:deploy/vm-worker/opencode-release-pin.json > "$RUNNER_TEMP/main-pin.json"
+          latest="$(node -e '
+            const { execFileSync } = require("node:child_process");
+            const tags = execFileSync("git", ["tag", "--list", "vm-worker-v*"], { encoding: "utf8" })
+              .split("\n").filter(Boolean)
+              .filter((tag) => /^vm-worker-v\d+\.\d+\.\d+$/.test(tag))
+              .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+            process.stdout.write(tags.at(-1) ?? "");
+          ')"
+          args=(--main-pin "$RUNNER_TEMP/main-pin.json")
+          if [[ -n "$latest" ]]; then
+            args+=(--latest-tag "$latest")
+            if git show "$latest:deploy/vm-worker/opencode-release-pin.json" > "$RUNNER_TEMP/latest-pin.json" 2>/dev/null; then
+              args+=(--latest-pin "$RUNNER_TEMP/latest-pin.json")
+            fi
+          fi
+          node scripts/vm-worker-release-plan.mjs "${args[@]}"
+      - name: Release the worker with the pinned build
+        if: steps.plan.outputs.needed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.PROMOTION_GITHUB_TOKEN || github.token }}
+        run: |
+          set -euo pipefail
+          # Релиз неизменяемый, тег vm-worker-vX.Y.Z; сборка и деплой
+          # проверяют подпись, дайджесты и метаданные бандла, а недовый
+          # процесс откатывается на прежний релиз.
+          git fetch origin main
+          git checkout -B release/promotion origin/main
+          TAG="$(node -p "require('./deploy/vm-worker/opencode-release-pin.json').OPENCODE_RELEASE_TAG")"
           current="$(node -p "require('./package.json').version")"
           next="$(node -e 'const [a,b,c]=process.argv[1].split(".").map(Number); process.stdout.write(`${a}.${b}.${c+1}`)' "$current")"
+          if git rev-parse "refs/tags/vm-worker-v$next" >/dev/null 2>&1; then
+            echo "Tag vm-worker-v$next already exists; a concurrent run released the pinned build" >&2
+            exit 0
+          fi
           npm version --no-git-tag-version --allow-same-version "$next" >/dev/null
           git add package.json package-lock.json
           git commit -m "chore: bump VM worker to v$next with the gated OpenCode fork build"
@@ -235,10 +333,7 @@ jobs:
           # GITHUB_TOKEN push of a tag does not trigger workflows; dispatch explicitly.
           gh workflow run vm-worker-release.yml -f build_tag=vm-worker-v$next
           echo "- worker release: \`vm-worker-v$next\`" >> "$GITHUB_STEP_SUMMARY"
-      - name: Summarise the promotion
+      - name: Note the release is already serving the pin
+        if: steps.plan.outputs.needed != 'true'
         run: |
-          {
-            echo "### OpenCode fork promotion"
-            echo "- candidate: \`${{ needs.detect.outputs.tag }}\` (\`${{ needs.detect.outputs.source_commit }}\`)"
-            echo "- pin updated: \`${{ steps.pin.outputs.changed }}\`"
-          } >> "$GITHUB_STEP_SUMMARY"
+          echo "- worker release serving the pin: \`${{ steps.plan.outputs.latest_tag }}\`" >> "$GITHUB_STEP_SUMMARY"
