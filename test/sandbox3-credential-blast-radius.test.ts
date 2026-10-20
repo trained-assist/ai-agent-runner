@@ -24,6 +24,7 @@ function makeHost({ agentWroteTheFile = true, sweepAfterKill = true, engineHasNo
   const checkpoint = JSON.stringify({ cleanup });
   return {
     calls,
+    get killed() { return killed; },
     async exec(command: string) {
       calls.push(command);
       if (command.startsWith('cat /var/lib/ai-agent-runner/runner/runs/') && command.endsWith('events.jsonl')) {
@@ -53,10 +54,13 @@ function makeHost({ agentWroteTheFile = true, sweepAfterKill = true, engineHasNo
   };
 }
 
-function makeApi({ state = 'succeeded' } = {}) {
+function makeApi({ state = 'succeeded' } = {}, host?: { killed: boolean }) {
   const requests: Array<{ url: string; method: string }> = [];
   const manifest = { profileChanges: { files: [{ path: LEAK_RELATIVE_PATH, sha256: 'a'.repeat(64), size: 10 }], deletes: [] } };
   const reply = (status: number, body: unknown) => ({ status, text: async () => JSON.stringify(body) });
+  // Пока хост жив, ран, который будет убит, идёт; после убийства — терминальный.
+  // Так проверка «убийство попало по активному рану» не проходит вхолостую.
+  let phaseASeen = false;
   return {
     requests,
     async fetch(url: string, init?: { method?: string }) {
@@ -64,7 +68,11 @@ function makeApi({ state = 'succeeded' } = {}) {
       const text = String(url);
       if (text.endsWith('/v1/runs') && (init?.method ?? 'GET') === 'POST') return reply(202, { runId: 'run_x' });
       if (text.includes('/result')) return reply(200, manifest);
-      if (text.endsWith('/status')) return reply(200, { state, answer: 'saved' });
+      if (text.endsWith('/status')) {
+        if (!host) return reply(200, { state, answer: 'saved' });
+        if (!phaseASeen) { phaseASeen = true; return reply(200, { state: 'succeeded', answer: 'saved' }); }
+        return reply(200, { state: host.killed ? 'succeeded' : 'running', answer: 'saved' });
+      }
       return reply(200, { events: [] });
     },
   };
@@ -102,7 +110,7 @@ describe('sandbox3 credential blast-radius drill', () => {
 
   it('measures the radius without ever printing the value', async () => {
     const host = makeHost();
-    const api = makeApi();
+    const api = makeApi({}, host);
     const originalFetch = globalThis.fetch;
     globalThis.fetch = api.fetch as unknown as typeof fetch;
     try {
@@ -130,7 +138,7 @@ describe('sandbox3 credential blast-radius drill', () => {
 
   it('plants the copy itself when the agent did not write it', async () => {
     const host = makeHost({ agentWroteTheFile: false });
-    const api = makeApi();
+    const api = makeApi({}, host);
     const originalFetch = globalThis.fetch;
     globalThis.fetch = api.fetch as unknown as typeof fetch;
     try {
@@ -157,7 +165,7 @@ describe('sandbox3 credential blast-radius drill', () => {
 
   it('kills the whole worker control group, and reports the run outcome instead of judging it', async () => {
     const host = makeHost();
-    const api = makeApi();
+    const api = makeApi({}, host);
     const originalFetch = globalThis.fetch;
     globalThis.fetch = api.fetch as unknown as typeof fetch;
     try {
@@ -183,7 +191,7 @@ describe('sandbox3 credential blast-radius drill', () => {
 
   it('reports the value-dependent checks as skipped when the value was never captured', async () => {
     const host = makeHost({ engineHasNoCredential: true });
-    const api = makeApi();
+    const api = makeApi({}, host);
     const originalFetch = globalThis.fetch;
     globalThis.fetch = api.fetch as unknown as typeof fetch;
     try {
@@ -210,7 +218,7 @@ describe('sandbox3 credential blast-radius drill', () => {
 
   it('reports a blocked sweep with the reason the recovery recorded', async () => {
     const host = makeHost({ sweepBlocked: true });
-    const api = makeApi();
+    const api = makeApi({}, host);
     const originalFetch = globalThis.fetch;
     globalThis.fetch = api.fetch as unknown as typeof fetch;
     try {
@@ -235,9 +243,35 @@ describe('sandbox3 credential blast-radius drill', () => {
     }
   });
 
+  it('fails the drill when the kill would land on a run that already finished', async () => {
+    const host = makeHost();
+    // API без живой фазы: ран всегда терминален — убийство попало бы в пустоту.
+    const api = makeApi({ state: 'succeeded' });
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = api.fetch as unknown as typeof fetch;
+    try {
+      const steps = await runCredentialBlastRadiusDrill({
+        apiUrl: 'https://runner.example',
+        apiKey: 'key',
+        registry: REGISTRY,
+        host,
+        kill: true,
+        waitMs: 1_000,
+        captureWaitMs: 2_000,
+        sweepWaitMs: 2_000,
+      });
+      // Удар по завершившемуся рану измеряет штатный выход, а не смерть хоста.
+      const failed = steps.filter((line) => line.startsWith('FAIL'));
+      expect(failed.some((line) => line.includes('the run finished before the host died'))).toBe(true);
+      expect(steps.join('\n')).not.toContain(SECRET);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   it('fails the drill when a copy survives the recovery', async () => {
     const host = makeHost({ sweepAfterKill: false });
-    const api = makeApi();
+    const api = makeApi({}, host);
     const originalFetch = globalThis.fetch;
     globalThis.fetch = api.fetch as unknown as typeof fetch;
     try {

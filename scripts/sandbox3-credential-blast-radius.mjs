@@ -339,8 +339,17 @@ export async function runCredentialBlastRadiusDrill({
   });
 
   await step('B: the host dies mid-flight: the worker is SIGKILLed', async () => {
+    if (!valueB?.cwd) return 'skipped: the value was not captured';
     // --kill-whom=all: гибнет вся контрольная группа воркера, включая движок.
     // Это и есть «хост умер» — падение питания, а не падение одного процесса.
+    //
+    // Убийство должно попасть по активному рану, а не по тому, что уже
+    // закончился: иначе drill измеряет штатный выход, а не смерть хоста.
+    // Проверяется до самого удара: если движок вышел за секунду до него,
+    // утверждение падает, а не молча проходит.
+    const before = await runner(`/v1/runs/${runB}/status`);
+    assert.notEqual(before.body?.state, 'succeeded', 'the run finished before the host died');
+    assert.notEqual(before.body?.state, 'failed', 'the run failed before the host died');
     const killed = await host.exec(killWorkerCgroup(service));
     assert.equal(killed.code, 0, `the kill failed: ${killed.stderr}`);
     assert.ok(!killed.stdout.includes('no main process'), killed.stdout);
