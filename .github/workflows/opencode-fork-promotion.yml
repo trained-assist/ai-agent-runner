@@ -140,10 +140,6 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
-      # Пин живёт в .github/workflows/vm-worker-release.yml, а токен CI без
-      # этого права не может изменить файл workflow: push ветки с новым пином
-      # отклоняется, и промоушен останавливается, не доставив пин.
-      workflows: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
