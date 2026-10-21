@@ -412,6 +412,17 @@ function validateTestMcp(value: Record<string, any>, errors: string[]): void {
   if (value['profileId'] !== TEST_MCP.profile) errors.push('test registry MCP is restricted to its pinned profile');
 }
 
+/**
+ * The disposable identity of a user catalog run is derived from its run id, and
+ * the gateway authenticates the profile in the run binding proof, not the lane
+ * profile of the run. The worker derives the same value the Runner and the
+ * gateway derive, so the header stays pinned to this run: a run can neither
+ * borrow another run's identity nor fall back to the lane profile.
+ */
+function disposableProfileId(runId: string): string {
+  return `sbx_${createHash('sha256').update(runId.toLowerCase()).digest('hex').slice(0, 32)}`;
+}
+
 /** The product user catalog is a second fixed sandbox endpoint; RunSpec cannot select a URL or expand its identity. */
 function validateUserMcp(value: Record<string, any>, errors: string[]): void {
   if (value['mcp'] === undefined && value['mcpSecrets'] === undefined) return;
@@ -425,7 +436,7 @@ function validateUserMcp(value: Record<string, any>, errors: string[]): void {
     Authorization: `Bearer {env:${USER_MCP.tokenEnv}}`,
     'X-MCP-Operation': 'invocation', 'X-MCP-Scope': USER_MCP.scope,
     'X-MCP-User-Task-Id': String(value['userTaskId']),
-    'X-MCP-Profile': String(value['profileId']), 'X-MCP-Run-Id': String(value['runId']),
+    'X-MCP-Profile': disposableProfileId(String(value['runId'])), 'X-MCP-Run-Id': String(value['runId']),
     'X-MCP-Run-Binding': `{env:${USER_MCP.proofEnv}}`,
   };
   if (server['type'] !== 'remote' || server['url'] !== USER_MCP.url || server['enabled'] !== true || !isRecord(headers) ||
