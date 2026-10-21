@@ -10,6 +10,23 @@ import type { EngineAdapter, EngineHandle, EngineStartContext } from './engine-a
 import { launchCommand } from './launch.js';
 import { findOnPath, handleForChild, isExecutableFile } from './process-tree.js';
 
+/**
+ * Флаги приватного сервера OpenCode.
+ *
+ * Фоновый сервер OpenCode резолвит конфиг провайдера один раз — при своём старте: `apiKey`
+ * (`{env:LLM_LADDER_TOKEN}`) и correlation-заголовки (`x-ladder-trace` / `x-ladder-run`)
+ * замораживаются на его окружении. Ран, подключившийся к такому серверу, уходит в Ladder с
+ * ключом и id чужого рана (ai-agent-runner#501), и подмена секрета не видна: запросы
+ * продолжают уходить, а в аналитике Ladder `key_hash` чужой.
+ *
+ * Приватный сервер на ран (`--standalone`) резолвит конфиг из окружения самого рана, поэтому
+ * per-run credential доходит до провайдера, а `x-ladder-trace` / `x-ladder-run` совпадают с
+ * ids текущего рана. Тот же флаг нужен `session import` / `session export`: иначе эти команды
+ * поднимают (или переиспользуют) общий фоновый сервер, и credential рана остаётся жить в
+ * долгоживущем процессе, который переживает ран.
+ */
+const PRIVATE_SERVER_ARGS = ['--standalone'] as const;
+
 export interface OpenCodeAdapterOptions {
   binary?: string;
   argv?: string[];
@@ -23,7 +40,7 @@ function defaultArgv(spec: RunSpec, sessionId?: string, model?: string): string[
     throw new EngineStartupError('opencode run requires a host-resolved input.inlinePrompt');
   }
   const modelArgs = model ? ['-m', model] : [];
-  if (!spec.ingressManifest) return ['run', prompt, '--format', 'json', ...modelArgs, ...(sessionId ? ['--session', sessionId] : [])];
+  if (!spec.ingressManifest) return ['run', prompt, ...PRIVATE_SERVER_ARGS, '--format', 'json', ...modelArgs, ...(sessionId ? ['--session', sessionId] : [])];
   const indexPath = join(spec.cwd, '.inputs', 'ingress', spec.runId, 'input-items.json');
   try {
     if (!lstatSync(indexPath).isFile()) throw new Error('not a regular file');
@@ -36,7 +53,7 @@ function defaultArgv(spec: RunSpec, sessionId?: string, model?: string): string[
     'Artifact paths are relative to the index directory; read the referenced files as needed. Do not infer order from filenames.',
   ].join(' ');
   const modelArgs2 = model ? ['-m', model] : [];
-  return ['run', `${prompt}\n\n${instruction}`, '--format', 'json', ...modelArgs2, ...(sessionId ? ['--session', sessionId] : [])];
+  return ['run', `${prompt}\n\n${instruction}`, ...PRIVATE_SERVER_ARGS, '--format', 'json', ...modelArgs2, ...(sessionId ? ['--session', sessionId] : [])];
 }
 
 export class OpenCodeAdapter implements EngineAdapter {
@@ -87,7 +104,7 @@ export class OpenCodeAdapter implements EngineAdapter {
         throw new EngineStartupError('restored OpenCode session checkpoint failed archive integrity validation');
       }
       sessionId = resume.sessionId;
-      const importLaunch = launchCommand(ctx, binary, ['session', 'import', checkpointPath]);
+      const importLaunch = launchCommand(ctx, binary, ['session', 'import', checkpointPath, ...PRIVATE_SERVER_ARGS]);
       const imported = await new Promise<number | null>((resolve, reject) => {
         const importer = spawn(importLaunch.command, importLaunch.args, {
           cwd: ctx.cwd,
@@ -226,7 +243,7 @@ export class OpenCodeAdapter implements EngineAdapter {
         try {
           checkpointPath = join(ctx.cwd, '.session-traces', `${sessionId}.json`);
           mkdirSync(join(ctx.cwd, '.session-traces'), { recursive: true, mode: 0o700 });
-          const exportLaunch = launchCommand(ctx, binary, ['session', 'export', sessionId]);
+          const exportLaunch = launchCommand(ctx, binary, ['session', 'export', sessionId, ...PRIVATE_SERVER_ARGS]);
           const exporter = spawn(exportLaunch.command, exportLaunch.args, {
             cwd: ctx.cwd,
             env: ctx.env,
