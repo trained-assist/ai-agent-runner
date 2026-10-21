@@ -184,7 +184,12 @@ async function main() {
     body: {
       userTaskId: taskId,
       input: { inlinePrompt: AGENT_PROMPT },
-      envAllowlist: [],
+      // The France VM worker runs the agent with the model credential the lane
+      // approves for runtime use. Without the name in the allowlist the worker
+      // starts the agent without it and the provider refuses the first call.
+      routeMode: 'france',
+      engine: { name: 'eu-vm-agent-run', adapterVersion: '1' },
+      envAllowlist: ['LLM_LADDER_TOKEN'],
       limits: { timeoutMs: 900_000, maxOutputBytes: 2_000_000, maxLogBytes: 2_000_000 },
       mcp: { servers: [{
         serverId: AGENT_SERVER, transport: 'remote', url: `${GATEWAY_URL}/mcp`,
