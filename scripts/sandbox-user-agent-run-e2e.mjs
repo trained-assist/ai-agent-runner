@@ -155,8 +155,10 @@ const AGENT_PROMPT = [
   '1. Call zerocreds_wallet_form_create with provider "github", kind "token", ttl_minutes 30,',
   '   a title that says the credential is sandbox-only and synthetic, and a unique idempotency_key.',
   '2. As soon as the tool returns, write the returned form id and form url into your reply text.',
-  '3. Then call zerocreds_wallet_form_status with that form id, repeating the call about every ten',
-  '   seconds (up to forty attempts) until the returned status is "done".',
+  '3. Then call zerocreds_wallet_form_status with that form id, one call per step, repeating the',
+  '   call about every ten seconds (up to forty attempts) until the returned status is "done".',
+  '   Do not wait inside code: your JavaScript sandbox has no timer, so call the MCP tool again',
+  '   directly instead of wrapping the wait in a script.',
   '4. When the status is "done", write a final line in the form: FORM_STATUS_DONE <form_id> <connection_id>.',
   'Never ask for, print, or guess any credential value.',
 ].join('\n');
@@ -228,7 +230,10 @@ async function main() {
     stderr = `${stderr}${status?.output?.stderr ?? ''}`;
 
     if (!form) {
-      const found = findFormUrl(stdout);
+      // The agent's tool traffic is reported on the run's stderr stream, so the
+      // form URL can appear on either stream depending on how the agent ran the
+      // tool (inline call or wrapped in a script).
+      const found = findFormUrl(`${stdout}\n${stderr}`);
       if (found) {
         form = found;
         pass('the agent created the synthetic GitHub form', `form_id=${found.formId}`);
@@ -281,14 +286,23 @@ async function main() {
       : `${scanned.length} surfaces scanned`);
 
   // 6. the Runner revoked the disposable identity -----------------------------
+  // The revocation is a post-terminal cleanup step, so it may land a few seconds
+  // after the run reports its terminal state. Give it a moment instead of
+  // failing the proof on a race that the product resolves on its own.
   const revokedGrant = {
     authToken, runId, taskId, profileId,
     proof: signRunBinding({ privateJwk, runId, taskId, profileId, userId, allowedTools: AGENT_TOOLS }),
   };
-  const afterCleanup = await mcp(revokedGrant, { method: 'tools/list', params: {} });
+  let afterCleanup = null;
+  const revokeDeadline = Date.now() + 120_000;
+  while (Date.now() < revokeDeadline) {
+    afterCleanup = await mcp(revokedGrant, { method: 'tools/list', params: {} });
+    if (afterCleanup.body?.error?.code === -32001) break;
+    await new Promise((resolve) => setTimeout(resolve, 4_000));
+  }
   check('the disposable identity loses access after the run',
-    afterCleanup.body?.error?.code === -32001,
-    `error=${JSON.stringify(afterCleanup.body?.error)}`);
+    afterCleanup?.body?.error?.code === -32001,
+    `error=${JSON.stringify(afterCleanup?.body?.error)}`);
 
   // 7. a later bootstrap cannot see the old state -----------------------------
   const secondRunId = randomUUID();
