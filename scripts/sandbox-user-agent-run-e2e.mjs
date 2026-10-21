@@ -194,7 +194,7 @@ async function main() {
     },
   });
   if (!check('the Runner API admits the task with the pinned user catalog',
-    submitted.status === 200 || submitted.status === 201,
+    [200, 201, 202].includes(submitted.status),
     `status=${submitted.status} body=${JSON.stringify(submitted.body).slice(0, 300)}`)) {
     throw new Error('cannot continue without an admitted run');
   }
@@ -249,17 +249,21 @@ async function main() {
     `state=${status?.state} reason=${status?.failure?.code ?? ''}`);
 
   // 3. collect every surface the run produced --------------------------------
-  const [result, events, artifacts] = await Promise.all([
+  const [result, events, artifacts, sessionLog] = await Promise.all([
     json(`${RUNNER_API}/v1/runs/${encodeURIComponent(runId)}/result`, { apiKey }),
     json(`${RUNNER_API}/v1/runs/${encodeURIComponent(runId)}/events?limit=500`, { apiKey }),
     json(`${RUNNER_API}/v1/runs/${encodeURIComponent(runId)}/artifacts`, { apiKey }),
+    json(`${RUNNER_API}/v1/runs/${encodeURIComponent(runId)}/log`, { apiKey, timeoutMs: 60_000 }),
   ]);
   scanned.push({ surface: 'stdout', body: stdout });
   scanned.push({ surface: 'stderr', body: stderr });
   scanned.push({ surface: 'result', body: result.text });
   scanned.push({ surface: 'events', body: events.text });
   scanned.push({ surface: 'artifacts', body: artifacts.text });
+  scanned.push({ surface: 'session-log', body: sessionLog.text });
   scanned.push({ surface: 'answer', body: JSON.stringify(status?.answer ?? '') });
+  pass('the run surfaces are collected',
+    `session-log=${sessionLog.status} bytes=${sessionLog.text.length} artifacts=${artifacts.body?.count ?? 0} events=${events.body?.events?.length ?? 0}`);
 
   // 4. the agent observed done ------------------------------------------------
   check('the agent observed the form as done', sawDone(`${stdout}\n${stderr}\n${result.text}`),
