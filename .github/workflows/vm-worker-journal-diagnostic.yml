@@ -1,0 +1,85 @@
+name: VM worker journal diagnostic
+
+# Read-only diagnosis of the EU VM worker service: systemd journal, unit
+# properties, kernel OOM evidence and host memory. Nothing on the VM is
+# modified; the only side effect is a short-lived Actions artifact.
+#
+# The worker process keeps restarting mid-run (see issue #390) and the journal
+# is the only source that explains why. Dispatch it from `main`: the
+# `production` environment only accepts deployments from `main`.
+#
+# Required environment secrets (not provisioned yet — the job fails fast with
+# the list below until an operator adds them):
+#   EU_VM_WORKER_SSH_HOST, EU_VM_WORKER_SSH_USER,
+#   EU_VM_WORKER_SSH_PRIVATE_KEY, EU_VM_WORKER_SSH_KNOWN_HOSTS
+
+on:
+  workflow_dispatch:
+    inputs:
+      since:
+        description: journalctl --since window
+        required: false
+        default: '8 hours ago'
+        type: string
+      unit:
+        description: systemd unit of the VM worker
+        required: false
+        default: 'ai-agent-vm-worker'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  journal:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Collect VM worker journal and host memory state
+        env:
+          SSH_HOST: ${{ secrets.EU_VM_WORKER_SSH_HOST }}
+          SSH_USER: ${{ secrets.EU_VM_WORKER_SSH_USER }}
+          SSH_KEY: ${{ secrets.EU_VM_WORKER_SSH_PRIVATE_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.EU_VM_WORKER_SSH_KNOWN_HOSTS }}
+          SINCE: ${{ inputs.since }}
+          UNIT: ${{ inputs.unit }}
+        run: |
+          set -euo pipefail
+          for value in "$SSH_HOST" "$SSH_USER" "$SSH_KEY" "$SSH_KNOWN_HOSTS"; do
+            [[ -n "$value" ]] || {
+              echo '::error::Missing VM worker SSH secret. Provision EU_VM_WORKER_SSH_HOST, EU_VM_WORKER_SSH_USER, EU_VM_WORKER_SSH_PRIVATE_KEY and EU_VM_WORKER_SSH_KNOWN_HOSTS in the production environment.'
+              exit 1
+            }
+          done
+          install -d -m 0700 "$HOME/.ssh"
+          printf '%s\n' "$SSH_KEY" > "$HOME/.ssh/id_vm2_diag"
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 0600 "$HOME/.ssh/id_vm2_diag" "$HOME/.ssh/known_hosts"
+          ssh_options=(-i "$HOME/.ssh/id_vm2_diag" -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o BatchMode=yes)
+          scp "${ssh_options[@]}" scripts/vm-worker-diagnostic.sh "$SSH_USER@$SSH_HOST:/tmp/vm-worker-diagnostic.sh"
+          # Quote the dispatch inputs for the remote shell instead of letting
+          # them become part of the command line.
+          printf -v unit_q '%q' "$UNIT"
+          printf -v since_q '%q' "$SINCE"
+          status=0
+          ssh "${ssh_options[@]}" "$SSH_USER@$SSH_HOST" \
+            "sudo -n bash /tmp/vm-worker-diagnostic.sh $unit_q $since_q" > vm-worker-diagnostic.txt 2>&1 || status=$?
+          if [[ "$status" -ne 0 ]]; then
+            echo "sudo path failed with status $status, retrying without sudo" >&2
+            ssh "${ssh_options[@]}" "$SSH_USER@$SSH_HOST" \
+              "bash /tmp/vm-worker-diagnostic.sh $unit_q $since_q" > vm-worker-diagnostic.txt 2>&1 || true
+          fi
+          ssh "${ssh_options[@]}" "$SSH_USER@$SSH_HOST" 'rm -f /tmp/vm-worker-diagnostic.sh' || true
+          wc -l vm-worker-diagnostic.txt
+          cat vm-worker-diagnostic.txt
+      - name: Upload VM worker diagnostic
+        uses: actions/upload-artifact@v4
+        with:
+          name: vm-worker-journal-diagnostic
+          path: vm-worker-diagnostic.txt
+          if-no-files-found: warn
+          retention-days: 1
