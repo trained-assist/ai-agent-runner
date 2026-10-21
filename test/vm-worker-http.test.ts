@@ -16,6 +16,9 @@ import type { BlobStore } from '../src/storage/blob-store.js';
 const TOKEN = 'vm-worker-test-secret-that-is-long-enough';
 const API_ORIGIN = 'https://api.example.test';
 const RUN_ID = 'run-vm-worker-test';
+// A user catalog run runs under a disposable identity derived from its run id,
+// and the gateway authenticates that profile, not the lane profile.
+const DISPOSABLE_PROFILE_ID = `sbx_${createHash('sha256').update(RUN_ID.toLowerCase()).digest('hex').slice(0, 32)}`;
 
 describe('installable VM HTTP worker', () => {
   const cleanups: Array<() => Promise<void>> = [];
@@ -203,7 +206,7 @@ describe('installable VM HTTP worker', () => {
       headers: {
         Authorization: 'Bearer {env:RUNNER_MCP_USER_TOKEN}',
         'X-MCP-Operation': 'invocation', 'X-MCP-Scope': 'mcp:user-agent-run',
-        'X-MCP-User-Task-Id': 'task-vm-worker-test', 'X-MCP-Profile': 'integration-telegram-ux-v1',
+        'X-MCP-User-Task-Id': 'task-vm-worker-test', 'X-MCP-Profile': DISPOSABLE_PROFILE_ID,
         'X-MCP-Run-Id': RUN_ID, 'X-MCP-Run-Binding': '{env:RUNNER_MCP_USER_PROOF}',
       },
     } } }, mcpSecrets: { RUNNER_MCP_USER_TOKEN: 'user-catalog-bearer-token-123456',
@@ -229,12 +232,39 @@ describe('installable VM HTTP worker', () => {
     expect(JSON.stringify(spec)).not.toContain('signed-user-run-proof-123456');
   });
 
+  it('refuses a user catalog launch whose profile is not this run’s disposable identity', async () => {
+    const fixture = await startFixture({ allowedEnvironmentNames: ['LLM_LADDER_TOKEN'] });
+    cleanups.push(fixture.close);
+    const launchWithProfile = async (profileId: string) => {
+      const request = launchRequest({ profileId: 'integration-telegram-ux-v1', mcp: { servers: { 'mem-gpt': {
+        type: 'remote', url: 'https://trained-assist-mcp-user-sandbox.skillset-apply.workers.dev/mcp', enabled: true,
+        headers: {
+          Authorization: 'Bearer {env:RUNNER_MCP_USER_TOKEN}',
+          'X-MCP-Operation': 'invocation', 'X-MCP-Scope': 'mcp:user-agent-run',
+          'X-MCP-User-Task-Id': 'task-vm-worker-test', 'X-MCP-Profile': profileId,
+          'X-MCP-Run-Id': RUN_ID, 'X-MCP-Run-Binding': '{env:RUNNER_MCP_USER_PROOF}',
+        },
+      } } }, mcpSecrets: { RUNNER_MCP_USER_TOKEN: 'user-catalog-bearer-token-123456',
+        RUNNER_MCP_USER_PROOF: 'signed-user-run-proof-123456' } });
+      return launch(fixture.base, request);
+    };
+    // The lane profile is not the identity the gateway authenticates.
+    expect((await launchWithProfile('integration-telegram-ux-v1')).status).toBe(400);
+    // Another run's disposable identity is not this run's identity either.
+    const otherRunProfile = `sbx_${createHash('sha256').update('run-vm-worker-other').digest('hex').slice(0, 32)}`;
+    expect((await launchWithProfile(otherRunProfile)).status).toBe(400);
+    expect(fixture.runner.startCalls).toHaveLength(0);
+    // This run's own disposable identity is accepted.
+    expect((await launchWithProfile(DISPOSABLE_PROFILE_ID)).status).toBe(202);
+    expect(fixture.runner.startCalls).toHaveLength(1);
+  });
+
   it('rejects a multi-server MCP payload even when each entry is individually pinned', async () => {
     const fixture = await startFixture();
     cleanups.push(fixture.close);
     const headers = { Authorization: 'Bearer {env:RUNNER_MCP_USER_TOKEN}', 'X-MCP-Operation': 'invocation',
       'X-MCP-Scope': 'mcp:user-agent-run', 'X-MCP-User-Task-Id': 'task-vm-worker-test',
-      'X-MCP-Profile': 'integration-telegram-ux-v1', 'X-MCP-Run-Id': RUN_ID,
+      'X-MCP-Profile': DISPOSABLE_PROFILE_ID, 'X-MCP-Run-Id': RUN_ID,
       'X-MCP-Run-Binding': '{env:RUNNER_MCP_USER_PROOF}' };
     const response = await launch(fixture.base, launchRequest({ profileId: 'integration-telegram-ux-v1', mcp: { servers: {
       'mem-gpt': { type: 'remote', url: 'https://trained-assist-mcp-user-sandbox.skillset-apply.workers.dev/mcp', enabled: true, headers },
