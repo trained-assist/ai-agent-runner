@@ -151,6 +151,23 @@ release, and the rollback restores the previous one. A host that hardcodes a pat
 into a versioned release directory keeps running that old build after a successful
 deployment.
 
+### One engine server per run
+
+The worker starts the engine with `opencode run --standalone`: the run gets a private
+OpenCode server instead of the shared background one. The provider config is resolved
+from the run's own environment, so the run-scoped `LLM_LADDER_TOKEN` and the
+`x-ladder-trace` / `x-ladder-run` correlation ids belong to that run
+([ai-agent-runner#501](https://github.com/trained-assist/ai-agent-runner/issues/501)).
+The shared background server resolved them once, at its own start, and every later run
+inherited the key and the run ids of whichever run started it: a rotated secret stayed
+invisible, and Ladder analytics showed a foreign `key_hash`.
+
+Two consequences for the host. A credential change no longer needs the OpenCode
+service restarted before the next run picks it up. And no long-lived OpenCode process
+holds a run's credential after the run ends: the session checkpoint import and export
+run on the same private server, so they cannot leave a background server behind
+either.
+
 ### Pinned Registry test MCP
 
 The France VM worker accepts remote MCP launch data only for the fixed

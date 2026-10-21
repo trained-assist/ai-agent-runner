@@ -106,6 +106,71 @@ describe('OpenCodeAdapter', () => {
     }
   });
 
+  it('runs the engine on a private server so the provider config comes from the run environment', async () => {
+    // issue #501: the shared background server resolves `apiKey` and the Ladder
+    // correlation headers once, at its own start. A run that reuses it calls Ladder
+    // with the key and the run ids of whichever run started that server, and a
+    // rotated secret stays invisible. A private server per run resolves the config
+    // from the run's own environment.
+    const cwd = mkdtempSync(join(tmpdir(), 'opencode-private-server-'));
+    try {
+      const capturedArgs = join(cwd, 'captured-args.txt');
+      const fakeOpenCode = join(cwd, 'opencode-stub.sh');
+      writeFileSync(fakeOpenCode, [
+        '#!/bin/sh',
+        'if [ "$1" = "session" ] && [ "$2" = "export" ]; then printf \'{"info":{"id":"%s"},"messages":[]}\\n\' "$3"; exit 0; fi',
+        'printf "%s\\n" "$@" > "$CAPTURE_ARGS"',
+        `printf '{"type":"text","sessionID":"ses_01J9A3J9Y7V8W2K4M6N0PQRSTZ","part":{"type":"text","text":"answer"}}\\n'`,
+      ].join('\n'));
+      chmodSync(fakeOpenCode, 0o700);
+      const { ctx, exit } = makeContext(cwd, { CAPTURE_ARGS: capturedArgs });
+      ctx.spec.input = { inlinePrompt: 'Do a task.' };
+      const adapter = new OpenCodeAdapter({ binary: fakeOpenCode });
+      await adapter.start(ctx);
+      await exit;
+
+      const args = readFileSync(capturedArgs, 'utf8').trim().split('\n');
+      expect(args).toContain('--standalone');
+      expect(args).toContain('run');
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps the session import and export off the shared background server', async () => {
+    // The import and the export speak to a server as well. Without a private server
+    // they would start (or reuse) the long-lived background process, and the run's
+    // credential would stay alive in a process that outlives the run.
+    const cwd = mkdtempSync(join(tmpdir(), 'opencode-session-private-'));
+    try {
+      const sessionId = 'ses_01J9A3J9Y7V8W2K4M6N0PQRSTZ';
+      const calls = join(cwd, 'calls.txt');
+      const binary = join(cwd, 'opencode-stub.sh');
+      writeFileSync(binary, [
+        '#!/bin/sh',
+        'if [ "$1" = "session" ] && [ "$2" = "import" ]; then echo "session import $3 $*" >> "$CALLS"; exit 0; fi',
+        'if [ "$1" = "session" ] && [ "$2" = "export" ]; then echo "session export $3 $*" >> "$CALLS"; printf \'{"info":{"id":"%s"},"messages":[]}\\n\' "$3"; exit 0; fi',
+        'echo "run $*" >> "$CALLS"',
+        `printf '{"type":"text","sessionID":"${sessionId}","part":{"type":"text","text":"answer"}}\\n'`,
+      ].join('\n'));
+      chmodSync(binary, 0o700);
+      const { ctx, exit } = makeContext(cwd, { CALLS: calls });
+      ctx.spec.input = { inlinePrompt: 'Do a task.' };
+      await new OpenCodeAdapter({ binary }).start(ctx);
+      await exit;
+
+      const recorded = readFileSync(calls, 'utf8').trim().split('\n');
+      expect(recorded).toHaveLength(2);
+      // Both the run and the export speak to a server: neither may use the shared
+      // background one, or the run's credential outlives the run in a long-lived process.
+      expect(recorded[0]).toContain('run Do a task.');
+      expect(recorded[1]).toContain(`session export ${sessionId}`);
+      for (const line of recorded) expect(line).toContain('--standalone');
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
   it.each(['ses_01J9A3J9Y7V8W2K4M6N0PQRSTZ', 'ses_eabdad9efffecDKCL3aEAtfJdY'])('forwards a typed question for %s without exposing it as an unstructured log', async (sessionId) => {
     const cwd = mkdtempSync(join(tmpdir(), 'opencode-question-'));
     try {
@@ -237,15 +302,16 @@ describe('OpenCodeAdapter', () => {
       writeFileSync(join(cwd, ...checkpointPath.split('/')), sessionBytes);
       const fakeOpenCode = join(cwd, 'opencode-stub.sh');
       const capture = join(cwd, 'calls.txt');
+      const importArgs = join(cwd, 'import-args.txt');
       writeFileSync(fakeOpenCode, [
         '#!/bin/sh',
-        'if [ "$1" = "session" ] && [ "$2" = "import" ]; then touch "$IMPORTED"; echo import >> "$CAPTURE"; exit 0; fi',
+        'if [ "$1" = "session" ] && [ "$2" = "import" ]; then touch "$IMPORTED"; echo import >> "$CAPTURE"; printf "%s\\n" "$@" > "$IMPORT_ARGS"; exit 0; fi',
         'if [ "$1" = "session" ] && [ "$2" = "export" ]; then printf \'{"info":{"id":"%s"},"messages":[]}\\n\' "$3"; exit 0; fi',
         '[ -f "$IMPORTED" ] || exit 9',
         'printf "%s\\n" "$@" >> "$CAPTURE"',
       ].join('\n'));
       chmodSync(fakeOpenCode, 0o700);
-      const { ctx, exit } = makeContext(cwd, { CAPTURE: capture, IMPORTED: join(cwd, 'imported') });
+      const { ctx, exit } = makeContext(cwd, { CAPTURE: capture, IMPORTED: join(cwd, 'imported'), IMPORT_ARGS: importArgs });
       ctx.spec.profileWorkspace = { bindingId: 'profile-a', snapshotUrl: 'https://example.test/snapshot', snapshotSha256: 'a'.repeat(64), snapshotSize: 1, savebackUrl: 'https://example.test/saveback', artifacts: [], excludedPatterns: [] };
       ctx.spec.input = { inlinePrompt: 'Continue the task.', resumeSessionFrom: {
         sourceRunId: 'run-previous', sessionId, path: checkpointPath,
@@ -257,6 +323,10 @@ describe('OpenCodeAdapter', () => {
       expect(calls.startsWith('import\n')).toBe(true);
       expect(calls).toContain(`--session\n${sessionId}`);
       expect(calls).toContain('Continue the task.');
+      // The import must not reach the shared background server either: the run's
+      // credential would then live in a process that outlives the run.
+      expect(readFileSync(importArgs, 'utf8').trim().split('\n')).toContain('--standalone');
+      expect(calls).toContain('--standalone');
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }
