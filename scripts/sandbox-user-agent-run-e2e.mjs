@@ -40,6 +40,9 @@ const AGENT_BINDING = 'mem-gpt-user-sandbox';
 const AGENT_SCOPE = 'mcp:user-agent-run';
 const AGENT_POLICY = 'mem-gpt-user-run-v1';
 const AGENT_CATALOGUE = 'mem-gpt-user-catalogue-v2';
+// The gateway refuses a proof whose catalogue digest does not match the one it
+// serves, so the harness signs the same digest the lane and the gateway publish.
+const CATALOGUE_DIGEST = process.env.MCP_USER_CATALOGUE_DIGEST || '483e6d2f949b32c05a70186f4e25aba291b1483eeb0bdc9a7a3bca4b9b7cdf11';
 const AGENT_TOOLS = [
   'identity.whoami',
   'google_docs.connect',
@@ -99,6 +102,7 @@ function signRunBinding({ privateJwk, runId, taskId, profileId, userId, allowedT
     profileId, principalId: `user:${userId}`, userId, ownerGeneration: 1,
     serverId: AGENT_SERVER, bindingRef: AGENT_BINDING, scope: AGENT_SCOPE,
     policyVersion: AGENT_POLICY, catalogueVersion: AGENT_CATALOGUE,
+    catalogueDigest: CATALOGUE_DIGEST,
     allowedTools, iat: now, exp: now + ttlSeconds,
   };
   const unsigned = `${base64url(JSON.stringify(header))}.${base64url(JSON.stringify(claims))}`;
@@ -220,6 +224,7 @@ async function main() {
   let stdout = '';
   let stderr = '';
   let form = null;
+  let connectionId = null;
   let submittedValue = false;
   let status = null;
 
@@ -246,8 +251,9 @@ async function main() {
           body: { t: found.formId, fields: { token: syntheticValue } },
         });
         submittedValue = sent.status === 200;
+        connectionId = sent.body?.connection_id ?? null;
         check('the synthetic-only value is accepted by the form', submittedValue,
-          `status=${sent.status} body=${JSON.stringify(sent.body).slice(0, 200)}`);
+          `status=${sent.status} connection_id=${connectionId ?? 'none'} body=${JSON.stringify(sent.body).slice(0, 200)}`);
       }
     }
 
@@ -324,10 +330,25 @@ async function main() {
         allowedTools: AGENT_TOOLS,
       }),
     };
+    const secondWho = await mcp(second, { method: 'tools/call', params: { name: 'identity.whoami', arguments: {} } });
+    const whoami = toolResultText(secondWho);
+    check('the later identity is a different principal',
+      whoami?.userId === secondBoot.body.userId && whoami?.userId !== userId,
+      `userId=${whoami?.userId ?? 'none'} error=${JSON.stringify(secondWho.body?.error ?? null)}`);
+
+    const oldConnection = connectionId
+      ? await mcp(second, { method: 'tools/call', params: { name: 'zerocreds_wallet_connection_status', arguments: { connection_id: connectionId } } })
+      : null;
+    const oldConnectionVisible = Boolean(oldConnection?.body?.result) && oldConnection.body.result.isError !== true;
+    check('the later identity cannot see the old connection', !oldConnectionVisible,
+      `response=${JSON.stringify(oldConnection?.body?.result?.content?.[0]?.text ?? oldConnection?.body?.error ?? null).slice(0, 160)}`);
+
     const oldForm = form
       ? await mcp(second, { method: 'tools/call', params: { name: 'zerocreds_wallet_form_status', arguments: { form_id: form.formId } } })
       : null;
-    const oldFormVisible = oldForm ? oldForm.body?.result?.isError !== true : false;
+    // A protocol refusal (-32001) and a tool-level refusal both mean the later
+    // identity cannot reach the old state; only a successful result could leak it.
+    const oldFormVisible = Boolean(oldForm?.body?.result) && oldForm.body.result.isError !== true;
     check('the later identity cannot see the old form', !oldFormVisible,
       `response=${JSON.stringify(oldForm?.body?.result?.content?.[0]?.text ?? oldForm?.body?.error ?? null).slice(0, 160)}`);
 
