@@ -9,7 +9,9 @@ async function expectStructuredRefusal(
   over: Parameters<typeof h.makeSpec>[0],
   expected: { code: string; retryable: boolean },
 ) {
-  const { receipt } = h.start(over);
+  const { receipt } = h.start({
+    ...over,
+  });
   const result = await h.runner.waitFor(receipt.runId);
   expect(result.outcome).toBe('failed');
   expect(result.exitReason).toBe('preflight_refused');
@@ -29,6 +31,18 @@ describe('structured outcomes for admission refusals (§9)', () => {
       code: 'BUDGET_UNAVAILABLE',
       retryable: true,
     });
+  });
+
+  it('refuses OpenCode when a numeric enforcement policy is declared but not enforceable', async () => {
+    const h = createHarness({ scenario: 'success' });
+    await expectStructuredRefusal(h, {
+      engine: { name: 'opencode', adapterVersion: '1' },
+      budget: {
+        correlationRef: 'budget-1',
+        approved: true,
+        enforcement: { provider: 'openai', policyId: 'sandbox-v1', maxInputTokens: 12000, maxOutputTokens: 2000, maxTotalTokens: 20000 },
+      },
+    }, { code: 'BUDGET_UNAVAILABLE', retryable: true });
   });
 
   it('missing credentials give CREDENTIALS_UNAVAILABLE', async () => {
