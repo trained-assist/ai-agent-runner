@@ -40,6 +40,9 @@ const AGENT_BINDING = 'mem-gpt-user-sandbox';
 const AGENT_SCOPE = 'mcp:user-agent-run';
 const AGENT_POLICY = 'mem-gpt-user-run-v1';
 const AGENT_CATALOGUE = 'mem-gpt-user-catalogue-v2';
+// The gateway refuses a proof whose catalogue digest does not match the one it
+// serves, so the harness signs the same digest the lane and the gateway publish.
+const CATALOGUE_DIGEST = process.env.MCP_USER_CATALOGUE_DIGEST || '483e6d2f949b32c05a70186f4e25aba291b1483eeb0bdc9a7a3bca4b9b7cdf11';
 const AGENT_TOOLS = [
   'identity.whoami',
   'google_docs.connect',
@@ -99,6 +102,7 @@ function signRunBinding({ privateJwk, runId, taskId, profileId, userId, allowedT
     profileId, principalId: `user:${userId}`, userId, ownerGeneration: 1,
     serverId: AGENT_SERVER, bindingRef: AGENT_BINDING, scope: AGENT_SCOPE,
     policyVersion: AGENT_POLICY, catalogueVersion: AGENT_CATALOGUE,
+    catalogueDigest: CATALOGUE_DIGEST,
     allowedTools, iat: now, exp: now + ttlSeconds,
   };
   const unsigned = `${base64url(JSON.stringify(header))}.${base64url(JSON.stringify(claims))}`;
@@ -155,8 +159,10 @@ const AGENT_PROMPT = [
   '1. Call zerocreds_wallet_form_create with provider "github", kind "token", ttl_minutes 30,',
   '   a title that says the credential is sandbox-only and synthetic, and a unique idempotency_key.',
   '2. As soon as the tool returns, write the returned form id and form url into your reply text.',
-  '3. Then call zerocreds_wallet_form_status with that form id, repeating the call about every ten',
-  '   seconds (up to forty attempts) until the returned status is "done".',
+  '3. Then call zerocreds_wallet_form_status with that form id, one call per step, repeating the',
+  '   call about every ten seconds (up to forty attempts) until the returned status is "done".',
+  '   Do not wait inside code: your JavaScript sandbox has no timer, so call the MCP tool again',
+  '   directly instead of wrapping the wait in a script.',
   '4. When the status is "done", write a final line in the form: FORM_STATUS_DONE <form_id> <connection_id>.',
   'Never ask for, print, or guess any credential value.',
 ].join('\n');
@@ -184,7 +190,12 @@ async function main() {
     body: {
       userTaskId: taskId,
       input: { inlinePrompt: AGENT_PROMPT },
-      envAllowlist: [],
+      // The France VM worker runs the agent with the model credential the lane
+      // approves for runtime use. Without the name in the allowlist the worker
+      // starts the agent without it and the provider refuses the first call.
+      routeMode: 'france',
+      engine: { name: 'eu-vm-agent-run', adapterVersion: '1' },
+      envAllowlist: ['LLM_LADDER_TOKEN'],
       limits: { timeoutMs: 900_000, maxOutputBytes: 2_000_000, maxLogBytes: 2_000_000 },
       mcp: { servers: [{
         serverId: AGENT_SERVER, transport: 'remote', url: `${GATEWAY_URL}/mcp`,
@@ -213,6 +224,7 @@ async function main() {
   let stdout = '';
   let stderr = '';
   let form = null;
+  let connectionId = null;
   let submittedValue = false;
   let status = null;
 
@@ -223,7 +235,10 @@ async function main() {
     stderr = `${stderr}${status?.output?.stderr ?? ''}`;
 
     if (!form) {
-      const found = findFormUrl(stdout);
+      // The agent's tool traffic is reported on the run's stderr stream, so the
+      // form URL can appear on either stream depending on how the agent ran the
+      // tool (inline call or wrapped in a script).
+      const found = findFormUrl(`${stdout}\n${stderr}`);
       if (found) {
         form = found;
         pass('the agent created the synthetic GitHub form', `form_id=${found.formId}`);
@@ -236,8 +251,9 @@ async function main() {
           body: { t: found.formId, fields: { token: syntheticValue } },
         });
         submittedValue = sent.status === 200;
+        connectionId = sent.body?.connection_id ?? null;
         check('the synthetic-only value is accepted by the form', submittedValue,
-          `status=${sent.status} body=${JSON.stringify(sent.body).slice(0, 200)}`);
+          `status=${sent.status} connection_id=${connectionId ?? 'none'} body=${JSON.stringify(sent.body).slice(0, 200)}`);
       }
     }
 
@@ -276,14 +292,23 @@ async function main() {
       : `${scanned.length} surfaces scanned`);
 
   // 6. the Runner revoked the disposable identity -----------------------------
+  // The revocation is a post-terminal cleanup step, so it may land a few seconds
+  // after the run reports its terminal state. Give it a moment instead of
+  // failing the proof on a race that the product resolves on its own.
   const revokedGrant = {
     authToken, runId, taskId, profileId,
     proof: signRunBinding({ privateJwk, runId, taskId, profileId, userId, allowedTools: AGENT_TOOLS }),
   };
-  const afterCleanup = await mcp(revokedGrant, { method: 'tools/list', params: {} });
+  let afterCleanup = null;
+  const revokeDeadline = Date.now() + 120_000;
+  while (Date.now() < revokeDeadline) {
+    afterCleanup = await mcp(revokedGrant, { method: 'tools/list', params: {} });
+    if (afterCleanup.body?.error?.code === -32001) break;
+    await new Promise((resolve) => setTimeout(resolve, 4_000));
+  }
   check('the disposable identity loses access after the run',
-    afterCleanup.body?.error?.code === -32001,
-    `error=${JSON.stringify(afterCleanup.body?.error)}`);
+    afterCleanup?.body?.error?.code === -32001,
+    `error=${JSON.stringify(afterCleanup?.body?.error)}`);
 
   // 7. a later bootstrap cannot see the old state -----------------------------
   const secondRunId = randomUUID();
@@ -305,10 +330,25 @@ async function main() {
         allowedTools: AGENT_TOOLS,
       }),
     };
+    const secondWho = await mcp(second, { method: 'tools/call', params: { name: 'identity.whoami', arguments: {} } });
+    const whoami = toolResultText(secondWho);
+    check('the later identity is a different principal',
+      whoami?.userId === secondBoot.body.userId && whoami?.userId !== userId,
+      `userId=${whoami?.userId ?? 'none'} error=${JSON.stringify(secondWho.body?.error ?? null)}`);
+
+    const oldConnection = connectionId
+      ? await mcp(second, { method: 'tools/call', params: { name: 'zerocreds_wallet_connection_status', arguments: { connection_id: connectionId } } })
+      : null;
+    const oldConnectionVisible = Boolean(oldConnection?.body?.result) && oldConnection.body.result.isError !== true;
+    check('the later identity cannot see the old connection', !oldConnectionVisible,
+      `response=${JSON.stringify(oldConnection?.body?.result?.content?.[0]?.text ?? oldConnection?.body?.error ?? null).slice(0, 160)}`);
+
     const oldForm = form
       ? await mcp(second, { method: 'tools/call', params: { name: 'zerocreds_wallet_form_status', arguments: { form_id: form.formId } } })
       : null;
-    const oldFormVisible = oldForm ? oldForm.body?.result?.isError !== true : false;
+    // A protocol refusal (-32001) and a tool-level refusal both mean the later
+    // identity cannot reach the old state; only a successful result could leak it.
+    const oldFormVisible = Boolean(oldForm?.body?.result) && oldForm.body.result.isError !== true;
     check('the later identity cannot see the old form', !oldFormVisible,
       `response=${JSON.stringify(oldForm?.body?.result?.content?.[0]?.text ?? oldForm?.body?.error ?? null).slice(0, 160)}`);
 
