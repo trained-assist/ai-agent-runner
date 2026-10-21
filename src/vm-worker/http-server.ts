@@ -33,7 +33,14 @@ const USER_MCP = Object.freeze({
   url: 'https://trained-assist-mcp-user-sandbox.skillset-apply.workers.dev/mcp',
   scope: 'mcp:user-agent-run', tokenEnv: 'RUNNER_MCP_USER_TOKEN',
   proofEnv: 'RUNNER_MCP_USER_PROOF', configEnv: 'OPENCODE_CONFIG_CONTENT',
-  allowedOpenCodeTools: ['mem-gpt_identity_whoami', 'mem-gpt_google_docs_connect', 'mem-gpt_google_docs_get_document'],
+  // OpenCode's headless run rejects a permission request it cannot resolve, so
+  // the allowlist has to name every catalog tool the agent may call. The wallet
+  // tools are part of the same pinned catalog as the identity and docs tools:
+  // a run that may not create a credential form cannot complete a run that
+  // waits for one.
+  allowedOpenCodeTools: ['mem-gpt_identity_whoami', 'mem-gpt_google_docs_connect', 'mem-gpt_google_docs_get_document',
+    'mem-gpt_zerocreds_wallet_form_create', 'mem-gpt_zerocreds_wallet_form_status',
+    'mem-gpt_zerocreds_wallet_connection_status', 'mem-gpt_zerocreds_wallet_connection_revoke'],
 });
 
 export interface VmWorkerServerOptions {

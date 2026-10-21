@@ -220,6 +220,10 @@ describe('installable VM HTTP worker', () => {
       'mem-gpt_identity_whoami': 'allow',
       'mem-gpt_google_docs_connect': 'allow',
       'mem-gpt_google_docs_get_document': 'allow',
+      'mem-gpt_zerocreds_wallet_form_create': 'allow',
+      'mem-gpt_zerocreds_wallet_form_status': 'allow',
+      'mem-gpt_zerocreds_wallet_connection_status': 'allow',
+      'mem-gpt_zerocreds_wallet_connection_revoke': 'allow',
     });
     expect(JSON.stringify(spec)).not.toContain('user-catalog-bearer-token-123456');
     expect(JSON.stringify(spec)).not.toContain('signed-user-run-proof-123456');
